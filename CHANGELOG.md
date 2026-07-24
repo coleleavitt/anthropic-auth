@@ -2,6 +2,21 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.18.0
+
+### Minor Changes
+
+- Add Claude Opus 5 request shaping to OpenCode and Pi's converter, including summarized adaptive thinking, effort-based reasoning, explicit disabled-thinking handling, and OpenCode fast mode.
+- Extend OpenCode content-filter recovery to Opus 5: temporarily downgrade refused requests to Opus 4.8 for 10 successful responses while preserving the selected model, prewarming the original Opus 5 cache, and reporting model-specific recovery transitions.
+
+### Patch Changes
+
+- Publish native OpenCode Opus 5 `low`, `medium`, `high`, `xhigh`, and `max` effort variants instead of inherited manual-thinking budgets.
+- Isolate Fable 5 and Opus 5 recovery state, cache warm chains, OAuth account binding, and standby anchors by session and source-model family.
+- Treat Darwin/Bun `EINVAL` during a contended eviction-marker create as a lost lock race, preventing high-contention refresh-lock failures.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the Opus 5 contribution.
+
 ## 1.17.0
 
 ### Minor Changes
