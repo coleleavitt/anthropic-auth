@@ -580,6 +580,61 @@ describe('provider.models', () => {
     })
   })
 
+  test('replaces stale Opus 5 manual-thinking variants with adaptive efforts', async () => {
+    const plugin = await getPlugin()
+    const models = {
+      'claude-opus-4-8': {
+        id: 'claude-opus-4-8',
+        variants: {
+          high: {
+            thinking: { type: 'adaptive', display: 'summarized' },
+            effort: 'high',
+          },
+        },
+      },
+      'claude-opus-5': {
+        id: 'claude-opus-5',
+        api: { id: 'claude-opus-5' },
+        variants: {
+          high: { thinking: { type: 'enabled', budgetTokens: 16_000 } },
+          max: { thinking: { type: 'enabled', budgetTokens: 31_999 } },
+        },
+      },
+    }
+
+    const result = await plugin.provider?.models?.(
+      { models } as never,
+      { auth: { type: 'api' } } as never,
+    )
+
+    expect(result?.['claude-opus-5']?.variants).toEqual({
+      low: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'low',
+      },
+      medium: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'medium',
+      },
+      high: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'high',
+      },
+      xhigh: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'xhigh',
+      },
+      max: {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort: 'max',
+      },
+    })
+    expect(models['claude-opus-5'].variants.max.thinking).toEqual({
+      type: 'enabled',
+      budgetTokens: 31_999,
+    })
+  })
+
   test('does not zero OAuth model costs when costZeroing is disabled', async () => {
     await useTempAccountFile(
       createFallbackStorage({ accounts: [], costZeroing: { enabled: false } }),
@@ -7365,6 +7420,29 @@ describe('auth.loader', () => {
     await new Promise((resolve) => setTimeout(resolve, 5))
     expect(normalModels).toHaveLength(11)
     expect(releaseFinalWarm).toBeDefined()
+
+    const opus5Request = {
+      ...request,
+      body: JSON.stringify({
+        ...JSON.parse(request.body),
+        model: 'claude-opus-5',
+      }),
+    }
+    const opus5ResponsePromise = result.fetch(MESSAGES_URL, opus5Request)
+    for (
+      let attempt = 0;
+      attempt < 1_000 && normalModels.at(-1) !== 'claude-opus-5';
+      attempt++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    const opus5ReachedUpstream = normalModels.at(-1) === 'claude-opus-5'
+    if (!opus5ReachedUpstream) releaseFinalWarm?.()
+    expect(opus5ReachedUpstream).toBe(true)
+    const opus5Response = await opus5ResponsePromise
+    await opus5Response.text()
+    expect(normalModels).toHaveLength(12)
+
     const waitingState = await waitForSidebarState((state) =>
       Boolean(
         state.fableRecoveries?.some(
@@ -7409,7 +7487,7 @@ describe('auth.loader', () => {
         }),
       }),
     )
-    expect(normalModels).toHaveLength(12)
+    expect(normalModels).toHaveLength(13)
 
     const restoredState = await waitForSidebarState((state) =>
       Boolean(

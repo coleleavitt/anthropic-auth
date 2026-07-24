@@ -136,7 +136,7 @@ describe('FableFallbackManager', () => {
     manager.activate(manager.plan('session-a', body())!)
     const failed = manager.plan('session-a', body())!
 
-    expect(manager.remaining('session-a')).toBe(10)
+    expect(manager.remaining(failed)).toBe(10)
     expect(manager.complete(failed)).toEqual({ counted: true, remaining: 9 })
     expect(manager.complete(failed)).toEqual({ counted: false, remaining: 9 })
   })
@@ -149,6 +149,38 @@ describe('FableFallbackManager', () => {
     expect(manager.plan('session-b', body())?.downgraded).toBe(false)
     expect(manager.plan('session-a', body('claude-opus-4-8'))).toBeNull()
     expect(manager.plan(undefined, body())).toBeNull()
+  })
+
+  test('tracks Fable and Opus 5 recovery independently in the same session', () => {
+    const manager = new FableFallbackManager()
+    const fable = manager.plan('session-a', body('claude-fable-5'))!
+    manager.activate(fable, 'fable-account')
+
+    const healthyOpus = manager.plan('session-a', body('claude-opus-5'))!
+    expect(healthyOpus).toMatchObject({
+      requestedModel: 'claude-opus-5',
+      effectiveModel: 'claude-opus-5',
+      downgraded: false,
+    })
+    expect(JSON.parse(healthyOpus.bodyText).model).toBe('claude-opus-5')
+
+    manager.activate(healthyOpus, 'opus-account')
+    const downgradedFable = manager.plan('session-a', body('claude-fable-5'))!
+    const downgradedOpus = manager.plan('session-a', body('claude-opus-5'))!
+
+    expect(downgradedFable).toMatchObject({
+      requestedModel: 'claude-fable-5',
+      effectiveModel: FABLE_FALLBACK_MODEL_ID,
+      cacheAccountId: 'fable-account',
+      downgraded: true,
+    })
+    expect(downgradedOpus).toMatchObject({
+      requestedModel: 'claude-opus-5',
+      effectiveModel: FABLE_FALLBACK_MODEL_ID,
+      cacheAccountId: 'opus-account',
+      downgraded: true,
+    })
+    expect(downgradedFable.cycle).not.toBe(downgradedOpus.cycle)
   })
 
   test('a new filter cycle does not let an older Opus response decrement it', () => {

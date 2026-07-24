@@ -708,6 +708,36 @@ function addFableMythos5Models<
   } as T
 }
 
+const CLAUDE_OPUS_5_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
+function createClaudeOpus5Variants() {
+  return Object.fromEntries(
+    CLAUDE_OPUS_5_EFFORTS.map((effort) => [
+      effort,
+      {
+        thinking: { type: 'adaptive', display: 'summarized' },
+        effort,
+      },
+    ]),
+  )
+}
+
+function applyClaudeOpus5Variants<
+  T extends Record<string, AnthropicProviderModel>,
+>(models: T) {
+  return Object.fromEntries(
+    Object.entries(models).map(([id, model]) => {
+      const modelId = model.api?.id ?? model.id ?? id
+      return [
+        id,
+        isClaudeOpus5Model(modelId)
+          ? { ...model, variants: createClaudeOpus5Variants() }
+          : model,
+      ]
+    }),
+  ) as T
+}
+
 function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   models: T,
 ) {
@@ -1165,9 +1195,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     },
   })
 
-  const fableWarmChains = new Map<string, Promise<void>>()
+  const recoveryWarmChains = new Map<string, Promise<void>>()
 
-  function warmFableAfterOpus(context: FableRequestContext) {
+  function warmRecoverySourceAfterOpus(context: FableRequestContext) {
     const sessionId = context.plan.sessionId
     const modelLabel = isClaudeOpus5Model(context.plan.requestedModel)
       ? 'Opus 5'
@@ -1206,7 +1236,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         if (result.ok) {
           logger.debug('fable-fallback', `${modelLabel} cache warmed`, {
             session: sessionId,
-            remaining: fableFallbackManager.remaining(sessionId),
+            remaining: fableFallbackManager.remaining(context.plan),
             ...(result.usage && { usage: result.usage }),
           })
           return
@@ -1224,12 +1254,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       }
     }
 
-    const previous = fableWarmChains.get(sessionId) ?? Promise.resolve()
+    const { recoveryKey } = context.plan
+    const previous = recoveryWarmChains.get(recoveryKey) ?? Promise.resolve()
     const current = previous.then(run, run)
-    fableWarmChains.set(sessionId, current)
+    recoveryWarmChains.set(recoveryKey, current)
     void current.finally(() => {
-      if (fableWarmChains.get(sessionId) === current) {
-        fableWarmChains.delete(sessionId)
+      if (recoveryWarmChains.get(recoveryKey) === current) {
+        recoveryWarmChains.delete(recoveryKey)
       }
     })
     return current
@@ -2401,7 +2432,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         provider: { models: Record<string, AnthropicProviderModel> },
         context: { auth?: { type?: string } },
       ) {
-        const models = addFableMythos5Models(provider.models)
+        const models = applyClaudeOpus5Variants(
+          addFableMythos5Models(provider.models),
+        )
         // Zero OAuth model costs by default (quota-based, not per-token billed).
         // Opt out via persisted config costZeroing.enabled=false to show real costs.
         // initialStorage is nullable (no config file yet) → default to enabled.
@@ -3899,7 +3932,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 incomingHeaders.get('x-opencode-session')
               let fablePlan = fableFallbackManager.plan(sessionId, init?.body)
               if (fablePlan && !fablePlan.downgraded) {
-                const finalWarm = fableWarmChains.get(fablePlan.sessionId)
+                const finalWarm = recoveryWarmChains.get(fablePlan.recoveryKey)
                 if (finalWarm) {
                   await finalWarm
                   fablePlan = fableFallbackManager.plan(sessionId, init?.body)
@@ -3989,13 +4022,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             storage,
                             auth,
                           )
-                          const warm = warmFableAfterOpus(fableRequest)
+                          const warm = warmRecoverySourceAfterOpus(fableRequest)
                           if (completed.remaining === 0) {
                             const notifyRestored = () => {
                               if (
-                                fableFallbackManager.remaining(
-                                  fablePlan.sessionId,
-                                ) !== 0
+                                fableFallbackManager.remaining(fablePlan) !== 0
                               )
                                 return
                               publishFableRecoveryNotice(
