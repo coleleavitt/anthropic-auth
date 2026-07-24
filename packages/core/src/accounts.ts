@@ -1615,7 +1615,11 @@ export async function acquireRefreshFileLock(options: {
           { encoding: 'utf8', mode: 0o600, flag: 'wx' },
         )
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        const code = (error as NodeJS.ErrnoException).code
+        // Another contender can rename the marker directory between mkdir and
+        // this exclusive create. Darwin/Bun reports that lost-parent race as
+        // either ENOENT or EINVAL; both mean this contender lost the marker.
+        if (code === 'ENOENT' || code === 'EINVAL') return false
         await releaseEvictionMarker()
         throw error
       }
