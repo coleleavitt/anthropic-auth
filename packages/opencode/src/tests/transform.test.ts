@@ -2363,6 +2363,84 @@ describe('rewriteRequestBody', () => {
     expect(result.messages[2].role).toBe('user')
   })
 
+  test('strips trailing whitespace after the latest assistant tool_use turn', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'start' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+            { type: 'text', text: ' ' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'one' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_2', name: 'Bash', input: {} },
+            { type: 'text', text: 'Checking another result.' },
+            { type: 'tool_use', id: 'tool_3', name: 'Bash', input: {} },
+            { type: 'text', text: ' \n' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_2', content: 'two' },
+            { type: 'tool_result', tool_use_id: 'tool_3', content: 'three' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.messages[1].content.at(-1)).toEqual({
+      type: 'text',
+      text: ' ',
+    })
+    expect(result.messages[3].content).toEqual([
+      { type: 'tool_use', id: 'tool_2', name: 'mcp_Bash', input: {} },
+      { type: 'text', text: 'Checking another result.' },
+      { type: 'tool_use', id: 'tool_3', name: 'mcp_Bash', input: {} },
+    ])
+  })
+
+  test('preserves meaningful text after the latest assistant tool_use turn', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'start' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+            { type: 'text', text: 'Waiting for this result.' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'done' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.messages[1].content.at(-1)).toEqual({
+      type: 'text',
+      text: 'Waiting for this result.',
+    })
+  })
+
   test('strips trailing assistant after tool_result + assistant', async () => {
     const body = JSON.stringify({
       system: 'sys',

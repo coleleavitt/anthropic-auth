@@ -1064,6 +1064,49 @@ function stripTrailingAssistantMessages(parsed: Record<string, unknown>) {
 }
 
 /**
+ * Anthropic can classify whitespace-only text after the latest assistant
+ * tool_use as assistant prefill on a later tool continuation, even when the
+ * request ends with a user tool_result message. Preserve older turns and
+ * meaningful text to avoid unnecessary prompt-cache churn.
+ */
+function stripLatestAssistantToolUseTrailingWhitespace(
+  parsed: Record<string, unknown>,
+) {
+  if (!Array.isArray(parsed.messages)) return 0
+
+  for (let index = parsed.messages.length - 1; index >= 0; index--) {
+    const message = parsed.messages[index]
+    if (!isRecord(message) || message.role !== 'assistant') continue
+    if (!Array.isArray(message.content)) return 0
+    if (
+      !message.content.some(
+        (block) => isRecord(block) && block.type === 'tool_use',
+      )
+    ) {
+      return 0
+    }
+
+    let removedBlocks = 0
+    while (message.content.length) {
+      const block = message.content[message.content.length - 1]
+      if (
+        !isRecord(block) ||
+        block.type !== 'text' ||
+        typeof block.text !== 'string' ||
+        block.text.trim()
+      ) {
+        break
+      }
+      message.content.pop()
+      removedBlocks++
+    }
+    return removedBlocks
+  }
+
+  return 0
+}
+
+/**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
  */
 type RewritePerfCallback = (
@@ -1134,6 +1177,8 @@ export async function rewriteRequestBody(
       ? parsed.messages.length
       : undefined
     stripTrailingAssistantMessages(parsed)
+    const removedWhitespaceBlocks =
+      stripLatestAssistantToolUseTrailingWhitespace(parsed)
     const messagesAfterStrip = Array.isArray(parsed.messages)
       ? parsed.messages.length
       : undefined
@@ -1144,6 +1189,7 @@ export async function rewriteRequestBody(
         typeof messagesAfterStrip === 'number'
           ? messagesBeforeStrip - messagesAfterStrip
           : undefined,
+      removedWhitespaceBlocks,
     })
 
     const modelNormalizeStart = rewriteNowMs()
