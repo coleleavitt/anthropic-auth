@@ -88,7 +88,7 @@ anthropic-auth/
 - `packages/core/src/oauth-profile.ts`: OAuth profile metadata fetch, tier formatting (`Max 5x`, `Team · Max 5x`), and 7-day TTL validation
 - `packages/core/src/quota-headers.ts`: Normalization of `anthropic-ratelimit-unified-*` headers from direct fetch and relay transports into shared quota snapshots
 - `packages/core/src/token-fingerprint.ts`: Non-reversible SHA-256 token fingerprinting for profile-to-token binding
-- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, in-process write serialization, cross-process configuration file locking and account merging
+- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, in-process write serialization, cross-process configuration file locking and account merging (with `ENOENT`/`EINVAL` eviction race handling)
 - `packages/core/src/quota-manager.ts`: Unified quota cache with backoff + staleness
 - `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
 - `packages/core/src/cch.ts`: XXH64-based request body signing
@@ -147,6 +147,6 @@ anthropic-auth/
 
 **New CLI command:** `packages/opencode/src/cli.ts` — add the subcommand handler following the `login`/`list`/`api add`/`relay setup` pattern.
 
-**New model spec:** `packages/core/src/models.ts` — add model ID, pricing, context window, and max output tokens constants. If it needs special request handling, update `packages/opencode/src/transform.ts` (e.g., Fable/Mythos thinking normalization or Sonnet 5 adaptive thinking normalization).
+**New model spec:** `packages/core/src/models.ts` — add model ID, pricing, context window, and max output tokens constants. If it needs special request handling, update `packages/opencode/src/transform.ts` (e.g., Fable/Mythos, Sonnet 5, or Opus 5 adaptive thinking normalization).
 
 **Shared utilities used across packages:** Extend `packages/core/src/` rather than duplicating between opencode and pi packages.
