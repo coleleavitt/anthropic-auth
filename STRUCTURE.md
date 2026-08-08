@@ -40,7 +40,7 @@ anthropic-auth/
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
 - Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `fable-fallback.ts` (session-and-source-family Fable/Opus 5 content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
+- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, and outcome detection), `fable-fallback.ts` (legacy session-and-source-family Fable/Opus 5 content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
@@ -108,9 +108,10 @@ anthropic-auth/
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
 - `packages/core/src/quotas.ts`: Quota calculation and formatting helpers
 - `packages/core/src/constants.ts`: Global application constants
-- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping), system sanitization, cache strategy and model-specific cache bridges, tool prefix, SSE stripping
-- `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 downgrade state and standby cache-anchor identity for Fable/Opus 5 content-filter recovery
-- `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed Fable recovery state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
+- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, tool prefix, SSE stripping
+- `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, and streamed handoff/sticky/restoration classification
+- `packages/opencode/src/fable-fallback.ts`: Legacy per-session and source-model-family 10-response Opus 4.8 downgrade state and standby cache-anchor identity, enabled by `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
+- `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting

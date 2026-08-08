@@ -32,7 +32,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
-- **Fable/Opus 5 content-filter recovery**: when Fable or Opus 5 ends a session response with Anthropic's `refusal` content-filter reason, transparently retry that source-model family with Opus 4.8 for 10 successful model responses. Recovery state and pending cache warms remain independent when a session switches between Fable and Opus 5. After each downgraded response, a zero-output prewarm advances the source model's prompt cache using the OAuth account that served the filtered request. The latest Opus cache boundary is retained so a later refusal can bridge back even after more than 20 content blocks. The TUI sidebar and OpenCode Desktop report both transitions while preserving the selected model.
+- **Fable/Opus 5 safety fallback**: eligible OAuth requests opt into Anthropic's server-side safety fallback by default. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history, and the TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to restore the previous deterministic 10-response Opus 4.8 recovery with source-model prewarming.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
@@ -517,6 +517,7 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
+| `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to use the previous deterministic 10-response client-side refusal recovery. The default is Anthropic server-side safety fallback. |
 | `PI_ANTHROPIC_AUTH_FILE` | Override the Pi sidecar config path. |
 | `PI_AGENT_DIR` | Override Pi's agent directory when deriving the default sidecar path. |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @cortexkit/opencode-anthropic-auth relay setup`. Not stored. |
@@ -532,7 +533,8 @@ For Claude Pro/Max OAuth requests, the plugin works at the final Anthropic wire-
 4. Prepends Claude Code identity and billing-header blocks.
 5. Rewrites cache controls according to `/claude-cache` mode.
 6. Renames MCP tool names into Claude-compatible PascalCase form.
-7. Computes final-body `cch` over the fully serialized request body.
+7. Opts eligible Fable 5 and Opus 5 OAuth requests into Anthropic's server-side safety fallback and restores stored fallback boundary markers.
+8. Computes final-body `cch` over the fully serialized request body.
 
 The sanitizer is anchor-based: it removes paragraphs containing known OpenCode documentation or source anchors, performs a small set of inline replacements, and preserves the rest of the prompt including user/project instructions, tool policy, environment context, and file paths.
 

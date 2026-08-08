@@ -7,6 +7,7 @@ Date: 2026-08-07
 - Anthropic, [Improving Fable 5's biology safeguards](https://www.anthropic.com/news/improving-fable-5-s-biology-safeguards)
 - Anthropic, [Introducing Claude Opus 5](https://www.anthropic.com/news/claude-opus-5)
 - Anthropic Platform, [Refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)
+- Anthropic Platform, [Fallback credit](https://platform.claude.com/docs/en/build-with-claude/fallback-credit)
 - Live Anthropic Models and Messages APIs queried with the `server-side-fallback-2026-07-01` beta on 2026-08-07
 
 ## Findings
@@ -33,26 +34,51 @@ A live OAuth Messages request to `claude-fable-5` with `fallbacks: "default"` an
 
 Sticky-served follow-up turns have no `fallback` boundary because no new refusal occurred. They remain distinguishable: the top-level model is the fallback model and `usage.iterations` contains `fallback_message` without a requested-model `message` attempt. A return to the selected model is likewise observable when the top-level model matches the requested model and no `fallback_message` served the response.
 
-## Current plugin behavior
+## Live OAuth verification
 
-The OpenCode plugin does not opt into Anthropic's server-side fallback beta. Its local recovery path instead:
+Testing against the OAuth Messages route confirmed:
 
-1. Detects any `stop_reason: "refusal"` from Fable 5 or Opus 5 without reading a refusal category.
-2. Rewrites both source models to `claude-opus-4-8`.
-3. Keeps the session on Opus 4.8 for ten successful responses before probing the source model again.
+- Sending only `anthropic-beta: server-side-fallback-2026-07-01` does not activate fallback; the request body must also contain `fallbacks: "default"`.
+- A Fable 5 biology refusal with both opt-ins was served by Opus 5. The response contained a `fallback` block from `claude-fable-5` to `claude-opus-5`, and usage contained one `message` iteration plus one `fallback_message` iteration.
+- Follow-up requests remained on the fallback model under Anthropic's best-effort sticky policy. Replaying or omitting the historical fallback block was accepted in controlled continuation probes, but preserving the block retains the complete Anthropic conversation boundary rather than silently discarding provider state.
+- A large cached prompt was charged one Fable cache write and one Opus cache write on the initial server fallback. This is the same cold dual-write shape observed with a tokenless manual retry.
 
-That behavior predates the documented Fable 5 → Opus 5 biology route. It is now demonstrably wrong for a Fable biology refusal and does not match Anthropic's category-aware routing. Its deterministic ten-successful-response recovery window also differs from Anthropic's best-effort, approximately one-hour sticky route.
+## Fallback Credit is not available to OAuth
 
-## Recommended direction
+Anthropic's separate Fallback Credit beta (`fallback-credit-2026-07-01`) can issue a short-lived credit token and optional prefill claim for client-managed retries under supported API-key authentication. It would have preserved the plugin's exact ten-response policy while avoiding duplicate prompt-cache writes.
 
-Do not merely change the local constant from Opus 4.8 to Opus 5. That would make Fable biology refusals correct while remaining wrong for Fable categories whose allowed/default target is Opus 4.8, and it would retain the unsupported ten-turn pinning heuristic.
+The OAuth spike did not issue a credit token:
 
-The durable implementation is to adopt Anthropic's server-side `fallbacks: "default"` behavior and normalize its response protocol for the host:
+- Fable 5 cyber and biology refusals returned no `fallback_credit_token` or prefill claim.
+- The result was unchanged across two OAuth accounts, streaming and non-streaming requests, and requests carrying the server-fallback beta.
+- Server-side fallback succeeded on the same OAuth route and refusal prompt.
 
-1. Add the server-side fallback beta and request field for supported OAuth model requests.
-2. Handle the API's `fallback` content block while preserving its exact position in assistant history, as required for later thinking-block validation.
-3. Preserve tool-name rewriting, streaming, usage accounting (including fallback iterations), and continuation semantics.
-4. Drive sidebar and Desktop state from the serving model and final `usage.iterations`, distinguishing a new handoff, a sticky-served turn, a return to the selected model, and a final refusal.
-5. Keep the local ten-turn recovery implementation behind an explicit rollback mode until the server-side path is proven end to end.
+Therefore Fallback Credit cannot implement OAuth refusal recovery in this plugin. Custom client retries remain useful only as the existing rollback path, without fallback-credit repricing.
 
-OpenCode's current Anthropic protocol implementation does not define a `fallback` content block or `stop_details`, so passing the beta response through unchanged is not sufficient. The plugin must normalize the stream into a host-supported representation that round-trips the boundary back to Anthropic at the same content position. Merely dropping the block is invalid, particularly when thinking blocks occur on both sides of a mid-output handoff.
+## Implemented policy
+
+OpenCode now defaults eligible Fable 5 and Opus 5 OAuth requests to Anthropic server-side safety fallback:
+
+1. Add `fallbacks: "default"` to the final request body and `server-side-fallback-2026-07-01` to the beta header.
+2. Detect an initial handoff from the streamed `fallback` content block.
+3. Detect sticky fallback turns from the top-level served model and `usage.iterations[].type === "fallback_message"`.
+4. Detect restoration when the requested model serves a completed non-refusal turn without fallback evidence.
+5. Publish one session-scoped active/restored transition to the TUI sidebar or, when no matching TUI is connected, OpenCode Desktop.
+
+OpenCode's protocol does not natively retain Anthropic's `fallback` block. The stream rewriter therefore converts it to a hidden thinking block containing a CortexKit-owned signature before OpenCode persists the response. On the next eligible server-fallback request, the body transformer validates that signature and reconstructs the original `fallback` block before cache transforms and `cch` signing. Markers are dropped rather than forwarded to ineligible models or custom API-key providers.
+
+The fallback beta and payload field are OAuth/provider-specific. Custom Anthropic-compatible API-key routes strip both before forwarding.
+
+## Rollback mode
+
+Set:
+
+```bash
+OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy
+```
+
+before starting OpenCode to restore the previous client-managed policy. Legacy mode keeps the existing ten-successful-response Opus 4.8 recovery, source-model zero-output prewarming, account-bound standby cache anchors, and deterministic countdown UX. No coexistence path runs both policies on one request: the environment variable selects server or legacy behavior at process startup.
+
+## Conclusion
+
+Server-side fallback is the default because it is the only Anthropic-supported OAuth mechanism that can turn safety refusals into completed responses. Its trade-offs remain server-controlled model selection, approximately one-hour best-effort stickiness, and cold fallback-model cache writes. The legacy mode remains intact as an explicit rollback path if live behavior proves worse than the deterministic ten-response policy.
