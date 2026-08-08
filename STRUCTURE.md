@@ -108,7 +108,7 @@ anthropic-auth/
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
 - `packages/core/src/quotas.ts`: Quota calculation and formatting helpers
 - `packages/core/src/constants.ts`: Global application constants
-- `packages/opencode/src/transform.ts`: Request rewriting, system sanitization, cache strategy and model-specific cache bridges, tool prefix, SSE stripping
+- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping), system sanitization, cache strategy and model-specific cache bridges, tool prefix, SSE stripping
 - `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 downgrade state and standby cache-anchor identity for Fable/Opus 5 content-filter recovery
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed Fable recovery state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
