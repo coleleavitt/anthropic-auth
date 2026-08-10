@@ -386,6 +386,7 @@ type PluginSessionClient = {
     | unknown[]
   prompt?: (input: NotificationRequest) => Promise<unknown> | unknown
   promptAsync?: (input: NotificationRequest) => Promise<unknown>
+  status?: () => Promise<unknown> | unknown
 }
 
 type PerfTrace = {
@@ -1757,9 +1758,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     // OpenCode's prompt endpoints run revert cleanup before honoring noReply.
     // Creating a notification while an assistant is still streaming can race the
     // active run and enqueue an extra provider turn. Queue it until OpenCode
-    // publishes the assistant's completed message update (or the following idle
-    // event if the outcome lands just after that update), then place it directly
-    // before that assistant in ID order.
+    // publishes the assistant's completed message update or becomes idle, then
+    // place it directly before that assistant in ID order. The status probe below
+    // closes the race where both events precede a delayed cache warm/outcome.
     const queue = pendingDesktopNotices.get(notice.sessionId) ?? []
     queue.push(desktopText)
     if (queue.length > 4) queue.splice(0, queue.length - 4)
@@ -1769,6 +1770,40 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const oldest = pendingDesktopNotices.keys().next().value
       if (oldest) pendingDesktopNotices.delete(oldest)
       else break
+    }
+    void flushDesktopNoticesIfIdle(notice.sessionId)
+  }
+
+  async function flushDesktopNoticesIfIdle(sessionId: string): Promise<void> {
+    const session = ctx.client.session as PluginSessionClient | undefined
+    if (typeof session?.status !== 'function') return
+
+    try {
+      const response = await Promise.resolve(session.status())
+      const responseRecord =
+        response !== null && typeof response === 'object'
+          ? (response as Record<string, unknown>)
+          : undefined
+      const data =
+        responseRecord && Object.hasOwn(responseRecord, 'data')
+          ? responseRecord.data
+          : responseRecord
+      if (data === null || typeof data !== 'object' || Array.isArray(data))
+        return
+      const status = (data as Record<string, unknown>)[sessionId]
+      if (status === undefined) {
+        await flushDesktopNotices(sessionId)
+        return
+      }
+      if (
+        status !== null &&
+        typeof status === 'object' &&
+        (status as { type?: unknown }).type === 'idle'
+      ) {
+        await flushDesktopNotices(sessionId)
+      }
+    } catch {
+      // Event-driven flushing remains the compatibility path for older hosts.
     }
   }
 

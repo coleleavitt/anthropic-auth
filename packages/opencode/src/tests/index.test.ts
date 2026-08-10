@@ -50,7 +50,10 @@ function extractUrl(input: string | URL | Request): string {
 }
 
 // Minimal mock of the OpenCode plugin client
-function createMockClient(messages?: unknown[]) {
+function createMockClient(
+  messages?: unknown[],
+  getSessionStatuses?: () => Record<string, { type: string }>,
+) {
   return {
     auth: {
       set: mock(() => Promise.resolve()),
@@ -58,6 +61,9 @@ function createMockClient(messages?: unknown[]) {
     session: {
       messages: messages
         ? mock(() => Promise.resolve({ data: messages }))
+        : undefined,
+      status: getSessionStatuses
+        ? mock(() => Promise.resolve({ data: getSessionStatuses() }))
         : undefined,
       promptAsync: mock((_input: unknown) => Promise.resolve()),
     },
@@ -7650,30 +7656,35 @@ describe('auth.loader', () => {
 
     const latestUserMessageId = 'msg_000000000100AAAAAAAAAAAAAA'
     const latestAssistantMessageId = 'msg_000000000200BBBBBBBBBBBBBB'
-    const mockClient = createMockClient([
-      {
-        info: {
-          id: latestUserMessageId,
-          role: 'user',
-          agent: 'Alfonso - CTO',
-          model: {
+    let sessionIdle = false
+    const mockClient = createMockClient(
+      [
+        {
+          info: {
+            id: latestUserMessageId,
+            role: 'user',
+            agent: 'Alfonso - CTO',
+            model: {
+              providerID: 'anthropic',
+              modelID: 'claude-fable-5',
+              variant: 'xhigh',
+            },
+          },
+        },
+        {
+          info: {
+            id: latestAssistantMessageId,
+            role: 'assistant',
+            agent: 'Alfonso - CTO',
             providerID: 'anthropic',
             modelID: 'claude-fable-5',
             variant: 'xhigh',
           },
         },
-      },
-      {
-        info: {
-          id: latestAssistantMessageId,
-          role: 'assistant',
-          agent: 'Alfonso - CTO',
-          providerID: 'anthropic',
-          modelID: 'claude-fable-5',
-          variant: 'xhigh',
-        },
-      },
-    ])
+      ],
+      (): Record<string, { type: string }> =>
+        sessionIdle ? {} : { ses_fable_filter: { type: 'busy' } },
+    )
     const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(
       () =>
@@ -7844,10 +7855,10 @@ describe('auth.loader', () => {
         (recovery) => recovery.sessionId === 'ses_fable_filter',
       )?.mode,
     ).toBe('opus')
-    releaseFinalWarm?.()
-    const restored = await restoredPromise
-    await restored.text()
-    expect(normalModels.at(-1)).toBe('claude-fable-5')
+
+    // Reproduce the host race: OpenCode can publish idle while the final cache
+    // warm is still pending, before the restoration notice has been queued.
+    sessionIdle = true
     await plugin.event?.({
       event: {
         type: 'session.status',
@@ -7857,6 +7868,12 @@ describe('auth.loader', () => {
         },
       },
     })
+    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
+
+    releaseFinalWarm?.()
+    const restored = await restoredPromise
+    await restored.text()
+    expect(normalModels.at(-1)).toBe('claude-fable-5')
 
     for (
       let attempt = 0;

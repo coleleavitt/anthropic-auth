@@ -11,6 +11,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Reconcile Desktop fallback notices against live OpenCode session status when a delayed cache warm completes after the normal completion/idle events.
 - Strip trailing whitespace-only text blocks after the latest assistant tool call before Anthropic replay, preventing valid tool-result continuations from being rejected as unsupported assistant prefills.
 
 ## 1.18.0
