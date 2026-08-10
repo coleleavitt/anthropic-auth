@@ -23,7 +23,7 @@
 **@cortexkit/opencode-anthropic-auth (OpenCode Plugin):**
 - Purpose: OpenCode plugin that intercepts Anthropic fetch requests, provides CLI, TUI sidebar, and command modal dialogs
 - Location: `packages/opencode/src/`
-- Contains: Plugin entry point (`index.ts`), CLI (`cli.ts`), request transform/SSE stripping (`transform.ts`), system prompt sanitization (`sanitize-memo.ts`, `prompt-context.ts`), TUI sidebar widget (`tui.tsx`), TUI preferences (`tui-preferences.ts`), command modal dialogs (`tui/command-dialogs.tsx`), loopback RPC server/client for TUI IPC (`rpc/`), and TUI sidebar IPC state management (`sidebar-state.ts`)
+- Contains: Plugin entry point (`index.ts`), CLI (`cli.ts`), request transform/SSE stripping (`transform.ts`), Anthropic server-side safety fallback (`server-fallback.ts`), legacy content-filter recovery (`fable-fallback.ts`), system prompt sanitization (`sanitize-memo.ts`, `prompt-context.ts`), TUI sidebar widget (`tui.tsx`), TUI preferences (`tui-preferences.ts`), command modal dialogs (`tui/command-dialogs.tsx`), loopback RPC server/client for TUI IPC (`rpc/`), and TUI sidebar IPC state management (`sidebar-state.ts`)
 - Depends on: `@cortexkit/anthropic-auth-core`, `@opencode-ai/plugin` (peer), `@opentui/core` + `@opentui/solid` + `solid-js` (TUI), `jsonc-parser` (TUI preferences)
 - Used by: OpenCode agent (loaded as plugin + TUI plugin)
 
@@ -37,7 +37,7 @@
 **End-to-End Tests:**
 - Purpose: Integration tests for the full OpenCode plugin flow with mock Anthropic and relay servers
 - Location: `packages/e2e-tests/`
-- Contains: Test harness (`src/harness.ts`), mock servers (`src/mock-anthropic.ts`, `src/mock-relay.ts`), OpenCode runner (`src/opencode-runner.ts` with orphaned process and temp directory hygiene), test files (`tests/tool-prefix.test.ts`)
+- Contains: Test harness (`src/harness.ts`), mock servers (`src/mock-anthropic.ts`, `src/mock-relay.ts`), OpenCode runner (`src/opencode-runner.ts` with orphaned process and temp directory hygiene), test files (`tests/tool-prefix.test.ts`, `tests/quota-header-relay.test.ts`, `tests/tmp-hygiene.test.ts`)
 
 ## Data Flow
 

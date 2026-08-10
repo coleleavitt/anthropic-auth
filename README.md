@@ -293,6 +293,20 @@ In OpenCode, this includes the main Anthropic account and sidecar fallback accou
 
 Reset times are rendered as relative durations, such as `resets in 10m` or `resets in 1h 15m`.
 
+## Safety fallback (OpenCode)
+
+Eligible Fable 5 and Opus 5 OAuth requests use Anthropic's server-side safety fallback by default. The plugin sends `fallbacks: "default"` with Anthropic's server-side fallback beta, preserves fallback conversation boundaries in OpenCode history, and reports model handoffs and restoration in the TUI sidebar or OpenCode Desktop. Follow-up requests may remain on Anthropic's selected fallback model for approximately one hour.
+
+Custom API-key routes do not receive the server-side fallback beta or request field.
+
+To return to CortexKit's previous deterministic recovery mechanism, start OpenCode with:
+
+```bash
+OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy opencode
+```
+
+Legacy mode routes a refused Fable 5 or Opus 5 session through Opus 4.8 for 10 successful responses, prewarms the selected source model's cache, and then restores that model. Unset the variable and restart OpenCode to use Anthropic's server-side fallback again.
+
 ## Quota sidebar (OpenCode TUI)
 
 OpenCode can render a live quota sidebar widget that surfaces plugin state without running a slash command. The widget is OpenCode-only; Pi has no TUI surface.

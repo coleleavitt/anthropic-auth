@@ -58,7 +58,7 @@ anthropic-auth/
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic and relay servers
-- Contains: Test harness, mock server implementations, process runner with temp dir hygiene, tool prefix tests
+- Contains: Test harness, mock server implementations, process runner with temp dir hygiene, end-to-end integration tests (tool prefix, quota header relay, temp directory hygiene)
 
 **`scripts/`:**
 - Purpose: Development, release, and analysis utilities
