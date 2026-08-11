@@ -403,9 +403,12 @@ export async function buildAnthropicRequest(
       firstUser.content = `${prompt}\n\n${content}`
     } else if (firstUser && Array.isArray(content)) {
       content.unshift({ type: 'text', text: prompt })
-    } else {
-      system.push({ type: 'text', text: prompt })
     }
+    // No else: with no user message, messages[] is necessarily empty
+    // (convertMessages emits only user/assistant, and trailing assistants are
+    // stripped above), so the request is already invalid. Pushing the prompt
+    // into system[] there would recreate the rejected three-entry shape for
+    // no benefit, so the prompt is dropped instead.
   }
 
   const body: AnthropicRequestBody = {

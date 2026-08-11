@@ -378,12 +378,14 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
     expect(content[0]).toEqual({ type: 'text', text: 'PI PROMPT' })
   })
 
-  test('falls back to system[] when there is no user message', async () => {
+  test('drops the prompt when there is no user message to carry it', async () => {
     const body = await buildBody([assistantMsg('only assistant')], 'PI PROMPT')
-    expect(body.system).toHaveLength(3)
-    // toMatchObject, not toEqual: the ephemeral cache anchor attaches to the
-    // last system entry, which in this fallback path is the prompt itself.
-    expect(body.system?.[2]).toMatchObject({ type: 'text', text: 'PI PROMPT' })
+    // convertMessages emits only user/assistant and trailing assistants are
+    // stripped, so a conversation with no user message converts to empty.
+    // system[] must stay at two entries even on this path.
+    expect(body.messages).toHaveLength(0)
+    expect(body.system).toHaveLength(2)
+    expect(JSON.stringify(body.system)).not.toContain('PI PROMPT')
   })
 
   test('leaves the identity block as the last system entry for cache anchoring', async () => {
