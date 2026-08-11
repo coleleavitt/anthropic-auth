@@ -391,7 +391,21 @@ export async function buildAnthropicRequest(
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
   if (context.systemPrompt?.trim()) {
-    system.push({ type: 'text', text: sanitize(context.systemPrompt) })
+    // Anthropic validates system[] for OAuth requests using Claude Code
+    // billing. Third-party system content alongside the identity block is
+    // rejected with 400 "You're out of extra usage". Keep only the billing
+    // header and identity in system[], and relocate Pi's prompt to the first
+    // user message, where it is functionally equivalent.
+    const prompt = sanitize(context.systemPrompt)
+    const firstUser = messages.find((m) => m.role === 'user')
+    const content = firstUser?.content
+    if (firstUser && typeof content === 'string') {
+      firstUser.content = `${prompt}\n\n${content}`
+    } else if (firstUser && Array.isArray(content)) {
+      content.unshift({ type: 'text', text: prompt })
+    } else {
+      system.push({ type: 'text', text: prompt })
+    }
   }
 
   const body: AnthropicRequestBody = {
