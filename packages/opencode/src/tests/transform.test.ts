@@ -760,6 +760,69 @@ describe('createStrippedStream', () => {
     expect(text).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
   })
 
+  test('preserves a completed fallback tool call instead of retrying its terminal refusal', async () => {
+    const filterContexts: boolean[] = []
+    const completions: string[] = []
+    const outcomes: ServerSideFallbackOutcome[] = []
+    const payload = [
+      sse('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_1', model: 'claude-opus-4-8' },
+      }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'tool_use',
+          id: 'toolu_1',
+          name: 'mcp_Bash',
+          input: {},
+        },
+      }),
+      sse('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: '{"command":"printf x"}',
+        },
+      }),
+      sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'refusal' },
+        usage: {
+          output_tokens: 1,
+          iterations: [{ type: 'fallback_message', model: 'claude-opus-4-8' }],
+        },
+      }),
+      sse('message_stop', { type: 'message_stop' }),
+    ].join('')
+    const response = createStrippedStream(new Response(payload), {
+      serverSideFallbackModel: 'claude-fable-5',
+      onContentFilter: (context) => {
+        filterContexts.push(context?.completedToolUse === true)
+        return true
+      },
+      onComplete: (finishReason) => completions.push(finishReason),
+      onServerSideFallbackOutcome: (outcome) => outcomes.push(outcome),
+    })
+
+    const text = await response.text()
+
+    expect(text).toContain('"stop_reason":"tool_use"')
+    expect(text).not.toContain('"stop_reason":"refusal"')
+    expect(filterContexts).toEqual([true])
+    expect(completions).toEqual(['tool_use'])
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        servedModel: 'claude-opus-4-8',
+        targetModel: 'claude-opus-4-8',
+        stopReason: 'refusal',
+      }),
+    ])
+  })
+
   test('turns Fable refusal finishes into retryable errors and signals once', async () => {
     const encoder = new TextEncoder()
     const chunks = [

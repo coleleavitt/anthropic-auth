@@ -7515,6 +7515,23 @@ describe('auth.loader', () => {
             id: latestAssistantMessageId,
             sessionID: 'ses_server_fallback',
             role: 'assistant',
+            finish: 'tool-calls',
+            time: { completed: Date.now() },
+          },
+        },
+      },
+    })
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: latestAssistantMessageId,
+            sessionID: 'ses_server_fallback',
+            role: 'assistant',
+            finish: 'stop',
             time: { completed: Date.now() },
           },
         },

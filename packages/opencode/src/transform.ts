@@ -1696,7 +1696,9 @@ export function createStrippedStream(
   response: Response,
   options: {
     perf?: RewritePerfCallback
-    onContentFilter?: () => boolean | undefined
+    onContentFilter?: (context?: {
+      completedToolUse: boolean
+    }) => boolean | undefined
     onComplete?: (finishReason: string) => void
     contentFilterModel?: unknown
     serverSideFallbackModel?: string
@@ -1724,10 +1726,24 @@ export function createStrippedStream(
     options.onContentFilter || options.onComplete
       ? createSseFinishState()
       : undefined
+  let contentFilterInvoked = false
+  let contentFilterHandled = false
+  const invokeContentFilter = (completedToolUse = false) => {
+    if (!options.onContentFilter) return false
+    if (!contentFilterInvoked) {
+      contentFilterInvoked = true
+      contentFilterHandled =
+        options.onContentFilter({ completedToolUse }) !== false
+    }
+    return contentFilterHandled
+  }
   const serverSideFallback = options.serverSideFallbackModel
     ? createServerSideFallbackStreamRewriter({
         requestedModel: options.serverSideFallbackModel,
         onOutcome: options.onServerSideFallbackOutcome,
+        onRefusalAfterToolUse: options.onContentFilter
+          ? () => invokeContentFilter(true)
+          : undefined,
       })
     : undefined
 
@@ -1735,10 +1751,9 @@ export function createStrippedStream(
     if (!sseFinish) return null
     const update = updateSseFinishState(sseFinish, text)
     if (update?.type === 'content-filter' && options.onContentFilter) {
-      const handled = options.onContentFilter()
-      return handled === false
-        ? null
-        : retryableFableContentFilterError(options.contentFilterModel)
+      return invokeContentFilter()
+        ? retryableFableContentFilterError(options.contentFilterModel)
+        : null
     }
     if (update?.type === 'complete') options.onComplete?.(update.finishReason)
     return null
@@ -1795,9 +1810,14 @@ export function createStrippedStream(
             const finalDecoded = decoder.decode()
             if (sseDiagnostics)
               updateSseDiagnostics(sseDiagnostics, finalDecoded)
+            const rewriteStart = rewriteNowMs()
+            const serverRewritten = serverSideFallback
+              ? serverSideFallback.push(finalDecoded) +
+                serverSideFallback.flush()
+              : finalDecoded
             const retryableStreamError =
               updateSseErrorState(sseErrors, finalDecoded) ??
-              updateFinish(finalDecoded)
+              updateFinish(serverRewritten)
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
                 error: retryableStreamError.message,
@@ -1806,11 +1826,6 @@ export function createStrippedStream(
               await cancelReader(retryableStreamError)
               throw retryableStreamError
             }
-            const rewriteStart = rewriteNowMs()
-            const serverRewritten = serverSideFallback
-              ? serverSideFallback.push(finalDecoded) +
-                serverSideFallback.flush()
-              : finalDecoded
             const flushed = splitToolPrefixRewriteBuffer(
               `${pending}${serverRewritten}`,
               true,
@@ -1831,8 +1846,13 @@ export function createStrippedStream(
           inputBytes += value.byteLength
           const decoded = decoder.decode(value, { stream: true })
           if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, decoded)
+          const rewriteStart = rewriteNowMs()
+          const serverRewritten = serverSideFallback
+            ? serverSideFallback.push(decoded)
+            : decoded
           const retryableStreamError =
-            updateSseErrorState(sseErrors, decoded) ?? updateFinish(decoded)
+            updateSseErrorState(sseErrors, decoded) ??
+            updateFinish(serverRewritten)
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               error: retryableStreamError.message,
@@ -1843,11 +1863,7 @@ export function createStrippedStream(
             releaseReader()
             throw retryableStreamError
           }
-          const serverRewritten = serverSideFallback
-            ? serverSideFallback.push(decoded)
-            : decoded
           const text = pending + serverRewritten
-          const rewriteStart = rewriteNowMs()
           const rewritten = splitToolPrefixRewriteBuffer(text)
           rewriteMs += rewriteNowMs() - rewriteStart
           pending = rewritten.pending

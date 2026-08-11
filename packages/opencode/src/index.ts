@@ -2546,6 +2546,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             id?: string
             sessionID?: string
             role?: string
+            finish?: string
             time?: { completed?: number }
           }
           status?: { type?: string }
@@ -2566,6 +2567,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       if (
         value.type === 'message.updated' &&
         info?.role === 'assistant' &&
+        info.finish !== 'tool-calls' &&
         typeof info.time?.completed === 'number'
       ) {
         await flushDesktopNotices(sessionId)
@@ -4178,7 +4180,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   contentFilterModel: fablePlan?.requestedModel,
                   ...(!fablePlan?.downgraded && fablePlan
                     ? {
-                        onContentFilter: () => {
+                        onContentFilter: (context) => {
                           if (!fableRequest?.warmTarget) {
                             logger.debug(
                               'fable-fallback',
@@ -4191,12 +4193,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             fablePlan,
                             fableRequest.warmTarget.oauthAccountId,
                           )
+                          serverFallbackTargets.delete(fablePlan.recoveryKey)
                           logger.info(
                             'fable-fallback',
                             'content filter detected; switching session to Opus 4.8',
                             {
                               session: fablePlan.sessionId,
                               requestedModel: fablePlan.requestedModel,
+                              completedToolUse:
+                                context?.completedToolUse === true,
                               remaining,
                             },
                           )
