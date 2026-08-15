@@ -33,8 +33,8 @@ function toolResultMsg(toolCallId: string, text: string): Message {
 
 const defaultCache = { enabled: false, mode: 'hybrid' as const }
 
-// systemPrompt is opt-in. buildAnthropicRequest relocates a non-empty prompt
-// onto the first user message, so tests that assert raw conversion output pass
+// systemPrompt is opt-in. buildAnthropicRequest carries a non-empty prompt as a
+// separate role: "system" message, so tests that assert raw conversion output pass
 // no prompt and observe messages unchanged. The relocation itself is covered by
 // the "Claude Code system[] shape" block below.
 async function buildMessages(messages: Message[], systemPrompt?: string) {
@@ -331,10 +331,10 @@ describe('convertMessages — empty base64 image guard', () => {
 })
 
 describe('buildAnthropicRequest — Claude Code system[] shape', () => {
-  // Anthropic rejects OAuth requests carrying Claude Code billing headers when
-  // third-party system content sits in system[] alongside the identity block.
-  // These cases pin the resulting shape: system[] holds only the billing header
-  // and the identity block, and Pi's prompt rides on the first user message.
+  // Pi's prompt cannot sit in the top-level system[] array — see the note in
+  // convert.ts. These cases pin the resulting shape: system[] holds only the
+  // billing header and the identity block, and Pi's prompt is carried as a
+  // role: "system" message immediately after the first user message.
   async function buildBody(messages: Message[], systemPrompt?: string) {
     const { body } = await buildAnthropicRequest(
       'claude-sonnet-4-20250514',
@@ -351,15 +351,25 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
     expect(JSON.stringify(body.system)).not.toContain('PI PROMPT')
   })
 
-  test('prepends the prompt to a string first user message', async () => {
+  test('carries the prompt as a system message after the first user message', async () => {
     const body = await buildBody([userMsg('hello')], 'PI PROMPT')
-    expect(body.messages[0]).toEqual({
-      role: 'user',
-      content: 'PI PROMPT\n\nhello',
+    expect(body.messages[0]).toEqual({ role: 'user', content: 'hello' })
+    expect(body.messages[1]).toEqual({
+      role: 'system',
+      content: [
+        {
+          type: 'text',
+          text: 'PI PROMPT',
+          // Set explicitly: addEphemeralCacheControl's message-level breakpoint
+          // only fires for array content on the last user message, which Pi's
+          // plain-string messages never satisfy.
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
     })
   })
 
-  test('prepends a text block when the first user message is structured', async () => {
+  test('leaves a structured first user message untouched', async () => {
     const body = await buildBody(
       [
         {
@@ -374,8 +384,9 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
       'PI PROMPT',
     )
     const content = body.messages[0]?.content as Array<Record<string, unknown>>
-    expect(content).toHaveLength(3)
-    expect(content[0]).toEqual({ type: 'text', text: 'PI PROMPT' })
+    expect(content).toHaveLength(2)
+    expect(content[0]).toMatchObject({ type: 'text', text: 'see image' })
+    expect(body.messages[1]).toMatchObject({ role: 'system' })
   })
 
   test('drops the prompt when there is no user message to carry it', async () => {

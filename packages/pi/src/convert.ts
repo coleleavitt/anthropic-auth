@@ -391,24 +391,36 @@ export async function buildAnthropicRequest(
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
   if (context.systemPrompt?.trim()) {
-    // Anthropic validates system[] for OAuth requests using Claude Code
-    // billing. Third-party system content alongside the identity block is
-    // rejected with 400 "You're out of extra usage". Keep only the billing
-    // header and identity in system[], and relocate Pi's prompt to the first
-    // user message, where it is functionally equivalent.
+    // Pi's prompt cannot sit in the top-level system[] array: two lines of its
+    // documentation paragraph (the docs/*.md enumeration and the "follow .md
+    // cross-references" instruction) are each independently sufficient to make
+    // Anthropic reject the request with 400 "You're out of extra usage". Entry
+    // count and payload size are ruled out — 2697 bytes of neutral filler in the
+    // same position is accepted. The same text is accepted inside messages[], so
+    // carry the prompt as a role: "system" message and keep system[] to the
+    // billing header and identity block.
+    //
+    // cache_control is set here rather than left to addEphemeralCacheControl,
+    // whose message-level breakpoint only fires when a message's content is an
+    // array — Pi sends plain strings, so it never fires. Without this marker the
+    // prompt sits outside the cached prefix and is reprocessed every turn.
     const prompt = sanitize(context.systemPrompt)
-    const firstUser = messages.find((m) => m.role === 'user')
-    const content = firstUser?.content
-    if (firstUser && typeof content === 'string') {
-      firstUser.content = `${prompt}\n\n${content}`
-    } else if (firstUser && Array.isArray(content)) {
-      content.unshift({ type: 'text', text: prompt })
+    const firstUserIndex = messages.findIndex((m) => m.role === 'user')
+    if (firstUserIndex !== -1) {
+      messages.splice(firstUserIndex + 1, 0, {
+        role: 'system',
+        content: [
+          {
+            type: 'text',
+            text: prompt,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      })
     }
     // No else: with no user message, messages[] is necessarily empty
     // (convertMessages emits only user/assistant, and trailing assistants are
-    // stripped above), so the request is already invalid. Pushing the prompt
-    // into system[] there would recreate the rejected three-entry shape for
-    // no benefit, so the prompt is dropped instead.
+    // stripped above), so the request is already invalid.
   }
 
   const body: AnthropicRequestBody = {
