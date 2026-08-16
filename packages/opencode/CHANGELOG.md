@@ -12,7 +12,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 - Preserve completed tool calls when a served fallback later refuses, continuing with the existing tool result instead of replaying potentially non-idempotent tools.
 - Return an explicit authentication or quota response when sticky-balanced routing has no eligible account instead of falling through to an excluded main account.
 - Clear a permanent, token-bound `invalid_grant` state immediately after the main account is re-authenticated, while retaining shared transient and rate-limit backoffs.
-- Capture the TUI preferences baseline before the watcher returns so an immediate first update cannot be silently absorbed by a delayed initialization read.
+- Keep TUI preferences live updates working when Bun cannot create a directory watcher (for example, `EBADF`) by running the polling fallback independently, and capture the baseline before returning so an immediate first update cannot be absorbed.
 
 Thanks to [@iceteaSA](https://github.com/iceteaSA) for the server-fallback recovery contribution.
 

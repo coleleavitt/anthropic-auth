@@ -3,9 +3,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import {
-  clearInterval as nativeClearInterval,
   clearTimeout as nativeClearTimeout,
-  setInterval as nativeSetInterval,
   setTimeout as nativeSetTimeout,
 } from 'node:timers'
 import { applyEdits, modify, type ParseError, parse } from 'jsonc-parser'
@@ -294,7 +292,10 @@ const WATCH_POLL_MS = 100
 //      events, and against mtime granularity.
 //
 // Returns a disposer; never throws.
-export function watchTuiPreferences(onChange: () => void): () => void {
+export function watchTuiPreferences(
+  onChange: () => void,
+  options: { watchDirectory?: typeof watch } = {},
+): () => void {
   const file = getTuiPreferencesFile()
   const name = basename(file)
   let timer: ReturnType<typeof nativeSetTimeout> | null = null
@@ -325,38 +326,52 @@ export function watchTuiPreferences(onChange: () => void): () => void {
     }, WATCH_DEBOUNCE_MS)
   }
 
+  let watcher: ReturnType<typeof watch> | null = null
   try {
-    const watcher = watch(dirname(file), (_event, filename) => {
-      // Exact match against the preferences file name, plus the temp file
-      // we use for atomic writes (carrying our pid + `.tmp`).
-      const isOurs =
-        filename === name ||
-        (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
-      if (filename != null && !isOurs) return
-      scheduleCheck()
-    })
+    watcher = (options.watchDirectory ?? watch)(
+      dirname(file),
+      (_event, filename) => {
+        // Exact match against the preferences file name, plus the temp file
+        // we use for atomic writes (carrying our pid + `.tmp`).
+        const isOurs =
+          filename === name ||
+          (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
+        if (filename != null && !isOurs) return
+        scheduleCheck()
+      },
+    )
+  } catch {
+    // If the file exists, polling remains a complete fallback even when Bun
+    // cannot allocate a directory watcher (for example, transient EBADF).
+    // If neither the file nor its directory can be observed, remain a no-op.
+    if (lastSeen === null) return () => {}
+  }
 
-    // Bun's fs.watch can miss atomic temp-file rename updates on some
-    // backends, so keep a low-cost referenced polling loop as the correctness
-    // path. The directory watcher already keeps the TUI process alive, and the
-    // disposer clears both resources. An unreferenced timer can be starved by
-    // Bun while unrelated test or host work remains active.
-    let pollInFlight = false
-    const pollTimer = nativeSetInterval(() => {
+  // Bun's fs.watch can miss atomic temp-file renames and can itself fail after
+  // repeated close/recreate cycles, so polling must be independent of watcher
+  // construction. Recursive unreferenced timers avoid fs.watchFile's lingering
+  // handles while the host's normal event loop keeps active watchers polling.
+  let pollTimer: ReturnType<typeof nativeSetTimeout> | null = null
+  let pollInFlight = false
+  const schedulePoll = () => {
+    if (disposed || pollTimer) return
+    pollTimer = nativeSetTimeout(() => {
+      pollTimer = null
       if (disposed || pollInFlight) return
       pollInFlight = true
       void checkForChange().finally(() => {
         pollInFlight = false
+        schedulePoll()
       })
     }, WATCH_POLL_MS)
+    pollTimer.unref?.()
+  }
+  schedulePoll()
 
-    return () => {
-      disposed = true
-      if (timer) nativeClearTimeout(timer)
-      nativeClearInterval(pollTimer)
-      watcher.close()
-    }
-  } catch {
-    return () => {}
+  return () => {
+    disposed = true
+    if (timer) nativeClearTimeout(timer)
+    if (pollTimer) nativeClearTimeout(pollTimer)
+    watcher?.close()
   }
 }

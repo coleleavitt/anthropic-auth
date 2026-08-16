@@ -387,6 +387,27 @@ describe('watchTuiPreferences', () => {
     }
   })
 
+  test('polls when directory watcher construction fails', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const watchDirectory = (() => {
+      throw Object.assign(new Error('bad file descriptor'), { code: 'EBADF' })
+    }) as unknown as typeof import('node:fs').watch
+    const dispose = watchTuiPreferences(
+      () => {
+        fired += 1
+      },
+      { watchDirectory },
+    )
+    try {
+      await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+      await sleep(400)
+      expect(fired).toBeGreaterThanOrEqual(1)
+    } finally {
+      dispose()
+    }
+  })
+
   test('debounces bursts into few callbacks', async () => {
     await writeFile(file, '{}', 'utf8')
     let fired = 0
