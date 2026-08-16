@@ -6874,6 +6874,119 @@ describe('auth.loader', () => {
     ])
   })
 
+  test('sticky-balanced reports main re-login instead of falling through when no fallback can serve the requested model', async () => {
+    const checkedAt = Date.now()
+    const quota = (fableRemaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+        checkedAt,
+      },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100 - fableRemaining,
+          remainingPercent: fableRemaining,
+          resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+          checkedAt,
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'sticky-balanced' },
+        refresh: {
+          enabled: true,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 240,
+          mainLastRefreshError: {
+            message:
+              'Claude OAuth refresh failed: 400 — {"error":"invalid_grant"}',
+            checkedAt,
+            nextRetryAt: checkedAt + 24 * 60 * 60_000,
+            retryCount: 1,
+            tokenHash: hashRefreshToken('main-refresh'),
+            status: 400,
+            permanent: true,
+          },
+        },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(88),
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+        accounts: [
+          {
+            id: 'fallback-a',
+            type: 'oauth',
+            access: 'fallback-a-access',
+            refresh: 'fallback-a-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(0),
+          },
+          {
+            id: 'fallback-b',
+            type: 'oauth',
+            access: 'fallback-b-access',
+            refresh: 'fallback-b-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(0),
+          },
+        ],
+      }),
+    )
+    let messageRequests = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (extractUrl(input).includes('/v1/messages')) messageRequests += 1
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt - 1,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_sticky_no_fable_route' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        message:
+          'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable for Fable.',
+      },
+    })
+    expect(messageRequests).toBe(0)
+  })
+
   test('sticky-balanced uses API routes only after confirmed OAuth exhaustion', async () => {
     const checkedAt = Date.now()
     const quota = (remainingPercent: number) => ({

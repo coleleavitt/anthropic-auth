@@ -26,6 +26,7 @@ import {
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   createEmptyStorage,
+  createStickyNoRouteResponse,
   decideStickyQuotaFailure,
   dumpDirectRequest,
   exchange,
@@ -4390,8 +4391,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       preferredAccountId,
                       excludeAccountIds,
                     })
+                  const mainPermanentlyUnavailable = isPermanentRefreshError(
+                    stickyRoutes.storage?.refresh?.mainLastRefreshError,
+                  )
                   const incompleteQuotaPool =
-                    stickyRoutes.allRoutes.length === 0 ||
+                    (stickyRoutes.allRoutes.length === 0 &&
+                      !mainPermanentlyUnavailable) ||
                     stickyRoutes.allRoutes.some(
                       (candidate) =>
                         !candidate.quota ||
@@ -4407,6 +4412,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     throw new Error(
                       'Sticky-balanced routing is waiting for current OAuth quota snapshots',
                     )
+                  }
+                  if (!resolution) {
+                    const response = createStickyNoRouteResponse({
+                      mainRefreshError:
+                        stickyRoutes.storage?.refresh?.mainLastRefreshError,
+                      routeQuotas: stickyRoutes.allRoutes.flatMap((route) =>
+                        route.quota ? [route.quota] : [],
+                      ),
+                      modelId: routingModelId,
+                    })
+                    trace.done('return_sticky_no_route', {
+                      status: response.status,
+                    })
+                    return response
                   }
                   let route = stickyRoutes.allRoutes.find(
                     (candidate) => candidate.id === resolution?.accountId,
