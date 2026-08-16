@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { writeFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -364,6 +365,21 @@ describe('watchTuiPreferences', () => {
     try {
       await sleep(50)
       await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+      await sleep(400)
+      expect(fired).toBeGreaterThanOrEqual(1)
+    } finally {
+      dispose()
+    }
+  })
+
+  test('observes a change made immediately after the watcher returns', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const dispose = watchTuiPreferences(() => {
+      fired += 1
+    })
+    try {
+      writeFileSync(file, '{"anthropic-auth":{"collapsed":true}}', 'utf8')
       await sleep(400)
       expect(fired).toBeGreaterThanOrEqual(1)
     } finally {

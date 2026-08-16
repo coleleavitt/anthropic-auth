@@ -1,4 +1,4 @@
-import { watch } from 'node:fs'
+import { readFileSync, watch } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -296,8 +296,15 @@ export function watchTuiPreferences(onChange: () => void): () => void {
   const file = getTuiPreferencesFile()
   const name = basename(file)
   let timer: ReturnType<typeof nativeSetTimeout> | null = null
+  // Capture the baseline before returning. An asynchronous seed can resolve
+  // after the caller's first write and absorb that change as already seen.
   let lastSeen: string | null = null
-  let observedEvent = false
+  try {
+    lastSeen = readFileSync(file, 'utf8')
+  } catch {
+    // Missing/unreadable files can still be created later and detected by the
+    // directory watcher or polling fallback.
+  }
   let disposed = false
 
   const checkForChange = async () => {
@@ -309,22 +316,12 @@ export function watchTuiPreferences(onChange: () => void): () => void {
   }
 
   const scheduleCheck = () => {
-    observedEvent = true
     if (timer) nativeClearTimeout(timer)
     timer = nativeSetTimeout(() => {
       timer = null
       void checkForChange()
     }, WATCH_DEBOUNCE_MS)
   }
-
-  // Seed asynchronously. If a real file event arrives before the read resolves,
-  // do not let the seed overwrite that pending change; the debounced re-read
-  // will compare against the previous value and fire.
-  void readFile(file, 'utf8')
-    .then((text) => {
-      if (!observedEvent && lastSeen === null) lastSeen = text
-    })
-    .catch(() => {})
 
   try {
     const watcher = watch(dirname(file), (_event, filename) => {
