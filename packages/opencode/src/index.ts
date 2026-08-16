@@ -1617,9 +1617,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (!storage?.refresh || !error?.tokenHash) return
     const tokenHash = hashRefreshToken(refreshToken)
     if (error.tokenHash === tokenHash) return
-    // Don't clear backoff if the error is still within its retry window —
-    // a new token (from another process) doesn't mean the rate limit is gone.
-    if (error.nextRetryAt && error.nextRetryAt > Date.now()) {
+    // Shared/transient backoffs can remain valid after another process rotates
+    // the token. A permanent invalid_grant is bound to the old refresh token,
+    // however: successful re-login must immediately make the new token usable.
+    if (
+      !isPermanentRefreshError(error) &&
+      error.nextRetryAt &&
+      error.nextRetryAt > Date.now()
+    ) {
       log(
         '[refresh] opencode main oauth keeping backoff despite token rotation',
         {

@@ -6955,14 +6955,14 @@ describe('auth.loader', () => {
     }) as unknown as typeof fetch
 
     const plugin = await getPlugin()
+    let currentAuth = {
+      type: 'oauth' as const,
+      access: 'main-access',
+      refresh: 'main-refresh',
+      expires: checkedAt - 1,
+    }
     const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: checkedAt - 1,
-        }),
+      () => Promise.resolve(currentAuth),
       { models: {} },
     )
     const response = await result.fetch(MESSAGES_URL, {
@@ -6985,6 +6985,27 @@ describe('auth.loader', () => {
       },
     })
     expect(messageRequests).toBe(0)
+
+    currentAuth = {
+      type: 'oauth',
+      access: 'main-access',
+      refresh: 'relogged-main-refresh',
+      expires: checkedAt + 5 * 60 * 60_000,
+    }
+    const recovered = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_sticky_no_fable_route' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'after re-login' }],
+      }),
+    })
+
+    expect(recovered.status).toBe(200)
+    expect(messageRequests).toBe(1)
+    const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(savedState.main?.lastRefreshError).toBeUndefined()
   })
 
   test('sticky-balanced uses API routes only after confirmed OAuth exhaustion', async () => {
