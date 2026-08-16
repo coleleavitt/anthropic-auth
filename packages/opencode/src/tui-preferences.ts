@@ -3,7 +3,9 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import {
+  clearInterval as nativeClearInterval,
   clearTimeout as nativeClearTimeout,
+  setInterval as nativeSetInterval,
   setTimeout as nativeSetTimeout,
 } from 'node:timers'
 import { applyEdits, modify, type ParseError, parse } from 'jsonc-parser'
@@ -335,30 +337,23 @@ export function watchTuiPreferences(onChange: () => void): () => void {
     })
 
     // Bun's fs.watch can miss atomic temp-file rename updates on some
-    // backends, so keep a low-cost polling loop as the correctness path.
-    // Use recursive timers instead of fs.watchFile because watchFile can keep
-    // Bun test processes alive long after unwatchFile().
-    let pollTimer: ReturnType<typeof nativeSetTimeout> | null = null
+    // backends, so keep a low-cost referenced polling loop as the correctness
+    // path. The directory watcher already keeps the TUI process alive, and the
+    // disposer clears both resources. An unreferenced timer can be starved by
+    // Bun while unrelated test or host work remains active.
     let pollInFlight = false
-    const schedulePoll = () => {
-      if (disposed || pollTimer) return
-      pollTimer = nativeSetTimeout(() => {
-        pollTimer = null
-        if (disposed || pollInFlight) return
-        pollInFlight = true
-        void checkForChange().finally(() => {
-          pollInFlight = false
-          schedulePoll()
-        })
-      }, WATCH_POLL_MS)
-      pollTimer.unref?.()
-    }
-    schedulePoll()
+    const pollTimer = nativeSetInterval(() => {
+      if (disposed || pollInFlight) return
+      pollInFlight = true
+      void checkForChange().finally(() => {
+        pollInFlight = false
+      })
+    }, WATCH_POLL_MS)
 
     return () => {
       disposed = true
       if (timer) nativeClearTimeout(timer)
-      if (pollTimer) nativeClearTimeout(pollTimer)
+      nativeClearInterval(pollTimer)
       watcher.close()
     }
   } catch {
