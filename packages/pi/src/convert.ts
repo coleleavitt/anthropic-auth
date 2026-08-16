@@ -27,6 +27,11 @@ import type {
   ToolResultMessage,
 } from '@earendil-works/pi-ai'
 
+// Anchor identifying Pi's documentation paragraph — the only part of the prompt
+// that Anthropic rejects in system[]. If pi upstream renames this heading the
+// split stops separating and the whole prompt returns to system[], which 400s.
+const PI_DOCS_ANCHOR = 'Pi documentation'
+
 const CLAUDE_CODE_TOOLS = new Map(
   [
     'Read',
@@ -391,36 +396,49 @@ export async function buildAnthropicRequest(
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
   if (context.systemPrompt?.trim()) {
-    // Pi's prompt cannot sit in the top-level system[] array: two lines of its
-    // documentation paragraph (the docs/*.md enumeration and the "follow .md
+    // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
+    // its documentation paragraph (the docs/*.md enumeration and the "follow .md
     // cross-references" instruction) are each independently sufficient to make
     // Anthropic reject the request with 400 "You're out of extra usage". Entry
     // count and payload size are ruled out — 2697 bytes of neutral filler in the
-    // same position is accepted. The same text is accepted inside messages[], so
-    // carry the prompt as a role: "system" message and keep system[] to the
-    // billing header and identity block.
+    // same position is accepted, and the same text is accepted inside messages[].
     //
-    // cache_control is set here rather than left to addEphemeralCacheControl,
-    // whose message-level breakpoint only fires when a message's content is an
-    // array — Pi sends plain strings, so it never fires. Without this marker the
-    // prompt sits outside the cached prefix and is reprocessed every turn.
-    const prompt = sanitize(context.systemPrompt)
-    const firstUserIndex = messages.findIndex((m) => m.role === 'user')
-    if (firstUserIndex !== -1) {
-      messages.splice(firstUserIndex + 1, 0, {
-        role: 'system',
-        content: [
-          {
-            type: 'text',
-            text: prompt,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-      })
+    // Keep the identity, tool contract and guidelines in system[], where they
+    // carry system weight and survive context compaction, and carry only the
+    // documentation paragraph in messages[].
+    //
+    // It goes in as its own content block ahead of the user's text, not merged
+    // into it and not as a separate message. A cache prefix matches contiguously
+    // from the start of the request, so a block boundary here lets the prefix end
+    // before the user's words: a new conversation with a different first message
+    // still reads the paragraph from cache instead of re-writing ~1.1k tokens.
+    // A role: "system" message cannot be used at messages[0] — Anthropic rejects
+    // that — and placing one after the first user message puts it behind content
+    // that varies, which defeats the caching.
+    //
+    // cache_control is set explicitly because addEphemeralCacheControl's
+    // message-level breakpoint only fires for array content on the *last* user
+    // message, which is not this one after the first turn.
+    const paras = sanitize(context.systemPrompt).split(/\n\n+/)
+    const keep = paras.filter((p) => !p.includes(PI_DOCS_ANCHOR))
+    const docs = paras.filter((p) => p.includes(PI_DOCS_ANCHOR))
+    if (keep.length) {
+      system.push({ type: 'text', text: keep.join('\n\n') })
     }
-    // No else: with no user message, messages[] is necessarily empty
-    // (convertMessages emits only user/assistant, and trailing assistants are
-    // stripped above), so the request is already invalid.
+    if (docs.length) {
+      const firstUser = messages.find((m) => m.role === 'user')
+      const content = firstUser?.content
+      const docsBlock = {
+        type: 'text',
+        text: docs.join('\n\n'),
+        cache_control: { type: 'ephemeral' as const },
+      }
+      if (firstUser && typeof content === 'string') {
+        firstUser.content = [docsBlock, { type: 'text', text: content }]
+      } else if (firstUser && Array.isArray(content)) {
+        content.unshift(docsBlock)
+      }
+    }
   }
 
   const body: AnthropicRequestBody = {
