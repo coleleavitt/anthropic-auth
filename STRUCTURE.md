@@ -7,6 +7,8 @@ anthropic-auth/
 ├── packages/
 │   ├── core/                   # Shared core library
 │   │   └── src/                # Reusable OAuth, quota, cache, relay, signing
+│   │       ├── commands/       # Shared command execution
+│   │       └── tests/          # Core-focused unit tests
 │   ├── opencode/               # OpenCode plugin + CLI
 │   │   ├── src/
 │   │   │   ├── rpc/            # Loopback RPC server/client for TUI IPC
@@ -25,7 +27,7 @@ anthropic-auth/
 │       └── tests/              # Test files
 ├── scripts/                    # Dev, release, and analysis scripts
 ├── captures/                   # System-prompt capture artifacts (git-ignored)
-├── docs/                       # Documentation (superpowers plans/specs/perf)
+├── docs/                       # Feature docs, research, plans, specs, and perf notes
 ├── images/                     # Images for README
 └── .github/                    # CI workflows + issue templates
 ```
@@ -40,7 +42,7 @@ anthropic-auth/
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
 - Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, and outcome detection), `fable-fallback.ts` (legacy session-and-source-family Fable/Opus 5 content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
+- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, outcome detection, and completed-tool refusal continuation), `fable-fallback.ts` (session-and-source-family 10-response Opus 4.8 backstop/legacy recovery and standby cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (comment-preserving JSONC preferences with directory-watch and independent polling reload paths), `sidebar-state.ts` (quota/routing and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
@@ -88,7 +90,7 @@ anthropic-auth/
 - `packages/core/src/oauth-profile.ts`: OAuth profile metadata fetch, tier formatting (`Max 5x`, `Team · Max 5x`), and 7-day TTL validation
 - `packages/core/src/quota-headers.ts`: Normalization of `anthropic-ratelimit-unified-*` headers from direct fetch and relay transports into shared quota snapshots
 - `packages/core/src/token-fingerprint.ts`: Non-reversible SHA-256 token fingerprinting for profile-to-token binding
-- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, in-process write serialization, cross-process configuration file locking and account merging (with `ENOENT`/`EINVAL` eviction race handling)
+- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, refresh-token-hash-bound error/backoff state, in-process write serialization, cross-process configuration file locking and account merging (with `ENOENT`/`EINVAL` eviction race handling)
 - `packages/core/src/quota-manager.ts`: Unified quota cache with backoff + staleness
 - `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
 - `packages/core/src/cch.ts`: XXH64-based request body signing
@@ -114,6 +116,7 @@ anthropic-auth/
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
+- `packages/opencode/src/tui-preferences.ts`: Comment-preserving JSONC preference reads/writes plus live reload through content-checked directory events and an independent polling fallback for missed events or `fs.watch` construction failures
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation
 
@@ -128,7 +131,7 @@ anthropic-auth/
 
 **Directories:** Lowercase with hyphens for feature directories (`rpc/`, `tui/`, `e2e-tests/`). Tests are co-located in `tests/` subdirectories.
 
-**Packages:** `@cortexkit/anthropic-auth-core`, `@cortexkit/opencode-anthropic-auth`, `@cortexkit/pi-anthropic-auth` — follows the `@scope/package` + `-core`/`-opencode`/`-pi` suffix convention for the monorepo packages.
+**Packages:** `@cortexkit/anthropic-auth-core` for the shared core, and `@cortexkit/<host>-anthropic-auth` for integrations (`opencode`, `pi`).
 
 **Exports:** Core library re-exports all modules through a barrel (`packages/core/src/index.ts`). OpenCode and Pi packages import from core by name, not path.
 
@@ -142,7 +145,7 @@ anthropic-auth/
 
 **New TUI feature:** `packages/opencode/src/tui/` — add components as `.tsx` files using SolidJS + OpenTUI. Add RPC protocol types in `packages/opencode/src/rpc/protocol.ts` if the feature needs server-to-TUI IPC.
 
-**New test:** Co-locate with source as `*.test.ts` — `packages/opencode/src/tests/` for unit tests covering opencode and core modules, `packages/pi/src/tests/` for Pi-specific tests, `packages/e2e-tests/tests/` for integration tests.
+**New test:** Add `*.test.ts` under the owning package's test directory — `packages/core/src/tests/` for core-only tests, `packages/opencode/src/tests/` for OpenCode and shared-core integration tests, `packages/pi/src/tests/` for Pi-specific tests, and `packages/e2e-tests/tests/` for process-level integration tests.
 
 **New script:** `scripts/` (for global analysis/development tools) or `packages/opencode/scripts/` (for TUI build/packaging validations) — use TypeScript (run with `bun`) or plain JavaScript. Reference `tsconfig.scripts.json` or `packages/opencode/tsconfig.scripts.json` for TypeScript compilation options.
 
