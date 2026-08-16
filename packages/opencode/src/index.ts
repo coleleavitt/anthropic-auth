@@ -778,7 +778,22 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   ) as T
 }
 
-export const AnthropicAuthPlugin: Plugin = async (ctx) => {
+type PluginRuntimeTimerOverrides = Partial<{
+  setTimeout: typeof globalThis.setTimeout
+  setInterval: typeof globalThis.setInterval
+  clearInterval: typeof globalThis.clearInterval
+}>
+
+const anthropicAuthPlugin = async (
+  ctx: Parameters<Plugin>[0],
+  timerOverrides: PluginRuntimeTimerOverrides = {},
+) => {
+  const runtimeTimers = {
+    setTimeout: globalThis.setTimeout,
+    setInterval: globalThis.setInterval,
+    clearInterval: globalThis.clearInterval,
+    ...timerOverrides,
+  }
   startEventLoopLagMonitor()
   const { client } = ctx
   const profileFetch = globalThis.fetch
@@ -1140,6 +1155,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
+    setIntervalImpl: runtimeTimers.setInterval,
+    clearIntervalImpl: runtimeTimers.clearInterval,
     onFallbackStorageChanged: () => {
       void refreshSidebarQuota().catch(() => {})
     },
@@ -1156,6 +1173,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   > = []
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    setIntervalImpl: runtimeTimers.setInterval,
+    clearIntervalImpl: runtimeTimers.clearInterval,
     onTrackedSessionsChanged: async (sessions) => {
       await cacheKeepRegistry.publish(sessions)
       aggregateCacheKeepSessions = await cacheKeepRegistry.list(sessions)
@@ -2756,7 +2775,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   const deadline = Date.now() + CONCURRENT_MAIN_REFRESH_WAIT_MS
                   while (Date.now() < deadline) {
                     await new Promise((resolve) =>
-                      setTimeout(
+                      runtimeTimers.setTimeout(
                         resolve,
                         CONCURRENT_MAIN_REFRESH_POLL_BASE_MS +
                           jitterMs(CONCURRENT_MAIN_REFRESH_POLL_BASE_MS),
@@ -2792,7 +2811,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   try {
                     if (attempt > 0) {
                       const delay = baseDelayMs * 2 ** (attempt - 1)
-                      await new Promise((resolve) => setTimeout(resolve, delay))
+                      await new Promise((resolve) =>
+                        runtimeTimers.setTimeout(resolve, delay),
+                      )
                     }
 
                     // Re-read auth to get the latest refresh token.
@@ -3035,7 +3056,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
           function startMainBackgroundRefresh() {
             if (mainBackgroundRefreshTimer) {
-              clearInterval(mainBackgroundRefreshTimer)
+              runtimeTimers.clearInterval(mainBackgroundRefreshTimer)
               mainBackgroundRefreshTimer = null
             }
 
@@ -3101,7 +3122,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
             }
 
-            mainBackgroundRefreshTimer = setInterval(() => {
+            mainBackgroundRefreshTimer = runtimeTimers.setInterval(() => {
               void run()
             }, MAIN_AUTH_REFRESH_TICK_MS +
               jitterMs(MAIN_AUTH_REFRESH_TICK_JITTER_MS))
@@ -5248,3 +5269,5 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }
+
+export const AnthropicAuthPlugin: Plugin = anthropicAuthPlugin
