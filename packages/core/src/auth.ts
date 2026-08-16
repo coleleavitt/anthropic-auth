@@ -76,16 +76,18 @@ export async function refreshClaudeOAuthToken(input: {
   now?: () => number
   maxRetries?: number
   baseDelayMs?: number
+  setTimeoutImpl?: typeof globalThis.setTimeout
 }): Promise<ClaudeOAuthRefreshResult> {
   const fetchImpl = input.fetchImpl ?? fetch
   const maxRetries = input.maxRetries ?? 2
   const baseDelayMs = input.baseDelayMs ?? 500
+  const setTimeoutImpl = input.setTimeoutImpl ?? globalThis.setTimeout
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       if (attempt > 0) {
         const delay = baseDelayMs * 2 ** (attempt - 1)
-        await new Promise((resolve) => setTimeout(resolve, delay))
+        await new Promise((resolve) => setTimeoutImpl(resolve, delay))
       }
 
       const response = await fetchImpl(TOKEN_URL, {
