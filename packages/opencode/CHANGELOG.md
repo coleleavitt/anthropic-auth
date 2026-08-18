@@ -5,6 +5,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 ## Unreleased
 
 - Deliver OpenCode Desktop recovery notices without triggering an extra billed provider turn on OpenCode 1.18 and newer.
+- Add opt-in `/claude-prime` scheduling that sends a minimal Haiku 4.5 request shortly after each OAuth account's five-hour quota reset so each window starts immediately.
 
 ## 1.19.1
 
