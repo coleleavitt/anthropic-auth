@@ -5,9 +5,11 @@ import { join } from 'node:path'
 import {
   addAccountPersistent,
   getAccountStatePath,
+  loadSharedAccountStore,
+  saveSharedAccountStore,
 } from '@cortexkit/anthropic-auth-core'
 
-import { addApiRoute, login, relaySetup } from '../cli'
+import { addApiRoute, login, relaySetup, revokeAccount } from '../cli'
 
 let tempDir: string
 
@@ -86,6 +88,13 @@ describe('CLI api add', () => {
       await readFile(getAccountStatePath(accountPath), 'utf8'),
     )
     expect(runtimeState.accounts['kie-opus'].apiKey).toBe('kie-key')
+
+    const shared = await loadSharedAccountStore({
+      path: join(tempDir, 'shared-anthropic-accounts.json'),
+      legacyPaths: [],
+    })
+    expect(shared.source).toEqual({ type: 'empty' })
+    expect(shared.store.accounts).toEqual([])
   })
 
   test('rejects invalid API base URL before saving route state', async () => {
@@ -165,7 +174,7 @@ describe('CLI login', () => {
 
     const stdout = logs.join('\n')
     // The real authorize() URL was printed and carries a generated state.
-    expect(stdout).toMatch(/[?&]state=[a-f0-9]+/)
+    expect(stdout).toMatch(/[?&]state=[A-Za-z0-9_-]{43}/)
     // The callback-code prompt and label prompt both fired, in order.
     expect(asked).toEqual([
       'Fallback account label (optional): ',
@@ -434,6 +443,56 @@ describe('CLI login', () => {
     expect(
       runtimeState.accounts['cli-label'].lastQuotaRefreshError,
     ).toBeUndefined()
+  })
+})
+
+describe('CLI OAuth revocation', () => {
+  test('requires confirmation, revokes remotely, removes sidecar, and disables canonical auth', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    await withAccountEnv(accountPath, {}, async () => {
+      const now = Date.now()
+      await saveSharedAccountStore({
+        version: 1,
+        current: 'revoked-account',
+        accounts: [
+          {
+            id: 'revoked-account',
+            label: 'Revoked Account',
+            credential: {
+              type: 'oauth',
+              access: 'sk-ant-oat01-abcdefghijklmnopqrstuvwxyz012345',
+              refresh: 'sk-ant-ort01-abcdefghijklmnopqrstuvwxyz012345',
+              expires_at: now + 60_000,
+            },
+            enabled: true,
+            created_at: new Date(now).toISOString(),
+          },
+        ],
+      })
+      await addAccountPersistent({
+        id: 'revoked-account',
+        label: 'Revoked Account',
+        type: 'oauth',
+        access: 'sk-ant-oat01-abcdefghijklmnopqrstuvwxyz012345',
+        refresh: 'sk-ant-ort01-abcdefghijklmnopqrstuvwxyz012345',
+        expires: now + 60_000,
+        enabled: true,
+      })
+      const calls: string[] = []
+      await revokeAccount('revoked-account', {
+        prompt: async () => 'revoke',
+        revoke: async ({ refreshToken }) => {
+          calls.push(refreshToken)
+          return 'revoked'
+        },
+      })
+      expect(calls).toEqual(['sk-ant-ort01-abcdefghijklmnopqrstuvwxyz012345'])
+      const shared = await loadSharedAccountStore()
+      expect(shared.store.accounts[0]?.enabled).toBe(false)
+      expect(shared.store.current).toBeUndefined()
+      const sidecar = JSON.parse(await readFile(accountPath, 'utf8'))
+      expect(sidecar.accounts).toEqual([])
+    })
   })
 })
 

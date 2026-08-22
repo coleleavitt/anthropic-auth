@@ -26,6 +26,7 @@ import {
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   createEmptyStorage,
+  createWifAuth,
   decideStickyQuotaFailure,
   dumpDirectRequest,
   exchange,
@@ -46,6 +47,8 @@ import {
   getCache1hMode,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getClaudeCodeIdentity,
+  getClaudeCodeVersion,
   getDefaultCacheKeepRegistryDirectory,
   getKillswitchConfig,
   getKillswitchThresholdsForAccount,
@@ -57,6 +60,7 @@ import {
   getScopedQuotaWindowForModel,
   getStickyRoutingStatePath,
   hashRefreshToken,
+  importNativeClaudeAccount,
   isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -79,11 +83,14 @@ import {
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
   loadAccounts,
+  loadSharedAccountStore,
   log,
   logger,
   mergeAnthropicBetas,
   normalizeQuotaHeaders,
+  OAUTH_BETA,
   type OAuthAccount,
+  type OAuthLoopbackSession,
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
   oauthProfileMatchesToken,
@@ -104,13 +111,18 @@ import {
   refreshBackoffActive,
   refreshClaudeOAuthToken,
   removeAccountPersistent,
+  removeSharedAccount,
   reorderAccountsPersistent,
+  reorderSharedAccounts,
   resolveClaudeCodeIdentity,
+  revokeClaudeOAuthToken,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
   StickySessionRouter,
   saveAccountState,
+  saveAccounts,
   saveOAuthProfileState,
+  saveTrustedDeviceToken,
   sendViaRelay,
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
@@ -128,11 +140,16 @@ import {
   setLogLevel,
   setLogLevelPersistent,
   setRoutingMode,
+  setSharedAccountEnabled,
   shouldFallbackStatus,
+  startOAuthLoopbackSession,
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
+  syncRefreshedFallbackAccountInSharedStore,
+  TrustedDeviceToken,
   tokenFingerprint,
+  upsertFallbackAccountInSharedStore,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import {
@@ -160,6 +177,14 @@ import {
   resolveContentFilterFallbackMode,
   type ServerSideFallbackOutcome,
 } from './server-fallback.ts'
+import {
+  getSharedAnthropicAuthType,
+  type OpenCodeAnthropicAuth,
+  persistConnectedAnthropicAuth,
+  persistRefreshedSharedOAuth,
+  type ResolvedMainAnthropicAuth,
+  reconcileAnthropicAuth,
+} from './shared-auth.ts'
 import {
   getInitialSidebarRoutingTestHooks,
   getSidebarState,
@@ -192,6 +217,16 @@ const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const SIDEBAR_ROUTING_FRESH_MS = 10 * 60 * 1000
+
+function stripOAuthBetaHeader(headers: Headers) {
+  const betas = (headers.get('anthropic-beta') ?? '')
+    .split(',')
+    .map((beta) => beta.trim())
+    .filter((beta) => beta && beta !== OAUTH_BETA)
+  if (betas.length > 0)
+    headers.set('anthropic-beta', [...new Set(betas)].join(','))
+  else headers.delete('anthropic-beta')
+}
 
 function hasEnabledOAuthAccount(
   storage: AccountStorage | null,
@@ -782,6 +817,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const { client } = ctx
   const profileFetch = globalThis.fetch
   const accountStoragePath = getAccountStoragePath()
+  const workloadIdentity = createWifAuth()
+  let latestResolvedAuth: ResolvedMainAnthropicAuth | null = null
 
   // -- OAuth add-flow pending state (Add account modal) --------------------
   interface OAuthPendingEntry {
@@ -789,6 +826,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     verifier: string
     redirectUri: string
     createdAt: number
+    loopback?: OAuthLoopbackSession
+    capturedCallback?: string
   }
   const OAUTH_PENDING_TTL_MS = 10 * 60 * 1000 // 10 minutes
   const OAUTH_PENDING_CAP = 50
@@ -799,6 +838,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     for (const [sessionId, entry] of oauthPending) {
       if (now - entry.createdAt > OAUTH_PENDING_TTL_MS) {
         oauthPending.delete(sessionId)
+        void entry.loopback?.close().catch(() => {})
       }
     }
   }
@@ -817,7 +857,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           oldestSession = sid
         }
       }
-      if (oldestSession) oauthPending.delete(oldestSession)
+      if (oldestSession) {
+        const oldest = oauthPending.get(oldestSession)
+        oauthPending.delete(oldestSession)
+        void oldest?.loopback?.close().catch(() => {})
+      }
     }
     oauthPending.set(sessionId, entry)
   }
@@ -828,6 +872,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (!entry) return undefined
     if (Date.now() - entry.createdAt > OAUTH_PENDING_TTL_MS) {
       oauthPending.delete(sessionId)
+      void entry.loopback?.close().catch(() => {})
       return undefined
     }
     return entry
@@ -957,14 +1002,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     profile: OAuthAccount['profile']
   }): Promise<boolean | undefined> {
     try {
-      if (input.accountId === 'main') {
-        const currentAuth = await latestGetAuth?.()
-        if (
-          currentAuth?.type !== 'oauth' ||
-          currentAuth.access !== input.accessToken
-        ) {
-          return false
-        }
+      if (
+        input.accountId === 'main' &&
+        (latestResolvedAuth?.type !== 'oauth' ||
+          latestResolvedAuth.access !== input.accessToken)
+      ) {
+        return false
       }
       return await saveOAuthProfileState(
         {
@@ -983,6 +1026,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     }
   }
 
+  const profilePersistenceChains = new Map<string, Promise<unknown>>()
+
+  function enqueueProfilePersistence(input: {
+    accountId: 'main' | string
+    accessToken: string
+    profile: OAuthAccount['profile']
+  }) {
+    const previous = profilePersistenceChains.get(input.accountId)
+    const next = (previous ?? Promise.resolve())
+      .then(() => persistProfileStateBestEffort(input))
+      .finally(() => {
+        if (profilePersistenceChains.get(input.accountId) === next) {
+          profilePersistenceChains.delete(input.accountId)
+        }
+      })
+    profilePersistenceChains.set(input.accountId, next)
+    return next
+  }
+
   async function ensureProfilesForQuotaDisplay(
     storage: AccountStorage,
     mainAccessToken?: string,
@@ -998,11 +1060,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       !oauthProfileMatchesToken(storage.main.profile, mainAccessToken)
     ) {
       storage.main.profile = undefined
-      void persistProfileStateBestEffort({
+      void enqueueProfilePersistence({
         accountId: 'main',
         accessToken: mainAccessToken,
         profile: undefined,
-      }).catch(() => {})
+      })
     }
     if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
       const profile = await hydrateProfileOnce('main', mainAccessToken, signal)
@@ -1012,11 +1074,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           provider: 'anthropic',
           profile,
         }
-        void persistProfileStateBestEffort({
+        void enqueueProfilePersistence({
           accountId: 'main',
           accessToken: mainAccessToken,
           profile,
-        }).catch(() => {})
+        })
       }
     }
 
@@ -1029,21 +1091,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         !oauthProfileMatchesToken(account.profile, accessToken)
       ) {
         account.profile = undefined
-        void persistProfileStateBestEffort({
+        void enqueueProfilePersistence({
           accountId: account.id,
           accessToken,
           profile: undefined,
-        }).catch(() => {})
+        })
       }
       if (oauthProfileIsFresh(account.profile, now)) continue
       const profile = await hydrateProfileOnce(account.id, accessToken, signal)
       if (profile) {
         account.profile = profile
-        void persistProfileStateBestEffort({
+        void enqueueProfilePersistence({
           accountId: account.id,
           accessToken,
           profile,
-        }).catch(() => {})
+        })
       }
     }
     return storage
@@ -1139,11 +1201,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
+    onFallbackCredentialChanged: async (account, expectedRefresh) => {
+      const synced = await syncRefreshedFallbackAccountInSharedStore(
+        account,
+        expectedRefresh,
+      )
+      return synced.result
+    },
     onFallbackStorageChanged: () => {
       void refreshSidebarQuota().catch(() => {})
     },
   })
   fallbackManager.startBackgroundRefresh()
+  void getClaudeCodeVersion().catch(() => {})
   let latestRefreshMainAccessToken: (() => Promise<string>) | null = null
   const cacheKeepRegistry = new CacheKeepSessionRegistry({
     directory:
@@ -1580,14 +1650,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       })
   }
 
-  let latestGetAuth:
-    | (() => Promise<{
-        type: string
-        access?: string
-        refresh?: string
-        expires?: number
-      }>)
-    | null = null
+  let latestGetAuth: (() => Promise<ResolvedMainAnthropicAuth>) | null = null
   let sidebarMainQuotaRefreshInFlight = false
   let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
   // Per-process counter of replayable model requests. Drives the every-N
@@ -2088,6 +2151,88 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   ) {
     const action = parseAccountCommandAction(argumentsText)
 
+    // -- import native Claude ---------------------------------------------
+    if (action.type === 'import-native') {
+      if (!action.confirmed) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
+        )
+        return {
+          text: 'Importing may copy a keychain-protected credential into the project-neutral store. Re-run with --confirm.',
+          accounts,
+        }
+      }
+      const imported = await importNativeClaudeAccount({
+        label: action.label?.trim() || 'Native Claude',
+      })
+      if (!imported) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
+        )
+        return {
+          text: 'No native Claude OAuth credentials were found.',
+          accounts,
+        }
+      }
+      if (imported.trustedDeviceToken) {
+        await saveTrustedDeviceToken({
+          accountId: imported.account.id,
+          token: TrustedDeviceToken.from(imported.trustedDeviceToken),
+        })
+      }
+      await refreshSidebarAfterMutation(await loadAccounts(accountStoragePath))
+      return {
+        text: `Imported native Claude OAuth as "${imported.account.label ?? imported.account.id}".`,
+        accounts: buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
+        ),
+      }
+    }
+
+    // -- remote revoke -----------------------------------------------------
+    if (action.type === 'revoke') {
+      const storage =
+        (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+      if (!action.confirmed) {
+        return {
+          text: 'Remote revocation cannot be undone. Re-run with --confirm.',
+          accounts: buildAccountList(storage),
+        }
+      }
+      const shared = await loadSharedAccountStore()
+      const account = shared.store.accounts.find(
+        (entry) => entry.id === action.id,
+      )
+      if (!account) {
+        return {
+          text: `Account "${action.id}" not found.`,
+          accounts: buildAccountList(storage),
+        }
+      }
+      if (account.credential.type !== 'oauth') {
+        return {
+          text: 'Only OAuth accounts can be remotely revoked.',
+          accounts: buildAccountList(storage),
+        }
+      }
+      const outcome = await revokeClaudeOAuthToken({
+        refreshToken: account.credential.refresh,
+      })
+      // Disable canonical state before sidecar cleanup. A crash cannot make the
+      // revoked token routable or let stale OpenCode auth silently re-adopt it.
+      await setSharedAccountEnabled(account.id, false)
+      await removeAccountPersistent(account.id, accountStoragePath).catch(
+        () => {},
+      )
+      const updatedStorage =
+        (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+      await refreshSidebarAfterMutation(updatedStorage)
+      return {
+        text: `OAuth token ${outcome === 'already-inactive' ? 'was already inactive' : 'was revoked'}; account "${account.label ?? account.id}" is disabled locally.`,
+        accounts: buildAccountList(updatedStorage),
+      }
+    }
+
     // -- add-apikey --------------------------------------------------------
     if (action.type === 'add-apikey') {
       if (!action.apiKey) {
@@ -2142,17 +2287,38 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
     // -- add-oauth-start ---------------------------------------------------
     if (action.type === 'add-oauth-start') {
-      const authResult = await authorize('max')
+      let loopback: OAuthLoopbackSession | undefined
+      let authResult: Awaited<ReturnType<typeof authorize>>
+      try {
+        loopback = await startOAuthLoopbackSession()
+        authResult = await authorize('max', {
+          redirectUri: loopback.redirectUri,
+          state: loopback.state,
+        })
+      } catch {
+        await loopback?.close().catch(() => {})
+        loopback = undefined
+        authResult = await authorize('max')
+      }
       const entry: OAuthPendingEntry = {
         state: authResult.state,
         verifier: authResult.verifier,
         redirectUri: authResult.redirectUri,
         createdAt: Date.now(),
+        loopback,
+      }
+      if (loopback) {
+        void loopback
+          .waitForCallback()
+          .then((callback) => {
+            entry.capturedCallback = `${callback.code}#${callback.state}`
+          })
+          .catch(() => {})
       }
       const key = sessionId ?? 'default'
       storeOAuthPending(key, entry)
       return {
-        text: `Open this URL in your browser:\n${authResult.url}`,
+        text: `Open this URL in your browser:\n${authResult.url}\n\nThe localhost callback completes automatically; manual paste remains available.`,
         knobs: { oauthUrl: authResult.url },
         accounts: buildAccountList(
           (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
@@ -2173,10 +2339,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           accounts,
         }
       }
+      const callbackInput = action.code ?? pending.capturedCallback
+      if (!callbackInput) {
+        const accounts = buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
+        )
+        return {
+          text: 'Still waiting for the localhost OAuth callback. Paste a callback URL/code or try again after browser sign-in completes.',
+          accounts,
+        }
+      }
+      if (action.code) pending.loopback?.cancel()
 
       try {
         const result = await exchange(
-          action.code,
+          callbackInput,
           pending.verifier,
           pending.redirectUri,
           pending.state,
@@ -2203,11 +2380,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           access: result.access,
           refresh: result.refresh,
           expires: result.expires,
+          refreshExpires: result.refreshTokenExpiresAt,
           enabled: true,
           addedAt: now,
           lastUsed: now,
           lastRefreshedAt: now,
         }
+        await upsertFallbackAccountInSharedStore(account)
         await addAccountPersistent(account, accountStoragePath)
         logger.info('commands', 'account added', {
           id: account.id,
@@ -2231,6 +2410,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         }
       } finally {
         oauthPending.delete(key)
+        await pending.loopback?.close().catch(() => {})
       }
     }
 
@@ -2261,6 +2441,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         result.updated.action === 'disable'
       ) {
         const enabled = result.updated.action === 'enable'
+        await setSharedAccountEnabled(result.updated.id, enabled)
         await setAccountEnabledPersistent(
           result.updated.id,
           enabled,
@@ -2274,6 +2455,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           enabled,
         })
       } else if (result.updated.action === 'remove') {
+        await removeSharedAccount(result.updated.id)
         await removeAccountPersistent(result.updated.id, accountStoragePath)
         const updatedId = result.updated.id
         const account = storage?.accounts.find((a) => a.id === updatedId)
@@ -2282,10 +2464,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           label: account?.label,
         })
       } else if (result.updated.action === 'reorder') {
-        await reorderAccountsPersistent(
-          result.updated.newOrder ?? result.updated.previousOrder ?? [],
-          accountStoragePath,
-        )
+        const orderedIds =
+          result.updated.newOrder ?? result.updated.previousOrder ?? []
+        await reorderSharedAccounts(orderedIds)
+        await reorderAccountsPersistent(orderedIds, accountStoragePath)
         const updatedId = result.updated.id
         const account = storage?.accounts.find((a) => a.id === updatedId)
         logger.info('commands', 'account reordered', {
@@ -2649,12 +2831,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           addFableMythos5Models(provider.models),
         )
         // Zero OAuth model costs by default (quota-based, not per-token billed).
+        // The canonical shared credential can intentionally differ from an old
+        // OpenCode auth snapshot, so use its kind when one is available.
+        const sharedAuthType = await getSharedAnthropicAuthType().catch(
+          () => null,
+        )
+        const authType = sharedAuthType ?? context.auth?.type
         // Opt out via persisted config costZeroing.enabled=false to show real costs.
         // initialStorage is nullable (no config file yet) → default to enabled.
-        if (
-          context.auth?.type !== 'oauth' ||
-          !isCostZeroingEnabled(initialStorage ?? {})
-        )
+        if (authType !== 'oauth' || !isCostZeroingEnabled(initialStorage ?? {}))
           return models
         return zeroModelCosts(models)
       },
@@ -2705,16 +2890,72 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     auth: {
       provider: 'anthropic',
       async loader(
-        getAuth: () => Promise<{
-          type: string
-          access?: string
-          refresh?: string
-          expires?: number
-        }>,
+        getOpenCodeAuth: () => Promise<OpenCodeAnthropicAuth>,
         _provider: { models: Record<string, { cost: unknown }> },
       ) {
+        const resolveAuth = async () => {
+          const openCodeAuth = await getOpenCodeAuth()
+          const sidecar =
+            (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+          const reconciled = await reconcileAnthropicAuth({
+            openCodeAuth,
+            legacyAccounts: sidecar.accounts,
+            wifAuth: workloadIdentity,
+          })
+          if (
+            JSON.stringify(sidecar.accounts) !==
+            JSON.stringify(reconciled.fallbacks)
+          ) {
+            const fallbackIds = new Set(
+              reconciled.fallbacks.map((account) => account.id),
+            )
+            await saveAccounts(
+              { ...sidecar, accounts: reconciled.fallbacks },
+              accountStoragePath,
+              {
+                removedAccountIds: sidecar.accounts
+                  .filter((account) => !fallbackIds.has(account.id))
+                  .map((account) => account.id),
+              },
+            )
+          }
+          return reconciled.auth
+        }
+        const initialAuth = await resolveAuth()
+        if (!initialAuth) return {}
+        latestResolvedAuth = initialAuth
+        const getAuth = async () => {
+          const resolved = await resolveAuth()
+          if (!resolved)
+            throw new Error('Anthropic credentials are unavailable')
+          latestResolvedAuth = resolved
+          return resolved
+        }
         latestGetAuth = getAuth
-        const auth = await getAuth()
+        const auth = initialAuth
+        if (auth.type === 'wif') {
+          return {
+            fetch: async (
+              input: string | URL | Request,
+              init?: RequestInit,
+            ) => {
+              const headers = await auth.provider.authorize(
+                new Headers(
+                  init?.headers ??
+                    (input instanceof Request ? input.headers : undefined),
+                ),
+              )
+              const response = await profileFetch(input, {
+                ...init,
+                headers,
+              })
+              if (response.status === 401 || response.status === 403) {
+                auth.provider.invalidate()
+              }
+              return response
+            },
+          }
+        }
         if (auth.type === 'oauth') {
           // Shared inflight refresh promise — prevents concurrent token refreshes
           // from racing against each other (and causing 401 cascades with token rotation)
@@ -2910,6 +3151,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     })
                     const refreshed = await refreshClaudeOAuthToken({
                       refreshToken: freshAuth.refresh,
+                      refreshTokenExpiresAt: freshAuth.refreshTokenExpiresAt,
                       // Main OpenCode OAuth already has request-path retry,
                       // persisted backoff, and cross-process serialization here.
                       // Keep the shared helper single-shot in this path so the
@@ -2917,6 +3159,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       maxRetries: 0,
                     })
 
+                    if (freshAuth.sharedAccountId) {
+                      const persisted = await persistRefreshedSharedOAuth({
+                        accountId: freshAuth.sharedAccountId,
+                        expectedRefresh: freshAuth.refresh,
+                        access: refreshed.access,
+                        refresh: refreshed.refresh,
+                        expires: refreshed.expires,
+                        refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt,
+                      })
+                      if (!persisted) {
+                        throw new Error(
+                          'Claude OAuth refresh was superseded by another process',
+                        )
+                      }
+                    }
+
+                    // Mirror the canonical credential into OpenCode's built-in
+                    // auth store so native provider surfaces remain compatible.
                     // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
                     await (client as any).auth.set({
                       path: {
@@ -3162,10 +3422,37 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             return headers.has('x-parent-session-id')
           }
 
+          /**
+           * Anthropic's explicit retry directive. It overrides all status-based
+           * routing in Claude Code, so `false` must suppress fallback even for
+           * a status that would normally route.
+           */
+          function parseShouldRetryHeader(
+            value: string | null,
+          ): boolean | undefined {
+            if (value === 'true') return true
+            if (value === 'false') return false
+            return undefined
+          }
+
           function isStreamingRateLimitText(text: string) {
             return (
               text.includes('rate_limit_error') ||
               /exceed your account'?s rate limit/i.test(text)
+            )
+          }
+
+          /**
+           * Capacity errors Anthropic reports inside an HTTP 200 SSE stream.
+           * Routable to another account, but deliberately NOT quota evidence:
+           * `responseShowsMainQuotaExhausted` must never treat these as proof
+           * the account is exhausted, or transient overload would unlock
+           * paid API-key routes.
+           */
+          function isStreamingOverloadedText(text: string) {
+            return (
+              text.includes('overloaded_error') ||
+              /server (?:is )?overloaded/i.test(text)
             )
           }
 
@@ -3181,7 +3468,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ) {
             if (!response.body || response.status !== 200) {
               trace?.mark('inspect_stream_skip', { status: response.status })
-              return { response, rateLimited: false }
+              return { response, rateLimited: false, overloaded: false }
             }
             if (
               response.headers.get('x-cortexkit-relay-optimistic') === 'true'
@@ -3190,7 +3477,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 status: response.status,
                 reason: 'optimistic_relay',
               })
-              return { response, rateLimited: false }
+              return { response, rateLimited: false, overloaded: false }
             }
 
             const start = nowMs()
@@ -3206,10 +3493,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               chunks.push(value)
               bytes += value.byteLength
               text += decoder.decode(value, { stream: true })
-              if (isStreamingRateLimitText(text)) break
+              if (
+                isStreamingRateLimitText(text) ||
+                isStreamingOverloadedText(text)
+              )
+                break
             }
 
-            if (isStreamingRateLimitText(text)) {
+            if (
+              isStreamingRateLimitText(text) ||
+              isStreamingOverloadedText(text)
+            ) {
               await reader.cancel().catch(() => {})
               try {
                 reader.releaseLock()
@@ -3220,10 +3514,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   controller.close()
                 },
               })
+              const rateLimited = isStreamingRateLimitText(text)
               trace?.mark('inspect_stream_first_event', {
                 ms: roundMs(nowMs() - start),
                 bytes,
-                rateLimited: true,
+                rateLimited,
+                overloaded: !rateLimited,
               })
               return {
                 response: new Response(stream, {
@@ -3231,7 +3527,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   statusText: response.statusText,
                   headers: response.headers,
                 }),
-                rateLimited: true,
+                rateLimited,
+                overloaded: !rateLimited,
               }
             }
 
@@ -3256,6 +3553,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               ms: roundMs(nowMs() - start),
               bytes,
               rateLimited: false,
+              overloaded: false,
             })
             return {
               response: new Response(stream, {
@@ -3264,6 +3562,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 headers: response.headers,
               }),
               rateLimited: false,
+              overloaded: false,
             }
           }
 
@@ -3278,6 +3577,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             } else {
               headers.set('Authorization', `Bearer ${account.apiKey ?? ''}`)
             }
+            stripOAuthBetaHeader(headers)
+            headers.set('anthropic-version', '2023-06-01')
             headers.set('Content-Type', 'application/json')
           }
 
@@ -3322,14 +3623,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 cache1hEnabled: !subagentRequest && isCache1hEnabled(),
                 cache1hMode: getCache1hMode(),
                 fastModeEnabled: fastModeRequested,
+                isSubagent: subagentRequest,
                 perf: (stage, data) =>
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
               })
               configureApiRouteHeaders(requestHeaders, account)
-              requestHeaders.set(
-                'anthropic-beta',
-                mergeAnthropicBetas(requestHeaders.get('anthropic-beta'), []),
+              const apiBetas = mergeAnthropicBetas(
+                requestHeaders.get('anthropic-beta'),
+                [],
               )
+              if (apiBetas) requestHeaders.set('anthropic-beta', apiBetas)
+              else requestHeaders.delete('anthropic-beta')
               if (fastModeRequested) addFastModeBetaHeader(requestHeaders)
               trace?.mark('rewrite_body', {
                 route,
@@ -3414,6 +3718,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               requestHeaders.get('x-session-affinity') ||
               requestHeaders.get('x-opencode-session')
             const subagentRequest = isSubagentRequest(requestHeaders)
+            // Claude Code sends no agent-id header for main agents, and
+            // identifies subagents with a Claude-namespace id, not the host's.
+            const agentId = subagentRequest
+              ? getClaudeCodeIdentity(
+                  `agent:${
+                    requestHeaders.get('x-opencode-session') ??
+                    requestHeaders.get('x-session-affinity') ??
+                    requestHeaders.get('x-parent-session-id') ??
+                    'anonymous'
+                  }`,
+                ).sessionId
+              : undefined
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
@@ -3471,6 +3787,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 identity,
                 hybridStandbyAnchor: standbyCacheAnchor,
                 serverSideFallbackEnabled: fallbackMode === 'server',
+                isSubagent: subagentRequest,
                 perf: (stage, data) => {
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data })
                   if (
@@ -3506,6 +3823,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 setOAuthHeaders(requestHeaders, accessToken, {
                   body: JSON.parse(body),
                   identity,
+                  agentId,
                 })
                 trace?.mark('set_oauth_headers_body_parse', {
                   route,
@@ -3514,7 +3832,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   parsed: true,
                 })
               } catch {
-                setOAuthHeaders(requestHeaders, accessToken, { identity })
+                setOAuthHeaders(requestHeaders, accessToken, {
+                  identity,
+                  agentId,
+                })
                 trace?.mark('set_oauth_headers_body_parse', {
                   route,
                   ms: roundMs(nowMs() - headerBodyParseStart),
@@ -4055,25 +4376,35 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             if (!hasPotentialFallbackRoute) return mainResponse
 
             let currentResponse = mainResponse
-            let shouldFallback = shouldFallbackStatus(
-              currentResponse.status,
-              storage,
+            const explicitRetryDirective = parseShouldRetryHeader(
+              currentResponse.headers.get('x-should-retry'),
             )
+            let shouldFallback =
+              explicitRetryDirective ??
+              shouldFallbackStatus(currentResponse.status, storage)
             let mainQuotaExhaustedByResponse = responseShowsMainQuotaExhausted(
               currentResponse,
               false,
             )
+            if (explicitRetryDirective === false) {
+              return currentResponse
+            }
             if (!shouldFallback) {
               const inspected = await inspectStreamingRateLimit(
                 currentResponse,
                 trace,
               )
               currentResponse = inspected.response
-              shouldFallback = inspected.rateLimited
+              // Overload is routable but not quota evidence: intentionally
+              // omitted from responseShowsMainQuotaExhausted below.
+              shouldFallback = inspected.rateLimited || inspected.overloaded
               mainQuotaExhaustedByResponse = responseShowsMainQuotaExhausted(
                 currentResponse,
                 inspected.rateLimited,
               )
+              if (inspected.overloaded && !inspected.rateLimited) {
+                log('[routing] mid-stream overload; trying another account')
+              }
             }
             if (!shouldFallback) {
               return currentResponse
@@ -4219,6 +4550,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         },
                       }
                     : {}),
+                  onTruncatedFinish: (finishReason: string) => {
+                    logger.warn('stream', 'response ended incomplete', {
+                      session: sessionId ?? undefined,
+                      finishReason,
+                    })
+                  },
                   ...(fablePlan?.downgraded && fableRequest
                     ? {
                         onComplete: (finishReason: string) => {
@@ -4297,9 +4634,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 authType: auth.type,
                 hasAccess: Boolean(auth.access),
               })
-              if (auth.type !== 'oauth') {
-                const response = await fetch(input, init)
-                trace.done('non_oauth_passthrough', { status: response.status })
+              if (auth.type === 'wif') {
+                const headers = await auth.provider.authorize(
+                  mergeHeaders(input, init),
+                )
+                const response = await profileFetch(input, { ...init, headers })
+                if (response.status === 401 || response.status === 403) {
+                  auth.provider.invalidate()
+                }
+                trace.done('wif_passthrough', { status: response.status })
+                return response
+              }
+              if (auth.type === 'api') {
+                const headers = mergeHeaders(input, init)
+                headers.delete('authorization')
+                headers.set('x-api-key', auth.key)
+                headers.set('anthropic-version', '2023-06-01')
+                stripOAuthBetaHeader(headers)
+                const response = await fetch(input, { ...init, headers })
+                trace.done('api_key_passthrough', { status: response.status })
                 return response
               }
               await clearStaleMainRefreshError(auth.refresh)
@@ -5159,6 +5512,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           }
         }
 
+        if (auth.type === 'api') {
+          return { apiKey: auth.key }
+        }
         return {}
       },
       methods: [
@@ -5172,12 +5528,26 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               instructions: 'Paste the authorization code here:',
               method: 'code',
               callback: async (code: string) => {
-                return exchange(
+                const credentials = await exchange(
                   code,
                   result.verifier,
                   result.redirectUri,
                   result.state,
                 )
+                if (credentials.type === 'success') {
+                  await persistConnectedAnthropicAuth({
+                    type: 'oauth',
+                    refresh: credentials.refresh,
+                    access: credentials.access,
+                    expires: credentials.expires,
+                    refreshTokenExpiresAt: credentials.refreshTokenExpiresAt,
+                    scopes: credentials.scopes,
+                    accountId: credentials.accountId,
+                    email: credentials.email,
+                    organizationId: credentials.organizationId,
+                  })
+                }
+                return credentials
               },
             }
           },
@@ -5209,6 +5579,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     },
                   },
                 ).then((r) => r.json() as Promise<{ raw_key: string }>)
+                await persistConnectedAnthropicAuth({
+                  type: 'api',
+                  key: apiKey.raw_key,
+                })
                 return { type: 'success' as const, key: apiKey.raw_key }
               },
             }

@@ -4,15 +4,28 @@ import { stdin as input, stdout as output } from 'node:process'
 import { createInterface } from 'node:readline/promises'
 import {
   type AccountStorage,
+  type ApiKeyAccount,
   addAccountPersistent,
   authorize,
+  discoverNativeClaudeCredentials,
   exchange,
+  fallbackAccountToShared,
   generateRelayToken,
   getAccountStoragePath,
+  importNativeClaudeAccount,
   isOAuthAccount,
   isValidApiBaseURL,
   loadAccounts,
+  loadSharedAccountStore,
+  type OAuthAccount,
+  removeAccountPersistent,
+  revokeClaudeOAuthToken,
   saveAccounts,
+  saveTrustedDeviceToken,
+  setSharedAccountEnabled,
+  startOAuthLoopbackSession,
+  TrustedDeviceToken,
+  upsertSharedAccount,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -43,10 +56,13 @@ function usage() {
   console.log(`Usage:
   opencode-anthropic-auth login [label]
   opencode-anthropic-auth api add [label]
+  opencode-anthropic-auth import-native [label]
+  opencode-anthropic-auth revoke <account-id>
   opencode-anthropic-auth list
   opencode-anthropic-auth relay setup
 
-Fallback accounts are stored in:
+OAuth fallback credentials are stored in the shared Anthropic account store.
+Custom API routes and plugin route settings are stored in:
   ${getAccountStoragePath()}`)
 }
 
@@ -293,6 +309,7 @@ export interface LoginDeps {
   prompt?: (message: string) => Promise<string>
   authorize?: typeof authorize
   exchange?: typeof exchange
+  startLoopback?: typeof startOAuthLoopbackSession
 }
 
 export async function login(labelArg?: string, deps: LoginDeps = {}) {
@@ -301,13 +318,48 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   const exchangeImpl = deps.exchange ?? exchange
   const label =
     labelArg?.trim() || (await ask('Fallback account label (optional): '))
-  const authorization = await authorizeImpl('max')
+  const startLoopback = deps.startLoopback ?? startOAuthLoopbackSession
+  let loopback: Awaited<ReturnType<typeof startOAuthLoopbackSession>> | null =
+    null
+  let authorization: Awaited<ReturnType<typeof authorize>>
+  try {
+    loopback = await startLoopback()
+    authorization = await authorizeImpl('max', {
+      redirectUri: loopback.redirectUri,
+      state: loopback.state,
+    })
+  } catch {
+    loopback = null
+    authorization = await authorizeImpl('max')
+    console.warn(
+      'Could not start the localhost OAuth callback; using manual paste-back.',
+    )
+  }
 
   console.log('\nOpen this URL in your browser and complete Claude sign-in:\n')
   console.log(`${authorization.url}\n`)
-  const code = await ask(
+  const manualCode = ask(
     'Paste the full callback URL or authorization code here: ',
   )
+  let code: string
+  if (loopback) {
+    try {
+      const completed = await Promise.race([
+        loopback.waitForCallback().then((callback) => ({
+          type: 'loopback' as const,
+          code: `${callback.code}#${callback.state}`,
+        })),
+        manualCode.then((value) => ({ type: 'manual' as const, code: value })),
+      ])
+      code = completed.code
+      if (completed.type === 'manual') loopback.cancel()
+      else if (!deps.prompt) closePromptInterface()
+    } finally {
+      await loopback.close().catch(() => {})
+    }
+  } else {
+    code = await manualCode
+  }
   const result = await exchangeImpl(
     code,
     authorization.verifier,
@@ -320,18 +372,41 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   }
 
   const now = Date.now()
-  await addAccountPersistent({
+  const account: OAuthAccount = {
     id: label || crypto.randomUUID(),
     label: label || undefined,
     type: 'oauth',
     access: result.access,
     refresh: result.refresh,
     expires: result.expires,
+    refreshExpires: result.refreshTokenExpiresAt,
     enabled: true,
     addedAt: now,
     lastUsed: now,
     lastRefreshedAt: now,
-  })
+  }
+  const sharedStore = await loadSharedAccountStore()
+  const existingSharedAccount = sharedStore.store.accounts.find(
+    (candidate) => candidate.id === account.id,
+  )
+  const sharedAccount = fallbackAccountToShared(account, existingSharedAccount)
+  if (sharedAccount.credential.type === 'oauth') {
+    if (result.email) sharedAccount.email = result.email
+    if (result.scopes) sharedAccount.credential.scopes = result.scopes
+    if (result.accountId) {
+      sharedAccount.credential.account = {
+        uuid: result.accountId,
+        ...(result.email ? { email_address: result.email } : {}),
+      }
+    }
+    if (result.organizationId) {
+      sharedAccount.credential.organization = {
+        uuid: result.organizationId,
+      }
+    }
+  }
+  await upsertSharedAccount(sharedAccount)
+  await addAccountPersistent(account)
 
   console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
 }
@@ -376,8 +451,7 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
   const authHeader =
     authHeaderInput === 'x-api-key' ? 'x-api-key' : 'authorization-bearer'
   const now = Date.now()
-
-  await addAccountPersistent({
+  const account: ApiKeyAccount = {
     id: label || crypto.randomUUID(),
     label: label || undefined,
     type: 'api',
@@ -387,10 +461,76 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
     enabled: true,
     addedAt: now,
     lastUsed: now,
-  })
+  }
+
+  await addAccountPersistent(account)
 
   console.log(
     `\nSaved API fallback route${label ? ` "${label}"` : ''} (${baseURL}).`,
+  )
+}
+
+export async function importNative(
+  labelArg?: string,
+  deps: { prompt?: (message: string) => Promise<string> } = {},
+) {
+  const ask = deps.prompt ?? prompt
+  const discovered = await discoverNativeClaudeCredentials()
+  if (!discovered) throw new Error('No native Claude OAuth credentials found')
+  const source =
+    discovered.source.type === 'keychain'
+      ? `secure storage (${discovered.source.service})`
+      : discovered.source.path
+  const confirmation = await ask(
+    `Import native Claude OAuth from ${source} into the project-neutral account store? Type IMPORT to continue: `,
+  )
+  if (confirmation !== 'IMPORT')
+    throw new Error('Native credential import cancelled')
+
+  const imported = await importNativeClaudeAccount({
+    label: labelArg?.trim() || 'Native Claude',
+  })
+  if (!imported) throw new Error('Native Claude OAuth credentials disappeared')
+  if (imported.trustedDeviceToken) {
+    await saveTrustedDeviceToken({
+      accountId: imported.account.id,
+      token: TrustedDeviceToken.from(imported.trustedDeviceToken),
+    })
+  }
+  console.log(
+    `Imported native Claude OAuth as "${imported.account.label ?? imported.account.id}".`,
+  )
+}
+
+export async function revokeAccount(
+  accountIdArg: string | undefined,
+  deps: {
+    prompt?: (message: string) => Promise<string>
+    revoke?: typeof revokeClaudeOAuthToken
+  } = {},
+) {
+  const accountId = requireText(accountIdArg, 'Account id')
+  const loaded = await loadSharedAccountStore()
+  const account = loaded.store.accounts.find((entry) => entry.id === accountId)
+  if (!account) throw new Error(`Account "${accountId}" not found`)
+  if (account.credential.type !== 'oauth') {
+    throw new Error('Only OAuth accounts can be remotely revoked')
+  }
+  const ask = deps.prompt ?? prompt
+  const confirmation = await ask(
+    `Remote revocation cannot be undone. Type revoke to revoke "${account.label ?? account.id}": `,
+  )
+  if (confirmation !== 'revoke') throw new Error('OAuth revocation cancelled')
+
+  const outcome = await (deps.revoke ?? revokeClaudeOAuthToken)({
+    refreshToken: account.credential.refresh,
+  })
+  // Disable canonical state first. If the process stops during cleanup, the
+  // revoked credential cannot be selected or re-adopted from a stale sidecar.
+  await setSharedAccountEnabled(account.id, false)
+  await removeAccountPersistent(account.id).catch(() => {})
+  console.log(
+    `OAuth token ${outcome === 'already-inactive' ? 'was already inactive' : 'was revoked'}; account "${account.label ?? account.id}" is disabled locally.`,
   )
 }
 
@@ -439,6 +579,16 @@ async function main() {
 
   if (command === 'api' && subcommandOrLabel === 'add') {
     await addApiRoute(maybeLabel)
+    return
+  }
+
+  if (command === 'import-native') {
+    await importNative(subcommandOrLabel)
+    return
+  }
+
+  if (command === 'revoke') {
+    await revokeAccount(subcommandOrLabel)
     return
   }
 

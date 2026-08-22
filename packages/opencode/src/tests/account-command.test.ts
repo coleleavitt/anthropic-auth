@@ -68,7 +68,12 @@ const baseStorage = (): AccountStorage => ({
 })
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-acct-cmd-'))
+  tempDir = await mkdtemp(
+    join(
+      process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR ?? tmpdir(),
+      'anthropic-auth-acct-cmd-',
+    ),
+  )
   accountPath = join(tempDir, 'anthropic-auth.json')
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
 })
@@ -105,6 +110,26 @@ describe('parseAccountCommandAction', () => {
     expect(parseAccountCommandAction('remove fallback-1')).toEqual({
       type: 'remove',
       id: 'fallback-1',
+    })
+  })
+
+  test('revoke and native import require explicit confirmation markers', () => {
+    expect(parseAccountCommandAction('revoke oauth-1')).toEqual({
+      type: 'revoke',
+      id: 'oauth-1',
+      confirmed: false,
+    })
+    expect(parseAccountCommandAction('revoke oauth-1 --confirm')).toEqual({
+      type: 'revoke',
+      id: 'oauth-1',
+      confirmed: true,
+    })
+    expect(
+      parseAccountCommandAction('import-native Work Account --confirm'),
+    ).toEqual({
+      type: 'import-native',
+      label: 'Work Account',
+      confirmed: true,
     })
   })
 

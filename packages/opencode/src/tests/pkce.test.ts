@@ -18,9 +18,9 @@ describe('generatePKCE', () => {
     expect(result.method).toBe('S256')
   })
 
-  test('verifier is 86 characters (64 bytes base64url)', async () => {
+  test('verifier is 43 characters (32 bytes base64url)', async () => {
     const result = await generatePKCE()
-    expect(result.verifier.length).toBe(86)
+    expect(result.verifier.length).toBe(43)
   })
 
   test('challenge is 43 characters (SHA-256 base64url)', async () => {
@@ -87,10 +87,9 @@ describe('generatePKCE', () => {
   })
 
   test('deterministic output for known random bytes', async () => {
-    // Bytes 0-63 produce +, / and = in raw base64,
-    // pinning all three .replace() calls
-    const knownBytes = new Uint8Array(64)
-    for (let i = 0; i < 64; i++) knownBytes[i] = i
+    // Bytes 0-31 pin the exact 32-byte Claude Code verifier shape.
+    const knownBytes = new Uint8Array(32)
+    for (let i = 0; i < 32; i++) knownBytes[i] = i
 
     const original = crypto.getRandomValues
     crypto.getRandomValues = (<T extends ArrayBufferView>(array: T): T => {
@@ -103,9 +102,9 @@ describe('generatePKCE', () => {
     try {
       const result = await generatePKCE()
 
-      // Expected verifier: base64url(bytes 0..63)
+      // Expected verifier: base64url(bytes 0..31)
       let bin = ''
-      for (let i = 0; i < 64; i++) bin += String.fromCharCode(i)
+      for (let i = 0; i < 32; i++) bin += String.fromCharCode(i)
       const expectedVerifier = btoa(bin)
         .replace(/\+/g, '-')
         .replace(/\//g, '_')

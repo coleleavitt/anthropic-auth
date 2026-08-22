@@ -1,13 +1,18 @@
 import { randomBytes, randomUUID } from 'node:crypto'
+import { getClaudeCodeUserAgent } from './claude-version.ts'
 import {
   CLAUDE_CODE_BUILD_HASH,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_STAINLESS_PACKAGE_VERSION,
   CLAUDE_CODE_STAINLESS_RUNTIME_VERSION,
   CLAUDE_CODE_VERSION,
+  EFFORT_BETA,
   FAST_MODE_BETA,
-  USER_AGENT,
 } from './constants.ts'
+import {
+  type DeviceIdentityOptions,
+  getOrCreateDeviceId,
+} from './device-identity.ts'
 
 export type ClaudeCodeIdentity = {
   deviceId: string
@@ -17,6 +22,8 @@ export type ClaudeCodeIdentity = {
 
 const IDENTITY_CACHE_LIMIT = 1_000
 const identityCache = new Map<string, ClaudeCodeIdentity>()
+let installationDeviceId = randomBytes(32).toString('hex')
+let installationDeviceIdPromise: Promise<string> | null = null
 
 function setBounded<K, V>(map: Map<K, V>, key: K, value: V) {
   if (!map.has(key) && map.size >= IDENTITY_CACHE_LIMIT) {
@@ -26,13 +33,39 @@ function setBounded<K, V>(map: Map<K, V>, key: K, value: V) {
   map.set(key, value)
 }
 
+export function configureClaudeCodeInstallationDeviceId(deviceId: string) {
+  if (!/^[0-9a-f]{64}$/.test(deviceId)) {
+    throw new TypeError(
+      'Claude Code device identity must be 32 bytes encoded as lowercase hex',
+    )
+  }
+  installationDeviceId = deviceId
+  for (const identity of identityCache.values()) identity.deviceId = deviceId
+}
+
+/** Load the project-neutral persistent device identity exactly once per process. */
+export async function loadClaudeCodeInstallationDeviceId(
+  options: DeviceIdentityOptions = {},
+) {
+  installationDeviceIdPromise ??= getOrCreateDeviceId(options)
+    .then((deviceId) => {
+      configureClaudeCodeInstallationDeviceId(deviceId)
+      return deviceId
+    })
+    .catch((error) => {
+      installationDeviceIdPromise = null
+      throw error
+    })
+  return installationDeviceIdPromise
+}
+
 export function getClaudeCodeIdentity(seed: string): ClaudeCodeIdentity {
   const cacheKey = seed || 'anonymous'
   const cached = identityCache.get(cacheKey)
   if (cached) return cached
 
   const identity: ClaudeCodeIdentity = {
-    deviceId: randomBytes(32).toString('hex'),
+    deviceId: installationDeviceId,
     sessionId: randomUUID(),
   }
   setBounded(identityCache, cacheKey, identity)
@@ -83,7 +116,9 @@ async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
 export async function resolveClaudeCodeIdentity(
   accessToken: string,
   model?: string,
+  deviceIdentityOptions: DeviceIdentityOptions = {},
 ): Promise<ClaudeCodeIdentity> {
+  await loadClaudeCodeInstallationDeviceId(deviceIdentityOptions)
   const identity = getClaudeCodeIdentity(accessToken)
   if (!accessToken.startsWith('sk-ant-oat')) return identity
 
@@ -161,40 +196,27 @@ export function applyClaudeCodeMetadata(
   return true
 }
 
-export const CLAUDE_CODE_FULL_AGENT_BETAS = [
+const CLAUDE_CODE_BASE_BETAS = [
+  'claude-code-20250219',
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
   'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'claude-code-20250219',
+  EFFORT_BETA,
+  'extended-cache-ttl-2025-04-11',
+] as const
+
+export const CLAUDE_CODE_FULL_AGENT_BETAS = [
+  ...CLAUDE_CODE_BASE_BETAS,
   'advisor-tool-2026-03-01',
   'advanced-tool-use-2025-11-20',
-  'extended-cache-ttl-2025-04-11',
   'cache-diagnosis-2026-04-07',
 ] as const
 
 const CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS = [
-  'oauth-2025-04-20',
-  'interleaved-thinking-2025-05-14',
-  'thinking-token-count-2026-05-13',
-  'context-management-2025-06-27',
-  'prompt-caching-scope-2026-01-05',
-  'advisor-tool-2026-03-01',
+  ...CLAUDE_CODE_BASE_BETAS,
   'structured-outputs-2025-12-15',
-  'cache-diagnosis-2026-04-07',
-] as const
-
-const CLAUDE_CODE_BASE_BETAS = [
-  'oauth-2025-04-20',
-  'interleaved-thinking-2025-05-14',
-  'thinking-token-count-2026-05-13',
-  'context-management-2025-06-27',
-  'prompt-caching-scope-2026-01-05',
-  'advisor-tool-2026-03-01',
-  'advanced-tool-use-2025-11-20',
-  'extended-cache-ttl-2025-04-11',
-  'cache-diagnosis-2026-04-07',
 ] as const
 
 function hasStructuredOutput(body: Record<string, unknown>) {
@@ -263,6 +285,23 @@ function stainlessArch() {
   }
 }
 
+const ENV_FORWARDED_HEADERS: ReadonlyArray<readonly [string, string]> = [
+  ['x-claude-remote-container-id', 'CLAUDE_CODE_CONTAINER_ID'],
+  ['x-claude-remote-session-id', 'CLAUDE_CODE_REMOTE_SESSION_ID'],
+  ['x-client-app', 'CLAUDE_AGENT_SDK_CLIENT_APP'],
+]
+
+function isTruthyEnvFlag(value: string | undefined): boolean {
+  if (!value) return false
+  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase().trim())
+}
+
+// Escapes `%` first so existing escapes are not double-encoded; \x20-\x7e is
+// the printable-ASCII range valid in an HTTP header value.
+function encodeHeaderValue(value: string): string {
+  return value.replace(/%|[^\x20-\x7e]/gu, (char) => encodeURIComponent(char))
+}
+
 export function applyClaudeCodeHeaders(
   headers: Headers,
   accessToken: string,
@@ -270,6 +309,8 @@ export function applyClaudeCodeHeaders(
     body?: Record<string, unknown> | null
     identity?: ClaudeCodeIdentity
     extraBetas?: string[]
+    agentId?: string
+    parentAgentId?: string
   } = {},
 ): Headers {
   const identity = options.identity ?? getClaudeCodeIdentity(accessToken)
@@ -282,7 +323,7 @@ export function applyClaudeCodeHeaders(
   headers.set('accept', 'application/json')
   headers.set('authorization', `Bearer ${accessToken}`)
   headers.set('content-type', 'application/json')
-  headers.set('user-agent', USER_AGENT)
+  headers.set('user-agent', getClaudeCodeUserAgent())
   headers.set('anthropic-beta', selectClaudeCodeBetas(options.body, extraBetas))
   headers.set('anthropic-dangerous-direct-browser-access', 'true')
   headers.set('anthropic-version', '2023-06-01')
@@ -303,6 +344,22 @@ export function applyClaudeCodeHeaders(
     CLAUDE_CODE_STAINLESS_RUNTIME_VERSION,
   )
   headers.set('x-stainless-timeout', '600')
+  if (options.body?.stream === true)
+    headers.set('x-stainless-helper-method', 'stream')
+  for (const [header, envVar] of ENV_FORWARDED_HEADERS) {
+    const value = process.env[envVar]
+    if (value) headers.set(header, encodeHeaderValue(value))
+  }
+  if (isTruthyEnvFlag(process.env.CLAUDE_CODE_ADDITIONAL_PROTECTION))
+    headers.set('x-anthropic-additional-protection', 'true')
+  if (options.agentId)
+    headers.set('x-claude-code-agent-id', encodeHeaderValue(options.agentId))
+  if (options.parentAgentId) {
+    headers.set(
+      'x-claude-code-parent-agent-id',
+      encodeHeaderValue(options.parentAgentId),
+    )
+  }
   headers.delete('x-api-key')
   return headers
 }

@@ -33,14 +33,14 @@ anthropic-auth/
 ## Directory Purposes
 
 **`packages/core/src/`:**
-- Purpose: All reusable OAuth, account management, quota, cache, relay, dump, signing, routing, and command execution logic
+- Purpose: Reusable OAuth/WIF lifecycle, native/secure credential discovery, account management, device/trusted/Cowork protocols, quota, cache, relay, signing, routing, and command execution logic
 - Contains: TypeScript modules, each focused on one concern, plus core unit tests in `tests/`
-- Key files: `index.ts` (re-exports all public API), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization + token exchange + refresh), `oauth-profile.ts` (OAuth profile fetch + rate limit tier formatting), `quota-headers.ts` (passive quota header extraction and normalization), `token-fingerprint.ts` (SHA-256 token fingerprinting), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cachekeep-registry.ts` (cross-process tracked-session lease registry), `cch.ts` (body signing), `claude-code.ts` (Claude Code identity + billing headers), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture and size-capped background sweeping), `models.ts` (Claude model specs), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
+- Key files: `index.ts` (re-exports all public API), `shared-account-store.ts` (Rust-compatible canonical Anthropic credential store), `shared-account-adapter.ts` (canonical-store/sidecar conversion), `accounts.ts` (sidecar storage + types + quota API), `auth.ts` (OAuth authorization/exchange/refresh/revocation), `oauth-loopback.ts` (automatic localhost completion), `oauth-profile.ts` (OAuth profile fetch + rate limit tier formatting), `quota-headers.ts` (passive quota header extraction and normalization), `token-fingerprint.ts` (SHA-256 token fingerprinting), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cachekeep-registry.ts` (cross-process tracked-session lease registry), `cch.ts` (2.1.233 canonical-preimage signing), `claude-code.ts` + `device-identity.ts` (persistent Claude identity), `wif.ts` (Workload Identity Federation), `native-claude-credentials.ts` + `secure-secret-store.ts` (native import/storage), `trusted-device.ts` + `attestation.ts` + `cowork-binding.ts` (Remote Control/Cowork security), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture and size-capped background sweeping), `models.ts` (Claude model specs), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
 - Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, and outcome detection), `fable-fallback.ts` (legacy session-and-source-family Fable/Opus 5 content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
+- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, and outcome detection), `fable-fallback.ts` (legacy session-and-source-family Fable/Opus 5 content-filter downgrade and standby Opus cache-anchor state), `cli.ts` (localhost OAuth, native import, confirmed revocation, API routes, and relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (JSONC preferences file), `sidebar-state.ts` (quota/routing and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver), `shared-auth.ts` (canonical shared-store resolution and OpenCode credential reconciliation)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
@@ -84,14 +84,22 @@ anthropic-auth/
 - `tsconfig.*.json`: TypeScript configs (root + per-package build configs)
 
 **Core Logic:**
-- `packages/core/src/auth.ts`: OAuth authorize → PKCE challenge → token exchange → refresh
+- `packages/core/src/auth.ts`: OAuth authorize → PKCE challenge → token exchange → expiry-aware refresh → revocation
+- `packages/core/src/oauth-loopback.ts`: Bounded one-shot localhost callback with manual fallback
+- `packages/core/src/wif.ts`: Service-account WIF environment resolution, assertion exchange, and single-flight cache
+- `packages/core/src/native-claude-credentials.ts`: Native keychain/plaintext discovery and explicit shared-store import
+- `packages/core/src/secure-secret-store.ts`: Bounded shell-free command reader and atomic private file secrets
+- `packages/core/src/device-identity.ts`: Persistent installation-wide 32-byte identity
+- `packages/core/src/trusted-device.ts`, `attestation.ts`, `cowork-binding.ts`: Trusted enrollment, fail-closed Remote Control status filtering, and P-256 Cowork binding
 - `packages/core/src/oauth-profile.ts`: OAuth profile metadata fetch, tier formatting (`Max 5x`, `Team · Max 5x`), and 7-day TTL validation
 - `packages/core/src/quota-headers.ts`: Normalization of `anthropic-ratelimit-unified-*` headers from direct fetch and relay transports into shared quota snapshots
 - `packages/core/src/token-fingerprint.ts`: Non-reversible SHA-256 token fingerprinting for profile-to-token binding
+- `packages/core/src/shared-account-store.ts`: Canonical `~/.anthropic-accounts/accounts.json` schema, path resolution, account selection, atomic writes, permissions, and safety checks compatible with the Rust `anthropic` crate
+- `packages/core/src/shared-account-adapter.ts`: Converts canonical OAuth/API-key accounts to and from legacy sidecar fallback entries
 - `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, in-process write serialization, cross-process configuration file locking and account merging (with `ENOENT`/`EINVAL` eviction race handling)
 - `packages/core/src/quota-manager.ts`: Unified quota cache with backoff + staleness
 - `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
-- `packages/core/src/cch.ts`: XXH64-based request body signing
+- `packages/core/src/cch.ts`: Claude 2.1.233 xxHash64 signing with seed `0x4d659218e32a3268` and model/max-token canonical preimage
 - `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager with local-window and process-lifetime `always` schedules
 - `packages/core/src/cachekeep-registry.ts`: Temporary lease registry for cross-process tracked-session status
 - `packages/core/src/routing.ts`: Main-first / fallback-first / sticky-balanced routing mode configuration and commands
@@ -114,6 +122,7 @@ anthropic-auth/
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
+- `packages/opencode/src/shared-auth.ts`: Resolves canonical shared credentials, adopts legacy OpenCode auth/fallbacks, preserves API-key versus OAuth header semantics, and synchronizes token rotations
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation
 

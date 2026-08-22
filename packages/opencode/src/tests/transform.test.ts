@@ -666,6 +666,95 @@ describe('createStrippedStream', () => {
     ).toBe(true)
   })
 
+  test('reports stop reasons that silently truncate a turn', async () => {
+    const encoder = new TextEncoder()
+    const truncated: string[] = []
+    const completed: string[] = []
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"pause_turn"}}\n\n',
+          ),
+        )
+        controller.close()
+      },
+    })
+
+    const response = createStrippedStream(
+      new Response(stream, { status: 200 }),
+      {
+        onTruncatedFinish: (reason) => truncated.push(reason),
+        onComplete: (reason) => completed.push(reason),
+      },
+    )
+    await response.text()
+
+    expect(truncated).toEqual(['pause_turn'])
+    expect(completed).toEqual(['pause_turn'])
+  })
+
+  test('does not report a normal end_turn as truncated', async () => {
+    const encoder = new TextEncoder()
+    const truncated: string[] = []
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+          ),
+        )
+        controller.close()
+      },
+    })
+
+    const response = createStrippedStream(
+      new Response(stream, { status: 200 }),
+      {
+        onTruncatedFinish: (reason) => truncated.push(reason),
+      },
+    )
+    await response.text()
+
+    expect(truncated).toEqual([])
+  })
+
+  test('cancels the upstream body when a mid-stream error is raised', async () => {
+    const encoder = new TextEncoder()
+    let cancelledWith: unknown
+    let cancelled = false
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
+      'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n',
+    ]
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      },
+      cancel(reason) {
+        cancelled = true
+        cancelledWith = reason
+      },
+    })
+
+    const stripped = createStrippedStream(new Response(stream, { status: 200 }))
+    const reader = stripped.body?.getReader()
+    await reader!.read()
+
+    let caught: unknown
+    try {
+      await reader!.read()
+    } catch (error) {
+      caught = error
+    }
+
+    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
+      'overloaded_error',
+    )
+    expect(cancelled).toBe(true)
+    expect(cancelledWith).toBe(caught)
+  })
+
   test('reports server-side fallback outcomes without turning them into retryable errors', async () => {
     const encoder = new TextEncoder()
     const outcomes: ServerSideFallbackOutcome[] = []
@@ -1276,6 +1365,19 @@ describe('rewriteRequestBody', () => {
     expect(result.system[0].text).toContain('x-anthropic-billing-header')
     expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
     expect(result.system[2].text).toBe('You are a helpful assistant.')
+  })
+
+  test('marks subagent requests in the billing header', async () => {
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'hello world test message' }],
+    })
+    const subagent = JSON.parse(
+      await rewriteRequestBody(body, { isSubagent: true }),
+    )
+    expect(subagent.system[0].text).toContain('cc_is_subagent=true;')
+
+    const primary = JSON.parse(await rewriteRequestBody(body))
+    expect(primary.system[0].text).not.toContain('cc_is_subagent')
   })
 
   test('handles missing system field', async () => {

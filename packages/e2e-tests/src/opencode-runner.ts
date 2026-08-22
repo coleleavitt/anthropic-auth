@@ -391,6 +391,10 @@ export async function spawnOpencode(
       env.configDir,
       'anthropic-auth.json',
     )
+    childEnv.ANTHROPIC_ACCOUNTS_FILE = join(
+      env.configDir,
+      'shared-anthropic-accounts.json',
+    )
     childEnv.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = join(
       env.configDir,
       'anthropic-auth-state.json',

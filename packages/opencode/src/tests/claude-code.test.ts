@@ -28,12 +28,12 @@ describe('Claude Code fingerprint helpers', () => {
       ...CLAUDE_CODE_FULL_AGENT_BETAS,
     ])
     const fullBetas = selectClaudeCodeBetas(body).split(',')
-    expect(fullBetas[0]).toBe('oauth-2025-04-20')
+    expect(fullBetas[0]).toBe('claude-code-20250219')
     expect(fullBetas).toContain('thinking-token-count-2026-05-13')
     expect(fullBetas).not.toContain('redact-thinking-2026-02-12')
     expect(fullBetas).toContain('claude-code-20250219')
     expect(fullBetas).not.toContain('context-1m-2025-08-07')
-    expect(fullBetas).not.toContain('effort-2025-11-24')
+    expect(fullBetas).toContain('effort-2025-11-24')
   })
 
   test('selects structured-output betas without full-agent private betas', () => {
@@ -49,10 +49,11 @@ describe('Claude Code fingerprint helpers', () => {
     expect(betas).toContain('structured-outputs-2025-12-15')
     expect(betas).toContain('thinking-token-count-2026-05-13')
     expect(betas).not.toContain('redact-thinking-2026-02-12')
-    expect(betas).not.toContain('claude-code-20250219')
+    expect(betas).toContain('claude-code-20250219')
+    expect(betas).toContain('effort-2025-11-24')
     expect(betas).not.toContain('advanced-tool-use-2025-11-20')
     expect(betas).not.toContain('context-1m-2025-08-07')
-    expect(betas).not.toContain('extended-cache-ttl-2025-04-11')
+    expect(betas).toContain('extended-cache-ttl-2025-04-11')
   })
 
   test('does not add full-agent-only betas for tool requests missing captured companion fields', () => {
@@ -64,12 +65,22 @@ describe('Claude Code fingerprint helpers', () => {
       stream: true,
     }).split(',')
 
+    expect(betas).toEqual([
+      'claude-code-20250219',
+      'oauth-2025-04-20',
+      'interleaved-thinking-2025-05-14',
+      'thinking-token-count-2026-05-13',
+      'context-management-2025-06-27',
+      'prompt-caching-scope-2026-01-05',
+      'effort-2025-11-24',
+      'extended-cache-ttl-2025-04-11',
+    ])
     expect(betas).toContain('thinking-token-count-2026-05-13')
-    expect(betas).toContain('advanced-tool-use-2025-11-20')
+    expect(betas).not.toContain('advanced-tool-use-2025-11-20')
     expect(betas).toContain('extended-cache-ttl-2025-04-11')
-    expect(betas).not.toContain('claude-code-20250219')
+    expect(betas).toContain('claude-code-20250219')
     expect(betas).not.toContain('context-1m-2025-08-07')
-    expect(betas).not.toContain('effort-2025-11-24')
+    expect(betas).toContain('effort-2025-11-24')
     expect(betas).not.toContain('redact-thinking-2026-02-12')
   })
 
@@ -77,10 +88,11 @@ describe('Claude Code fingerprint helpers', () => {
     const betas = selectClaudeCodeBetas(null).split(',')
 
     for (const beta of REQUIRED_BETAS) expect(betas).toContain(beta)
-    expect(betas[0]).toBe('oauth-2025-04-20')
+    expect(betas[0]).toBe('claude-code-20250219')
     expect(betas).toContain('thinking-token-count-2026-05-13')
+    expect(betas).toContain('effort-2025-11-24')
     expect(betas).not.toContain('redact-thinking-2026-02-12')
-    expect(betas).not.toContain('claude-code-20250219')
+    expect(betas).toContain('claude-code-20250219')
   })
 
   test('applies Claude Code headers and couples session id to metadata', () => {
@@ -103,10 +115,10 @@ describe('Claude Code fingerprint helpers', () => {
       { body, identity },
     )
 
-    expect(headers.get('user-agent')).toBe('claude-cli/2.1.177 (external, cli)')
+    expect(headers.get('user-agent')).toBe('claude-cli/2.1.233 (external, cli)')
     expect(headers.get('x-claude-code-session-id')).toBe(identity.sessionId)
-    expect(headers.get('x-stainless-package-version')).toBe('0.94.0')
-    expect(headers.get('x-stainless-runtime-version')).toBe('v24.3.0')
+    expect(headers.get('x-stainless-package-version')).toBe('0.112.1')
+    expect(headers.get('x-stainless-runtime-version')).toBe('v26.3.0')
     expect(headers.get('x-app')).toBe('cli')
     expect(headers.get('anthropic-dangerous-direct-browser-access')).toBe(
       'true',
@@ -121,6 +133,82 @@ describe('Claude Code fingerprint helpers', () => {
       account_uuid: '11111111-2222-4333-8444-555555555555',
       session_id: identity.sessionId,
     })
+  })
+
+  test('sets the stream helper method only for streaming requests', () => {
+    expect(
+      applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test', {
+        body: { stream: true },
+      }).get('x-stainless-helper-method'),
+    ).toBe('stream')
+    expect(
+      applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test', {
+        body: { stream: false },
+      }).get('x-stainless-helper-method'),
+    ).toBeNull()
+    expect(
+      applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test').get(
+        'x-stainless-helper-method',
+      ),
+    ).toBeNull()
+  })
+
+  test('sets agent id headers only when ids are supplied', () => {
+    const headers = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test', {
+      agentId: 'ses_child',
+      parentAgentId: 'ses_parent',
+    })
+    expect(headers.get('x-claude-code-agent-id')).toBe('ses_child')
+    expect(headers.get('x-claude-code-parent-agent-id')).toBe('ses_parent')
+
+    const bare = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test')
+    expect(bare.get('x-claude-code-agent-id')).toBeNull()
+    expect(bare.get('x-claude-code-parent-agent-id')).toBeNull()
+  })
+
+  test('forwards remote/container headers only when their env vars are set', () => {
+    expect(
+      applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test').get(
+        'x-claude-remote-container-id',
+      ),
+    ).toBeNull()
+
+    process.env.CLAUDE_CODE_CONTAINER_ID = 'container-7'
+    process.env.CLAUDE_CODE_REMOTE_SESSION_ID = 'remote-9'
+    process.env.CLAUDE_AGENT_SDK_CLIENT_APP = 'sdk-app'
+    process.env.CLAUDE_CODE_ADDITIONAL_PROTECTION = 'on'
+    try {
+      const headers = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test')
+      expect(headers.get('x-claude-remote-container-id')).toBe('container-7')
+      expect(headers.get('x-claude-remote-session-id')).toBe('remote-9')
+      expect(headers.get('x-client-app')).toBe('sdk-app')
+      expect(headers.get('x-anthropic-additional-protection')).toBe('true')
+    } finally {
+      delete process.env.CLAUDE_CODE_CONTAINER_ID
+      delete process.env.CLAUDE_CODE_REMOTE_SESSION_ID
+      delete process.env.CLAUDE_AGENT_SDK_CLIENT_APP
+      delete process.env.CLAUDE_CODE_ADDITIONAL_PROTECTION
+    }
+  })
+
+  test('ignores a falsy additional-protection flag', () => {
+    process.env.CLAUDE_CODE_ADDITIONAL_PROTECTION = 'false'
+    try {
+      expect(
+        applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test').get(
+          'x-anthropic-additional-protection',
+        ),
+      ).toBeNull()
+    } finally {
+      delete process.env.CLAUDE_CODE_ADDITIONAL_PROTECTION
+    }
+  })
+
+  test('percent-encodes agent ids that are invalid in a header value', () => {
+    const headers = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test', {
+      agentId: 'ses_café\n',
+    })
+    expect(headers.get('x-claude-code-agent-id')).toBe('ses_caf%C3%A9%0A')
   })
 
   test('orders serialized body fields like captured Claude Code requests', () => {
@@ -158,7 +246,7 @@ describe('Claude Code bootstrap identity lookup', () => {
         expect(url.searchParams.get('model')).toBe('claude-sonnet-4-6')
 
         const headers = new Headers(init?.headers)
-        expect(headers.get('user-agent')).toBe('claude-code/2.1.177')
+        expect(headers.get('user-agent')).toBe('claude-code/2.1.233')
         expect(headers.get('anthropic-beta')).toBe('oauth-2025-04-20')
         expect(headers.get('content-type')).toBe('application/json')
 
@@ -209,6 +297,27 @@ describe('Claude Code bootstrap identity lookup', () => {
     expect(first.accountUuid).toBeUndefined()
     expect(second.accountUuid).toBeUndefined()
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('uses one installation device id across distinct accounts while keeping sessions separate', async () => {
+    let calls = 0
+    const fetchMock = mock(async () => {
+      calls += 1
+      return Response.json({
+        oauth_account: {
+          account_uuid:
+            calls === 1
+              ? '11111111-2222-4333-8444-555555555555'
+              : 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        },
+      })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity('sk-ant-oat-global-device-a')
+    const second = await resolveClaudeCodeIdentity('sk-ant-oat-global-device-b')
+    expect(second.deviceId).toBe(first.deviceId)
+    expect(second.sessionId).not.toBe(first.sessionId)
   })
 
   test('keeps identity stable across rotated access tokens for the same account UUID', async () => {

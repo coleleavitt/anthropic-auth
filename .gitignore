@@ -5,6 +5,11 @@ packages/*/dist/
 packages/opencode/src/tui-compiled/
 *.tsbuildinfo
 
+# Override broad user-level `core` ignores for this workspace package's source.
+!packages/core/
+!packages/core/src/
+!packages/core/src/**
+
 # Local agent/dev state
 .opencode/
 .claude/

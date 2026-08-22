@@ -4,10 +4,18 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+### Minor Changes
+
+- Use the Rust-compatible `~/.anthropic-accounts/accounts.json` store as OpenCode's canonical Anthropic credential source, adopting existing OAuth/fallback credentials and supporting both OAuth bearer tokens and first-party `x-api-key` credentials while retaining the sidecar for plugin settings and runtime compatibility.
+- Complete the native auth/device surface with localhost OAuth callbacks, refresh-token expiry, explicit native credential import and revocation, Workload Identity Federation, persistent installation identity, trusted-device/attestation support, and Cowork P-256 binding helpers.
+
 ### Patch Changes
 
+- Refresh the Claude Code request fingerprint from the verified 2.1.233 Linux binary: exact 32-byte PKCE/state generation, message-derived billing suffix, current SDK/runtime versions, current base beta ordering, and OAuth refresh metadata.
+- Independently re-derive the 2.1.233 CCH signer from fail-closed native captures: xxHash64 seed `0x4d659218e32a3268`, with the 2.1.172+ global model/`max_tokens` canonical preimage, including nested-field oracle coverage.
 - Keep deterministic Opus 4.8 recovery armed as a backstop when Anthropic's server-side safety policy still returns a refusal, while stripping the server-fallback opt-in from source-model prewarms.
 - Preserve completed tool calls when a served fallback later refuses, continuing with the existing tool result instead of replaying potentially non-idempotent tools.
+- Close a stale refresh-lock eviction gap by serializing post-failure acquisition through the owner-checked marker and atomically renaming the stale lock, validated with repeated 1,000-round contention tests.
 
 ## 1.19.0
 

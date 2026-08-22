@@ -130,6 +130,24 @@ function createRequestId() {
   return `req_${Date.now().toString(36)}_${nextRequestId.toString(36)}`
 }
 
+export function relayWebSocketSessionKey(
+  affinity: string,
+  headers: Headers,
+): string {
+  const authorization = headers.get('authorization')?.trim() ?? ''
+  const apiKey = headers.get('x-api-key')?.trim() ?? ''
+  const organization = headers.get('x-organization-uuid')?.trim() ?? ''
+  const fingerprintSource = authorization || apiKey || organization
+  if (!fingerprintSource) return affinity
+  const fingerprint = createHash('sha256')
+    .update(fingerprintSource)
+    .update('\0')
+    .update(organization)
+    .digest('hex')
+    .slice(0, 16)
+  return `${affinity}:${fingerprint}`
+}
+
 function logRelayConfigOnce(message: string): void {
   if (loggedRelayConfigMessages.has(message)) return
   loggedRelayConfigMessages.add(message)
@@ -1070,15 +1088,20 @@ function cleanupRelaySessionCaches(now = Date.now()) {
   }
 }
 
-function getPersistentRelaySession(config: RelayConfig, affinity: string) {
+function getPersistentRelaySession(
+  config: RelayConfig,
+  affinity: string,
+  headers: Headers,
+) {
   cleanupRelaySessionCaches()
-  const existing = websocketSessions.get(affinity)
+  const key = relayWebSocketSessionKey(affinity, headers)
+  const existing = websocketSessions.get(key)
   if (existing) {
     existing.touch()
     return existing
   }
   const session = new PersistentRelaySession(config, affinity)
-  websocketSessions.set(affinity, session)
+  websocketSessions.set(key, session)
   cleanupRelaySessionCaches()
   return session
 }
@@ -1153,7 +1176,7 @@ export async function sendViaRelay(options: {
     const sendStart = perfNowMs()
     if (config.transport === 'websocket') {
       try {
-        const session = getPersistentRelaySession(config, affinity)
+        const session = getPersistentRelaySession(config, affinity, headers)
         result = await session.send(
           payload,
           bodyText,

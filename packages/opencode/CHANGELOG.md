@@ -4,10 +4,18 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+### Minor Changes
+
+- Use the Rust-compatible `~/.anthropic-accounts/accounts.json` store as the canonical Anthropic credential source, adopting existing OAuth/fallback credentials and supporting both OAuth bearer tokens and first-party `x-api-key` credentials while retaining the sidecar for plugin settings and runtime compatibility.
+- Add localhost OAuth completion, native credential import, confirmed revocation, WIF routing, persistent device identity, trusted-device/attestation support, and Cowork P-256 binding helpers.
+
 ### Patch Changes
 
+- Refresh the Claude Code request fingerprint from the verified 2.1.233 Linux binary: exact 32-byte PKCE/state generation, message-derived billing suffix, current SDK/runtime versions, current base beta ordering, and OAuth refresh metadata.
+- Correct CCH signing to the independently verified 2.1.233 seed `0x4d659218e32a3268` and the 2.1.172+ global model/max-token canonical preimage, including nested fields.
 - Keep deterministic Opus 4.8 recovery armed as a backstop when Anthropic's server-side safety policy still returns a refusal, while stripping the server-fallback opt-in from source-model prewarms.
 - Preserve completed tool calls when a served fallback later refuses, continuing with the existing tool result instead of replaying potentially non-idempotent tools.
+- Serialize stale refresh-lock recovery through the eviction marker and atomically rename the stale owner, eliminating a dual-winner contention gap.
 
 ## 1.19.0
 

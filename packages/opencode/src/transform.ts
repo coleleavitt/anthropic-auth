@@ -148,6 +148,8 @@ export function setOAuthHeaders(
   options: {
     body?: Record<string, unknown> | null
     identity?: ClaudeCodeIdentity
+    agentId?: string
+    parentAgentId?: string
   } = {},
 ): Headers {
   return applyClaudeCodeHeaders(headers, accessToken, {
@@ -1177,6 +1179,7 @@ export async function rewriteRequestBody(
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
+    isSubagent?: boolean
   } = {},
 ): Promise<string> {
   try {
@@ -1246,11 +1249,14 @@ export async function rewriteRequestBody(
             parsed.messages,
             undefined,
             CLAUDE_CODE_ENTRYPOINT,
+            undefined,
+            { isSubagent: options.isSubagent === true },
           )
         : null
     options.perf?.('billing_header', {
       ms: rewriteRoundMs(rewriteNowMs() - billingStart),
       hasBillingHeader: Boolean(billingHeader),
+      isSubagent: options.isSubagent === true,
     })
 
     // Sanitize system prompt and prepend Claude Code identity
@@ -1527,6 +1533,21 @@ type SseFinishUpdate =
   | { type: 'content-filter' }
   | { type: 'complete'; finishReason: string }
 
+/**
+ * Stop reasons that end a turn without an error while leaving the answer
+ * incomplete. Anthropic returns HTTP 200, so nothing else marks them as
+ * abnormal and the truncation is otherwise silent.
+ */
+const TRUNCATING_STOP_REASONS = new Set([
+  'pause_turn',
+  'max_tokens',
+  'model_context_window_exceeded',
+])
+
+export function isTruncatingStopReason(stopReason: string | undefined) {
+  return stopReason !== undefined && TRUNCATING_STOP_REASONS.has(stopReason)
+}
+
 function createSseFinishState(): SseFinishState {
   return { pending: '', completed: false }
 }
@@ -1700,6 +1721,7 @@ export function createStrippedStream(
       completedToolUse: boolean
     }) => boolean | undefined
     onComplete?: (finishReason: string) => void
+    onTruncatedFinish?: (finishReason: string) => void
     contentFilterModel?: unknown
     serverSideFallbackModel?: string
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
@@ -1723,7 +1745,7 @@ export function createStrippedStream(
   const sseDiagnostics = options.perf ? createSseDiagnosticState() : undefined
   const sseErrors = createSseErrorState()
   const sseFinish =
-    options.onContentFilter || options.onComplete
+    options.onContentFilter || options.onComplete || options.onTruncatedFinish
       ? createSseFinishState()
       : undefined
   let contentFilterInvoked = false
@@ -1755,7 +1777,11 @@ export function createStrippedStream(
         ? retryableFableContentFilterError(options.contentFilterModel)
         : null
     }
-    if (update?.type === 'complete') options.onComplete?.(update.finishReason)
+    if (update?.type === 'complete') {
+      if (isTruncatingStopReason(update.finishReason))
+        options.onTruncatedFinish?.(update.finishReason)
+      options.onComplete?.(update.finishReason)
+    }
     return null
   }
 
@@ -1860,7 +1886,9 @@ export function createStrippedStream(
               readMs,
               lastChunkBytes: value.byteLength,
             })
-            releaseReader()
+            // Throwing from `pull` never invokes the `cancel` handler, so
+            // releasing the lock alone strands the upstream connection.
+            await cancelReader(retryableStreamError)
             throw retryableStreamError
           }
           const text = pending + serverRewritten

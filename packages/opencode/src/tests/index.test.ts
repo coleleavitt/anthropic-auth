@@ -9,6 +9,7 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   getAccountStatePath,
+  getSharedAccountStorePath,
   hashRefreshToken,
   type LogTestRecord,
   loadAccounts,
@@ -20,6 +21,7 @@ import {
   resetFastModeState,
   saveAccountState,
   saveAccounts,
+  saveSharedAccountStore,
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -590,6 +592,43 @@ describe('provider.models', () => {
     })
   })
 
+  test('uses canonical API-key cost semantics over stale OpenCode OAuth metadata', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    await saveSharedAccountStore(
+      {
+        version: 1,
+        current: 'api-main',
+        accounts: [
+          {
+            id: 'api-main',
+            credential: { type: 'api_key', key: 'canonical-api-key' },
+            enabled: true,
+            created_at: '2026-08-14T00:00:00.000Z',
+          },
+        ],
+      },
+      { path: getSharedAccountStorePath() },
+    )
+    const plugin = await getPlugin()
+    const models = {
+      'claude-opus-4-8': {
+        id: 'claude-opus-4-8',
+        cost: { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+      },
+    }
+
+    const result = await plugin.provider?.models?.(
+      { models } as never,
+      { auth: { type: 'oauth' } } as never,
+    )
+
+    expect(result?.['claude-opus-4-8']?.cost).toEqual({
+      input: 5,
+      output: 25,
+      cache: { read: 0.5, write: 6.25 },
+    })
+  })
+
   test('replaces stale Opus 5 manual-thinking variants with adaptive efforts', async () => {
     const plugin = await getPlugin()
     const models = {
@@ -721,13 +760,134 @@ describe('auth.loader', () => {
     }
   })
 
-  test('returns empty object for non-oauth auth', async () => {
+  test('uses built-in Anthropic configuration for API-key auth', async () => {
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(
-      () => Promise.resolve({ type: 'api' }),
+      () => Promise.resolve({ type: 'api', key: 'anthropic-api-key' }),
       { models: {} },
     )
-    expect(result).toEqual({})
+    expect(result).toEqual({ apiKey: 'anthropic-api-key' })
+  })
+
+  test('routes WIF as standard bearer auth without Claude Code identity transforms', async () => {
+    const names = [
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_PROFILE',
+      'ANTHROPIC_FEDERATION_RULE_ID',
+      'ANTHROPIC_ORGANIZATION_ID',
+      'ANTHROPIC_SERVICE_ACCOUNT_ID',
+      'ANTHROPIC_IDENTITY_TOKEN',
+    ] as const
+    const previous = new Map(names.map((name) => [name, process.env[name]]))
+    try {
+      delete process.env.ANTHROPIC_API_KEY
+      delete process.env.ANTHROPIC_AUTH_TOKEN
+      delete process.env.ANTHROPIC_PROFILE
+      process.env.ANTHROPIC_FEDERATION_RULE_ID = 'rule'
+      process.env.ANTHROPIC_ORGANIZATION_ID = 'org'
+      process.env.ANTHROPIC_SERVICE_ACCOUNT_ID = 'service'
+      process.env.ANTHROPIC_IDENTITY_TOKEN = 'header.payload.signature'
+      const calls: Array<{ url: string; init?: RequestInit }> = []
+      globalThis.fetch = mock(
+        (input: string | URL | Request, init?: RequestInit) => {
+          calls.push({ url: extractUrl(input), init })
+          if (extractUrl(input).endsWith('/v1/oauth/token')) {
+            return Promise.resolve(
+              Response.json({
+                access_token: 'wif-access',
+                expires_in: 3600,
+                token_type: 'Bearer',
+              }),
+            )
+          }
+          return Promise.resolve(Response.json({ ok: true }))
+        },
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () => Promise.resolve({ type: 'wellknown' }),
+        { models: {} },
+      )
+      const requestBody = JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'unchanged' }],
+      })
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: requestBody,
+        headers: {
+          'x-api-key': 'stale',
+          'anthropic-beta': 'oauth-2025-04-20,fast-mode-2026-02-01',
+        },
+      })
+      expect(calls).toHaveLength(2)
+      const exchangeHeaders = new Headers(calls[0]?.init?.headers)
+      expect(exchangeHeaders.get('anthropic-beta')).toBe(
+        'oauth-2025-04-20,oidc-federation-2026-04-01',
+      )
+      const messageHeaders = new Headers(calls[1]?.init?.headers)
+      expect(messageHeaders.get('authorization')).toBe('Bearer wif-access')
+      expect(messageHeaders.get('x-api-key')).toBeNull()
+      expect(messageHeaders.get('anthropic-beta')).toBe('fast-mode-2026-02-01')
+      expect(messageHeaders.get('x-app')).toBeNull()
+      expect(calls[1]?.init?.body).toBe(requestBody)
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  })
+
+  test('an OAuth loader switches to canonical API-key headers when current changes', async () => {
+    const captured: Headers[] = []
+    globalThis.fetch = mock(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        captured.push(new Headers(init?.headers))
+        return Promise.resolve(new Response(null, { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'oauth-access',
+          refresh: 'oauth-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await saveSharedAccountStore(
+      {
+        version: 1,
+        current: 'api-main',
+        accounts: [
+          {
+            id: 'api-main',
+            credential: { type: 'api_key', key: 'canonical-api-key' },
+            enabled: true,
+            created_at: '2026-08-14T00:00:00.000Z',
+          },
+        ],
+      },
+      { path: getSharedAccountStorePath() },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: '{}',
+      headers: {
+        authorization: 'Bearer stale-oauth',
+        'anthropic-beta': 'oauth-2025-04-20,fast-mode-2026-02-01',
+      },
+    })
+
+    expect(captured).toHaveLength(1)
+    expect(captured[0]?.get('authorization')).toBeNull()
+    expect(captured[0]?.get('x-api-key')).toBe('canonical-api-key')
+    expect(captured[0]?.get('anthropic-beta')).toBe('fast-mode-2026-02-01')
   })
 
   test('returns fetch wrapper for oauth auth', async () => {
@@ -2598,9 +2758,7 @@ describe('auth.loader', () => {
       authorization: 'Bearer kie-key',
     })
     expect(requests[1]?.body).not.toHaveProperty('fallbacks')
-    expect(requests[1]?.beta?.split(',')).not.toContain(
-      SERVER_SIDE_FALLBACK_BETA,
-    )
+    expect(requests[1]?.beta).toBeNull()
   })
 
   test('does not route to API-key fallback after main 429 when quota does not confirm exhaustion', async () => {
@@ -2675,6 +2833,85 @@ describe('auth.loader', () => {
       url: 'https://api.anthropic.com/v1/messages?beta=true',
       authorization: 'Bearer main-access',
     })
+  })
+
+  test('honors x-should-retry:false and skips fallback for a routable status', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        } as AccountStorage['quota'],
+        accounts: [
+          {
+            id: 'oauth-fallback',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+          },
+        ],
+      }),
+    )
+
+    const requests: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      requests.push(
+        `${url}|${new Headers(init?.headers).get('authorization') ?? ''}`,
+      )
+      return Promise.resolve(
+        new Response(
+          'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n',
+          {
+            status: 200,
+            headers: {
+              'content-type': 'text/event-stream',
+              'x-should-retry': 'false',
+            },
+          },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(requests).toEqual([
+      'https://api.anthropic.com/v1/messages?beta=true|Bearer main-access',
+    ])
   })
 
   test('does not route to API-key fallback after non-quota main OAuth fallback status', async () => {
@@ -4779,6 +5016,17 @@ describe('auth.loader', () => {
     } catch (error) {
       commandError = error
     } finally {
+      // Profile persistence is fire-and-forget, so its debug record can land
+      // after the command resolves; wait for it before removing the sink.
+      const deadline = Date.now() + 1000
+      while (
+        Date.now() < deadline &&
+        !records.some(
+          (record) => record.message === 'failed to persist account profile',
+        )
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
       await chmod(stateDir, 0o755)
       __setLogTestSink(null)
       setLogLevel('info')

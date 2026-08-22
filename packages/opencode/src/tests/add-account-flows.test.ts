@@ -171,12 +171,13 @@ describe('parseAccountCommandAction — add actions', () => {
     })
   })
 
-  test('add-oauth-finish without code falls to usage', async () => {
+  test('add-oauth-finish without code can consume an automatic localhost callback', async () => {
     const { parseAccountCommandAction } = await import(
       '@cortexkit/anthropic-auth-core'
     )
     expect(parseAccountCommandAction('add-oauth-finish')).toEqual({
-      type: 'usage',
+      type: 'add-oauth-finish',
+      label: undefined,
     })
   })
 
@@ -236,7 +237,8 @@ describe('add-apikey flow', () => {
     const plugin = await getPlugin()
     await executeCommand(plugin, 'claude-account', 'add-apikey sk-ant-test123')
 
-    const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
+    const { getSharedAccountStorePath, loadAccounts, loadSharedAccountStore } =
+      await import('@cortexkit/anthropic-auth-core')
     const loaded = await loadAccounts(accountPath)
     expect(loaded).not.toBeNull()
     expect(loaded!.accounts).toHaveLength(1)
@@ -248,6 +250,13 @@ describe('add-apikey flow', () => {
       expect(account.authHeader).toBe('authorization-bearer')
     }
     expect(account.enabled).toBe(true)
+
+    const shared = await loadSharedAccountStore({
+      path: getSharedAccountStorePath(),
+      legacyPaths: [],
+    })
+    expect(shared.source).toEqual({ type: 'empty' })
+    expect(shared.store.accounts).toEqual([])
   })
 
   test('persists with a label', async () => {
@@ -481,6 +490,7 @@ describe('add-oauth label threading', () => {
               access_token: 'oauth-access',
               refresh_token: 'oauth-refresh',
               expires_in: 3600,
+              refresh_token_expires_in: 7200,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
           ),
@@ -511,6 +521,9 @@ describe('add-oauth label threading', () => {
     const account = loaded!.accounts[0]!
     expect(account.type).toBe('oauth')
     expect(account.label).toBe('work')
+    if (account.type === 'oauth') {
+      expect(account.refreshExpires).toBeGreaterThan(Date.now())
+    }
   })
 
   test('add-oauth-finish without --label leaves label undefined (UUID-name fallback)', async () => {

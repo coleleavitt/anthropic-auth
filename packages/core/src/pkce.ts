@@ -9,7 +9,7 @@ export async function generatePKCE(): Promise<{
   challenge: string
   method: 'S256'
 }> {
-  const buf = new Uint8Array(64)
+  const buf = new Uint8Array(32)
   crypto.getRandomValues(buf)
   const verifier = base64UrlEncode(buf)
   const digest = await crypto.subtle.digest(

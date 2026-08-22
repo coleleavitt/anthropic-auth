@@ -8,6 +8,8 @@ export type AccountCommandAction =
   | { type: 'enable'; id: string }
   | { type: 'disable'; id: string }
   | { type: 'remove'; id: string }
+  | { type: 'revoke'; id: string; confirmed: boolean }
+  | { type: 'import-native'; label?: string; confirmed: boolean }
   | { type: 'move-up'; id: string }
   | { type: 'move-down'; id: string }
   | {
@@ -18,7 +20,7 @@ export type AccountCommandAction =
       authHeader?: 'authorization-bearer' | 'x-api-key'
     }
   | { type: 'add-oauth-start' }
-  | { type: 'add-oauth-finish'; code: string; label?: string }
+  | { type: 'add-oauth-finish'; code?: string; label?: string }
   | { type: 'usage' }
 
 export function parseAccountCommandAction(
@@ -33,6 +35,20 @@ export function parseAccountCommandAction(
   if (action === 'enable' && rest) return { type: 'enable', id: rest }
   if (action === 'disable' && rest) return { type: 'disable', id: rest }
   if (action === 'remove' && rest) return { type: 'remove', id: rest }
+  if (action === 'revoke' && rest) {
+    const confirmed = /(?:^|\s)--confirm(?:\s|$)/.test(rest)
+    const id = rest.replace(/(?:^|\s)--confirm(?:\s|$)/, ' ').trim()
+    return id ? { type: 'revoke', id, confirmed } : { type: 'usage' }
+  }
+  if (action === 'import-native') {
+    const confirmed = /(?:^|\s)--confirm(?:\s|$)/.test(rest)
+    const label = rest.replace(/(?:^|\s)--confirm(?:\s|$)/, ' ').trim()
+    return {
+      type: 'import-native',
+      ...(label ? { label } : {}),
+      confirmed,
+    }
+  }
   if (action === 'move-up' && rest) return { type: 'move-up', id: rest }
   if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
 
@@ -90,7 +106,7 @@ export function parseAccountCommandAction(
 
   if (action === 'add-oauth-start') return { type: 'add-oauth-start' }
 
-  if (action === 'add-oauth-finish' && rest) {
+  if (action === 'add-oauth-finish') {
     let remaining = rest
 
     // Parse --label flag (mirrors add-apikey). The OAuth code is opaque (may
@@ -103,8 +119,11 @@ export function parseAccountCommandAction(
       remaining = remaining.replace(labelMatch[0], '').trim()
     }
 
-    if (!remaining) return { type: 'usage' }
-    return { type: 'add-oauth-finish', code: remaining, label }
+    return {
+      type: 'add-oauth-finish',
+      ...(remaining ? { code: remaining } : {}),
+      label,
+    }
   }
 
   return { type: 'usage' }
@@ -116,6 +135,7 @@ export interface AccountListItem {
   role: 'main' | 'fallback'
   enabled: boolean
   quotaPercent: number | null
+  authType?: 'oauth' | 'api'
   tierLabel?: string
 }
 
@@ -143,6 +163,7 @@ export function buildAccountList(storage: AccountStorage): AccountListItem[] {
       role: 'fallback',
       enabled: account.enabled !== false,
       quotaPercent: fiveHourQuota?.usedPercent ?? null,
+      authType: account.type,
       tierLabel:
         account.type === 'oauth'
           ? formatOAuthAccountTier(account.profile)
@@ -158,12 +179,14 @@ const USAGE_TEXT = [
   '  /claude-account                       Show account list',
   '  /claude-account enable <id>           Enable a fallback account',
   '  /claude-account disable <id>          Disable a fallback account',
-  '  /claude-account remove <id>           Remove a fallback account',
+  '  /claude-account remove <id>           Remove a fallback account locally',
+  '  /claude-account revoke <id> --confirm Remote-revoke and disable OAuth',
+  '  /claude-account import-native [label] --confirm  Import native Claude OAuth',
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
   '  /claude-account add-apikey <key>      Add an API key fallback account',
-  '  /claude-account add-oauth-start       Start OAuth device flow',
-  '  /claude-account add-oauth-finish <code>  Complete OAuth flow',
+  '  /claude-account add-oauth-start       Start browser OAuth login',
+  '  /claude-account add-oauth-finish [code]  Complete captured/manual OAuth flow',
 ].join('\n')
 
 export function executeAccountCommand(input: {
@@ -209,6 +232,20 @@ export function executeAccountCommand(input: {
   }
   if (action.type === 'add-oauth-finish') {
     return { text: 'add-oauth-finish' }
+  }
+  if (action.type === 'revoke') {
+    return {
+      text: action.confirmed
+        ? 'revoke'
+        : 'Remote revocation cannot be undone. Re-run with --confirm.',
+    }
+  }
+  if (action.type === 'import-native') {
+    return {
+      text: action.confirmed
+        ? 'import-native'
+        : 'Importing may copy a keychain-protected credential into the project-neutral store. Re-run with --confirm.',
+    }
   }
 
   const id = action.id

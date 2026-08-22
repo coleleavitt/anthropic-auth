@@ -17,6 +17,8 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Capability | OpenCode | Pi |
 | --- | --- | --- |
 | Primary Claude Pro/Max OAuth | OpenCode `/connect anthropic` | Pi `/login anthropic` |
+| Workload Identity Federation | Automatic when official WIF env wins precedence | Core provider available; Pi host auth cannot represent async refreshless credentials |
+| Shared Anthropic credentials | `~/.anthropic-accounts/accounts.json` (OAuth and first-party API key) | Pi keeps native host auth and mirrors OAuth/refresh-expiry rotations into the shared store |
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
 | Runtime state | `~/.config/opencode/anthropic-auth-state.json` | next to the Pi sidecar as `anthropic-auth-state.json` |
@@ -25,6 +27,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 
 ## What CortexKit adds over the original plugin
 
+- **Complete auth/device compatibility**: localhost OAuth with manual fallback, refresh-expiry persistence, native Claude import, confirmed revocation, WIF, persistent device identity, trusted-device/attestation helpers, and Cowork P-256 binding.
 - **Fallback Claude accounts**: keep each agent's normal Anthropic login as the primary account, then route to ordered fallback OAuth accounts on auth/quota/rate-limit failures.
 - **Routing modes**: use `/claude-routing sticky-balanced` to distribute cold sessions by current OAuth quota headroom while keeping each session on one account, or choose `main-first` / `fallback-first` ordering.
 - **Quota-aware routing**: skip main or fallback accounts when their 5-hour or 7-day Claude quota falls below your configured minimum.
@@ -133,7 +136,21 @@ For Pi, install the Pi package, restart Pi, then use Pi's Anthropic login flow:
 /login anthropic
 ```
 
-The Pi package registers under Pi's built-in `anthropic` provider ID and stores primary OAuth credentials through Pi's normal credential flow. CortexKit package state, fallback accounts, cache mode, dump mode, and relay config live in the Pi sidecar file.
+The Pi package registers under Pi's built-in `anthropic` provider ID and stores primary OAuth credentials through Pi's normal credential flow. It mirrors refresh-token expiry and rotations into the canonical shared store because Pi's host credential schema has only access/refresh/access-expiry fields. CortexKit settings remain in the Pi sidecar.
+
+## Shared Anthropic credentials
+
+OpenCode resolves Anthropic OAuth sessions and first-party API keys from the project-neutral store used by the Rust `anthropic` crate:
+
+```text
+~/.anthropic-accounts/accounts.json
+```
+
+Path resolution is: `ANTHROPIC_ACCOUNTS_FILE`, then `ANTHROPIC_ACCOUNTS_DIR/accounts.json`, then the default above. The JSON schema supports ordered accounts, a pinned `current` account, OAuth credentials with optional `refresh_expires_at`, and `api_key` credentials. The installation ID is separate in `device.json`; trusted-device tokens and Cowork private keys never enter account JSON. OAuth requests use `Authorization: Bearer` plus `anthropic-beta: oauth-2025-04-20`; first-party API keys stay on OpenCode's built-in Anthropic path and use `x-api-key`.
+
+The canonical `current` account—or the first available account when `current` is unset—wins over an older OpenCode auth snapshot, matching the Rust store's ordered selection. Only when the shared store is empty does the adapter adopt OpenCode's existing Anthropic login as `current` and import valid legacy fallback credentials. New OAuth/API-key connections and token rotations are written back atomically to the shared store. `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_API_KEY` remain non-persisted environment fallbacks; the first and last match Gajae-Code's built-in Anthropic behavior, while `ANTHROPIC_AUTH_TOKEN` supports the standard Anthropic bearer convention.
+
+Known Rust-schema-compatible legacy shared-store locations under `~/.config/jfc`, `~/.grok`, and `~/.config/opencode` are read when the canonical file does not exist; older incompatible application-specific schemas are skipped rather than treated as canonical credentials. Store writes refuse directly symlinked files, use user-only permissions, lock compare-and-swap refresh rotations, and reject accidental empty writes while allowing an explicit final-account removal.
 
 ## Sidecar config
 
@@ -213,9 +230,9 @@ Example:
 }
 ```
 
-The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's primary auth entry; Pi keeps primary OAuth credentials in Pi's own credential store, but uses the same sidecar shape for CortexKit settings and fallback account labels.
+The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's Anthropic integration; the selected credential itself comes from the shared account store. Pi keeps primary OAuth credentials in Pi's own credential store but uses the same sidecar shape for CortexKit settings and fallback labels.
 
-Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
+Runtime data is stored separately in `anthropic-auth-state.json`: token-refresh backoff, quota snapshots, quota API backoff, custom API-route keys, and a compatibility mirror used by existing routing code. Canonical OAuth and first-party Anthropic API-key credentials live in `~/.anthropic-accounts/accounts.json`. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
 ## Fallback accounts
 
@@ -238,12 +255,14 @@ Add and inspect OpenCode fallback accounts with the CLI:
 ```bash
 bunx @cortexkit/opencode-anthropic-auth login personal-alt
 bunx @cortexkit/opencode-anthropic-auth api add kie-opus
+bunx @cortexkit/opencode-anthropic-auth import-native native-claude
+bunx @cortexkit/opencode-anthropic-auth revoke <oauth-account-id>
 bunx @cortexkit/opencode-anthropic-auth list
 ```
 
 Prefer npm? Use `npx -y @cortexkit/opencode-anthropic-auth ...` with the same subcommands.
 
-API fallback routes use `Authorization: Bearer <key>` by default and rewrite requests to the configured Anthropic-compatible base URL. For Kie, use `https://api.kie.ai/claude` as the base URL; the plugin appends `/v1/messages` automatically. API-key routes are only eligible after direct evidence that the main OAuth quota is exhausted: a fresh token-bound quota snapshot at 0% remaining, or an actual main OAuth model response with HTTP 429 / streaming rate-limit error followed by a live quota check that confirms 0% remaining. Low-but-nonzero quota, stale cached quota, unconfirmed 429s, 401, or 403 do not trigger API-key routes. API-route keys are stored in `anthropic-auth-state.json`, while `anthropic-auth.json` keeps the route label, type, enabled flag, base URL, and auth-header mode.
+API fallback routes use `Authorization: Bearer <key>` by default and rewrite requests to the configured Anthropic-compatible base URL. For Kie, use `https://api.kie.ai/claude` as the base URL; the plugin appends `/v1/messages` automatically. API-key routes are only eligible after direct evidence that the main OAuth quota is exhausted: a fresh token-bound quota snapshot at 0% remaining, or an actual main OAuth model response with HTTP 429 / streaming rate-limit error followed by a live quota check that confirms 0% remaining. Low-but-nonzero quota, stale cached quota, unconfirmed 429s, 401, or 403 do not trigger API-key routes. First-party Anthropic API keys used by the built-in provider are canonical in `~/.anthropic-accounts/accounts.json`. Custom API fallback routes remain in the OpenCode sidecar/state pair because the shared Rust schema intentionally has no custom endpoint or auth-header fields; this prevents a proxy credential from being reconstructed as a first-party `x-api-key`. Pi continues to use its native credential flow plus the Pi sidecar.
 
 OpenCode cost accounting stays simple: when the native Anthropic auth entry is OAuth, OpenCode sees zero-cost Claude OAuth models by default. If a request falls through to an API-key route, token accounting is still recorded, but OpenCode's built-in dollar cost is not route-aware. Advanced users can set `costZeroing.enabled` to `false` to show Anthropic model pricing for OAuth sessions too.
 
@@ -258,7 +277,7 @@ Fallback retries are only attempted when the request body is safely replayable. 
 
 ### Token refresh
 
-Fallback OAuth tokens refresh in the background so idle accounts do not expire before they are needed. Refresh token rotation is persisted immediately. The plugin also re-reads the latest sidecar account before refreshing, which avoids using stale refresh-token snapshots when multiple background paths run close together.
+Fallback OAuth tokens refresh in the background. Access and refresh-token expiries persist in the Rust-compatible schema; expired refresh tokens fail locally. Omitted refresh-expiry fields preserve the known absolute expiry, and rotations commit with a locked compare-and-swap so a newer cross-process token cannot be overwritten.
 
 If Anthropic reports `invalid_grant`, that fallback account must be logged in again.
 
@@ -531,6 +550,16 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | Variable | Description |
 | --- | --- |
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
+| `ANTHROPIC_ACCOUNTS_FILE` | Override the canonical shared Anthropic account-store file. |
+| `ANTHROPIC_ACCOUNTS_DIR` | Override the directory containing the canonical `accounts.json`. Ignored when `ANTHROPIC_ACCOUNTS_FILE` is set. |
+| `ANTHROPIC_OAUTH_TOKEN` | Gajae-compatible, non-persisted OAuth bearer fallback used when no shared or OpenCode credential is available. |
+| `ANTHROPIC_AUTH_TOKEN` | Standard Anthropic bearer-token fallback, checked after `ANTHROPIC_OAUTH_TOKEN`. |
+| `ANTHROPIC_API_KEY` | Non-persisted first-party API-key fallback; its presence shadows WIF. |
+| `ANTHROPIC_FEDERATION_RULE_ID` / `ANTHROPIC_ORGANIZATION_ID` | Required Workload Identity Federation resource IDs; `ANTHROPIC_SERVICE_ACCOUNT_ID` is optional. |
+| `ANTHROPIC_IDENTITY_TOKEN_FILE` / `ANTHROPIC_IDENTITY_TOKEN` | Rotating projected or inline WIF assertion. |
+| `ANTHROPIC_WORKSPACE_ID` | Optional multi-workspace WIF selector. |
+| `CLAUDE_TRUSTED_DEVICE_TOKEN` | Trusted-device override for explicit Remote Control/Cowork calls only. |
+| `CLAUDE_CODE_OAUTH_CLIENT_ID` | Override the public PKCE OAuth client ID, matching Claude Code and the Rust `anthropic` crate. |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
 | `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to bypass Anthropic's server policy and use deterministic 10-response client recovery exclusively. The default tries server-side safety fallback first and uses client recovery as a backstop. |
@@ -550,7 +579,7 @@ For Claude Pro/Max OAuth requests, the plugin works at the final Anthropic wire-
 5. Rewrites cache controls according to `/claude-cache` mode.
 6. Renames MCP tool names into Claude-compatible PascalCase form.
 7. Opts eligible Fable 5 and Opus 5 OAuth requests into Anthropic's server-side safety fallback, restores stored fallback boundaries, and activates replay-safe client recovery if the response still refuses.
-8. Computes final-body `cch` over the fully serialized request body.
+8. Computes Claude 2.1.233 `cch` with seed `0x4d659218e32a3268` over the canonical preimage with every model value emptied and every integer max-token field removed, then patches only the five-character billing slot in the unchanged wire body.
 
 The sanitizer is anchor-based: it removes paragraphs containing known OpenCode documentation or source anchors, performs a small set of inline replacements, and preserves the rest of the prompt including user/project instructions, tool policy, environment context, and file paths.
 

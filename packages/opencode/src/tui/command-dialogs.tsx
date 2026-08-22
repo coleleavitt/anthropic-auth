@@ -273,6 +273,7 @@ export function openCommandDialog(
         role: string
         enabled: boolean
         quotaPercent: number | null
+        authType?: 'oauth' | 'api'
         tierLabel?: string
       }>) ?? []
 
@@ -350,6 +351,12 @@ export function openCommandDialog(
               description:
                 'Provide an API key for an Anthropic-compatible endpoint',
             },
+            {
+              title: 'Import native Claude',
+              value: 'native',
+              description:
+                'Explicitly copy Claude Code OAuth from secure storage or its private fallback file',
+            },
             { title: 'Back', value: 'back' },
           ]}
           onSelect={(option) => {
@@ -361,8 +368,50 @@ export function openCommandDialog(
               openAddApiKey()
               return
             }
+            if (option.value === 'native') {
+              openImportNative()
+              return
+            }
             openAddOAuthStart()
           }}
+        />
+      ))
+    }
+
+    // -- Import native Claude (label → explicit confirmation) -------------
+    const openImportNative = () => {
+      const DialogPrompt = api.ui.DialogPrompt
+      const DialogConfirm = api.ui.DialogConfirm
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogPrompt
+          title='Import native Claude OAuth — label'
+          description={() => (
+            <text>A short name for the imported account (optional).</text>
+          )}
+          placeholder='Native Claude'
+          value=''
+          onConfirm={(value: string) => {
+            const label = value.trim()
+            api.ui.dialog.replace(() => (
+              <DialogConfirm
+                title='Import native Claude OAuth?'
+                message='This may copy a keychain-protected credential into the private project-neutral account store.'
+                onConfirm={() => {
+                  const args = label
+                    ? `import-native ${label} --confirm`
+                    : 'import-native --confirm'
+                  void apply('claude-account', args).then((r) => {
+                    api.ui.toast({ message: r.text })
+                    updateAccounts(r)
+                    buildL1()
+                  })
+                }}
+                onCancel={() => openImportNative()}
+              />
+            ))
+          }}
+          onCancel={() => openAddType()}
         />
       ))
     }
@@ -653,8 +702,15 @@ export function openCommandDialog(
         options.push({
           title: 'Remove\u2026',
           value: 'remove',
-          description: 'Delete this account permanently',
+          description: 'Delete this account locally',
         })
+        if (account.authType === 'oauth') {
+          options.push({
+            title: 'Disconnect and revoke\u2026',
+            value: 'revoke',
+            description: 'Remotely invalidate the OAuth token family',
+          })
+        }
       }
       options.push({ title: 'Back', value: 'back' })
 
@@ -665,6 +721,27 @@ export function openCommandDialog(
           onSelect={(option) => {
             if (option.value === 'back') {
               buildL1()
+              return
+            }
+
+            if (option.value === 'revoke') {
+              api.ui.dialog.replace(() => (
+                <DialogConfirm
+                  title={`Revoke ${account.label}?`}
+                  message={`Remote revocation cannot be undone. Revoke the OAuth token family for "${account.label}" and disable it locally?`}
+                  onConfirm={() => {
+                    void apply(
+                      'claude-account',
+                      `revoke ${account.id} --confirm`,
+                    ).then((r) => {
+                      api.ui.toast({ message: r.text })
+                      updateAccounts(r)
+                      buildL1()
+                    })
+                  }}
+                  onCancel={() => openManage(account, isMain)}
+                />
+              ))
               return
             }
 

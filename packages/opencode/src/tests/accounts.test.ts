@@ -30,6 +30,7 @@ import {
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
+  isPermanentProviderError,
   isPermanentRefreshError,
   type KillswitchThresholds,
   killswitchPassesPolicy,
@@ -1611,6 +1612,28 @@ describe('account storage', () => {
     expect(shouldFallbackStatus(500, null)).toBe(false)
   })
 
+  test('routes Anthropic overload (529) to another account by default', () => {
+    expect(shouldFallbackStatus(529, null)).toBe(true)
+    expect(shouldFallbackStatus(401, null)).toBe(true)
+    expect(shouldFallbackStatus(403, null)).toBe(true)
+  })
+
+  test('classifies permanent credential failures as non-retryable', () => {
+    expect(
+      isPermanentProviderError(
+        new Error('OAuth access token has been revoked.'),
+      ),
+    ).toBe(true)
+    expect(
+      isPermanentProviderError(new Error('OAuth access token is invalid.')),
+    ).toBe(true)
+    expect(isPermanentProviderError(new Error('API key is invalid.'))).toBe(
+      true,
+    )
+    expect(isPermanentProviderError(new Error('Overloaded'))).toBe(false)
+    expect(isPermanentProviderError('not an error')).toBe(false)
+  })
+
   test('persists claudeCache enabled state and mode', async () => {
     await setCache1hPersistentEnabled(true)
     let saved = await loadAccounts()
@@ -1791,13 +1814,19 @@ describe('FallbackAccountManager', () => {
       },
     ) as unknown as typeof fetch
 
+    let synchronizedAccess: string | undefined
     const manager = new FallbackAccountManager({
       fetchImpl,
       now: () => 1_000,
+      onFallbackCredentialChanged: (account) => {
+        synchronizedAccess = account.access
+        return { status: 'applied' }
+      },
     })
 
     const accounts = await manager.getUsableFallbackAccounts()
     expect(accounts[0]?.access).toBe('new-access')
+    expect(synchronizedAccess).toBe('new-access')
 
     const saved = await loadAccounts()
     expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')

@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
+import { parseRetryAfterSeconds, refreshClaudeOAuthToken } from './auth.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
@@ -35,6 +35,7 @@ export type OAuthAccount = AccountBase & {
   access?: string
   refresh: string
   expires?: number
+  refreshExpires?: number
   lastRefreshedAt?: number
   lastRefreshError?: AccountOperationError
   lastQuotaRefreshError?: AccountOperationError
@@ -259,6 +260,7 @@ export type AccountRuntimeEntry = Partial<
     | 'access'
     | 'refresh'
     | 'expires'
+    | 'refreshExpires'
     | 'lastUsed'
     | 'lastRefreshedAt'
     | 'lastRefreshError'
@@ -333,6 +335,11 @@ type OAuthUsageResponse = {
   } | null
 }
 
+export type FallbackCredentialSyncResult =
+  | { status: 'applied' }
+  | { status: 'superseded'; account: OAuthAccount }
+  | { status: 'rejected' }
+
 export type AccountManagerOptions = {
   now?: () => number
   fetchImpl?: typeof fetch
@@ -343,6 +350,10 @@ export type AccountManagerOptions = {
   // (e.g. the OpenCode sidebar) can re-render without a request flowing through
   // the fetch handler.
   onFallbackStorageChanged?: () => void
+  onFallbackCredentialChanged?: (
+    account: OAuthAccount,
+    expectedRefresh: string,
+  ) => FallbackCredentialSyncResult | Promise<FallbackCredentialSyncResult>
 }
 
 export type AccountRefreshError = {
@@ -350,7 +361,9 @@ export type AccountRefreshError = {
   message: string
 }
 
-const DEFAULT_FALLBACK_ON = [401, 403, 429]
+// 529 is Anthropic's overload status; Claude Code treats it as the canonical
+// capacity signal alongside a mid-stream overloaded_error.
+const DEFAULT_FALLBACK_ON = [401, 403, 429, 529]
 const MIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES = MIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
@@ -441,6 +454,10 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     access: typeof value.access === 'string' ? value.access : undefined,
     refresh: value.refresh,
     expires: typeof value.expires === 'number' ? value.expires : undefined,
+    refreshExpires:
+      typeof value.refreshExpires === 'number'
+        ? value.refreshExpires
+        : undefined,
     lastRefreshedAt:
       typeof value.lastRefreshedAt === 'number'
         ? value.lastRefreshedAt
@@ -843,6 +860,7 @@ function accountRuntimeState(account: FallbackAccount) {
     access: account.access,
     refresh: account.refresh,
     expires: account.expires,
+    refreshExpires: account.refreshExpires,
     lastUsed: account.lastUsed,
     lastRefreshedAt: account.lastRefreshedAt,
     lastRefreshError: account.lastRefreshError,
@@ -1634,10 +1652,10 @@ export async function acquireRefreshFileLock(options: {
     }
 
     for (let attempt = 0; attempt < MAX_STEAL_ATTEMPTS; attempt++) {
-      acquired = await tryAcquire()
-      if (acquired) break
-      if (await lockIsLive()) return null
-
+      // After the first failed create, all stale-lock work is serialized by the
+      // eviction marker. Retrying the real lock before owning that marker lets
+      // a contender enter the remove/rename gap and later be mistaken for the
+      // stale owner.
       try {
         if (!(await tryAcquireEvictionMarker())) {
           await backoff()
@@ -1677,11 +1695,27 @@ export async function acquireRefreshFileLock(options: {
       }
 
       try {
+        acquired = await tryAcquire()
+        if (acquired) break
         if (await lockIsLive()) return null
         if (!(await ownsEvictionMarker())) return null
         await options.onStep?.('stale-lock-confirmed')
         if (!(await ownsEvictionMarker())) return null
-        await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+        // Atomically move the exact stale lock out of the acquisition path.
+        // A plain rm creates a gap where an unmarked contender can acquire and
+        // then be deleted by this stale owner, allowing two callers to return
+        // as winners. After rename, any contender may win the now-empty path;
+        // this marker owner simply returns null when its own create loses.
+        const staleLockPath = `${lockPath}.stale-${evictOwnerId}`
+        try {
+          await rename(lockPath, staleLockPath)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+          return null
+        }
+        await rm(staleLockPath, { recursive: true, force: true }).catch(
+          () => {},
+        )
         if (!(await ownsEvictionMarker())) return null
         acquired = await tryAcquire()
         if (!acquired) return null
@@ -1917,19 +1951,56 @@ export function hashRefreshToken(refreshToken: string) {
   return createHash('sha256').update(refreshToken).digest('hex')
 }
 
+// Mirrors Claude Code's `sie` (reset-like) and `gde` (connect-like) sets.
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'EPIPE',
+  'ConnectionClosed',
+  'ETIMEDOUT',
+  'ECONNABORTED',
+  'ERR_SOCKET_CLOSED',
+  'StreamSuspended',
+  'ECONNREFUSED',
+  'ConnectionRefused',
+  'ENOTFOUND',
+  'ENETUNREACH',
+  'ENETDOWN',
+  'EHOSTUNREACH',
+  'EHOSTDOWN',
+  'EAI_AGAIN',
+  'FailedToOpenSocket',
+  'ERR_PROXY_TUNNEL',
+  'UND_ERR_CONNECT_TIMEOUT',
+])
+
+// Mirrors Claude Code's `M8b`: credential/request failures that retrying can
+// never resolve, so they must not consume refresh attempts.
+const PERMANENT_ERROR_MESSAGES = new Set([
+  'OAuth access token has expired. Re-authenticate to continue.',
+  'OAuth access token has been revoked.',
+  'OAuth access token is invalid.',
+  'API key is invalid.',
+  'Request exceeds the maximum size',
+  'Request not allowed',
+])
+
+export function isPermanentProviderError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  return PERMANENT_ERROR_MESSAGES.has(error.message.trim())
+}
+
 function isTransientRefreshError(error: unknown) {
+  if (isPermanentProviderError(error)) return false
   const status = (error as { status?: unknown }).status
   if (typeof status === 'number' && Number.isFinite(status)) {
-    return status === 429 || status >= 500
+    return status === 408 || status === 429 || status >= 500
   }
   if (!(error instanceof Error)) return false
   return (
     error.message.includes('fetch failed') ||
     ('code' in error &&
-      (error.code === 'ECONNRESET' ||
-        error.code === 'ECONNREFUSED' ||
-        error.code === 'ETIMEDOUT' ||
-        error.code === 'UND_ERR_CONNECT_TIMEOUT'))
+      typeof error.code === 'string' &&
+      TRANSIENT_NETWORK_ERROR_CODES.has(error.code))
   )
 }
 
@@ -1976,6 +2047,7 @@ export function buildRefreshOperationError(input: {
       : ''
   const isInvalidGrant =
     body.includes('invalid_grant') || message.includes('invalid_grant')
+  const explicitPermanent = (input.error as { permanent?: unknown }).permanent
   return {
     message,
     checkedAt: input.now,
@@ -1983,7 +2055,10 @@ export function buildRefreshOperationError(input: {
     retryCount,
     tokenHash,
     status,
-    permanent: status === 400 && isInvalidGrant,
+    permanent:
+      typeof explicitPermanent === 'boolean'
+        ? explicitPermanent
+        : status === 400 && isInvalidGrant,
   }
 }
 
@@ -2696,7 +2771,10 @@ export async function fetchOAuthQuotaSnapshot(input: {
       new Error(`Claude quota check failed: ${response.status} — ${body}`),
       {
         status: response.status,
-        retryAfter: parseRetryAfterHeader(response.headers.get('Retry-After')),
+        retryAfter: parseRetryAfterSeconds(
+          response.headers.get('Retry-After'),
+          response.headers.get('Retry-After-Ms'),
+        ),
       },
     )
     throw error
@@ -2831,6 +2909,12 @@ export class FallbackAccountManager {
   private quotaTimer: ReturnType<typeof setInterval> | null = null
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
   private readonly onFallbackStorageChanged: (() => void) | undefined
+  private readonly onFallbackCredentialChanged:
+    | ((
+        account: OAuthAccount,
+        expectedRefresh: string,
+      ) => FallbackCredentialSyncResult | Promise<FallbackCredentialSyncResult>)
+    | undefined
 
   constructor(options: AccountManagerOptions = {}) {
     this.now = options.now ?? Date.now
@@ -2838,6 +2922,7 @@ export class FallbackAccountManager {
     this.configPath = options.configPath ?? getAccountStoragePath()
     this.quotaManager = options.quotaManager ?? null
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
+    this.onFallbackCredentialChanged = options.onFallbackCredentialChanged
   }
 
   /**
@@ -3315,17 +3400,46 @@ export class FallbackAccountManager {
       })
       const refreshed = await refreshClaudeOAuthToken({
         refreshToken,
+        refreshTokenExpiresAt: sourceAccount.refreshExpires,
         fetchImpl: this.fetchImpl,
         now: this.now,
       })
       sourceAccount.access = refreshed.access
       sourceAccount.refresh = refreshed.refresh
       sourceAccount.expires = refreshed.expires
+      sourceAccount.refreshExpires =
+        refreshed.refreshTokenExpiresAt ?? sourceAccount.refreshExpires
       sourceAccount.lastRefreshedAt =
         refreshed.expires - refreshed.expiresIn * 1000
       sourceAccount.lastRefreshError = undefined
       updateStoredAccount(storage, sourceAccount)
       await this.save(storage)
+      let syncResult: FallbackCredentialSyncResult | undefined
+      try {
+        syncResult = await this.onFallbackCredentialChanged?.(
+          sourceAccount,
+          refreshToken,
+        )
+      } catch (error) {
+        syncResult = undefined
+        logger.warn('refresh', 'failed to sync refreshed fallback credential', {
+          accountId: sourceAccount.id,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+      if (syncResult?.status === 'superseded') {
+        updateStoredAccount(storage, syncResult.account)
+        await this.save(storage)
+        return syncResult.account
+      }
+      if (syncResult?.status === 'rejected') {
+        sourceAccount.enabled = false
+        updateStoredAccount(storage, sourceAccount)
+        await this.save(storage)
+        throw new Error(
+          `Fallback OAuth account ${sourceAccount.id} was removed or disabled during refresh`,
+        )
+      }
       log('[refresh] fallback oauth refresh succeeded', {
         accountId: sourceAccount.id,
         expiresInMs: sourceAccount.expires

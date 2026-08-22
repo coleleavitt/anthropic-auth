@@ -1,13 +1,17 @@
 import { createHash } from 'node:crypto'
 import xxhashInit from 'xxhash-wasm'
-import { CLAUDE_CODE_BUILD_HASH, CLAUDE_CODE_VERSION } from './constants.ts'
+import { getCachedClaudeCodeVersion } from './claude-version.ts'
+import { CCH_POSITIONS, CCH_SALT } from './constants.ts'
 
 type Message = {
   role?: string
+  isMeta?: boolean
   content?: string | Array<{ type?: string; text?: string }>
 }
 
-const CCH_SEED = 0x6e52736ac806831en
+// Claude Code 2.1.138–2.1.233 seed, independently validated against six
+// controlled native-fetch oracles and four 92 KiB no-egress captures.
+const CCH_SEED = 0x4d659218e32a3268n
 const CCH_PLACEHOLDER = 'cch=00000;'
 export const CCH_PATTERN = /\bcch=([0-9a-f]{5});/
 const BILLING_HEADER_CCH_PATTERN =
@@ -32,7 +36,9 @@ async function ensureXxhash() {
  * Kept for diagnostics/backward-compatible tests; CCH signing no longer uses it.
  */
 export function extractFirstUserMessageText(messages: Message[]): string {
-  const userMsg = messages.find((message) => message.role === 'user')
+  const userMsg = messages.find(
+    (message) => message.role === 'user' && message.isMeta !== true,
+  )
   if (!userMsg) return ''
 
   const { content } = userMsg
@@ -47,10 +53,10 @@ export function extractFirstUserMessageText(messages: Message[]): string {
 }
 
 /**
- * Compute Claude Code's cch token over the final serialized request body.
+ * Compute the seeded xxHash64 token for already-canonicalized preimage bytes.
  *
- * Real Claude Code signs the full body bytes with xxHash64 using a fixed seed,
- * masks to 20 bits, and writes that value into the billing-header placeholder.
+ * Callers signing a serialized Messages body must apply [`buildCCHPreimage`]
+ * first, then mask to 20 bits and patch only the billing-header placeholder.
  */
 export async function computeCCH(bodyBytes: Uint8Array): Promise<string> {
   await ensureXxhash()
@@ -62,6 +68,19 @@ export function resetBillingHeaderCCH(bodyString: string): string {
   return bodyString.replace(BILLING_HEADER_CCH_PATTERN, `$1${CCH_PLACEHOLDER}`)
 }
 
+/**
+ * Claude Code 2.1.172+ canonicalizes the hash preimage before xxHash64:
+ * every JSON `model` value becomes empty and every integer `max_tokens`
+ * field plus one adjacent comma is removed. Native-fetch oracle probes with
+ * nested fields confirm that this transform is intentionally global. The wire body itself
+ * remains unchanged apart from the five-character CCH slot.
+ */
+export function buildCCHPreimage(bodyString: string): string {
+  return bodyString
+    .replace(/("model":")[^"]*(")/g, '$1$2')
+    .replace(/"max_tokens":\d+,|,"max_tokens":\d+|"max_tokens":\d+(?=})/g, '')
+}
+
 export function extractBillingHeaderCCH(bodyString: string): string | null {
   return BILLING_HEADER_CCH_PATTERN.exec(bodyString)?.[2] ?? null
 }
@@ -70,44 +89,75 @@ export async function signRequestBody(bodyString: string): Promise<string> {
   if (!BILLING_HEADER_CCH_PATTERN.test(bodyString)) return bodyString
 
   const unsignedBodyString = resetBillingHeaderCCH(bodyString)
-  const token = await computeCCH(new TextEncoder().encode(unsignedBodyString))
+  const preimage = buildCCHPreimage(unsignedBodyString)
+  const token = await computeCCH(new TextEncoder().encode(preimage))
   return unsignedBodyString.replace(
     BILLING_HEADER_CCH_PLACEHOLDER_PATTERN,
     `$1cch=${token};`,
   )
 }
 
-/**
- * Compute a stable 3-character suffix for cc_version.
- *
- * The captured Claude Code version uses its observed build hash. Custom/future
- * versions get a deterministic version-only suffix so date changes never rotate
- * the billing header and bust prompt-cache prefixes.
- */
+/** Compute Claude Code's message-derived 3-character cc_version suffix. */
 export function computeVersionSuffix(
-  version: string = CLAUDE_CODE_VERSION,
-  _date: Date = new Date(),
+  version: string = getCachedClaudeCodeVersion(),
+  firstUserText = '',
 ): string {
-  if (version === CLAUDE_CODE_VERSION) return CLAUDE_CODE_BUILD_HASH
-  return createHash('sha256').update(version).digest('hex').slice(0, 3)
+  const sampled = CCH_POSITIONS.map(
+    (position) => firstUserText[position] || '0',
+  ).join('')
+  return createHash('sha256')
+    .update(`${CCH_SALT}${sampled}${version}`)
+    .digest('hex')
+    .slice(0, 3)
+}
+
+const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]{1,36}$/
+const PROMPT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export type BillingHeaderAttribution = {
+  workload?: string
+  isSubagent?: boolean
+  previousRequestId?: string
+  promptId?: string
 }
 
 /**
  * Build the billing header with a cch placeholder.
  * signRequestBody() must run after final request serialization to replace it.
+ *
+ * Segment order and spacing mirror Claude Code 2.1.233 exactly: each optional
+ * segment carries its own leading space, and the cch placeholder is emitted
+ * first so the five-character slot keeps a stable offset for signing.
  */
 export function buildBillingHeaderValue(
   _messages: Message[],
-  version: string = CLAUDE_CODE_VERSION,
+  version: string = getCachedClaudeCodeVersion(),
   entrypoint: string,
-  date: Date = new Date(),
+  _date: Date = new Date(),
+  attribution: BillingHeaderAttribution = {},
 ): string {
-  const suffix = computeVersionSuffix(version, date)
+  const suffix = computeVersionSuffix(
+    version,
+    extractFirstUserMessageText(_messages),
+  )
+
+  const workload = attribution.workload?.trim()
+  const previousRequestId = attribution.previousRequestId?.trim()
+  const promptId = attribution.promptId?.trim()
 
   return (
     'x-anthropic-billing-header: ' +
     `cc_version=${version}.${suffix}; ` +
-    `cc_entrypoint=${entrypoint}; ` +
-    'cch=00000;'
+    `cc_entrypoint=${entrypoint};` +
+    ' cch=00000;' +
+    (workload ? ` cc_workload=${workload};` : '') +
+    (attribution.isSubagent ? ' cc_is_subagent=true;' : '') +
+    (previousRequestId && REQUEST_ID_PATTERN.test(previousRequestId)
+      ? ` cc_prev_req=${previousRequestId};`
+      : '') +
+    (promptId && PROMPT_ID_PATTERN.test(promptId)
+      ? ` cc_prompt_id=${promptId};`
+      : '')
   )
 }

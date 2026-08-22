@@ -1,4 +1,9 @@
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+export const CLIENT_ID_ENV = 'CLAUDE_CODE_OAUTH_CLIENT_ID'
+
+export function getOAuthClientId() {
+  return process.env[CLIENT_ID_ENV]?.trim() || CLIENT_ID
+}
 
 export const AUTHORIZE_URLS = {
   console: 'https://platform.claude.com/oauth/authorize',
@@ -9,6 +14,7 @@ export const CODE_CALLBACK_URL =
   'https://platform.claude.com/oauth/code/callback'
 
 export const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
+export const REVOKE_URL = `${TOKEN_URL}/revoke`
 
 export const AXIOS_USER_AGENT = 'axios/1.15.2'
 
@@ -26,10 +32,10 @@ export const REFRESH_SCOPE =
 
 export const TOOL_PREFIX = 'mcp_'
 
-export const REQUIRED_BETAS = [
-  'oauth-2025-04-20',
-  'interleaved-thinking-2025-05-14',
-]
+export const OAUTH_BETA = 'oauth-2025-04-20'
+
+export const REQUIRED_BETAS = [OAUTH_BETA, 'interleaved-thinking-2025-05-14']
+export const EFFORT_BETA = 'effort-2025-11-24'
 export const FAST_MODE_BETA = 'fast-mode-2026-02-01'
 
 export function mergeAnthropicBetas(
@@ -67,13 +73,14 @@ export const PARALLEL_TOOL_CALLS_SYSTEM_PROMPT = [
 
 export const CCH_SALT = '59cf53e54c78'
 export const CCH_POSITIONS = [4, 7, 20]
-export const CLAUDE_CODE_VERSION = '2.1.177'
-export const CLAUDE_CODE_BUILD_HASH = '3bf'
+export const CLAUDE_CODE_VERSION = '2.1.233'
+// Empty-user-text fallback. Real billing suffixes are message-derived.
+export const CLAUDE_CODE_BUILD_HASH = '015'
 export const CLAUDE_CODE_ENTRYPOINT = 'cli'
-export const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION = '0.94.0'
-export const CLAUDE_CODE_STAINLESS_RUNTIME_VERSION = 'v24.3.0'
+export const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION = '0.112.1'
+export const CLAUDE_CODE_STAINLESS_RUNTIME_VERSION = 'v26.3.0'
 
-export const USER_AGENT = 'claude-cli/2.1.177 (external, cli)'
+export const USER_AGENT = 'claude-cli/2.1.233 (external, cli)'
 
 export const CACHE_1H_MODES = ['explicit', 'automatic', 'hybrid'] as const
 export type Cache1hMode = (typeof CACHE_1H_MODES)[number]
