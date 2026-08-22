@@ -10,6 +10,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Preserve fresh scoped-only fallback quota snapshots, permanent refresh-error classification across lock contention, and explicit re-login guidance for unusable fallback accounts.
 - Evict complete request artifact groups when enforcing the dump-directory size cap.
 - Capture Anthropic cache diagnostics in versioned `MC-CACHE-DIAG ` debug records, preserve provider response IDs across requests and cachekeep prewarms, and write response/request dump artifacts without response content. Finalize response-artifact writes before the transformed response stream completes so a valid provider envelope cannot leave the initial status-only artifact behind. Document the beta states and known fingerprint, organization, workspace, and beta-set limitations.
+- Fix Pi OAuth billing rejection by relocating its documentation paragraph from top-level `system[]` to a cached block before the first user's text, with a safe whole-prompt fallback for unknown future Pi prompt layouts, and expose Claude Opus 5 in Pi's provider catalog.
+
+Thanks to [@unspecd-dev](https://github.com/unspecd-dev) for diagnosing and contributing the Pi request-shape and Opus 5 changes.
 
 ## 1.19.1
 

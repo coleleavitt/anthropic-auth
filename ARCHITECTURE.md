@@ -57,9 +57,10 @@
 **Pi Request Lifecycle:**
 
 1. **Extension load** — Pi loads `@cortexkit/pi-anthropic-auth` package, which calls `registerCommands()` and `pi.registerProvider("anthropic", ...)` — `packages/pi/src/index.ts`
-2. **Provider registration** — Provider defines OAuth login/refresh functions (delegating to core's `authorize`/`exchange`/`refreshClaudeOAuthToken`) and a `streamSimple` function — `packages/pi/src/index.ts`
-3. **Stream implementation** — `streamCortexKitAnthropic()` in `packages/pi/src/stream.ts` builds the Anthropic request, sends via relay or direct, handles ordered or persistent sticky-balanced routing (including model-scoped OAuth routing and the confirmed-general-exhaustion gate for API-key routes), and cache keepalive
-4. **Slash commands** — `/claude-*` commands registered in `packages/pi/src/commands.ts` reuse core command execution functions
+2. **Provider registration** — Provider defines OAuth login/refresh functions (delegating to core's `authorize`/`exchange`/`refreshClaudeOAuthToken`), exposes the CortexKit model catalog including Opus 5, and registers a `streamSimple` function — `packages/pi/src/index.ts`
+3. **Request conversion** — `buildAnthropicRequest()` builds the Claude Code-compatible body and signature. The recognized Pi documentation paragraph is kept out of top-level `system[]`—where its path-enumeration/cross-reference text can cause OAuth billing rejection—and is prepended as a separately cached block before the first user's text. If Pi changes the documentation heading or prompt layout, the converter moves the complete host prompt to that safe cached block rather than restoring the rejected top-level shape. — `packages/pi/src/convert.ts`
+4. **Stream implementation** — `streamCortexKitAnthropic()` in `packages/pi/src/stream.ts` sends via relay or direct, handles ordered or persistent sticky-balanced routing (including model-scoped OAuth routing and the confirmed-general-exhaustion gate for API-key routes), and cache keepalive
+5. **Slash commands** — `/claude-*` commands registered in `packages/pi/src/commands.ts` reuse core command execution functions
 
 **Quota Refresh & Header Harvest Flow:**
 1. Background timer fires at `checkIntervalMinutes` (default 5) — `packages/core/src/quota-manager.ts`
