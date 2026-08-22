@@ -53,6 +53,7 @@ import {
   getCache1hPersistentMode,
   getCacheKeepWindow,
   getDefaultCacheKeepRegistryDirectory,
+  getFallbackReauthLabels,
   getKillswitchConfig,
   getKillswitchThresholdsForAccount,
   getOrCreatePrimeAuthLineageId,
@@ -109,10 +110,10 @@ import {
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
-  primeQuotaSnapshotCheckedAt,
   type QuotaAccountSummary,
   type QuotaEntry,
   QuotaManager,
+  quotaSnapshotCheckedAt,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -797,7 +798,7 @@ export function primeQuotaSnapshotIsFreshSince(
   quota: OAuthQuotaSnapshot | undefined,
   refreshStartedAt: number,
 ): boolean {
-  return primeQuotaSnapshotCheckedAt(quota) > refreshStartedAt
+  return quotaSnapshotCheckedAt(quota) > refreshStartedAt
 }
 
 type PluginRuntimeTimerOverrides = Partial<{
@@ -4870,6 +4871,9 @@ const anthropicAuthPlugin = async (
                     const response = createStickyNoRouteResponse({
                       mainRefreshError:
                         stickyRoutes.storage?.refresh?.mainLastRefreshError,
+                      fallbackReauthLabels: getFallbackReauthLabels(
+                        stickyRoutes.storage,
+                      ),
                       routeQuotas: stickyRoutes.allRoutes.flatMap((route) =>
                         route.quota ? [route.quota] : [],
                       ),
