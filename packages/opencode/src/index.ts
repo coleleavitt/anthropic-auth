@@ -888,7 +888,6 @@ const anthropicAuthPlugin = async (
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const desktopNoticeFlushes = new Map<string, Promise<void>>()
-  const desktopNoticePostIdleUpdates = new Set<string>()
   const desktopNoticeSafeSessions = new Set<string>()
   const desktopNoticeProbes = new Map<string, number>()
   const stickySessionRouter = new StickySessionRouter({
@@ -2963,23 +2962,14 @@ const anthropicAuthPlugin = async (
         value.type === 'session.status' &&
         value.properties?.status?.type !== 'idle'
       ) {
-        desktopNoticePostIdleUpdates.delete(sessionId)
         desktopNoticeSafeSessions.delete(sessionId)
       }
 
       if (value.type === 'session.idle') {
-        desktopNoticePostIdleUpdates.add(sessionId)
-        while (desktopNoticePostIdleUpdates.size > 128) {
-          const oldest = desktopNoticePostIdleUpdates.values().next().value
-          if (oldest) desktopNoticePostIdleUpdates.delete(oldest)
-          else break
-        }
-      }
-
-      if (
-        value.type === 'session.updated' &&
-        desktopNoticePostIdleUpdates.delete(sessionId)
-      ) {
+        // Defer the prompt until after this event handler returns, then verify the
+        // live status map is still idle. OpenCode 1.18 no longer guarantees a
+        // session.updated event after session.idle, so that event cannot be used
+        // as the release signal.
         desktopNoticeSafeSessions.add(sessionId)
         while (desktopNoticeSafeSessions.size > 128) {
           const oldest = desktopNoticeSafeSessions.values().next().value
@@ -2992,7 +2982,6 @@ const anthropicAuthPlugin = async (
       if (value.type === 'session.deleted') {
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
-        desktopNoticePostIdleUpdates.delete(sessionId)
         desktopNoticeSafeSessions.delete(sessionId)
         desktopNoticeProbes.delete(sessionId)
       }
