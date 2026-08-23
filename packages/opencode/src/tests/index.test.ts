@@ -65,7 +65,9 @@ async function freshPrimeQuotaResponse(
 // Minimal mock of the OpenCode plugin client
 function createMockClient(
   messages?: unknown[],
-  getSessionStatuses?: () => Record<string, { type: string }>,
+  getSessionStatuses?: () =>
+    | Record<string, { type: string }>
+    | Promise<Record<string, { type: string }>>,
 ) {
   return {
     auth: {
@@ -76,7 +78,7 @@ function createMockClient(
         ? mock(() => Promise.resolve({ data: messages }))
         : undefined,
       status: getSessionStatuses
-        ? mock(() => Promise.resolve({ data: getSessionStatuses() }))
+        ? mock(async () => ({ data: await getSessionStatuses() }))
         : undefined,
       promptAsync: mock((_input: unknown) => Promise.resolve()),
     },
@@ -7866,6 +7868,9 @@ describe('auth.loader', () => {
 
     const latestUserMessageId = 'msg_000000000100AAAAAAAAAAAAAA'
     const latestAssistantMessageId = 'msg_000000000200BBBBBBBBBBBBBB'
+    let releaseStaleIdleStatus:
+      | ((statuses: Record<string, { type: string }>) => void)
+      | undefined
     let noticeStatusChecks = 0
     const mockClient = createMockClient(
       [
@@ -7892,15 +7897,12 @@ describe('auth.loader', () => {
           },
         },
       ],
-      (): Record<string, { type: string }> => {
-        if (noticeStatusChecks++ === 0) {
-          throw new Error('transient status failure')
-        }
-        if (noticeStatusChecks === 2) {
-          return [] as unknown as Record<string, { type: string }>
-        }
-        if (noticeStatusChecks === 3) {
-          return { ses_fable_filter: { type: 'busy' } }
+      () => {
+        noticeStatusChecks++
+        if (noticeStatusChecks === 1) {
+          return new Promise<Record<string, { type: string }>>((resolve) => {
+            releaseStaleIdleStatus = resolve
+          })
         }
         return {}
       },
@@ -7953,21 +7955,78 @@ describe('auth.loader', () => {
       )?.remaining,
     ).toBe(10)
 
-    // OpenCode briefly reports idle after the refused source response while its
-    // internal retry is still pending. Do not insert the Desktop notice there:
-    // that user message would start another provider turn and consume the Opus
-    // retry response.
+    // The switch notice is deliberately held until the first successful Opus
+    // response proves that OpenCode's internal retry has completed.
+    const firstOpus = await result.fetch(MESSAGES_URL, request)
+    await firstOpus.text()
+
+    // Reproduce the host race from issue #162: an idle probe starts, then a new
+    // prompt marks the session busy before the asynchronous status response
+    // arrives with its now-stale idle snapshot. The notice must remain queued;
+    // otherwise OpenCode can adopt that ignored user message as the active retry
+    // parent and dispatch an extra provider request.
     await plugin.event?.({
       event: {
         type: 'session.idle',
         properties: { sessionID: 'ses_fable_filter' },
       },
     })
-    await Bun.sleep(250)
+    for (let attempt = 0; attempt < 100 && !releaseStaleIdleStatus; attempt++) {
+      await Bun.sleep(1)
+    }
+    expect(releaseStaleIdleStatus).toBeDefined()
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_fable_filter',
+          status: { type: 'busy' },
+        },
+      },
+    })
+    releaseStaleIdleStatus?.({})
+    await Bun.sleep(10)
     expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
 
-    const firstOpus = await result.fetch(MESSAGES_URL, request)
-    await firstOpus.text()
+    // Also cover the later race window: status was idle, but a new prompt starts
+    // while the notification path is resolving message history for placement.
+    const immediateMessages = mockClient.session.messages
+    let releasePromptContext: (() => void) | undefined
+    mockClient.session.messages = mock(
+      () =>
+        new Promise<{ data: unknown[] }>((resolve) => {
+          releasePromptContext = () => {
+            void Promise.resolve(immediateMessages?.()).then((response) =>
+              resolve(response ?? { data: [] }),
+            )
+          }
+        }),
+    )
+    await plugin.event?.({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'ses_fable_filter' },
+      },
+    })
+    for (let attempt = 0; attempt < 100 && !releasePromptContext; attempt++) {
+      await Bun.sleep(1)
+    }
+    expect(releasePromptContext).toBeDefined()
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_fable_filter',
+          status: { type: 'busy' },
+        },
+      },
+    })
+    releasePromptContext?.()
+    await Bun.sleep(10)
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+    mockClient.session.messages = immediateMessages
+
+    // A later authoritative idle signal retries the still-queued notice.
     await plugin.event?.({
       event: {
         type: 'session.idle',

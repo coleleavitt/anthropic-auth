@@ -557,8 +557,9 @@ async function sendIgnoredMessage(
   options: {
     noReply?: boolean
     beforeActiveAssistant?: boolean
+    canSend?: () => boolean
   } = {},
-) {
+): Promise<boolean> {
   const session = ctx.client.session as PluginSessionClient | undefined
   const promptContext = await resolvePromptContext(ctx.client, sessionId)
   const request: NotificationRequest = {
@@ -581,14 +582,19 @@ async function sendIgnoredMessage(
   if (promptContext?.model) request.body.model = promptContext.model
   if (promptContext?.variant) request.body.variant = promptContext.variant
 
+  // Resolving the active prompt context crosses the OpenCode process boundary.
+  // A new user prompt can start while that request is in flight, so re-check the
+  // caller's delivery lease immediately before inserting the ignored message.
+  if (options.canSend && !options.canSend()) return false
+
   if (typeof session?.promptAsync === 'function') {
     await session.promptAsync(request)
-    return
+    return true
   }
 
   if (typeof session?.prompt === 'function') {
     await Promise.resolve(session.prompt(request))
-    return
+    return true
   }
 
   throw new Error(
@@ -2383,6 +2389,12 @@ const anthropicAuthPlugin = async (
         return
       }
     }
+    // The status request is asynchronous. A new prompt can mark the session busy
+    // while that request is in flight, even if its response still reflects the
+    // preceding idle state. Never let that stale snapshot authorize insertion of
+    // an ignored user message into the active run: OpenCode can adopt it as the
+    // retry parent and dispatch the provider request again.
+    if (!desktopNoticeSafeSessions.has(sessionId)) return
     await flushDesktopNotices(sessionId)
   }
 
@@ -2393,16 +2405,19 @@ const anthropicAuthPlugin = async (
     const flush = (async () => {
       while (true) {
         const queue = pendingDesktopNotices.get(sessionId)
-        const text = queue?.shift()
+        const text = queue?.[0]
         if (!text) {
           pendingDesktopNotices.delete(sessionId)
           return
         }
         try {
-          await sendIgnoredMessage(ctx, sessionId, text, {
+          const sent = await sendIgnoredMessage(ctx, sessionId, text, {
             noReply: true,
             beforeActiveAssistant: true,
+            canSend: () => desktopNoticeSafeSessions.has(sessionId),
           })
+          if (!sent) return
+          queue.shift()
         } catch (error) {
           logger.warn('fable-fallback', 'Desktop notification failed', {
             session: sessionId,
