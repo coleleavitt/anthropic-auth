@@ -105,7 +105,7 @@ anthropic-auth/
 - `packages/core/src/commands/account.ts`: Account slash command execution logic
 - `packages/core/src/cache1h.ts`: 1h prompt cache configuration and commands
 - `packages/core/src/fast.ts`: Fast mode configuration and commands
-- `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, CacheKeep/Prime prewarm tagging, and commands
+- `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, same-session on-disk byte-diff baseline recovery after restart, CacheKeep/Prime prewarm tagging, and commands
 - `packages/core/src/models.ts`: Supported Claude models and specs, including the Haiku 4.5 prime model and pricing constants
 - `packages/core/src/logger.ts`: Shared structured logger
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper

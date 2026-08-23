@@ -9,7 +9,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 - Retry failed CacheKeep prewarms while the last confirmed cache can still be alive, and serialize overlapping manager ticks to avoid duplicate requests.
 - Preserve fresh scoped-only fallback quota snapshots, permanent refresh-error classification across lock contention, and explicit re-login guidance for unusable fallback accounts.
 - Evict complete request artifact groups when enforcing the dump-directory size cap.
-- Capture Anthropic cache diagnostics in debug logs and sanitized dump artifacts, finalizing a valid provider response artifact before its transformed response stream completes.
+- Capture Anthropic cache diagnostics in debug logs and sanitized dump artifacts, finalizing a valid provider response artifact before its transformed response stream completes and restoring the first same-session request byte-diff baseline from disk after a process restart.
 
 ## 1.19.1
 
