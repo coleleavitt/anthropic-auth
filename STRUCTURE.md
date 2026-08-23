@@ -41,8 +41,8 @@ anthropic-auth/
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
-- Contains: Plugin entry point, transform pipeline, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, outcome detection, and completed-tool refusal continuation), `fable-fallback.ts` (session-and-source-family 10-response Opus 4.8 backstop/legacy recovery and standby cache-anchor state), `prime-manager-registry.ts` (process-wide PrimeManager registry keyed by account-storage identity), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (comment-preserving JSONC preferences with directory-watch and independent polling reload paths), `sidebar-state.ts` (quota/routing, prime status, and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
+- Contains: Plugin entry point, transform pipeline, cache diagnostics, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
+- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `cache-diagnostics.ts` (cache diagnosis beta opt-in, message ID tracking, and schema v:2 record formatting), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, outcome detection, and completed-tool refusal continuation), `fable-fallback.ts` (session-and-source-family 10-response Opus 4.8 backstop/legacy recovery and standby cache-anchor state), `prime-manager-registry.ts` (process-wide PrimeManager registry keyed by account-storage identity), `cli.ts` (fallback account login + relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (comment-preserving JSONC preferences with directory-watch and independent polling reload paths), `sidebar-state.ts` (quota/routing, prime status, and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between OpenCode server and TUI process
@@ -105,13 +105,14 @@ anthropic-auth/
 - `packages/core/src/commands/account.ts`: Account slash command execution logic
 - `packages/core/src/cache1h.ts`: 1h prompt cache configuration and commands
 - `packages/core/src/fast.ts`: Fast mode configuration and commands
-- `packages/core/src/dump.ts`: Request/response dump capture logic and commands
+- `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, CacheKeep/Prime prewarm tagging, and commands
 - `packages/core/src/models.ts`: Supported Claude models and specs, including the Haiku 4.5 prime model and pricing constants
 - `packages/core/src/logger.ts`: Shared structured logger
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
 - `packages/core/src/quotas.ts`: Quota calculation and formatting helpers
 - `packages/core/src/constants.ts`: Global application constants
-- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
+- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping and cache diagnostics opt-in), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
+- `packages/opencode/src/cache-diagnostics.ts`: Cache diagnosis beta request opt-in (`diagnostics.previous_message_id`), session message ID tracking, schema v:2 record construction with TTL token breakdown, and beta header hash deduplication
 - `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, streamed handoff/sticky/restoration classification, and terminal-refusal rewriting after completed tool calls
 - `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 backstop state, source-model prewarming, and standby cache-anchor identity; used after unabsorbed server-policy refusals or exclusively under `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
 - `packages/opencode/src/prime-manager-registry.ts`: Process-wide registry that shares PrimeManager instances by account-storage identity and releases managers when project slots move
