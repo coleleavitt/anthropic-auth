@@ -33,6 +33,7 @@ import {
   drainNotifications,
   resetNotificationsForTest,
 } from '../rpc/notifications'
+import { COMMAND_MODAL_NAMES } from '../rpc/protocol'
 import {
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
@@ -3214,32 +3215,20 @@ describe('auth.loader', () => {
 
     // Every modal command must be registered — if one is missing it won't appear
     // in the slash-command palette and users will get "No matching items".
-    const required = [
-      'claude-account',
-      'claude-cache',
-      'claude-cachekeep',
-      'claude-prime',
-      'claude-start',
-      'claude-quota',
-      'claude-dump',
-      'claude-fast',
-      'claude-routing',
-      'claude-killswitch',
-      'claude-logging',
-    ]
-    for (const name of required) {
+    for (const name of COMMAND_MODAL_NAMES) {
       expect(registered).toContain(name)
     }
 
     // The config hook must not register extra claude-* commands beyond the
-    // modalCommands set (drift in either direction is a bug). Exactly
-    // `required.length` names should be claude-* keys — no more, no less. (The foreign
-    // 'other-plugin-cmd' is excluded from this count via the claude- prefix.)
+    // shared modal-command set (drift in either direction is a bug). The foreign
+    // 'other-plugin-cmd' is excluded from this count via the claude- prefix.
     const claudeRegistered = registered.filter((name) =>
       name.startsWith('claude-'),
     )
-    expect(claudeRegistered).toHaveLength(required.length)
-    expect([...claudeRegistered].sort()).toEqual([...required].sort())
+    expect(claudeRegistered).toHaveLength(COMMAND_MODAL_NAMES.length)
+    expect([...claudeRegistered].sort()).toEqual(
+      [...COMMAND_MODAL_NAMES].sort(),
+    )
   })
 
   test('handles /claude-start by injecting one visible synthetic prompt', async () => {

@@ -189,11 +189,12 @@ import {
   isTuiConnected,
   pushNotification,
 } from './rpc/notifications.ts'
-import type {
-  ApplyRequest,
-  ApplyResult,
-  CommandModalName,
-  OpenDialogPayload,
+import {
+  type ApplyRequest,
+  type ApplyResult,
+  COMMAND_MODAL_NAMES,
+  type CommandModalName,
+  type OpenDialogPayload,
 } from './rpc/protocol.ts'
 import { getRpcDir } from './rpc/rpc-dir.ts'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
@@ -3087,6 +3088,11 @@ const anthropicAuthPlugin = async (
         },
       }
     }
+    if (command !== 'claude-killswitch') {
+      const unhandledCommand: never = command
+      throw new Error(`Unhandled command modal: ${unhandledCommand}`)
+    }
+
     const storage = await loadAccounts()
     const config = getKillswitchConfig(storage)
     const accountIds = (storage?.accounts ?? [])
@@ -3413,20 +3419,8 @@ const anthropicAuthPlugin = async (
       arguments: string
       sessionID: string
     }) => {
-      const modalCommands: CommandModalName[] = [
-        'claude-account',
-        'claude-cache',
-        'claude-cachekeep',
-        'claude-prime',
-        'claude-start',
-        'claude-quota',
-        'claude-dump',
-        'claude-fast',
-        'claude-routing',
-        'claude-killswitch',
-        'claude-logging',
-      ]
-      if (!modalCommands.includes(input.command as CommandModalName)) return
+      if (!COMMAND_MODAL_NAMES.includes(input.command as CommandModalName))
+        return
       const command = input.command as CommandModalName
       const payload = await buildDialogPayload(
         command,
