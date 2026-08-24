@@ -7,10 +7,12 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   exchange,
   findSharedAccountByCredential,
+  type LoadedSharedAccountStore,
   loadSharedAccountStore,
   refreshClaudeOAuthToken,
   resolveAnthropicModelCatalog,
   resolveModelCost,
+  type SharedAnthropicAccount,
   startOAuthLoopbackSession,
   updateSharedAccountStore,
 } from '@cortexkit/anthropic-auth-core'
@@ -172,16 +174,46 @@ export const FALLBACK_MODEL_CATALOG: CatalogModel[] = [
   fallbackModel('claude-sonnet-5', 'Claude Sonnet 5', 1_000_000, 128_000),
 ]
 
-async function currentSharedAccessToken(): Promise<string | undefined> {
-  const loaded = await loadSharedAccountStore().catch(() => null)
-  if (!loaded) return undefined
-  const { store } = loaded
-  const account =
+const SHARED_CREDENTIAL_ADOPTION_SKEW_MS = 60_000
+
+function currentSharedAccount(
+  store: LoadedSharedAccountStore['store'],
+): SharedAnthropicAccount | undefined {
+  return (
     store.accounts.find(
       (entry) => entry.id === store.current && entry.enabled !== false,
     ) ?? store.accounts.find((entry) => entry.enabled !== false)
-  const credential = account?.credential
+  )
+}
+
+async function currentSharedAccessToken(): Promise<string | undefined> {
+  const loaded = await loadSharedAccountStore().catch(() => null)
+  if (!loaded) return undefined
+  const credential = currentSharedAccount(loaded.store)?.credential
   return credential?.type === 'oauth' ? credential.access : undefined
+}
+
+/**
+ * Anthropic rotates the refresh token on every refresh, so a peer process that
+ * refreshed first leaves this one holding a superseded token whose failure
+ * invalidates the whole login, not just one request.
+ */
+function adoptableSharedCredential(
+  store: LoadedSharedAccountStore['store'],
+  credentials: OAuthCredentials,
+  now: number,
+): OAuthCredentials | undefined {
+  const credential = currentSharedAccount(store)?.credential
+  if (credential?.type !== 'oauth') return undefined
+  // An unrotated match means no peer refreshed; this caller still has to.
+  if (credential.refresh === credentials.refresh) return undefined
+  if (credential.expires_at <= now + SHARED_CREDENTIAL_ADOPTION_SKEW_MS)
+    return undefined
+  return {
+    refresh: credential.refresh,
+    access: credential.access,
+    expires: credential.expires_at,
+  }
 }
 
 export async function resolvePiModelCatalog(): Promise<CatalogModel[]> {
@@ -201,6 +233,14 @@ export async function refreshAnthropicToken(
       account.credential.type === 'oauth' &&
       account.credential.refresh === credentials.refresh,
   )
+  if (loaded && !sharedAccount) {
+    const adopted = adoptableSharedCredential(
+      loaded.store,
+      credentials,
+      Date.now(),
+    )
+    if (adopted) return adopted
+  }
   const refreshExpiry =
     sharedAccount?.credential.type === 'oauth'
       ? sharedAccount.credential.refresh_expires_at

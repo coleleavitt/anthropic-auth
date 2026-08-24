@@ -436,6 +436,17 @@ describe('buildAnthropicRequest — Opus 5 thinking', () => {
     expect((body.thinking as { display?: string }).display).toBe('summarized')
   })
 
+  test('remaps Pi minimal reasoning to Anthropic low effort for Opus 5', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'minimal' } as any,
+      defaultCache,
+    )
+
+    expect(body.output_config).toEqual({ effort: 'low' })
+  })
+
   test('keeps manual thinking budgets for non-Opus5 models', async () => {
     const { body } = await buildAnthropicRequest(
       'claude-opus-4-8',

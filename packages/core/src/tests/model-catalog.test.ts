@@ -152,12 +152,16 @@ describe('normalizeCatalogModel', () => {
     expect(normalizeCatalogModel(apiModel())?.limited).toBeUndefined()
   })
 
-  test('falls back to sane sizes when the API omits limits', () => {
-    const model = normalizeCatalogModel(
-      apiModel({ max_input_tokens: null, max_tokens: 0 }),
-    )
-    expect(model?.contextWindow).toBe(200_000)
-    expect(model?.maxTokens).toBe(64_000)
+  test('rejects degraded entries that omit max_input_tokens', () => {
+    expect(
+      normalizeCatalogModel(
+        apiModel({ max_input_tokens: null, max_tokens: 0 }),
+      ),
+    ).toBeNull()
+    expect(
+      normalizeCatalogModel(apiModel({ max_input_tokens: undefined })),
+    ).toBeNull()
+    expect(normalizeCatalogModel(apiModel({ max_input_tokens: 0 }))).toBeNull()
   })
 })
 

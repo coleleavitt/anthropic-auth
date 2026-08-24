@@ -381,6 +381,83 @@ describe('Pi API fallback routing helpers', () => {
     expect(authorizations).toEqual(['Bearer fallback-access', 'Bearer api-key'])
   })
 
+  async function streamWithMessageDelta(delta: string) {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-stop-reason-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      if (!url.includes('/v1/messages'))
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      return Promise.resolve(
+        new Response(
+          [
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            `event: message_delta\ndata: ${delta}\n\n`,
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join(''),
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_stop_reason',
+    })
+    const terminalTypes: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminalTypes.push(event.type)
+    }
+    return { message: await stream.result(), terminalTypes }
+  }
+
+  test('reports a refusal stop reason with an actionable message', async () => {
+    const { message, terminalTypes } = await streamWithMessageDelta(
+      '{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":1}}',
+    )
+
+    expect(message.stopReason).toBe('error')
+    expect(message.errorMessage).toContain('refusal')
+    expect(terminalTypes).toEqual(['error'])
+  })
+
+  test('names the context window when Anthropic reports it exceeded', async () => {
+    const { message, terminalTypes } = await streamWithMessageDelta(
+      '{"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{"output_tokens":1}}',
+    )
+
+    expect(message.stopReason).toBe('error')
+    expect(message.errorMessage).toContain('context window')
+    expect(terminalTypes).toEqual(['error'])
+  })
+
+  test('names an unrecognized stop reason instead of dropping it', async () => {
+    const { message, terminalTypes } = await streamWithMessageDelta(
+      '{"type":"message_delta","delta":{"stop_reason":"brand_new_reason"},"usage":{"output_tokens":1}}',
+    )
+
+    expect(message.stopReason).toBe('error')
+    expect(message.errorMessage).toContain('brand_new_reason')
+    expect(terminalTypes).toEqual(['error'])
+  })
+
+  test('treats a usage-only message_delta as a healthy stream', async () => {
+    const { message, terminalTypes } = await streamWithMessageDelta(
+      '{"type":"message_delta","delta":{},"usage":{"output_tokens":1}}',
+    )
+
+    expect(message.stopReason).not.toBe('error')
+    expect(message.errorMessage).toBeUndefined()
+    expect(terminalTypes).toEqual(['done'])
+  })
+
   test('releases early-abandoned SSE readers without cancelling the stream', async () => {
     let cancelled = false
     const body = new ReadableStream({

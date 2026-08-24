@@ -186,6 +186,21 @@ function mapStopReason(reason: string | null | undefined): StopReason {
   }
 }
 
+// `model_context_window_exceeded` stays a failure instead of mapping to the
+// `length` truncation Claude Code reuses for it, because a caller that compacts
+// a conversation would accept the truncated response as a complete summary and
+// persist it over the original messages.
+function describeStopReasonFailure(reason: string): string {
+  switch (reason) {
+    case 'refusal':
+      return 'Anthropic refused this request (stop_reason: refusal). Rephrase the request or try a different model.'
+    case 'model_context_window_exceeded':
+      return 'Anthropic stopped early: the request exceeded the model context window (stop_reason: model_context_window_exceeded). Compact or split the conversation.'
+    default:
+      return `Anthropic stream ended with an unhandled stop reason: ${reason}`
+  }
+}
+
 function createOutput(model: Model<Api>): AssistantMessage {
   return {
     role: 'assistant',
@@ -1150,9 +1165,16 @@ export function streamCortexKitAnthropic(
             })
           }
         } else if (event.type === 'message_delta') {
-          output.stopReason = mapStopReason(
-            String(event.delta?.stop_reason ?? ''),
-          )
+          // A usage-only message_delta carries no stop_reason, so mapping the
+          // absent value would report a healthy stream as a failed one.
+          const rawStopReason = event.delta?.stop_reason
+          if (rawStopReason) {
+            output.stopReason = mapStopReason(String(rawStopReason))
+            if (output.stopReason === 'error')
+              output.errorMessage = describeStopReasonFailure(
+                String(rawStopReason),
+              )
+          }
           updateUsage(model, output, event.usage)
         } else if (event.type === 'error') {
           throw new Error(JSON.stringify(event))
@@ -1160,6 +1182,12 @@ export function streamCortexKitAnthropic(
       }
 
       if (options?.signal?.aborted) throw new Error('Request was aborted')
+      // A `done` event only admits stop/length/toolUse, so an error stop reason
+      // has to leave through the error path or it reaches the caller unlabelled.
+      if (output.stopReason === 'error')
+        throw new Error(
+          output.errorMessage ?? describeStopReasonFailure('(none reported)'),
+        )
       for (const block of output.content as Block[]) delete block.index
       stream.push({
         type: 'done',

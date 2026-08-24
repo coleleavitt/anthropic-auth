@@ -83,6 +83,71 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
     })
   })
 
+  async function seedRotatedStore(sharedExpiresAt: number) {
+    const directory = await mkdtemp(join(tmpdir(), 'pi-refresh-rotated-'))
+    tempDirectories.push(directory)
+    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
+    await saveSharedAccountStore({
+      version: 1,
+      current: 'pi-main',
+      accounts: [
+        {
+          id: 'pi-main',
+          credential: {
+            type: 'oauth',
+            access: 'rotated-access',
+            refresh: 'rotated-refresh',
+            expires_at: sharedExpiresAt,
+            refresh_expires_at: Date.now() + 86_400_000,
+          },
+          enabled: true,
+          created_at: new Date().toISOString(),
+        },
+      ],
+    })
+    let refreshCalls = 0
+    globalThis.fetch = (async () => {
+      refreshCalls += 1
+      return Response.json({
+        access_token: 'doomed-access',
+        refresh_token: 'doomed-refresh',
+        expires_in: 3600,
+      })
+    }) as unknown as typeof fetch
+    return { calls: () => refreshCalls }
+  }
+
+  test('adopts the rotated shared credential instead of spending a superseded refresh token', async () => {
+    const sharedExpiry = Date.now() + 3_600_000
+    const refresh = await seedRotatedStore(sharedExpiry)
+
+    await expect(
+      refreshAnthropicToken({
+        access: 'superseded-access',
+        refresh: 'superseded-refresh',
+        expires: Date.now() - 1_000,
+      }),
+    ).resolves.toEqual({
+      access: 'rotated-access',
+      refresh: 'rotated-refresh',
+      expires: sharedExpiry,
+    })
+    expect(refresh.calls()).toBe(0)
+  })
+
+  test('refreshes normally when the rotated shared credential is also expired', async () => {
+    const refresh = await seedRotatedStore(Date.now() - 1_000)
+
+    await expect(
+      refreshAnthropicToken({
+        access: 'superseded-access',
+        refresh: 'superseded-refresh',
+        expires: Date.now() - 1_000,
+      }),
+    ).resolves.toMatchObject({ access: 'doomed-access' })
+    expect(refresh.calls()).toBe(1)
+  })
+
   test('uses the canonical winner when another process supersedes refresh CAS', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'pi-refresh-cas-'))
     tempDirectories.push(directory)

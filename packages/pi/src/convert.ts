@@ -429,7 +429,18 @@ export async function buildAnthropicRequest(
 
   if (options?.reasoning) {
     if (isFableOrMythos5 || isSonnet5 || isOpus5) {
-      body.output_config = { effort: options.reasoning }
+      // Pi's `minimal` is not in Anthropic's effort enum (low/medium/high/xhigh/max) — 400s if passed through.
+      const effortByReasoning: Record<string, string> = {
+        minimal: 'low',
+        low: 'low',
+        medium: 'medium',
+        high: 'high',
+        xhigh: 'xhigh',
+        max: 'max',
+      }
+      body.output_config = {
+        effort: effortByReasoning[options.reasoning] ?? 'medium',
+      }
     } else {
       const budgets: Record<string, number> = {
         minimal: 1024,

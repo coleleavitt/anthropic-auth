@@ -181,6 +181,13 @@ export function normalizeCatalogModel(raw: unknown): CatalogModel | null {
   const id = typeof model.id === 'string' ? model.id.trim() : ''
   if (!id || !isUsableModelId(id)) return null
 
+  // Reject degraded entries (no max_input_tokens) so they can't overwrite the cache with 200k/64k default-collapse.
+  if (
+    !(typeof model.max_input_tokens === 'number' && model.max_input_tokens > 0)
+  ) {
+    return null
+  }
+
   const capabilities = model.capabilities ?? {}
   const thinkingTypes = capabilities.thinking?.types ?? {}
   const adaptiveThinking = isSupported(thinkingTypes.adaptive)
@@ -212,12 +219,41 @@ export function getModelCatalogPath(): string {
   )
 }
 
+// Cached entries are already normalized (contextWindow/maxTokens); re-running the raw-API
+// normalizeCatalogModel over them recomputes from absent max_input_tokens → 200k/64k collapse.
+function coerceCachedCatalogModel(raw: unknown): CatalogModel | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const m = raw as Partial<CatalogModel>
+  const id = typeof m.id === 'string' ? m.id.trim() : ''
+  if (!id || !isUsableModelId(id)) return null
+  if (!(typeof m.contextWindow === 'number' && m.contextWindow > 0)) return null
+  if (!(typeof m.maxTokens === 'number' && m.maxTokens > 0)) return null
+  return {
+    id,
+    name: typeof m.name === 'string' ? m.name : id,
+    reasoning: m.reasoning === true,
+    input:
+      Array.isArray(m.input) && m.input.includes('image')
+        ? ['text', 'image']
+        : ['text'],
+    cost: resolveModelCost(id),
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens,
+    effortLevels: Array.isArray(m.effortLevels)
+      ? m.effortLevels.filter((l): l is string => typeof l === 'string')
+      : [],
+    adaptiveThinking: m.adaptiveThinking === true,
+    budgetThinking: m.budgetThinking === true,
+    ...(m.limited === true ? { limited: true } : {}),
+  }
+}
+
 function parseCatalog(text: string): ModelCatalog | null {
   try {
     const parsed = JSON.parse(text) as { models?: unknown; fetchedAt?: unknown }
     if (!Array.isArray(parsed.models)) return null
     const models = parsed.models.flatMap((entry) => {
-      const model = normalizeCatalogModel(entry)
+      const model = coerceCachedCatalogModel(entry)
       return model ? [model] : []
     })
     if (models.length === 0) return null
