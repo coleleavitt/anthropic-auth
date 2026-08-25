@@ -1553,7 +1553,7 @@ describe('PrimeManager — recordSuccess', () => {
       scheduled = handler
       scheduledDelay = delay
       return 42
-    }) as typeof setTimeout
+    }) as unknown as typeof setTimeout
     globalThis.clearTimeout = (() => {}) as typeof clearTimeout
     const h = await makeHarness({
       storage: fixture.storage,
@@ -1603,7 +1603,7 @@ describe('PrimeManager — recordSuccess', () => {
     globalThis.setTimeout = ((handler: () => void) => {
       scheduled = handler
       return 42
-    }) as typeof setTimeout
+    }) as unknown as typeof setTimeout
     globalThis.clearTimeout = (() => {}) as typeof clearTimeout
     const h = await makeHarness({
       storage: fixture.storage,
@@ -1770,7 +1770,7 @@ describe('PrimeManager — lifecycle', () => {
     globalThis.setTimeout = ((handler: () => void) => {
       scheduled = handler
       return 42
-    }) as typeof setTimeout
+    }) as unknown as typeof setTimeout
     globalThis.clearTimeout = ((timer: unknown) => {
       cleared.push(timer)
     }) as typeof clearTimeout

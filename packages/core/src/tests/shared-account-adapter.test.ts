@@ -13,10 +13,11 @@ import {
   syncRefreshedFallbackAccountInSharedStore,
   upsertFallbackAccountInSharedStore,
 } from '../shared-account-adapter.ts'
-import { loadSharedAccountStore, 
+import {
   loadSharedAccountStore,
   type SharedAnthropicAccount,
-  saveSharedAccountStore,} from '../shared-account-store.ts'
+  saveSharedAccountStore,
+} from '../shared-account-store.ts'
 
 const tempDirectories: string[] = []
 
