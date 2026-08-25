@@ -12,6 +12,8 @@ import {
   loadSharedAccountStore,
   logger,
   markSharedRefreshTokenDead,
+  publishNativeClaudeOAuth,
+  readNativeClaudeOAuth,
   refreshClaudeOAuthToken,
   releaseSharedAccountRefresh,
   resolveAnthropicModelCatalog,
@@ -319,6 +321,32 @@ export async function refreshAnthropicToken(
     }
   }
 
+  // Claude Code may hold this very credential. Anthropic revokes the family
+  // when a superseded refresh token is presented, so a rotation that is not
+  // published back forks the two copies and the next refresh from either side
+  // kills the account for both. Check before spending, and adopt whatever the
+  // native app already has rather than racing it.
+  const nativeBefore = await readNativeClaudeOAuth().catch(() => null)
+  const sharesNativeCredential =
+    nativeBefore?.refreshToken === credentials.refresh
+  if (nativeBefore && !sharesNativeCredential) {
+    // The native app already moved on. Its token is the live one.
+    if (
+      nativeBefore.accessToken &&
+      typeof nativeBefore.expiresAt === 'number' &&
+      nativeBefore.expiresAt > Date.now()
+    ) {
+      logger.info('refresh.spend', 'adopting the native app rotation', {
+        selfPid: process.pid,
+      })
+      return {
+        refresh: nativeBefore.refreshToken,
+        access: nativeBefore.accessToken,
+        expires: nativeBefore.expiresAt,
+      }
+    }
+  }
+
   let refreshed: Awaited<ReturnType<typeof refreshClaudeOAuthToken>>
   try {
     refreshed = await refreshClaudeOAuthToken({
@@ -377,6 +405,24 @@ export async function refreshAnthropicToken(
         expires: winner.credential.expires_at,
       }
     }
+  }
+
+  if (sharesNativeCredential) {
+    // Publish the rotation so Claude Code's mtime watch picks it up; without
+    // this its copy is superseded the moment we succeed.
+    const outcome = await publishNativeClaudeOAuth({
+      accessToken: refreshed.access,
+      refreshToken: refreshed.refresh,
+      expiresAt: refreshed.expires,
+      ...(refreshed.refreshTokenExpiresAt !== undefined
+        ? { refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt }
+        : {}),
+      ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
+    }).catch(() => 'absent' as const)
+    logger.info('refresh.spend', 'published rotation to Claude Code', {
+      outcome,
+      selfPid: process.pid,
+    })
   }
 
   return {

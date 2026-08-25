@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-
+import { syncRefreshedFallbackAccountInSharedStore } from '../shared-account-adapter.ts'
 import {
   claimSharedAccountRefresh,
   loadSharedAccountStore,
@@ -311,5 +311,77 @@ describe('quota attribution', () => {
 
     const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
     expect(pickSharedAccount(loaded.store)?.id).toBe('fresh')
+  })
+})
+
+describe('a rotation must reach the shared store', () => {
+  test('syncing prevents the next pass re-presenting the old token', async () => {
+    // The single-process double-spend, in miniature. A refresh rotates the
+    // token, but if the new one is only written to a per-app sidecar the
+    // shared store still holds the old one — so the next routing pass reads it
+    // and presents it a second time. Anthropic revokes the whole family on
+    // that second presentation, and no cross-process claim can prevent it:
+    // both spends genuinely believe they hold a live token.
+    const path = await storeWith([account('acct', 'refresh-v1')])
+
+    // A pass reads the store and refreshes.
+    const first = await loadSharedAccountStore({ path, legacyPaths: [] })
+    const held =
+      first.store.accounts[0]?.credential.type === 'oauth'
+        ? first.store.accounts[0].credential.refresh
+        : undefined
+    expect(held).toBe('refresh-v1')
+
+    await syncRefreshedFallbackAccountInSharedStore(
+      {
+        id: 'acct',
+        type: 'oauth',
+        access: 'access-v2',
+        refresh: 'refresh-v2',
+        expires: Date.now() + 60_000,
+      } as never,
+      'refresh-v1',
+      { path },
+    )
+
+    // The next pass must see the rotated token, not the spent one.
+    const second = await loadSharedAccountStore({ path, legacyPaths: [] })
+    const next =
+      second.store.accounts[0]?.credential.type === 'oauth'
+        ? second.store.accounts[0].credential.refresh
+        : undefined
+    expect(next).toBe('refresh-v2')
+
+    // And the spent token is now recognised as spent rather than reused.
+    const claim = await claimSharedAccountRefresh('acct', 'refresh-v1', {
+      path,
+    })
+    expect(claim.status).toBe('already-refreshed')
+  })
+
+  test('a sync from a stale holder does not clobber a newer rotation', async () => {
+    // Two passes overlap: the slower one must not write its older token over
+    // the newer one, which would reintroduce the spent credential.
+    const path = await storeWith([account('acct', 'refresh-v2')])
+
+    await syncRefreshedFallbackAccountInSharedStore(
+      {
+        id: 'acct',
+        type: 'oauth',
+        access: 'access-stale',
+        refresh: 'refresh-stale',
+        expires: Date.now() + 60_000,
+      } as never,
+      // Expects v1, but the store already moved to v2.
+      'refresh-v1',
+      { path },
+    )
+
+    const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
+    const current =
+      loaded.store.accounts[0]?.credential.type === 'oauth'
+        ? loaded.store.accounts[0].credential.refresh
+        : undefined
+    expect(current).toBe('refresh-v2')
   })
 })

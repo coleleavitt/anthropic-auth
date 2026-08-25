@@ -52,6 +52,7 @@ import {
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
+  syncRefreshedFallbackAccountInSharedStore,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Api,
@@ -103,6 +104,20 @@ function getPiRoutingServices(
     fallbackManager = new FallbackAccountManager({
       configPath: storagePath,
       quotaManager,
+      // Persist every rotation back into the shared store. Without this the new
+      // token lands only in Pi's sidecar — which does not exist on a host that
+      // has never run Pi's own login — so the next routing pass re-reads the
+      // *old* refresh token from the shared store and presents it a second
+      // time. Anthropic revokes the whole family on the second presentation,
+      // which is a single-process double-spend that no cross-process claim can
+      // prevent, because both spends genuinely believe they hold a live token.
+      onFallbackCredentialChanged: async (account, expectedRefresh) => {
+        const synced = await syncRefreshedFallbackAccountInSharedStore(
+          account,
+          expectedRefresh,
+        )
+        return synced.result
+      },
     })
     setBoundedService(quotaManagers, storagePath, quotaManager)
     setBoundedService(fallbackManagers, storagePath, fallbackManager)

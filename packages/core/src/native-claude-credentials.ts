@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { inspect } from 'node:util'
@@ -585,5 +586,124 @@ export async function importNativeClaudeAccount(
     ...(loaded.credentials.trustedDeviceToken
       ? { trustedDeviceToken: loaded.credentials.trustedDeviceToken }
       : {}),
+  }
+}
+
+/**
+ * Whether native-credential access should be suppressed.
+ *
+ * A test run points the shared store at a temporary directory but has no way to
+ * relocate Claude Code's own file, so without this a test would read — and,
+ * worse, rewrite — the developer's live credential. An explicit path opts back
+ * in, which is how the tests for these helpers exercise them.
+ */
+function nativeAccessIsSandboxed(options: NativeClaudePathOptions) {
+  if (options.configDirectory || options.homeDirectory || options.homeDir) {
+    return false
+  }
+  const environment = options.environment ?? process.env
+  return Boolean(
+    environment.OPENCODE_ANTHROPIC_AUTH_TEST_DIR ||
+      environment.ANTHROPIC_ACCOUNTS_DIR ||
+      environment.ANTHROPIC_ACCOUNTS_FILE,
+  )
+}
+
+/**
+ * Publish a rotated OAuth credential back into Claude Code's own store.
+ *
+ * Anthropic rotates the refresh token on every refresh and revokes the whole
+ * family when a superseded one is presented. So when this library refreshes a
+ * credential Claude Code also holds, staying silent forks the family: our copy
+ * moves forward, the native app keeps the token it had, and the next refresh
+ * from either side kills the account for both.
+ *
+ * Claude Code stats `.credentials.json` and clears its credential cache when
+ * the mtime changes (`J8()` in the 2.1.241 bundle), so writing here is how the
+ * rotation reaches it — there is no IPC to call.
+ *
+ * Every field the file already carries is preserved: `subscriptionType` and
+ * `rateLimitTier` are written by the login flow and never by a refresh, and
+ * dropping them would degrade the native app's own behaviour. Unknown
+ * top-level keys survive too, since this file is Claude Code's, not ours.
+ */
+export async function publishNativeClaudeOAuth(
+  oauth: {
+    accessToken: string
+    refreshToken: string
+    expiresAt: number
+    refreshTokenExpiresAt?: number
+    scopes?: readonly string[]
+  },
+  options: NativeClaudePathOptions = {},
+): Promise<'written' | 'absent' | 'unchanged'> {
+  // Never touch the developer's real Claude Code credential from a test run.
+  if (nativeAccessIsSandboxed(options)) return 'absent'
+  const path = getNativeClaudeCredentialsPath(options)
+
+  let existingRaw: string
+  try {
+    existingRaw = await readFile(path, 'utf8')
+  } catch {
+    // No native install, or a keychain-backed one: nothing to keep in step.
+    return 'absent'
+  }
+
+  let existing: Record<string, unknown>
+  try {
+    existing = JSON.parse(existingRaw) as Record<string, unknown>
+  } catch {
+    // Refuse to overwrite a file we cannot parse — it may be mid-write, and a
+    // clobbered credential file logs the user out of Claude Code entirely.
+    return 'absent'
+  }
+
+  const previous = isRecord(existing.claudeAiOauth)
+    ? existing.claudeAiOauth
+    : {}
+  if (previous.refreshToken === oauth.refreshToken) return 'unchanged'
+
+  const next = {
+    ...existing,
+    claudeAiOauth: {
+      ...previous,
+      accessToken: oauth.accessToken,
+      refreshToken: oauth.refreshToken,
+      expiresAt: oauth.expiresAt,
+      ...(oauth.refreshTokenExpiresAt !== undefined
+        ? { refreshTokenExpiresAt: oauth.refreshTokenExpiresAt }
+        : {}),
+      ...(oauth.scopes ? { scopes: [...oauth.scopes] } : {}),
+    },
+  }
+
+  // Write-and-rename so a reader never observes a half-written credential.
+  const temporary = `${path}.tmp-${process.pid}`
+  await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, {
+    mode: 0o600,
+  })
+  await rename(temporary, path)
+  return 'written'
+}
+
+/**
+ * The OAuth credential Claude Code currently holds, or null when there is no
+ * readable file-backed one.
+ */
+export async function readNativeClaudeOAuth(
+  options: NativeClaudePathOptions = {},
+): Promise<NativeClaudeAiOauth | null> {
+  if (nativeAccessIsSandboxed(options)) return null
+  try {
+    const raw = await readFile(getNativeClaudeCredentialsPath(options), 'utf8')
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const oauth = isRecord(parsed.claudeAiOauth) ? parsed.claudeAiOauth : null
+    if (!oauth) return null
+    return typeof oauth.accessToken === 'string' &&
+      typeof oauth.refreshToken === 'string'
+      ? (oauth as unknown as NativeClaudeAiOauth)
+      : null
+  } catch {
+    return null
   }
 }
