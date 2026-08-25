@@ -6,17 +6,17 @@ import { join } from 'node:path'
 import type { FallbackAccount, OAuthAccount } from '../accounts.ts'
 import {
   ANTHROPIC_API_BASE_URL,
+  backfillSharedAccountIdentities,
   fallbackAccountToShared,
   materializeSharedFallbackAccounts,
   reconcileSharedFallbackAccounts,
   syncRefreshedFallbackAccountInSharedStore,
   upsertFallbackAccountInSharedStore,
 } from '../shared-account-adapter.ts'
-import {
+import { loadSharedAccountStore, 
   loadSharedAccountStore,
   type SharedAnthropicAccount,
-  saveSharedAccountStore,
-} from '../shared-account-store.ts'
+  saveSharedAccountStore,} from '../shared-account-store.ts'
 
 const tempDirectories: string[] = []
 
@@ -303,5 +303,145 @@ describe('shared Anthropic account adapter', () => {
       { path, legacyPaths: [], now: () => 1_800_000_000_000 },
     )
     expect(reconciled.store.accounts).toHaveLength(0)
+  })
+})
+
+describe('backfillSharedAccountIdentities', () => {
+  const DIRS: string[] = []
+  afterEach(async () => {
+    const { rm } = await import('node:fs/promises')
+    await Promise.all(
+      DIRS.splice(0).map((d) => rm(d, { recursive: true, force: true })),
+    )
+  })
+
+  async function storeWith(accounts: unknown[]) {
+    const { mkdtemp, writeFile } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = await mkdtemp(join(tmpdir(), 'backfill-identity-'))
+    DIRS.push(dir)
+    const path = join(dir, 'accounts.json')
+    await writeFile(path, JSON.stringify({ version: 1, accounts }))
+    return path
+  }
+
+  function bare(id: string, access: string) {
+    // What a native-keychain import looks like: tokens only, no identity.
+    return {
+      id,
+      credential: {
+        type: 'oauth',
+        access,
+        refresh: `${access}-refresh`,
+        expires_at: Date.now() + 60_000,
+      },
+      enabled: true,
+      created_at: '2026-08-14T00:00:00.000Z',
+    }
+  }
+
+  test('fills in the identity an imported credential never carried', async () => {
+    // Without this the row cannot be matched against the same account added by
+    // `login`, so the store holds it twice under two different names — and the
+    // import keeps whatever label it was created with, so it can appear to be
+    // an account it is not.
+    const path = await storeWith([bare('native-claude', 'tok-a')])
+
+    const results = await backfillSharedAccountIdentities({
+      fetchIdentity: async () => ({
+        accountUuid: 'acct-uuid',
+        email: 'person@example.com',
+        organizationUuid: 'org-uuid',
+      }),
+      options: { path, legacyPaths: [] },
+    })
+
+    expect(results[0]).toMatchObject({
+      id: 'native-claude',
+      email: 'person@example.com',
+      accountUuid: 'acct-uuid',
+    })
+
+    const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
+    const account = loaded.store.accounts[0]!
+    if (account.credential.type !== 'oauth') throw new Error('expected oauth')
+    expect(account.credential.account?.uuid).toBe('acct-uuid')
+    expect(account.credential.organization?.uuid).toBe('org-uuid')
+    expect(account.email).toBe('person@example.com')
+  })
+
+  test('leaves an already-identified account untouched', async () => {
+    // Safe to run repeatedly: one request per unidentified account, none for
+    // the rest.
+    const path = await storeWith([
+      {
+        ...bare('known', 'tok-b'),
+        credential: {
+          ...bare('known', 'tok-b').credential,
+          account: { uuid: 'existing-uuid' },
+        },
+      },
+    ])
+    let called = 0
+
+    const results = await backfillSharedAccountIdentities({
+      fetchIdentity: async () => {
+        called += 1
+        return { accountUuid: 'should-not-be-used' }
+      },
+      options: { path, legacyPaths: [] },
+    })
+
+    expect(called).toBe(0)
+    expect(results[0]?.skipped).toBe('already identified')
+  })
+
+  test('leaves the account alone when the profile is unavailable', async () => {
+    // A failed lookup must not stamp a guess onto a working credential.
+    const path = await storeWith([bare('native-claude', 'tok-c')])
+
+    const results = await backfillSharedAccountIdentities({
+      fetchIdentity: async () => ({}),
+      options: { path, legacyPaths: [] },
+    })
+
+    expect(results[0]?.skipped).toBe('profile unavailable')
+    const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
+    const account = loaded.store.accounts[0]!
+    if (account.credential.type !== 'oauth') throw new Error('expected oauth')
+    expect(account.credential.account).toBeUndefined()
+  })
+
+  test('backfilled identity makes a duplicate matchable', async () => {
+    // The point of the exercise: two rows for one account become recognisable
+    // as the same login only once both carry identity.
+    const path = await storeWith([
+      bare('native-claude', 'tok-d'),
+      {
+        ...bare('person@example.com', 'tok-e'),
+        email: 'person@example.com',
+        credential: {
+          ...bare('person@example.com', 'tok-e').credential,
+          account: { uuid: 'shared-uuid', email_address: 'person@example.com' },
+          organization: { uuid: 'org-uuid' },
+        },
+      },
+    ])
+
+    await backfillSharedAccountIdentities({
+      fetchIdentity: async () => ({
+        accountUuid: 'shared-uuid',
+        email: 'person@example.com',
+        organizationUuid: 'org-uuid',
+      }),
+      options: { path, legacyPaths: [] },
+    })
+
+    const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
+    const uuids = loaded.store.accounts.map((a) =>
+      a.credential.type === 'oauth' ? a.credential.account?.uuid : undefined,
+    )
+    expect(uuids).toEqual(['shared-uuid', 'shared-uuid'])
   })
 })

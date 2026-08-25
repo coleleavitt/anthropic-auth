@@ -3,6 +3,7 @@ import type {
   FallbackAccount,
   OAuthAccount,
 } from './accounts.ts'
+import { fetchOAuthAccountIdentity } from './oauth-profile.ts'
 import {
   findSharedAccountByCredential,
   loadSharedAccountStore,
@@ -305,4 +306,79 @@ export function materializeSharedFallbackAccounts(
   }
 
   return ordered
+}
+
+/**
+ * Fill in the account/organization identity an OAuth credential is missing.
+ *
+ * A credential imported from the native Claude Code keychain carries only the
+ * tokens — no account uuid, no email, no organization. Identity matching then
+ * has nothing to work with beyond the row's own id, so the same login added a
+ * second way (a `login` run, a legacy adoption) cannot be recognised as the
+ * same account and sits in the store twice under different names. Worse, the
+ * imported row keeps whatever label it was created with, so it can appear to be
+ * an account it is not.
+ *
+ * Reads {@link fetchOAuthAccountIdentity} and writes what comes back. Accounts
+ * that already carry an account uuid are left alone, so this is safe to run
+ * repeatedly and costs one request per unidentified account.
+ */
+export async function backfillSharedAccountIdentities(
+  input: {
+    fetchIdentity?: typeof fetchOAuthAccountIdentity
+    options?: SharedAccountStoreOptions
+  } = {},
+): Promise<
+  Array<{ id: string; email?: string; accountUuid?: string; skipped?: string }>
+> {
+  const fetchIdentity = input.fetchIdentity ?? fetchOAuthAccountIdentity
+  const loaded = await loadSharedAccountStore(input.options ?? {})
+  const results: Array<{
+    id: string
+    email?: string
+    accountUuid?: string
+    skipped?: string
+  }> = []
+
+  for (const account of loaded.store.accounts) {
+    if (account.credential.type !== 'oauth') {
+      results.push({ id: account.id, skipped: 'not an oauth account' })
+      continue
+    }
+    if (account.credential.account?.uuid) {
+      results.push({ id: account.id, skipped: 'already identified' })
+      continue
+    }
+    const identity = await fetchIdentity({
+      accessToken: account.credential.access,
+    })
+    if (!identity.accountUuid) {
+      results.push({ id: account.id, skipped: 'profile unavailable' })
+      continue
+    }
+
+    await updateSharedAccountStore((store) => {
+      const target = store.accounts.find(
+        (candidate) => candidate.id === account.id,
+      )
+      if (target?.credential.type !== 'oauth') return false
+      target.credential.account = {
+        uuid: identity.accountUuid!,
+        ...(identity.email ? { email_address: identity.email } : {}),
+      }
+      if (identity.organizationUuid) {
+        target.credential.organization = { uuid: identity.organizationUuid }
+      }
+      if (identity.email && !target.email) target.email = identity.email
+      return true
+    }, input.options ?? {})
+
+    results.push({
+      id: account.id,
+      email: identity.email,
+      accountUuid: identity.accountUuid,
+    })
+  }
+
+  return results
 }
