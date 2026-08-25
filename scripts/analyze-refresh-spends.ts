@@ -8,7 +8,11 @@
  * ordinary churn: a fingerprint spent more than once, and spends of the same
  * fingerprint from more than one PID.
  *
- *   bun run scripts/analyze-refresh-spends.ts [logfile]
+ * The log is append-only across rebuilds, so records from before a fix are
+ * still present afterwards and read as fresh evidence that it failed. Pass
+ * `--since` to cut the report to spends that happened after a known point.
+ *
+ *   bun run scripts/analyze-refresh-spends.ts [logfile] [--since <iso|epoch-ms>]
  */
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -31,7 +35,25 @@ type Record_ = {
   body?: string
 }
 
-const path = process.argv[2] ?? join(tmpdir(), 'opencode-anthropic-auth.log')
+const argv = process.argv.slice(2)
+const sinceIndex = argv.indexOf('--since')
+let since = Number.NEGATIVE_INFINITY
+if (sinceIndex >= 0) {
+  const rawSince = argv[sinceIndex + 1] ?? ''
+  const parsed = /^\d+$/.test(rawSince)
+    ? Number(rawSince)
+    : Date.parse(rawSince)
+  if (!Number.isFinite(parsed)) {
+    console.error(
+      `--since expects an ISO timestamp or epoch ms, got ${rawSince}`,
+    )
+    process.exit(2)
+  }
+  since = parsed
+  argv.splice(sinceIndex, 2)
+}
+
+const path = argv[0] ?? join(tmpdir(), 'opencode-anthropic-auth.log')
 const raw = await readFile(path, 'utf8').catch(() => '')
 if (!raw.trim()) {
   console.log(`no log at ${path}`)
@@ -58,6 +80,11 @@ for (const line of raw.split('\n')) {
   } catch {
     // A truncated final line during a live tail is expected; skip it.
   }
+  const latest = records.at(-1)
+  if (latest && Number.isFinite(since)) {
+    const at = latest.ts ? Date.parse(latest.ts) : Number.NaN
+    if (!Number.isFinite(at) || at < since) records.pop()
+  }
 }
 
 const spends = records.filter((r) => r.message === 'presenting a refresh token')
@@ -70,7 +97,14 @@ const unclaimed = records.filter((r) =>
 )
 
 console.log(`log: ${path}`)
-console.log(`refresh.spend records: ${records.length}`)
+const window = Number.isFinite(since)
+  ? ` (since ${new Date(since).toISOString()})`
+  : ''
+const span = records.length
+  ? `${records[0]?.ts ?? '?'} .. ${records.at(-1)?.ts ?? '?'}`
+  : 'none'
+console.log(`refresh.spend records: ${records.length}${window}`)
+console.log(`  spanning            : ${span}`)
 console.log(`  token presentations : ${spends.length}`)
 console.log(`  revoked families    : ${revoked.length}`)
 console.log(`  claim contentions   : ${contended.length}`)
