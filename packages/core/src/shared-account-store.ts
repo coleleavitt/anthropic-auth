@@ -704,6 +704,21 @@ function quotaExhausted(account: SharedAnthropicAccount, now: number) {
   )
 }
 
+/**
+ * Whether this account can currently serve a request.
+ *
+ * Exported because the same rule has to gate the fallback pool, not just the
+ * main pick. Gating only the main leaves an exhausted account first in the
+ * rotation, where every request pays a full round trip to be told 429 before
+ * moving on.
+ */
+export function sharedAccountIsAvailable(
+  account: SharedAnthropicAccount,
+  now = Date.now(),
+) {
+  return accountAvailable(account, now)
+}
+
 function accountAvailable(account: SharedAnthropicAccount, now: number) {
   if (!account.enabled) return false
   if (quotaExhausted(account, now)) return false

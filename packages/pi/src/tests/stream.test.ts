@@ -27,12 +27,28 @@ const originalFetch = globalThis.fetch
 // pins it to a path that never exists and disables legacy migration scanning.
 // Without this every fixture would be polluted by the developer's real logins.
 const originalSharedDir = process.env.ANTHROPIC_ACCOUNTS_DIR
+const originalSharedFile = process.env.ANTHROPIC_ACCOUNTS_FILE
 const originalSharedTestDir = process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
-process.env.ANTHROPIC_ACCOUNTS_DIR = join(
-  tmpdir(),
-  `pi-stream-tests-shared-${process.pid}`,
-)
-process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = '1'
+const sharedTestDir = join(tmpdir(), `pi-stream-tests-shared-${process.pid}`)
+
+/**
+ * Re-assert the store location before every test.
+ *
+ * A workspace-wide `bun test` evaluates every test file in one process, and
+ * several of them assign these variables at module scope — so setting them here
+ * once is not enough. `ANTHROPIC_ACCOUNTS_FILE` in particular takes precedence
+ * over `ANTHROPIC_ACCOUNTS_DIR` in `getSharedAccountStorePath`, so a sibling
+ * file setting it silently redirects this suite's store to that file's fixture:
+ * these tests then pass alone and fail in the full run.
+ */
+function pinSharedStoreEnvironment() {
+  process.env.ANTHROPIC_ACCOUNTS_DIR = sharedTestDir
+  delete process.env.ANTHROPIC_ACCOUNTS_FILE
+  process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = '1'
+}
+
+pinSharedStoreEnvironment()
+beforeEach(pinSharedStoreEnvironment)
 const anthropicModel = {
   id: 'claude-fable-5',
   name: 'Claude Fable 5',
@@ -54,6 +70,9 @@ const anthropicContext = {
 afterAll(() => {
   if (originalSharedDir === undefined) delete process.env.ANTHROPIC_ACCOUNTS_DIR
   else process.env.ANTHROPIC_ACCOUNTS_DIR = originalSharedDir
+  if (originalSharedFile === undefined)
+    delete process.env.ANTHROPIC_ACCOUNTS_FILE
+  else process.env.ANTHROPIC_ACCOUNTS_FILE = originalSharedFile
   if (originalSharedTestDir === undefined)
     delete process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
   else process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = originalSharedTestDir
@@ -748,7 +767,7 @@ describe('Pi transient retry', () => {
 })
 
 describe('Pi routes from the shared account store', () => {
-  const sharedStoreDir = process.env.ANTHROPIC_ACCOUNTS_DIR!
+  const sharedStoreDir = sharedTestDir
 
   async function writeSharedStore(accounts: unknown[]) {
     await mkdir(sharedStoreDir, { recursive: true })
@@ -860,6 +879,166 @@ describe('Pi routes from the shared account store', () => {
     )
   })
 
+  test('never contacts a fallback the store knows is exhausted', async () => {
+    // Observed in production: an account at 100% of its weekly window stayed
+    // first in the rotation, so every single request paid a round trip to be
+    // told 429 (`unified-status: rejected`, `retry-after: 168070` — 46 hours)
+    // before moving on. The quota was recorded correctly; only the *main* pick
+    // consulted it, never the fallback pool.
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-shared-spent-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+    const spent = sharedOAuthAccount('spent-shared', 'b')
+    await writeSharedStore([
+      sharedOAuthAccount('main-shared', 'a'),
+      {
+        ...spent,
+        quota: {
+          five_hour_percent: 0,
+          seven_day_percent: 100,
+          checked_at: new Date().toISOString(),
+        },
+      },
+      sharedOAuthAccount('healthy-shared', 'c'),
+    ])
+
+    const seenTokens: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (!url.includes('/v1/messages')) {
+          return Promise.resolve(new Response(HEALTHY_USAGE, { status: 200 }))
+        }
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        seenTokens.push(authorization)
+        if (authorization.includes('main-access')) {
+          return Promise.resolve(
+            new Response(
+              '{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}',
+              { status: 429, headers: { 'retry-after': '0' } },
+            ),
+          )
+        }
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_shared_spent',
+    })
+    const terminalTypes: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminalTypes.push(event.type)
+    }
+
+    expect(terminalTypes).toEqual(['done'])
+    // The exhausted account's token was never presented; the healthy one served.
+    expect(
+      seenTokens.some((token) => token.includes(spent.credential.access)),
+    ).toBe(false)
+    expect(seenTokens.some((token) => token.includes('c'.repeat(24)))).toBe(
+      true,
+    )
+  })
+
+  test('skips a primary its quota already says is spent', async () => {
+    // Pi hands us its own credential, which is not in the shared store and so
+    // can never be rotated away. When that account is exhausted every request
+    // was sent to it first, 429'd, and only then fell back — a wasted round
+    // trip on every single call for as long as the window stayed spent.
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-spent-primary-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+    await writeSharedStore([
+      sharedOAuthAccount('main-shared', 'a'),
+      sharedOAuthAccount('healthy-shared', 'c'),
+    ])
+
+    const EXHAUSTED_USAGE = JSON.stringify({
+      five_hour: {
+        utilization: 100,
+        resets_at: new Date(Date.now() + 3 * 60 * 60_000).toISOString(),
+      },
+      seven_day: {
+        utilization: 100,
+        resets_at: new Date(Date.now() + 46 * 60 * 60_000).toISOString(),
+      },
+    })
+
+    const messageTokens: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        if (!url.includes('/v1/messages')) {
+          return Promise.resolve(
+            new Response(
+              authorization.includes('main-access')
+                ? EXHAUSTED_USAGE
+                : HEALTHY_USAGE,
+              { status: 200 },
+            ),
+          )
+        }
+        messageTokens.push(authorization)
+        if (authorization.includes('main-access')) {
+          return Promise.resolve(
+            new Response(
+              '{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}',
+              {
+                status: 429,
+                headers: {
+                  'anthropic-ratelimit-unified-status': 'rejected',
+                  'retry-after': '168070',
+                },
+              },
+            ),
+          )
+        }
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_spent_primary',
+    })
+    const terminalTypes: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminalTypes.push(event.type)
+    }
+
+    expect(terminalTypes).toEqual(['done'])
+    // The spent primary was never sent a message; the fallback served directly.
+    expect(messageTokens.some((token) => token.includes('main-access'))).toBe(
+      false,
+    )
+    expect(messageTokens.length).toBe(1)
+  })
+
   test('leaves routing untouched when the shared store is empty', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-shared-empty-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
@@ -906,7 +1085,7 @@ describe('Pi routes from the shared account store', () => {
 })
 
 describe('Pi credential fallback', () => {
-  const sharedStoreDir = process.env.ANTHROPIC_ACCOUNTS_DIR!
+  const sharedStoreDir = sharedTestDir
 
   async function writeSharedStore(accounts: unknown[]) {
     await mkdir(sharedStoreDir, { recursive: true })

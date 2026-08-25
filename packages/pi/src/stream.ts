@@ -48,11 +48,13 @@ import {
   StickySessionRouter,
   sendViaRelay,
   setDumpEnabled,
+  sharedAccountIsAvailable,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
   syncRefreshedFallbackAccountInSharedStore,
+  tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Api,
@@ -417,10 +419,18 @@ async function sendAnthropicRequest(options: {
 
   const directFetch = async () => {
     const startedAt = Date.now()
+    // Fingerprint the bearer that actually goes out. `oauthAccountId` is only
+    // set on some call sites, so without this a 429 in the log cannot be tied
+    // to the account that earned it — which is how an exhausted account sat
+    // first in the rotation unnoticed.
+    const sentToken = /^Bearer\s+(.+)$/i.exec(
+      headers.get('authorization') ?? '',
+    )?.[1]
     logger.debug('pi.send', 'direct fetch start', {
       url: input.toString(),
       route: options.route ?? (options.apiAccount ? 'api' : 'oauth'),
       oauthAccountId: options.oauthAccountId,
+      tokenFp: sentToken ? tokenFingerprint(sentToken) : undefined,
       bodyBytes: bodyText.length,
       betas: headers.get('anthropic-beta'),
     })
@@ -429,10 +439,9 @@ async function sendAnthropicRequest(options: {
       logger.debug('pi.send', 'direct fetch done', {
         status: response.status,
         durationMs: Date.now() - startedAt,
-        unifiedStatus: response.headers.get(
-          'anthropic-ratelimit-unified-status',
-        ),
-        retryAfter: response.headers.get('retry-after'),
+        oauthAccountId: options.oauthAccountId,
+        tokenFp: sentToken ? tokenFingerprint(sentToken) : undefined,
+        ...describeRateLimitHeaders(response.headers),
       })
       await dumpDirectRequest({
         affinity: relayAffinity,
@@ -477,6 +486,36 @@ async function sendAnthropicRequest(options: {
     fallback: directFetch,
     affinity: relayAffinity,
   })
+}
+
+/** Compact quota rendering for logs: `5h 48% / 7d 55%`, or `unknown`. */
+function describeQuota(quota: OAuthQuotaSnapshot | undefined): string {
+  if (!quota) return 'unknown'
+  const percent = (key: 'five_hour' | 'seven_day') => {
+    const remaining = quota[key]?.remainingPercent
+    return typeof remaining === 'number'
+      ? `${Math.round((1 - remaining) * 100)}%`
+      : '?'
+  }
+  return `5h ${percent('five_hour')} / 7d ${percent('seven_day')}`
+}
+
+/**
+ * The rate-limit headers that decide whether a 429 is worth retrying. Logged
+ * together because reading them one at a time out of a log is how a hard limit
+ * gets mistaken for a transient one.
+ */
+function describeRateLimitHeaders(headers: Headers) {
+  return {
+    unifiedStatus: headers.get('anthropic-ratelimit-unified-status'),
+    overageStatus: headers.get('anthropic-ratelimit-unified-overage-status'),
+    overageDisabledReason: headers.get(
+      'anthropic-ratelimit-unified-overage-disabled-reason',
+    ),
+    claim: headers.get('anthropic-ratelimit-unified-representative-claim'),
+    retryAfter: headers.get('retry-after'),
+    requestId: headers.get('request-id'),
+  }
 }
 
 function quotaSnapshotIsExhausted(
@@ -580,10 +619,25 @@ async function loadRoutingStorage(storagePath: string) {
     mainAccountId: mainAccountId ?? '(none available)',
     pinned: loaded.store.current ?? '(unpinned)',
   })
+  // Drop accounts the store already knows are spent. `accountAvailable` fails
+  // open on a missing or stale reading, so only a *freshly observed* exhausted
+  // account is skipped — and skipping it here is what stops every request
+  // paying a round trip to be told 429 by an account whose weekly window does
+  // not reset for days.
+  const spent = new Set(
+    loaded.store.accounts
+      .filter((account) => !sharedAccountIsAvailable(account))
+      .map((account) => account.id),
+  )
+  if (spent.size) {
+    logger.debug('pi.route', 'excluding spent accounts from the pool', {
+      ids: [...spent],
+    })
+  }
   const accounts = materializeSharedFallbackAccounts(
     storage?.accounts ?? [],
     loaded.store,
-  )
+  ).filter((account) => !spent.has(account.id))
   logger.debug('pi.route', 'routing pool built', {
     fallbacks: accounts.length,
     ids: accounts.map((account) => account.id),
@@ -775,17 +829,56 @@ async function executeWithFallback(options: {
     }).catch(() => {})
   }
 
+  /**
+   * Which stored account the primary token belongs to, if any.
+   *
+   * Pi supplies the primary credential itself, so it is frequently *not* in the
+   * shared store — and then a 429 on the primary leg names no account at all.
+   * Reporting `unknown` explicitly is the point: it says the failing account is
+   * one this router cannot rotate away from.
+   */
+  async function describePrimary() {
+    const token = options.primaryAccessToken
+    const fp = tokenFingerprint(token)
+    try {
+      const loaded = await loadSharedAccountStore()
+      const match = loaded.store.accounts.find(
+        (candidate) =>
+          candidate.credential.type === 'oauth' &&
+          candidate.credential.access === token,
+      )
+      return {
+        tokenFp: fp,
+        accountId: match?.id ?? 'unknown (not in the shared store)',
+        storeQuota: match?.quota
+          ? `5h ${match.quota.five_hour_percent}% / 7d ${match.quota.seven_day_percent}%`
+          : 'none recorded',
+      }
+    } catch {
+      return { tokenFp: fp, accountId: 'unknown (store unreadable)' }
+    }
+  }
+
   async function primaryQuotaRefreshConfirmsExhausted() {
     try {
       const quota = await quotaManager.refreshMain(options.primaryAccessToken)
       await recordQuotaObservation(options.primaryAccessToken, quota)
       const entry = quotaManager.getMain(options.primaryAccessToken)
-      return Boolean(
+      const exhausted = Boolean(
         entry &&
           entry.refreshAfter > Date.now() &&
           quotaSnapshotIsExhausted(quota),
       )
-    } catch {
+      logger.debug('pi.quota', 'primary quota refreshed', {
+        quota: describeQuota(quota),
+        exhausted,
+        entryFresh: Boolean(entry && entry.refreshAfter > Date.now()),
+      })
+      return exhausted
+    } catch (error) {
+      logger.debug('pi.quota', 'primary quota refresh failed', {
+        error: errorText(error),
+      })
       return false
     }
   }
@@ -810,6 +903,54 @@ async function executeWithFallback(options: {
       entry &&
         quotaSnapshotModelScopeIsExhausted(entry.quota, options.model.id),
     )
+  }
+
+  /**
+   * The primary is spent according to a reading we already have.
+   *
+   * Pi hands us its own credential, which lives outside the shared store, so
+   * an exhausted primary can never be rotated away — it is simply retried
+   * first on every request, eats a 429, and only then falls back. Checking the
+   * cached quota costs nothing and skips that wasted round trip. Deliberately
+   * uses the *fresh* reading only: a stale one would strand the primary after
+   * its window had already reset.
+   */
+  function primaryFreshExhausted() {
+    const entry = quotaManager.getMain(options.primaryAccessToken)
+    return Boolean(
+      entry &&
+        !quotaManager.isMainStale(options.model.id) &&
+        quotaSnapshotIsExhausted(entry.quota),
+    )
+  }
+
+  /**
+   * The primary has no headroom left.
+   *
+   * Checks the cached reading first and only probes `/api/oauth/usage` when it
+   * has gone stale — `refreshMain` caches behind its own `refreshAfter` and
+   * dedups in-flight calls, so this costs one small request per staleness
+   * window rather than one per message.
+   */
+  async function primaryExhausted() {
+    if (primaryFreshExhausted()) {
+      logger.debug('pi.quota', 'primary exhausted: fresh cached reading', {
+        quota: describeQuota(
+          quotaManager.getMain(options.primaryAccessToken)?.quota,
+        ),
+      })
+      return true
+    }
+    const stale = quotaManager.isMainStale(options.model.id)
+    logger.trace('pi.quota', 'primary headroom check', {
+      cached: describeQuota(
+        quotaManager.getMain(options.primaryAccessToken)?.quota,
+      ),
+      stale,
+      willProbe: stale,
+    })
+    if (!stale) return false
+    return await primaryQuotaRefreshConfirmsExhausted()
   }
 
   function primaryFreshModelScopeExhausted() {
@@ -841,18 +982,51 @@ async function executeWithFallback(options: {
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
     )
-    for (const configured of storage?.accounts ?? []) {
+    const order = (storage?.accounts ?? []).map((account) => account.id)
+    logger.debug('pi.route', 'fallback attempt order', { order })
+    for (const [position, configured] of (storage?.accounts ?? []).entries()) {
       let response: Response | null = null
       const account = isOAuthAccount(configured)
         ? usableOAuthById.get(configured.id)
         : configured
-      if (!account) continue
+      if (!account) {
+        // The manager dropped it — expired, disabled, or permanently failed.
+        // Saying so here is what distinguishes "never tried" from "tried and
+        // failed" when reading the log backwards from a failure.
+        logger.debug('pi.route', 'fallback candidate not usable', {
+          id: configured.id,
+          position,
+          reason: 'absent from getUsableFallbackAccounts',
+        })
+        continue
+      }
 
       if (isOAuthAccount(account)) {
-        if (routeOptions.apiOnly === true || !account.access) continue
+        if (routeOptions.apiOnly === true || !account.access) {
+          logger.debug('pi.route', 'fallback candidate skipped', {
+            id: account.id,
+            position,
+            reason:
+              routeOptions.apiOnly === true
+                ? 'api-only pass'
+                : 'no access token',
+          })
+          continue
+        }
+        logger.debug('pi.route', 'fallback attempt: sending', {
+          id: account.id,
+          position,
+          route: 'oauth',
+          tokenFp: tokenFingerprint(account.access),
+          knownQuota: describeQuota(
+            quotaManager.getFallback(account.id, account.access)?.quota ??
+              account.quota,
+          ),
+        })
         response = await sendAnthropicRequest({
           ...options,
           accessToken: account.access,
+          oauthAccountId: account.id,
         })
       } else if (
         routeOptions.includeApiRoutes === true &&
@@ -861,14 +1035,22 @@ async function executeWithFallback(options: {
         account.apiKey &&
         isValidApiBaseURL(account.baseURL)
       ) {
+        logger.debug('pi.route', 'fallback attempt: sending', {
+          id: account.id,
+          position,
+          route: 'api',
+          baseURL: account.baseURL,
+        })
         response = await sendAnthropicRequest({
           ...options,
           apiAccount: account,
         })
       }
       if (!response) {
-        logger.trace('pi.route', 'fallback candidate skipped', {
+        logger.debug('pi.route', 'fallback candidate skipped', {
           id: configured.id,
+          position,
+          reason: 'no route matched this account shape',
         })
         continue
       }
@@ -883,12 +1065,22 @@ async function executeWithFallback(options: {
       }
       logger.debug('pi.route', 'fallback attempt failed', {
         id: account.id,
+        position,
         status: preflight instanceof Response ? preflight.status : 'sse-error',
+        ...(preflight instanceof Response
+          ? describeRateLimitHeaders(preflight.headers)
+          : { sseError: preflight }),
       })
       if (
         preflight instanceof Response &&
         !shouldFallbackStatus(preflight.status, storage)
       ) {
+        // A status the router treats as terminal: surface it rather than
+        // burning the rest of the pool on a failure that will repeat.
+        logger.info('pi.route', 'fallback halted on a terminal status', {
+          id: account.id,
+          status: preflight.status,
+        })
         return preflight
       }
       await response.body?.cancel().catch(() => {})
@@ -1176,28 +1368,45 @@ async function executeWithFallback(options: {
     const fallback = await tryFallbackAccounts()
     if (fallback) return fallback
   } else if (
+    (await primaryExhausted()) ||
     primaryFreshModelScopeExhausted() ||
     (primaryCachedModelScopeExhausted() &&
       (await primaryQuotaRefreshConfirmsModelScopeExhausted()))
   ) {
+    logger.debug('pi.route', 'skipping a spent primary', {
+      modelScopeExhausted: primaryFreshModelScopeExhausted(),
+    })
+    // Falling through to the primary when no fallback can serve is deliberate:
+    // a 429 from the real account beats a synthesised failure.
     const fallback = await tryFallbackAccounts()
     if (fallback) return fallback
   }
 
-  logger.debug('pi.route', 'sending on the primary account')
+  const primaryIdentity = await describePrimary()
+  logger.debug('pi.route', 'sending on the primary account', primaryIdentity)
   const primary = await sendAnthropicRequest({
     ...options,
     accessToken: options.primaryAccessToken,
+    oauthAccountId: primaryIdentity.accountId,
   })
   const primaryPreflight = await firstStreamingError(primary)
   logger.debug('pi.route', 'primary responded', {
+    ...primaryIdentity,
     status:
       primaryPreflight instanceof Response ? primaryPreflight.status : 'sse',
     signal: primaryPreflight instanceof Response ? undefined : primaryPreflight,
+    ...(primaryPreflight instanceof Response
+      ? describeRateLimitHeaders(primaryPreflight.headers)
+      : {}),
   })
   if (primaryPreflight instanceof Response) {
-    if (!shouldFallbackStatus(primaryPreflight.status, storage))
+    if (!shouldFallbackStatus(primaryPreflight.status, storage)) {
+      logger.info('pi.route', 'primary status is terminal; not falling back', {
+        status: primaryPreflight.status,
+        ...primaryIdentity,
+      })
       return primaryPreflight
+    }
   }
 
   const primaryAllowsQuotaFallback =
@@ -1226,8 +1435,22 @@ async function executeWithFallback(options: {
       }
       return fallback
     }
+  } else {
+    logger.debug('pi.route', 'fallback pass not attempted', {
+      fallbackFirst,
+      allowApiFallback,
+      allowModelScopedOAuthFallback,
+    })
   }
 
+  // Every account in the pool has now failed. Surfacing the primary's response
+  // is the honest answer, but the log has to say that it is a last resort
+  // rather than a first-choice result.
+  logger.warn('pi.route', 'no account could serve; returning the primary', {
+    ...primaryIdentity,
+    primaryStatus:
+      primaryPreflight instanceof Response ? primaryPreflight.status : 'sse',
+  })
   return primaryPreflight instanceof Response ? primaryPreflight : primary
 }
 
@@ -1295,6 +1518,11 @@ async function executeWithRetry(
       status: response.status,
       retryable: classification.retryable,
       hardLimitReason: classification.hardLimitReason,
+      // Anthropic returns several different 429 shapes — a plan-window limit,
+      // an org-level `{"message":"Rate limited"}`, a credits failure — and the
+      // headers alone do not distinguish them. Without the body in the log, a
+      // report of "429" cannot be matched to the response that caused it.
+      body: bodyText.slice(0, 300),
     })
     if (!classification.retryable || attempt >= maxRetries || signal?.aborted) {
       logger.info('pi.retry', 'giving up', {
@@ -1310,8 +1538,20 @@ async function executeWithRetry(
     }
 
     const delayMs = nextRetryDelayMs(response.headers, attempt)
-    logger.info('pi.retry', 'backing off before retry', { attempt, delayMs })
+    logger.info('pi.retry', 'backing off before retry', {
+      attempt,
+      delayMs,
+      // Where the wait came from. A server-directed `retry-after` can be days
+      // long, so a delay that did not come from the local backoff curve is the
+      // first thing to check when a request appears to hang.
+      source: response.headers.get('retry-after')
+        ? `retry-after: ${response.headers.get('retry-after')}`
+        : 'local backoff',
+      nextAttempt: attempt + 1,
+      remainingRetries: maxRetries - attempt,
+    })
     await sleep(delayMs, signal)
+    logger.trace('pi.retry', 'backoff elapsed', { attempt, delayMs })
     attempt += 1
   }
 }
@@ -1333,8 +1573,16 @@ export function streamCortexKitAnthropic(
       // nothing to give even when several accounts are logged in and routable.
       // Falling back to the shared store is the whole point of having one —
       // every other path here already reads it.
-      const accessToken =
-        options?.apiKey?.trim() || (await sharedAccessToken()) || ''
+      const hostKey = options?.apiKey?.trim()
+      const accessToken = hostKey || (await sharedAccessToken()) || ''
+      logger.debug('pi.stream', 'primary credential resolved', {
+        source: hostKey
+          ? 'host-supplied (Pi own store)'
+          : accessToken
+            ? 'shared account store'
+            : 'none',
+        tokenFp: accessToken ? tokenFingerprint(accessToken) : undefined,
+      })
       if (!accessToken) {
         logger.error('pi.stream', 'no usable Anthropic credential', {
           model: model.id,
