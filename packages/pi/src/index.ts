@@ -11,6 +11,7 @@ import {
   type LoadedSharedAccountStore,
   loadSharedAccountStore,
   logger,
+  markSharedRefreshTokenDead,
   refreshClaudeOAuthToken,
   releaseSharedAccountRefresh,
   resolveAnthropicModelCatalog,
@@ -272,8 +273,9 @@ export async function refreshAnthropicToken(
         break
       }
       if (claim.status === 'already-refreshed') {
-        logger.info('pi.refresh', 'another process already rotated the token', {
+        logger.info('refresh.spend', 'peer already rotated; adopting', {
           accountId: sharedAccount.id,
+          selfPid: process.pid,
         })
         return {
           refresh: claim.credential.refresh,
@@ -281,16 +283,34 @@ export async function refreshAnthropicToken(
           expires: claim.credential.expires_at,
         }
       }
+      if (claim.status === 'dead-token') {
+        // Anthropic already rejected this token; the family is gone.
+        logger.error('refresh.spend', 'skipping a known-dead refresh token', {
+          accountId: sharedAccount.id,
+          selfPid: process.pid,
+        })
+        throw new Error(
+          `Anthropic account ${sharedAccount.id} has a revoked refresh token; re-login is required`,
+        )
+      }
       if (claim.status === 'unknown-account') break
       if (attempt >= REFRESH_CLAIM_MAX_ATTEMPTS) {
-        logger.warn('pi.refresh', 'refresh claim timed out; proceeding alone', {
+        // Proceeding without the claim is the one path that can still
+        // double-spend, so it is logged loudly with both processes named.
+        logger.error('refresh.spend', 'claim timed out; refreshing unclaimed', {
           accountId: sharedAccount.id,
+          selfPid: process.pid,
+          holderPid: claim.status === 'held' ? claim.holderPid : undefined,
+          attempts: attempt + 1,
         })
         break
       }
       // Matches the CLI's lock retry: bounded attempts, jittered waits.
-      logger.debug('pi.refresh', 'refresh claim held by another process', {
+      logger.info('refresh.spend', 'claim held by another process', {
         accountId: sharedAccount.id,
+        selfPid: process.pid,
+        holderPid: claim.holderPid,
+        heldForMs: claim.until - Date.now(),
         attempt,
       })
       await new Promise((resolve) =>
@@ -306,6 +326,16 @@ export async function refreshAnthropicToken(
       refreshTokenExpiresAt: refreshExpiry,
     })
   } catch (error) {
+    if (
+      sharedAccount &&
+      error instanceof Error &&
+      error.message.includes('invalid_grant')
+    ) {
+      await markSharedRefreshTokenDead(
+        sharedAccount.id,
+        credentials.refresh,
+      ).catch(() => {})
+    }
     if (sharedAccount && leaseId) {
       await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
         () => {},

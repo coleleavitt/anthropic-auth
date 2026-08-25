@@ -29,6 +29,7 @@ import {
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
+  claimSharedAccountRefresh,
   computeXxhash64Hex,
   continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
@@ -132,6 +133,7 @@ import {
   quotaSnapshotPassesPolicy,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
+  releaseSharedAccountRefresh,
   removeAccountPersistent,
   removeSharedAccount,
   reorderAccountsPersistent,
@@ -3736,6 +3738,9 @@ const anthropicAuthPlugin = async (
                 let leaseId: string | null = null
                 let leaseTokenHash: string | null = null
                 let releaseFileLock: (() => Promise<void>) | null = null
+                // The machine-wide claim, released alongside the sidecar lease.
+                let sharedMainLeaseId: string | undefined
+                let sharedMainLeaseAccountId: string | undefined
 
                 async function updateMainRefreshState(
                   update: (storage: AccountStorage) => void,
@@ -3924,6 +3929,38 @@ const anthropicAuthPlugin = async (
                       )
                     }
 
+                    // The lease above is the sidecar's, scoped to this app's
+                    // config path — but the credential is machine-wide. Pi and
+                    // OpenCode each hold their own, so both can present the
+                    // same refresh token, and Anthropic revokes the whole
+                    // family when it sees one twice. Claim it in the store the
+                    // credential actually lives in.
+                    if (freshAuth.sharedAccountId) {
+                      const sharedClaim = await claimSharedAccountRefresh(
+                        freshAuth.sharedAccountId,
+                        freshAuth.refresh,
+                        {},
+                      ).catch(() => undefined)
+                      logger.info('refresh', 'shared refresh claim', {
+                        accountId: freshAuth.sharedAccountId,
+                        status: sharedClaim?.status ?? 'errored',
+                        refreshFp: hashRefreshToken(freshAuth.refresh).slice(
+                          0,
+                          8,
+                        ),
+                      })
+                      if (sharedClaim?.status === 'already-refreshed') {
+                        // A peer spent this token first; presenting it now
+                        // would revoke the family.
+                        return sharedClaim.credential.access
+                      }
+                      sharedMainLeaseId =
+                        sharedClaim?.status === 'claimed'
+                          ? sharedClaim.leaseId
+                          : undefined
+                      sharedMainLeaseAccountId = freshAuth.sharedAccountId
+                    }
+
                     log('[refresh] opencode main oauth refresh request start', {
                       attempt,
                     })
@@ -4073,6 +4110,13 @@ const anthropicAuthPlugin = async (
                           storage.refresh.mainRefreshLeaseTokenHash = undefined
                         }
                       }).catch(() => {})
+                    }
+                    if (sharedMainLeaseId && sharedMainLeaseAccountId) {
+                      await releaseSharedAccountRefresh(
+                        sharedMainLeaseAccountId,
+                        sharedMainLeaseId,
+                      ).catch(() => {})
+                      sharedMainLeaseId = undefined
                     }
                     await releaseFileLock?.().catch(() => {})
                   }

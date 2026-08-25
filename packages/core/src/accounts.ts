@@ -11,6 +11,11 @@ import {
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
 import { type LogLevel, log, logger } from './logger.ts'
+import {
+  claimSharedAccountRefresh,
+  markSharedRefreshTokenDead,
+  releaseSharedAccountRefresh,
+} from './shared-account-store.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
@@ -3901,6 +3906,8 @@ export class FallbackAccountManager {
     }
 
     let sourceAccount = latestAccount ?? account
+    // Held across the try so the `finally` can release a claim taken inside it.
+    let sharedLeaseIdForRelease: string | undefined
     const fileLock = await acquireRefreshFileLock({
       name: fallbackRefreshLockName(sourceAccount.id),
       ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
@@ -3939,20 +3946,79 @@ export class FallbackAccountManager {
 
       sourceAccount = latestAccount ?? sourceAccount
       const refreshToken = sourceAccount.refresh
+
+      // The file lock above is scoped to this app's config path, but the
+      // credential is machine-wide: Pi locks under ~/.pi/agent and OpenCode
+      // under ~/.config/opencode, so both can reach the token endpoint with the
+      // same refresh token at once. Anthropic revokes the whole family when a
+      // refresh token is presented twice, so take the shared-store claim too —
+      // it is keyed on the store the credential actually lives in.
+      //
+      // An account the shared store does not know reports `unknown-account`
+      // and proceeds exactly as before.
+      const sharedClaim = await claimSharedAccountRefresh(
+        sourceAccount.id,
+        refreshToken,
+        {},
+      ).catch(() => undefined)
+      if (sharedClaim?.status === 'dead-token') {
+        // Anthropic already rejected this exact token; the family is gone and
+        // no retry recovers it. Fail here rather than spending a round trip.
+        log('[refresh] fallback oauth refresh skipped known-dead token', {
+          accountId: sourceAccount.id,
+        })
+        throw new Error(
+          `Fallback OAuth account ${sourceAccount.id} has a revoked refresh token; re-login is required`,
+        )
+      }
+      if (sharedClaim?.status === 'already-refreshed') {
+        // A peer spent this token first. Adopting its result is the only safe
+        // move: presenting the superseded token would revoke the family.
+        log('[refresh] fallback oauth refresh adopted a peer rotation', {
+          accountId: sourceAccount.id,
+        })
+        sourceAccount.access = sharedClaim.credential.access
+        sourceAccount.refresh = sharedClaim.credential.refresh
+        sourceAccount.expires = sharedClaim.credential.expires_at
+        sourceAccount.refreshExpires =
+          sharedClaim.credential.refresh_expires_at ??
+          sourceAccount.refreshExpires
+        sourceAccount.lastRefreshError = undefined
+        updateStoredAccount(storage, sourceAccount)
+        await this.save(storage)
+        return sourceAccount
+      }
+      sharedLeaseIdForRelease =
+        sharedClaim?.status === 'claimed' ? sharedClaim.leaseId : undefined
+
       log('[refresh] fallback oauth refresh request start', {
         accountId: sourceAccount.id,
         force: options.force === true,
+        sharedClaim: sharedClaim?.status,
         expiresInMs: sourceAccount.expires
           ? sourceAccount.expires - this.now()
           : undefined,
       })
-      const refreshed = await refreshClaudeOAuthToken({
-        refreshToken,
-        refreshTokenExpiresAt: sourceAccount.refreshExpires,
-        authLineageId: sourceAccount.authLineageId,
-        fetchImpl: this.fetchImpl,
-        now: this.now,
-      })
+      let refreshed: Awaited<ReturnType<typeof refreshClaudeOAuthToken>>
+      try {
+        refreshed = await refreshClaudeOAuthToken({
+          refreshToken,
+          refreshTokenExpiresAt: sourceAccount.refreshExpires,
+          authLineageId: sourceAccount.authLineageId,
+          fetchImpl: this.fetchImpl,
+          now: this.now,
+        })
+      } catch (error) {
+        // Remember the verdict so the next pass short-circuits instead of
+        // asking again.
+        if (error instanceof Error && error.message.includes('invalid_grant')) {
+          await markSharedRefreshTokenDead(
+            sourceAccount.id,
+            refreshToken,
+          ).catch(() => {})
+        }
+        throw error
+      }
       sourceAccount.access = refreshed.access
       sourceAccount.refresh = refreshed.refresh
       sourceAccount.authLineageId =
@@ -3999,6 +4065,12 @@ export class FallbackAccountManager {
       })
       return sourceAccount
     } finally {
+      if (sharedLeaseIdForRelease) {
+        await releaseSharedAccountRefresh(
+          account.id,
+          sharedLeaseIdForRelease,
+        ).catch(() => {})
+      }
       await fileLock.release()
     }
   }

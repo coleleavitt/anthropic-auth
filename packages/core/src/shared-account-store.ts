@@ -85,7 +85,26 @@ export type SharedAnthropicAccount = {
     id: string
     until: number
     token_fingerprint: string
+    /**
+     * The process holding the claim. A revoked token family means someone
+     * presented the same refresh token twice; knowing which PID held the claim
+     * — and which PID was refused — is what turns that into a reproducible
+     * contention story rather than a guess.
+     */
+    holder_pid?: number
+    claimed_at?: string
   }
+  /**
+   * Fingerprint of a refresh token Anthropic has already rejected with
+   * `invalid_grant`.
+   *
+   * A revoked family never recovers, but the credential stays on disk, so the
+   * router keeps presenting it on every pass — a wasted round trip each time,
+   * and a failure that looks transient when it is terminal. Claude Code keeps
+   * the same registry in memory (`u2n`) and short-circuits with
+   * `known_dead_refresh_token`; persisting it survives a restart.
+   */
+  dead_refresh_fingerprint?: string
 }
 
 export type SharedAnthropicAccountStore = {
@@ -374,7 +393,19 @@ function normalizeRefreshLease(
   const until = value.until
   if (!id || !fingerprint) return undefined
   if (typeof until !== 'number' || !Number.isFinite(until)) return undefined
-  return { id, until, token_fingerprint: fingerprint }
+  const holderPid =
+    typeof value.holder_pid === 'number' && Number.isFinite(value.holder_pid)
+      ? value.holder_pid
+      : undefined
+  return {
+    id,
+    until,
+    token_fingerprint: fingerprint,
+    ...(holderPid !== undefined ? { holder_pid: holderPid } : {}),
+    ...(validTimestamp(value.claimed_at)
+      ? { claimed_at: validTimestamp(value.claimed_at) }
+      : {}),
+  }
 }
 
 function normalizeAccount(value: unknown): SharedAnthropicAccount | null {
@@ -417,6 +448,13 @@ function normalizeAccount(value: unknown): SharedAnthropicAccount | null {
       : {}),
     ...(normalizeRefreshLease(value.refresh_lease)
       ? { refresh_lease: normalizeRefreshLease(value.refresh_lease) }
+      : {}),
+    ...(optionalString(value.dead_refresh_fingerprint)
+      ? {
+          dead_refresh_fingerprint: optionalString(
+            value.dead_refresh_fingerprint,
+          ),
+        }
       : {}),
   }
 }
@@ -1014,7 +1052,9 @@ export type SharedRefreshClaim =
   /** Another process already rotated the token; use `credential` as-is. */
   | { status: 'already-refreshed'; credential: SharedOAuthCredential }
   /** Another process holds a live claim; wait and re-read. */
-  | { status: 'held'; until: number }
+  | { status: 'held'; until: number; holderPid?: number }
+  /** Anthropic already rejected this token; presenting it again is pointless. */
+  | { status: 'dead-token' }
   | { status: 'unknown-account' }
 
 /**
@@ -1052,9 +1092,25 @@ export function claimSharedAccountRefresh(
       return false
     }
 
+    // Already rejected once. The family does not come back, so short-circuit
+    // rather than spending another round trip to be told the same thing.
+    if (
+      account.dead_refresh_fingerprint &&
+      account.dead_refresh_fingerprint === tokenFingerprint(refreshToken)
+    ) {
+      outcome = { status: 'dead-token' }
+      return false
+    }
+
     const lease = account.refresh_lease
     if (lease && lease.until > now && lease.id !== leaseId) {
-      outcome = { status: 'held', until: lease.until }
+      outcome = {
+        status: 'held',
+        until: lease.until,
+        ...(lease.holder_pid !== undefined
+          ? { holderPid: lease.holder_pid }
+          : {}),
+      }
       return false
     }
 
@@ -1062,10 +1118,38 @@ export function claimSharedAccountRefresh(
       id: leaseId,
       until: now + ttl,
       token_fingerprint: tokenFingerprint(refreshToken),
+      holder_pid: process.pid,
+      claimed_at: new Date(now).toISOString(),
     }
     outcome = { status: 'claimed', leaseId }
     return true
   }, options).then(() => outcome)
+}
+
+/**
+ * Record that Anthropic rejected `refreshToken` with `invalid_grant`.
+ *
+ * Mirrors Claude Code's `u2n` dead-token set, persisted rather than in-memory
+ * so a restart does not start re-presenting a token that is already gone.
+ */
+export function markSharedRefreshTokenDead(
+  accountId: string,
+  refreshToken: string,
+  options: SharedAccountStoreOptions = {},
+) {
+  return updateSharedAccountStore((store) => {
+    const account = store.accounts.find(
+      (candidate) => candidate.id === accountId,
+    )
+    if (!account || account.credential.type !== 'oauth') return false
+    // Only mark the token the account still holds: a later rotation must not
+    // inherit a predecessor's verdict.
+    if (account.credential.refresh !== refreshToken) return false
+    account.dead_refresh_fingerprint = tokenFingerprint(refreshToken)
+    account.last_error = 'invalid_grant'
+    account.refresh_lease = undefined
+    return true
+  }, options)
 }
 
 /** Release a refresh claim without altering the credential. */

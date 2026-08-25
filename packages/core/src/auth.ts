@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 
 import {
   AUTHORIZE_URLS,
@@ -10,7 +10,9 @@ import {
   REVOKE_URL,
   TOKEN_URL,
 } from './constants.ts'
+import { logger } from './logger.ts'
 import { generatePKCE } from './pkce.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 type CallbackParams = {
   code: string
@@ -187,6 +189,26 @@ export async function refreshClaudeOAuthToken(input: {
   const maxRetries = input.maxRetries ?? 2
   const baseDelayMs = input.baseDelayMs ?? 500
   const initialNow = input.now?.() ?? Date.now()
+
+  // Every reach for the token endpoint is recorded, with the caller's stack.
+  // Anthropic revokes the whole family when one refresh token is presented
+  // twice, so when a family dies the only question that matters is which code
+  // paths spent it and in what order — and by then the token itself is gone.
+  // A fingerprint plus a call site makes that reconstructable after the fact.
+  const spendId = randomUUID().slice(0, 8)
+  const refreshFp = tokenFingerprint(input.refreshToken).slice(0, 8)
+  logger.info('refresh.spend', 'presenting a refresh token', {
+    spendId,
+    refreshFp,
+    pid: process.pid,
+    authLineageId: input.authLineageId,
+    maxRetries,
+    callSite: new Error().stack
+      ?.split('\n')
+      .slice(2, 6)
+      .map((line) => line.trim())
+      .join(' | '),
+  })
   if (
     input.refreshTokenExpiresAt !== undefined &&
     !Number.isSafeInteger(input.refreshTokenExpiresAt)
@@ -230,6 +252,23 @@ export async function refreshClaudeOAuthToken(input: {
           continue
         }
         const body = await readOAuthErrorBody(response, [input.refreshToken])
+        // `invalid_grant` is the family being gone, not a transient failure —
+        // the loudest signal that a token was spent twice somewhere. Logged at
+        // error so it stands out from ordinary refresh churn.
+        const isDeadFamily = body.includes('invalid_grant')
+        logger[isDeadFamily ? 'error' : 'warn'](
+          'refresh.spend',
+          isDeadFamily
+            ? 'refresh token rejected — token family is revoked'
+            : 'refresh failed',
+          {
+            spendId,
+            refreshFp,
+            status: response.status,
+            attempt,
+            body: body.slice(0, 300),
+          },
+        )
         throw new ClaudeOAuthRefreshError(
           response.status,
           body,
@@ -292,6 +331,20 @@ export async function refreshClaudeOAuthToken(input: {
           'Claude OAuth refresh returned an overflowing refresh-token expiry',
         )
       }
+
+      // Records the rotation edge: which token was spent and which replaced
+      // it. Chained across a log this reconstructs the family's whole lineage,
+      // and a fork in it — two spends of the same fingerprint — is exactly the
+      // double-spend that gets a family revoked.
+      const rotatedTo = json.refresh_token ?? input.refreshToken
+      logger.info('refresh.spend', 'refresh succeeded', {
+        spendId,
+        refreshFp,
+        rotatedToFp: tokenFingerprint(rotatedTo).slice(0, 8),
+        rotated: rotatedTo !== input.refreshToken,
+        expiresInSec: json.expires_in,
+        scopes: json.scope,
+      })
 
       return {
         access: json.access_token,
