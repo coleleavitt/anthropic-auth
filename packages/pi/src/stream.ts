@@ -512,6 +512,28 @@ async function firstStreamingError(
  * router had nothing to rotate to — every 429 became fatal even with several
  * healthy logins on disk.
  */
+/**
+ * An access token from the machine-wide store, for when the host has none.
+ *
+ * Prefers whatever selection would route to, so the credential handed back is
+ * the same one the router would have chosen anyway.
+ */
+async function sharedAccessToken(): Promise<string | undefined> {
+  const loaded = await loadSharedAccountStore().catch((error) => {
+    logger.warn('pi.stream', 'shared account store unreadable', {
+      error: errorText(error),
+    })
+    return null
+  })
+  if (!loaded) return undefined
+  const account = pickSharedAccount(loaded.store)
+  if (account?.credential.type !== 'oauth') return undefined
+  logger.info('pi.stream', 'using a shared-store credential', {
+    accountId: account.id,
+  })
+  return account.credential.access || undefined
+}
+
 async function loadRoutingStorage(storagePath: string) {
   logger.trace('pi.route', 'loadRoutingStorage: start', { storagePath })
   const storage = await loadAccounts(storagePath)
@@ -1275,8 +1297,23 @@ export function streamCortexKitAnthropic(
     stream.push({ type: 'start', partial: output })
 
     try {
-      const accessToken = options?.apiKey ?? ''
-      if (!accessToken) throw new Error('Missing Anthropic OAuth access token')
+      // Pi hands us its own stored credential. That store is separate from the
+      // machine-wide one, so a host that has never run Pi's own login has
+      // nothing to give even when several accounts are logged in and routable.
+      // Falling back to the shared store is the whole point of having one —
+      // every other path here already reads it.
+      const accessToken =
+        options?.apiKey?.trim() || (await sharedAccessToken()) || ''
+      if (!accessToken) {
+        logger.error('pi.stream', 'no usable Anthropic credential', {
+          model: model.id,
+          sessionId: options?.sessionId,
+          hostSuppliedKey: Boolean(options?.apiKey?.trim()),
+        })
+        throw new Error(
+          'Missing Anthropic OAuth access token: neither Pi nor the shared account store at ~/.anthropic-accounts/accounts.json holds a usable credential. Run `/login anthropic` in Pi, or add an account with `opencode-anthropic-auth login`.',
+        )
+      }
 
       const storagePath = getPiAccountStoragePath()
       logger.info('pi.stream', 'request start', {

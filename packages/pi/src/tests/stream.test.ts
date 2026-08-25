@@ -904,3 +904,101 @@ describe('Pi routes from the shared account store', () => {
     expect(messageCalls).toBe(1)
   })
 })
+
+describe('Pi credential fallback', () => {
+  const sharedStoreDir = process.env.ANTHROPIC_ACCOUNTS_DIR!
+
+  async function writeSharedStore(accounts: unknown[]) {
+    await mkdir(sharedStoreDir, { recursive: true })
+    await writeFile(
+      join(sharedStoreDir, 'accounts.json'),
+      JSON.stringify({ version: 1, accounts }),
+    )
+  }
+
+  beforeEach(async () => {
+    await rm(join(sharedStoreDir, 'accounts.json'), { force: true })
+  })
+
+  afterEach(async () => {
+    await rm(join(sharedStoreDir, 'accounts.json'), { force: true })
+  })
+
+  function sharedOAuthAccount(id: string, suffix: string) {
+    return {
+      id,
+      label: id,
+      credential: {
+        type: 'oauth',
+        access: `sk-ant-oat01-${suffix.repeat(24)}`,
+        refresh: `sk-ant-ort01-${suffix.repeat(24)}`,
+        expires_at: Date.now() + 24 * 60 * 60_000,
+        scopes: ['user:inference'],
+      },
+      enabled: true,
+      created_at: '2026-08-14T00:00:00.000Z',
+    }
+  }
+
+  async function runWithoutHostKey() {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-no-host-key-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+
+    const seenTokens: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (!url.includes('/v1/messages')) {
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        }
+        seenTokens.push(new Headers(init?.headers).get('authorization') ?? '')
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+
+    // apiKey deliberately absent: Pi has no credential of its own.
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      sessionId: 'ses_pi_no_host_key',
+    } as never)
+    const terminalTypes: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminalTypes.push(event.type)
+    }
+    return { terminalTypes, result: await stream.result(), seenTokens }
+  }
+
+  test('falls back to the shared store when the host supplies no key', async () => {
+    // Pi keeps its credential separately from the machine-wide store, so a host
+    // that has never run Pi's own login has nothing to hand over even when
+    // several accounts are logged in and routable.
+    await writeSharedStore([sharedOAuthAccount('shared-main', 'a')])
+
+    const { terminalTypes, seenTokens } = await runWithoutHostKey()
+
+    expect(terminalTypes).toEqual(['done'])
+    expect(seenTokens.some((token) => token.includes('sk-ant-oat01-'))).toBe(
+      true,
+    )
+  })
+
+  test('names both stores when neither holds a credential', async () => {
+    const { terminalTypes, result } = await runWithoutHostKey()
+
+    expect(terminalTypes).toEqual(['error'])
+    // The old message said only "Missing Anthropic OAuth access token", which
+    // gave no hint about which store was empty or how to fix it.
+    expect(result.errorMessage).toContain('shared account store')
+    expect(result.errorMessage).toContain('/login anthropic')
+  })
+})
