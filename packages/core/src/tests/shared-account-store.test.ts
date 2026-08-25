@@ -540,6 +540,12 @@ describe('shared account store — legacy flat schema adoption', () => {
               refresh: `sk-ant-ort01-${'z'.repeat(24)}`,
               expires_at: Date.now() + 60_000,
               account: { uuid, email_address: 'fallback@example.com' },
+              // Same organization as the legacy row: identity is the
+              // (account, organization) pair, so both sides must name it for
+              // the rows to be recognised as one login.
+              organization: {
+                uuid: '66666666-7777-8888-9999-000000000000',
+              },
             },
             enabled: true,
             created_at: '2026-08-14T00:00:00.000Z',
@@ -556,6 +562,101 @@ describe('shared account store — legacy flat schema adoption', () => {
 
     expect(loaded.store.accounts).toHaveLength(1)
     expect(loaded.store.accounts[0]?.id).toBe('fallback@example.com')
+  })
+
+  test('keeps two organizations of the same person as separate accounts', async () => {
+    // One email and one account uuid can hold a grant in several
+    // organizations; those are separate routable credentials. Collapsing them
+    // would silently drop a working login.
+    const canonical = await tempStorePath()
+    const legacy = join(canonical, '..', 'anthropic-accounts.json')
+    const uuid = '11111111-2222-3333-4444-555555555555'
+    await writeFile(
+      canonical,
+      JSON.stringify({
+        version: 1,
+        accounts: [
+          {
+            id: 'person@example.com (org-a)',
+            email: 'person@example.com',
+            credential: {
+              type: 'oauth',
+              access: `sk-ant-oat01-${'a'.repeat(24)}`,
+              refresh: `sk-ant-ort01-${'a'.repeat(24)}`,
+              expires_at: Date.now() + 60_000,
+              account: { uuid, email_address: 'person@example.com' },
+              organization: { uuid: 'org-a' },
+            },
+            enabled: true,
+            created_at: '2026-08-14T00:00:00.000Z',
+          },
+        ],
+      }),
+    )
+    // Same person, same account uuid, same email — different organization.
+    await writeFlatLegacy(legacy, [
+      flatLegacyAccount({
+        uuid,
+        email: 'person@example.com',
+        organizationUuid: 'org-b',
+        refreshToken: `sk-ant-ort01-${'b'.repeat(24)}`,
+      }),
+    ])
+
+    const loaded = await loadSharedAccountStore({
+      path: canonical,
+      legacyPaths: [legacy],
+    })
+
+    expect(loaded.store.accounts).toHaveLength(2)
+    expect(
+      loaded.store.accounts.map(
+        (a) => a.credential.type === 'oauth' && a.credential.organization?.uuid,
+      ),
+    ).toEqual(['org-a', 'org-b'])
+  })
+
+  test('does not merge a row that never captured its organization', async () => {
+    // An unqualified row matches nothing qualified. An unmerged duplicate is a
+    // tidy-up; a wrongly merged pair loses an account.
+    const canonical = await tempStorePath()
+    const legacy = join(canonical, '..', 'anthropic-accounts.json')
+    const uuid = '11111111-2222-3333-4444-555555555555'
+    await writeFile(
+      canonical,
+      JSON.stringify({
+        version: 1,
+        accounts: [
+          {
+            id: 'no-org',
+            email: 'person@example.com',
+            credential: {
+              type: 'oauth',
+              access: `sk-ant-oat01-${'a'.repeat(24)}`,
+              refresh: `sk-ant-ort01-${'a'.repeat(24)}`,
+              expires_at: Date.now() + 60_000,
+              account: { uuid, email_address: 'person@example.com' },
+            },
+            enabled: true,
+            created_at: '2026-08-14T00:00:00.000Z',
+          },
+        ],
+      }),
+    )
+    await writeFlatLegacy(legacy, [
+      flatLegacyAccount({
+        uuid,
+        email: 'person@example.com',
+        refreshToken: `sk-ant-ort01-${'b'.repeat(24)}`,
+      }),
+    ])
+
+    const loaded = await loadSharedAccountStore({
+      path: canonical,
+      legacyPaths: [legacy],
+    })
+
+    expect(loaded.store.accounts).toHaveLength(2)
   })
 
   test('lists the in-directory legacy filename as a migration candidate', async () => {

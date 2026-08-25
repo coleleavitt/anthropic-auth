@@ -391,10 +391,34 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   }
 
   const now = Date.now()
+  const sharedStoreForNaming = await loadSharedAccountStore()
+  const organizationUuid = result.organizationId ?? identity.organizationUuid
+
   // Prefer the profile email, then the grant's: both are stable across
   // re-logins, so signing in again updates the existing account instead of
   // stacking a second copy under a fresh random id.
-  const derivedId = label || identity.email || result.email
+  //
+  // An email is not unique on its own, though — one person can hold a grant in
+  // several organizations, and those are separate routable credentials. If the
+  // plain email is already taken by a *different* organization, qualify this
+  // one so the two coexist instead of overwriting each other.
+  const preferredId = label || identity.email || result.email
+  const collidesWithOtherOrg =
+    !label &&
+    Boolean(preferredId) &&
+    sharedStoreForNaming.store.accounts.some(
+      (candidate) =>
+        candidate.id === preferredId &&
+        candidate.credential.type === 'oauth' &&
+        candidate.credential.organization?.uuid !== organizationUuid,
+    )
+  const organizationSuffix =
+    identity.organizationName ?? organizationUuid?.slice(0, 8)
+  const derivedId =
+    collidesWithOtherOrg && organizationSuffix
+      ? `${preferredId} (${organizationSuffix})`
+      : preferredId
+
   const account: OAuthAccount = {
     id: derivedId || crypto.randomUUID(),
     label: derivedId || undefined,
@@ -409,7 +433,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     lastUsed: now,
     lastRefreshedAt: now,
   }
-  const sharedStore = await loadSharedAccountStore()
+  const sharedStore = sharedStoreForNaming
   const existingSharedAccount = sharedStore.store.accounts.find(
     (candidate) => candidate.id === account.id,
   )
@@ -427,7 +451,6 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
         ...(email ? { email_address: email } : {}),
       }
     }
-    const organizationUuid = result.organizationId ?? identity.organizationUuid
     if (organizationUuid) {
       sharedAccount.credential.organization = { uuid: organizationUuid }
     }

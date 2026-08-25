@@ -182,6 +182,77 @@ describe('CLI login', () => {
     })
   })
 
+  test('a second organization for the same person gets its own account', async () => {
+    // An email is not unique on its own: one person can hold a grant in
+    // several organizations, and those are separate routable credentials.
+    // Naming both after the bare email would make the second overwrite the
+    // first and silently drop a working login.
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const prompt = async () =>
+      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
+
+    const originalFetch = globalThis.fetch
+    // The suite already isolates the shared store; capture wherever it resolves
+    // rather than assuming, so this stays correct if that isolation changes.
+    let sharedPath = ''
+
+    let currentOrg = 'org-a'
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.includes('/api/oauth/profile')) {
+        return new Response(
+          JSON.stringify({
+            account: { uuid: 'shared-uuid', email: 'person@example.com' },
+            organization: { uuid: currentOrg, name: currentOrg },
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof fetch
+
+    const exchangeFor =
+      (suffix: string) =>
+      async (): Promise<{
+        type: 'success'
+        access: string
+        refresh: string
+        expires: number
+      }> => ({
+        type: 'success',
+        access: `access-${suffix}`,
+        refresh: `refresh-${suffix}`,
+        expires: Date.now() + 3600 * 1000,
+      })
+
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      await withAccountEnv(accountPath, {}, async () => {
+        const { getSharedAccountStorePath } = await import(
+          '@cortexkit/anthropic-auth-core'
+        )
+        sharedPath = getSharedAccountStorePath()
+        return login(undefined, { prompt, exchange: exchangeFor('a') })
+      })
+      currentOrg = 'org-b'
+      await withAccountEnv(accountPath, {}, () =>
+        login(undefined, { prompt, exchange: exchangeFor('b') }),
+      )
+    } finally {
+      console.log = origLog
+      globalThis.fetch = originalFetch
+    }
+
+    const shared = JSON.parse(await readFile(sharedPath, 'utf8')) as {
+      accounts: Array<{ id: string }>
+    }
+
+    const ids = shared.accounts.map((account) => account.id)
+    expect(ids).toContain('person@example.com')
+    expect(ids).toContain('person@example.com (org-b)')
+  })
+
   test('names the account from the grant email and saves it', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
 

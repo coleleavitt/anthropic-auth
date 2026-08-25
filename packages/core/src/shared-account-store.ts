@@ -525,13 +525,26 @@ function accountIdentities(account: SharedAnthropicAccount) {
   if (account.credential.refresh) {
     keys.push(`refresh:${account.credential.refresh}`)
   }
+
+  // Identity is the (account, organization) pair, not the account alone. One
+  // person can hold a grant in several organizations — the login flow even
+  // takes an org to authorize against — and those are separate routable
+  // credentials that share an account uuid and an email. Keying on either
+  // alone would collapse them and silently drop a working login, so both are
+  // qualified by the organization.
+  //
+  // A row that predates organization capture emits the unqualified form, which
+  // therefore matches nothing qualified. That direction is deliberate: an
+  // unmerged duplicate is a tidy-up, a wrongly merged pair is data loss.
+  const organizationScope = account.credential.organization?.uuid
+    ? `@${account.credential.organization.uuid}`
+    : ''
   const uuid = account.credential.account?.uuid
-  if (uuid) keys.push(`uuid:${uuid}`)
-  // An Anthropic account has exactly one email, and login now reads it from
-  // the profile endpoint rather than inferring it, so it is a dependable
-  // identity for a row whose token has already rotated away.
+  if (uuid) keys.push(`uuid:${uuid}${organizationScope}`)
   const email = account.email ?? account.credential.account?.email_address
-  if (email) keys.push(`email:${email.trim().toLowerCase()}`)
+  if (email) {
+    keys.push(`email:${email.trim().toLowerCase()}${organizationScope}`)
+  }
   return keys
 }
 
