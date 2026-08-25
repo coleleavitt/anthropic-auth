@@ -556,8 +556,10 @@ async function loadRoutingStorage(storagePath: string) {
     return { storage, mainAccountId: undefined }
   }
 
-  // The account the shared store would select is the one this request runs as,
-  // so quota observed on the request path belongs to it.
+  // Logged for routing visibility only. Deliberately NOT used to attribute a
+  // quota reading: selection can move between the read and the write, and
+  // stamping one account's usage onto another cascades until every account
+  // looks exhausted. Attribution goes by access token instead.
   const mainAccountId = pickSharedAccount(loaded.store)?.id
   logger.debug('pi.route', 'shared main selected', {
     mainAccountId: mainAccountId ?? '(none available)',
@@ -585,8 +587,7 @@ async function executeWithFallback(options: {
   primaryAccessToken: string
   storagePath: string
 }): Promise<Response> {
-  const { storage, mainAccountId: sharedMainAccountId } =
-    await loadRoutingStorage(options.storagePath)
+  const { storage } = await loadRoutingStorage(options.storagePath)
   const { quotaManager, fallbackManager: manager } = getPiRoutingServices(
     options.storagePath,
     storage,
@@ -726,10 +727,25 @@ async function executeWithFallback(options: {
    * depend on a bookkeeping write.
    */
   async function recordQuotaObservation(
-    accountId: string | undefined,
+    accessToken: string,
     quota: OAuthQuotaSnapshot | undefined,
   ) {
-    if (!accountId || !quota) return
+    if (!quota) return
+    // Identify the account by the token the quota was actually read with.
+    // Using the router's current pick instead stamps one account's usage onto
+    // whichever row selection happens to favour, and because a stamped row is
+    // then skipped, the next pick inherits the same figures — an exhausted
+    // account cascades until every account looks exhausted.
+    const loaded = await loadSharedAccountStore().catch(() => null)
+    const accountId = loaded?.store.accounts.find(
+      (candidate) =>
+        candidate.credential.type === 'oauth' &&
+        candidate.credential.access === accessToken,
+    )?.id
+    if (!accountId) {
+      logger.debug('pi.quota', 'no shared account matches this token', {})
+      return
+    }
     const fiveHour = quota.five_hour?.usedPercent
     const sevenDay = quota.seven_day?.usedPercent
     if (fiveHour === undefined && sevenDay === undefined) return
@@ -747,7 +763,7 @@ async function executeWithFallback(options: {
   async function primaryQuotaRefreshConfirmsExhausted() {
     try {
       const quota = await quotaManager.refreshMain(options.primaryAccessToken)
-      await recordQuotaObservation(sharedMainAccountId, quota)
+      await recordQuotaObservation(options.primaryAccessToken, quota)
       const entry = quotaManager.getMain(options.primaryAccessToken)
       return Boolean(
         entry &&

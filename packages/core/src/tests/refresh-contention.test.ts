@@ -7,6 +7,8 @@ import {
   claimSharedAccountRefresh,
   loadSharedAccountStore,
   markSharedRefreshTokenDead,
+  pickSharedAccount,
+  recordSharedAccountQuota,
   releaseSharedAccountRefresh,
   type SharedAnthropicAccount,
 } from '../shared-account-store.ts'
@@ -272,5 +274,42 @@ describe('dead refresh tokens are never re-presented', () => {
 
     const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
     expect(loaded.store.accounts[0]?.refresh_lease).toBeUndefined()
+  })
+})
+
+describe('quota attribution', () => {
+  test('a reading lands only on the account it was taken from', async () => {
+    // Regression: quota was recorded against whichever account selection
+    // currently favoured, not the one the token belonged to. One exhausted
+    // account's figures were stamped onto its neighbour, that neighbour was
+    // then skipped, selection moved on, and the same figures were stamped
+    // again — cascading until every account looked exhausted and routing had
+    // nowhere left to go.
+    const path = await storeWith([
+      account('spent', `${REFRESH}-spent`),
+      account('fresh', `${REFRESH}-fresh`),
+    ])
+
+    await recordSharedAccountQuota(
+      'spent',
+      { fiveHourPercent: 0, sevenDayPercent: 100 },
+      { path },
+    )
+
+    const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
+    const byId = new Map(loaded.store.accounts.map((a) => [a.id, a]))
+    expect(byId.get('spent')?.quota?.seven_day_percent).toBe(100)
+    expect(byId.get('fresh')?.quota).toBeUndefined()
+  })
+
+  test('an exhausted account does not make its neighbours unselectable', async () => {
+    const path = await storeWith([
+      account('spent', `${REFRESH}-spent`),
+      account('fresh', `${REFRESH}-fresh`),
+    ])
+    await recordSharedAccountQuota('spent', { sevenDayPercent: 100 }, { path })
+
+    const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
+    expect(pickSharedAccount(loaded.store)?.id).toBe('fresh')
   })
 })
