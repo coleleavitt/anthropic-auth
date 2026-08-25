@@ -52,6 +52,16 @@ export interface FableRecoverySidebarState {
   targetModelId?: string
 }
 
+export interface PrimeSidebarAccountState {
+  id: string
+  label: string
+  nextDueAt?: number | null
+  lastPrimedAt?: number | null
+  lastResult?: 'ok' | 'error'
+  usage?: PrimeUsageCounters
+  estimatedCostUsd?: number
+}
+
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
@@ -71,6 +81,15 @@ export interface SidebarState {
     window?: string
     trackedSessions?: number
   }
+  /**
+   * Prime opt-in flag plus per-account status. Absent on the wire when
+   * the feature is disabled — `normalizeSidebarState` validates every
+   * account independently and drops any entry it cannot prove.
+   */
+  prime?: {
+    enabled: boolean
+    accounts: PrimeSidebarAccountState[]
+  }
   fableRecoveries?: FableRecoverySidebarState[]
   lastUpdated: number
 }
@@ -88,6 +107,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import type { PrimeUsageCounters } from '@cortexkit/anthropic-auth-core'
 import { logger } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
@@ -109,6 +129,77 @@ export const DEFAULT_SIDEBAR_STATE: SidebarState = {
 }
 function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function normalizePrimeUsage(value: unknown): PrimeUsageCounters | undefined {
+  if (!isRecord(value)) return undefined
+  const count = Number(value.count)
+  const inputTokens = Number(value.inputTokens)
+  const outputTokens = Number(value.outputTokens)
+  const since = Number(value.since)
+  if (
+    ![count, inputTokens, outputTokens, since].every(Number.isFinite) ||
+    count < 0 ||
+    inputTokens < 0 ||
+    outputTokens < 0 ||
+    since < 0
+  ) {
+    return undefined
+  }
+  return {
+    count: Math.floor(count),
+    inputTokens: Math.floor(inputTokens),
+    outputTokens: Math.floor(outputTokens),
+    since: Math.floor(since),
+  }
+}
+
+function normalizePrimeAccount(
+  value: unknown,
+): PrimeSidebarAccountState | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.id !== 'string' || !value.id.trim()) return undefined
+  if (typeof value.label !== 'string' || !value.label.trim()) return undefined
+  const account: PrimeSidebarAccountState = {
+    id: value.id.trim(),
+    label: value.label.trim(),
+  }
+  if (value.nextDueAt === null) {
+    account.nextDueAt = null
+  } else if (isFiniteNumber(value.nextDueAt)) {
+    account.nextDueAt = value.nextDueAt
+  }
+  if (value.lastPrimedAt === null) {
+    account.lastPrimedAt = null
+  } else if (isFiniteNumber(value.lastPrimedAt)) {
+    account.lastPrimedAt = value.lastPrimedAt
+  }
+  if (value.lastResult === 'ok' || value.lastResult === 'error') {
+    account.lastResult = value.lastResult
+  }
+  const usage = normalizePrimeUsage(value.usage)
+  if (usage) account.usage = usage
+  if (isFiniteNumber(value.estimatedCostUsd)) {
+    account.estimatedCostUsd = value.estimatedCostUsd
+  }
+  return account
+}
+
+function normalizePrimeSection(
+  value: unknown,
+): SidebarState['prime'] | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.enabled !== 'boolean') return undefined
+  const accounts = Array.isArray(value.accounts)
+    ? value.accounts
+        .map(normalizePrimeAccount)
+        .filter((a): a is PrimeSidebarAccountState => a != null)
+    : []
+  return { enabled: value.enabled, accounts }
 }
 
 function normalizeQuotaWindow(value: unknown): QuotaWindow | undefined {
@@ -322,6 +413,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         ? raw.fastMode
         : DEFAULT_SIDEBAR_STATE.fastMode,
     cacheKeep,
+    prime: normalizePrimeSection(raw.prime),
     fableRecoveries: fableRecoveries.length > 0 ? fableRecoveries : undefined,
     lastUpdated: typeof raw.lastUpdated === 'number' ? raw.lastUpdated : 0,
   }
@@ -348,12 +440,20 @@ interface SidebarStateWriteTestHooks {
   lockRetryMaxMs?: number
 }
 
-let sidebarStateWriteTestHooks: SidebarStateWriteTestHooks | null = null
+const sidebarStateWriteTestHooks = new Map<string, SidebarStateWriteTestHooks>()
 
 export function __setSidebarStateWriteTestHooks(
   hooks: SidebarStateWriteTestHooks | null,
+  stateFile = getSidebarStateFile(),
 ): void {
-  sidebarStateWriteTestHooks = hooks
+  if (hooks) sidebarStateWriteTestHooks.set(stateFile, hooks)
+  else sidebarStateWriteTestHooks.delete(stateFile)
+}
+
+function sidebarStateWriteHooksFor(
+  stateFile: string,
+): SidebarStateWriteTestHooks | undefined {
+  return sidebarStateWriteTestHooks.get(stateFile)
 }
 
 // Boot-routing test hooks live here rather than in index.ts: the plugin entry
@@ -388,12 +488,10 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
   ownsLock: () => Promise<boolean>
 } | null> {
   const lockDir = `${stateFile}.lock`
-  const budgetMs =
-    sidebarStateWriteTestHooks?.lockBudgetMs ?? SIDEBAR_LOCK_BUDGET_MS
-  const retryMinMs =
-    sidebarStateWriteTestHooks?.lockRetryMinMs ?? SIDEBAR_LOCK_RETRY_MIN_MS
-  const retryMaxMs =
-    sidebarStateWriteTestHooks?.lockRetryMaxMs ?? SIDEBAR_LOCK_RETRY_MAX_MS
+  const testHooks = sidebarStateWriteHooksFor(stateFile)
+  const budgetMs = testHooks?.lockBudgetMs ?? SIDEBAR_LOCK_BUDGET_MS
+  const retryMinMs = testHooks?.lockRetryMinMs ?? SIDEBAR_LOCK_RETRY_MIN_MS
+  const retryMaxMs = testHooks?.lockRetryMaxMs ?? SIDEBAR_LOCK_RETRY_MAX_MS
   const deadline = Date.now() + budgetMs
 
   while (true) {
@@ -406,7 +504,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
         mode: 0o600,
         flag: 'wx',
       })
-      await sidebarStateWriteTestHooks?.onLockAcquired?.(lockDir)
+      await testHooks?.onLockAcquired?.(lockDir)
       return {
         ownsLock: async () => {
           try {
@@ -424,9 +522,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
           } catch {
             return
           }
-          await sidebarStateWriteTestHooks?.beforeReleaseDirectoryRemoval?.(
-            lockDir,
-          )
+          await testHooks?.beforeReleaseDirectoryRemoval?.(lockDir)
           await rmdir(lockDir).catch(() => {})
         },
       }
@@ -443,7 +539,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
     try {
       const lockStat = await stat(lockDir)
       if (Date.now() - lockStat.mtimeMs > SIDEBAR_LOCK_STALE_MS) {
-        await sidebarStateWriteTestHooks?.afterStaleLockStat?.(lockDir)
+        await testHooks?.afterStaleLockStat?.(lockDir)
         const evictedLockDir = `${lockDir}.evict-${process.pid}-${randomUUID()}`
         try {
           await rename(lockDir, evictedLockDir)
@@ -451,7 +547,7 @@ async function acquireSidebarStateLock(stateFile: string): Promise<{
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
           throw error
         }
-        await sidebarStateWriteTestHooks?.onStaleLockClaimed?.(lockDir)
+        await testHooks?.onStaleLockClaimed?.(lockDir)
         await rm(evictedLockDir, { recursive: true, force: true }).catch(
           () => {},
         )
@@ -491,6 +587,7 @@ async function writeSidebarStateAtomic(
   state: SidebarState,
   ownsLock: () => Promise<boolean>,
 ): Promise<'written' | 'lock-lost-before-rename' | 'lock-lost-after-rename'> {
+  const testHooks = sidebarStateWriteHooksFor(stateFile)
   const tempFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
   await writeFile(tempFile, JSON.stringify(state), {
     encoding: 'utf8',
@@ -504,7 +601,7 @@ async function writeSidebarStateAtomic(
       await rm(tempFile, { force: true }).catch(() => {})
       return 'lock-lost-before-rename'
     }
-    await sidebarStateWriteTestHooks?.beforeRename?.(stateFile, tempFile)
+    await testHooks?.beforeRename?.(stateFile, tempFile)
     // No production await separates this ownership fence from rename. A process
     // freeze between the adjacent syscalls remains possible, so rename is also
     // fenced from the other side below.
@@ -516,7 +613,7 @@ async function writeSidebarStateAtomic(
       return 'lock-lost-before-rename'
     }
     await rename(tempFile, stateFile)
-    await sidebarStateWriteTestHooks?.afterRename?.(stateFile)
+    await testHooks?.afterRename?.(stateFile)
     if (!(await ownsLock())) return 'lock-lost-after-rename'
     return 'written'
   } catch (error) {
@@ -601,7 +698,9 @@ export async function setSidebarState(
                 ),
               }
             }
-            await sidebarStateWriteTestHooks?.afterMergeRead?.(stateFile)
+            await sidebarStateWriteHooksFor(stateFile)?.afterMergeRead?.(
+              stateFile,
+            )
           } else if (repairingPostRenameLoss) {
             const current = await getSidebarState(stateFile)
             // A successor owns its fresh account/quota and recovery snapshots;
@@ -708,6 +807,44 @@ export function formatFallbackModelLabel(modelId: string | undefined): string {
   if (modelId === 'claude-opus-4-8' || modelId?.startsWith('claude-opus-4-8-'))
     return 'Opus 4.8'
   return modelId ?? 'Fable 5'
+}
+
+export function formatPrimeTime(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+export function formatPrimeCost(value: number): string {
+  if (value === 0) return '0'
+  if (value < 0.0001) return value.toExponential(2)
+  return value.toFixed(Math.min(6, Math.max(0, 4)))
+}
+
+export function formatPrimeAccountValue(account: PrimeSidebarAccountState): {
+  text: string
+  hasError: boolean
+} {
+  if (account.lastResult === 'error') {
+    return { text: 'err', hasError: true }
+  }
+  if (account.nextDueAt && account.nextDueAt > Date.now()) {
+    return { text: formatPrimeTime(account.nextDueAt), hasError: false }
+  }
+  if (account.lastPrimedAt) {
+    return {
+      text: `primed ${formatPrimeTime(account.lastPrimedAt)} \u2713`,
+      hasError: false,
+    }
+  }
+  if (account.usage?.count) {
+    return {
+      text: `\u2713 ${account.usage.count} \u2248 $${formatPrimeCost(account.estimatedCostUsd ?? 0)}`,
+      hasError: false,
+    }
+  }
+  return { text: '\u2014', hasError: false }
 }
 
 export function getFableRecoverySummary(

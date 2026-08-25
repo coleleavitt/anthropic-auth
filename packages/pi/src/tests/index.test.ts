@@ -199,4 +199,27 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
       expires: 9_999_999,
     })
   })
+
+  test('exposes Claude Opus 5 in the Pi Anthropic catalog', async () => {
+    await isolateCatalogState()
+    globalThis.fetch = (() => {
+      throw new Error('offline')
+    }) as unknown as typeof fetch
+    const { pi, providers } = mockPi()
+
+    await cortexKitPiAnthropicAuth(pi)
+
+    const opus5 = providers
+      .get('anthropic')
+      ?.models?.find((model) => model.id === 'claude-opus-5')
+    expect(opus5).toMatchObject({
+      id: 'claude-opus-5',
+      name: 'Claude Opus 5',
+      reasoning: true,
+      input: ['text', 'image'],
+      cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+    })
+  })
 })

@@ -24,15 +24,21 @@ describe('Claude Code fingerprint helpers', () => {
       stream: true,
     }
 
+    // Claude Code carries a `[1m]` marker on the model id internally and gates
+    // the 1M beta on it, but sends the bare id on the wire — so a capture can
+    // never show the marker. We derive the same capability from the model
+    // family instead, which means the beta is present here where the capture
+    // could not record it.
     expect(selectClaudeCodeBetas(body).split(',')).toEqual([
       ...CLAUDE_CODE_FULL_AGENT_BETAS,
+      'context-1m-2025-08-07',
     ])
     const fullBetas = selectClaudeCodeBetas(body).split(',')
     expect(fullBetas[0]).toBe('claude-code-20250219')
     expect(fullBetas).toContain('thinking-token-count-2026-05-13')
     expect(fullBetas).not.toContain('redact-thinking-2026-02-12')
     expect(fullBetas).toContain('claude-code-20250219')
-    expect(fullBetas).not.toContain('context-1m-2025-08-07')
+    expect(fullBetas).toContain('context-1m-2025-08-07')
     expect(fullBetas).toContain('effort-2025-11-24')
   })
 
@@ -74,12 +80,15 @@ describe('Claude Code fingerprint helpers', () => {
       'prompt-caching-scope-2026-01-05',
       'effort-2025-11-24',
       'extended-cache-ttl-2025-04-11',
+      'cache-diagnosis-2026-04-07',
+      // sonnet-4-6 is a 1M family, so the beta is derived from the model id.
+      'context-1m-2025-08-07',
     ])
     expect(betas).toContain('thinking-token-count-2026-05-13')
     expect(betas).not.toContain('advanced-tool-use-2025-11-20')
     expect(betas).toContain('extended-cache-ttl-2025-04-11')
     expect(betas).toContain('claude-code-20250219')
-    expect(betas).not.toContain('context-1m-2025-08-07')
+    expect(betas).toContain('context-1m-2025-08-07')
     expect(betas).toContain('effort-2025-11-24')
     expect(betas).not.toContain('redact-thinking-2026-02-12')
   })

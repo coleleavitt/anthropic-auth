@@ -8,6 +8,7 @@ import {
   buildAccountList,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
+  buildPrimeRequestBody,
   buildRefreshOperationError,
   CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
@@ -22,13 +23,21 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_FAST_COMMAND_NAME,
+  CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_LOGGING_COMMAND_NAME,
+  CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  CLAUDE_START_COMMAND_NAME,
+  computeXxhash64Hex,
+  continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
+  createStickyNoRouteResponse,
   createWifAuth,
+  type DumpHandle,
   decideStickyQuotaFailure,
   dumpDirectRequest,
+  dumpResponseArtifact,
   exchange,
   executeAccountCommand,
   executeCache1hCommand,
@@ -36,7 +45,9 @@ import {
   executeDumpCommand,
   executeFastModeCommand,
   executeKillswitchCommand,
+  executeLaneStartCommand,
   executeLoggingCommand,
+  executePrimeCommand,
   executeRoutingCommand,
   FallbackAccountManager,
   fetchOAuthAccountProfile,
@@ -50,8 +61,10 @@ import {
   getClaudeCodeIdentity,
   getClaudeCodeVersion,
   getDefaultCacheKeepRegistryDirectory,
+  getFallbackReauthLabels,
   getKillswitchConfig,
   getKillswitchThresholdsForAccount,
+  getOrCreatePrimeAuthLineageId,
   getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
@@ -61,6 +74,7 @@ import {
   getStickyRoutingStatePath,
   hashRefreshToken,
   importNativeClaudeAccount,
+  incrementPrimeUsagePersistent,
   isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -77,6 +91,7 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isPermanentRefreshError,
+  isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
@@ -95,16 +110,23 @@ import {
   oauthProfileIsFresh,
   oauthProfileMatchesToken,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  PrimeManager,
+  type PrimeManagerOptions,
+  type PrimeRefreshResult,
+  type PrimeSendResult,
   parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
+  parseLaneStartCommandAction,
   parseLoggingCommandAction,
+  parsePrimeCommandAction,
   parseRoutingCommandAction,
   type QuotaAccountSummary,
   type QuotaEntry,
   QuotaManager,
+  quotaSnapshotCheckedAt,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -139,12 +161,12 @@ import {
   setKillswitchPersistent,
   setLogLevel,
   setLogLevelPersistent,
+  setPrimePersistentEnabled,
   setRoutingMode,
   setSharedAccountEnabled,
   shouldFallbackStatus,
   startOAuthLoopbackSession,
   stickyQuotaSnapshotIsFresh,
-  stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
   syncRefreshedFallbackAccountInSharedStore,
   TrustedDeviceToken,
@@ -153,23 +175,43 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import {
+  applyCacheDiagnosticsOptIn,
+  buildCacheDiagnosticsRecord,
+  CACHE_DIAGNOSTICS_BETA,
+  CacheDiagnosticsBetaTracker,
+  type CacheDiagnosticsRequestContext,
+  type CacheDiagnosticsSource,
+  CacheDiagnosticsTracker,
+  copyCacheDiagnosticsContext,
+  formatCacheDiagnosticsLogLine,
+  summarizeCacheTtl,
+  withStickyRetryAfter,
+} from './cache-diagnostics.ts'
+import {
   FableFallbackManager,
   type FableFallbackPlan,
   type FableStandbyCacheAnchor,
   isRecoverableRefusalModel,
   recoverableRefusalFamily,
 } from './fable-fallback.ts'
+import {
+  fireLaneStart,
+  LANE_START_REQUEST_HEADER,
+  LaneStartTracker,
+} from './lane-start.ts'
+import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
   drainNotifications,
   isTuiConnected,
   pushNotification,
 } from './rpc/notifications.ts'
-import type {
-  ApplyRequest,
-  ApplyResult,
-  CommandModalName,
-  OpenDialogPayload,
+import {
+  type ApplyRequest,
+  type ApplyResult,
+  COMMAND_MODAL_NAMES,
+  type CommandModalName,
+  type OpenDialogPayload,
 } from './rpc/protocol.ts'
 import { getRpcDir } from './rpc/rpc-dir.ts'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
@@ -209,6 +251,7 @@ const HTTP_SERVER_RESPONSE_TYPE_ID = '~effect/http/HttpServerResponse'
 const HTTP_COOKIES_TYPE_ID = '~effect/http/Cookies'
 const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
 const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
+const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
@@ -424,6 +467,9 @@ type PluginSessionClient = {
   status?: () => Promise<unknown> | unknown
 }
 
+const DESKTOP_NOTICE_PROBE_LIMIT = 4
+const DESKTOP_NOTICE_PROBE_DELAY_MS = 25
+
 type PerfTrace = {
   requestId: string
   start: number
@@ -555,8 +601,9 @@ async function sendIgnoredMessage(
   options: {
     noReply?: boolean
     beforeActiveAssistant?: boolean
+    canSend?: () => boolean
   } = {},
-) {
+): Promise<boolean> {
   const session = ctx.client.session as PluginSessionClient | undefined
   const promptContext = await resolvePromptContext(ctx.client, sessionId)
   const request: NotificationRequest = {
@@ -573,25 +620,25 @@ async function sendIgnoredMessage(
           promptContext.latestUserMessageId,
         )
       : undefined
-    if (!messageID) {
-      throw new Error(
-        'OpenCode assistant ordering is unavailable for the fallback notification.',
-      )
-    }
-    request.body.messageID = messageID
+    if (messageID) request.body.messageID = messageID
   }
   if (promptContext?.agent) request.body.agent = promptContext.agent
   if (promptContext?.model) request.body.model = promptContext.model
   if (promptContext?.variant) request.body.variant = promptContext.variant
 
+  // Resolving the active prompt context crosses the OpenCode process boundary.
+  // A new user prompt can start while that request is in flight, so re-check the
+  // caller's delivery lease immediately before inserting the ignored message.
+  if (options.canSend && !options.canSend()) return false
+
   if (typeof session?.promptAsync === 'function') {
     await session.promptAsync(request)
-    return
+    return true
   }
 
   if (typeof session?.prompt === 'function') {
     await Promise.resolve(session.prompt(request))
-    return
+    return true
   }
 
   throw new Error(
@@ -812,7 +859,38 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   ) as T
 }
 
-export const AnthropicAuthPlugin: Plugin = async (ctx) => {
+export function primeQuotaSnapshotIsFreshSince(
+  quota: OAuthQuotaSnapshot | undefined,
+  refreshStartedAt: number,
+): boolean {
+  return quotaSnapshotCheckedAt(quota) > refreshStartedAt
+}
+
+type PluginRuntimeTimerOverrides = Partial<{
+  setTimeout: typeof globalThis.setTimeout
+  setInterval: typeof globalThis.setInterval
+  clearInterval: typeof globalThis.clearInterval
+}>
+
+const anthropicAuthPlugin = async (
+  ctx: Parameters<Plugin>[0],
+  timerOverrides: PluginRuntimeTimerOverrides = {},
+) => {
+  const _baseSI = timerOverrides.setInterval ?? globalThis.setInterval
+  const _wrapSI = ((...a: unknown[]) => {
+    console.error(
+      'DBGSI',
+      new Error().stack?.split('\n').slice(2, 4).join(' | '),
+    )
+    return (_baseSI as (...x: unknown[]) => unknown)(...a)
+  }) as typeof globalThis.setInterval
+  const runtimeTimers = {
+    setTimeout: globalThis.setTimeout,
+    setInterval: _wrapSI,
+    clearInterval: globalThis.clearInterval,
+    ...timerOverrides,
+    ...(timerOverrides.setInterval ? {} : { setInterval: _wrapSI }),
+  }
   startEventLoopLagMonitor()
   const { client } = ctx
   const profileFetch = globalThis.fetch
@@ -891,9 +969,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
   )
   const fableFallbackManager = new FableFallbackManager()
+  const laneStartTracker = new LaneStartTracker()
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
+  const pendingRecoveryDesktopNotices = new Map<string, string>()
   const desktopNoticeFlushes = new Map<string, Promise<void>>()
+  const desktopNoticeSafeSessions = new Set<string>()
+  const desktopNoticeProbes = new Map<string, number>()
   const stickySessionRouter = new StickySessionRouter({
     path:
       process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
@@ -1208,12 +1290,156 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       )
       return synced.result
     },
+    setIntervalImpl: runtimeTimers.setInterval,
+    clearIntervalImpl: runtimeTimers.clearInterval,
     onFallbackStorageChanged: () => {
       void refreshSidebarQuota().catch(() => {})
     },
   })
   fallbackManager.startBackgroundRefresh()
   void getClaudeCodeVersion().catch(() => {})
+  const cacheDiagnosticsTracker = new CacheDiagnosticsTracker()
+  const cacheDiagnosticsBetaTracker = new CacheDiagnosticsBetaTracker()
+  type CacheDiagnosticsResponse = {
+    request?: CacheDiagnosticsRequestContext
+    trackSessionId?: string
+    source: CacheDiagnosticsSource
+    accountId: string
+    synthetic: boolean
+    betasHash: string
+    betas: string[]
+    requestedModel?: string
+    dump: DumpHandle | null
+    status: number
+    streaming: boolean
+    dumpWrite: Promise<void>
+  }
+  const cacheDiagnosticsResponses = new WeakMap<
+    Response,
+    CacheDiagnosticsResponse
+  >()
+  const cacheKeepDiagnosticsRequests = new Map<
+    string,
+    CacheDiagnosticsRequestContext & {
+      accountId: string
+      synthetic: boolean
+      betasHash?: string
+      betas?: string[]
+      requestedModel?: string
+    }
+  >()
+
+  async function getCacheDiagnosticsBetas(headers: Headers) {
+    const betas = (headers.get('anthropic-beta') ?? '')
+      .split(',')
+      .map((beta) => beta.trim())
+      .filter(Boolean)
+      .sort()
+    return {
+      betas,
+      betasHash: await computeXxhash64Hex(betas.join(',')),
+    }
+  }
+
+  function observeCacheDiagnosticsMessage(input: {
+    source: CacheDiagnosticsSource
+    accountId: string
+    synthetic: boolean
+    betasHash: string
+    betas: string[]
+    requestedModel?: string
+    request?: CacheDiagnosticsRequestContext
+    trackSessionId?: string
+    status: number
+    message: unknown
+    receivedAt: number
+    dump?: DumpHandle | null
+    dumpWrite?: Promise<void>
+  }) {
+    try {
+      if (!input.request) return
+      const observed = buildCacheDiagnosticsRecord({
+        request: input.request,
+        source: input.source,
+        accountId: input.accountId,
+        synthetic: input.synthetic,
+        betasHash: input.betasHash,
+        requestedModel: input.requestedModel,
+        onWarning: (message) => logger.warn('cache-diagnostics', message),
+        message: input.message,
+        receivedAt: input.receivedAt,
+      })
+      if (!observed.record || !observed.messageId) {
+        logger.debug('cache-diagnostics', 'skipped invalid response envelope', {
+          status: input.status,
+        })
+        return
+      }
+      logger.debug(
+        'cache-diagnostics',
+        formatCacheDiagnosticsLogLine(observed.record),
+      )
+      const betaLine = cacheDiagnosticsBetaTracker.capture(
+        input.betasHash,
+        input.betas,
+      )
+      if (betaLine) logger.debug('cache-diagnostics', betaLine)
+      if (observed.canary) {
+        logger.warn(
+          'cache-diagnostics',
+          'short-gap previous_message_not_found',
+          {
+            message_id: observed.canary.messageId,
+            previous_message_id: observed.canary.previousMessageId,
+          },
+        )
+      }
+      if (input.trackSessionId) {
+        cacheDiagnosticsTracker.capture(
+          input.trackSessionId,
+          observed.messageId,
+          input.receivedAt,
+        )
+      }
+    } catch (error) {
+      logger.debug('cache-diagnostics', 'response observation failed', {
+        status: input.status,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  function observeCacheDiagnosticsResponse(
+    response: Response,
+    message: unknown,
+  ) {
+    const context = cacheDiagnosticsResponses.get(response)
+    if (!context) return
+    context.dumpWrite = context.dumpWrite
+      .then(() =>
+        dumpResponseArtifact(context.dump, {
+          status: context.status,
+          message,
+        }),
+      )
+      .catch(() => {})
+    observeCacheDiagnosticsMessage({
+      ...context,
+      message,
+      receivedAt: Date.now(),
+    })
+  }
+
+  function attachCacheDiagnosticsResponse(
+    response: Response,
+    input: Omit<CacheDiagnosticsResponse, 'dumpWrite'>,
+  ) {
+    const dumpWrite = Promise.resolve(
+      dumpResponseArtifact(input.dump, { status: input.status, message: null }),
+    ).catch(() => {})
+    cacheDiagnosticsResponses.set(response, { ...input, dumpWrite })
+  }
+
   let latestRefreshMainAccessToken: (() => Promise<string>) | null = null
   const cacheKeepRegistry = new CacheKeepSessionRegistry({
     directory:
@@ -1225,9 +1451,87 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   > = []
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    setIntervalImpl: runtimeTimers.setInterval,
+    clearIntervalImpl: runtimeTimers.clearInterval,
     onTrackedSessionsChanged: async (sessions) => {
       await cacheKeepRegistry.publish(sessions)
       aggregateCacheKeepSessions = await cacheKeepRegistry.list(sessions)
+    },
+    prepareBody: (bodyText, target) => {
+      if (
+        !new Headers(target.headers)
+          .get('anthropic-beta')
+          ?.split(',')
+          .map((beta) => beta.trim())
+          .includes(CACHE_DIAGNOSTICS_BETA)
+      ) {
+        return bodyText
+      }
+      try {
+        const body = JSON.parse(bodyText) as Record<string, unknown>
+        const previous = cacheDiagnosticsTracker.previousFor(target.id)
+        const previousMessageId = previous?.messageId ?? null
+        applyCacheDiagnosticsOptIn(body, previousMessageId)
+        cacheKeepDiagnosticsRequests.set(target.id, {
+          sessionId: target.id,
+          previousMessageId,
+          ...(previous
+            ? { previousMessageReceivedAt: previous.receivedAt }
+            : {}),
+          isSubagent: target.isSubagent,
+          ttlSent: summarizeCacheTtl(body),
+          accountId: target.oauthAccountId ?? 'main',
+          synthetic: true,
+          requestedModel:
+            typeof body.model === 'string' ? body.model : undefined,
+        })
+        return JSON.stringify(body)
+      } catch {
+        return bodyText
+      }
+    },
+    onResponse: ({ target, bodyText, status, data, receivedAt }) => {
+      const prepared = cacheKeepDiagnosticsRequests.get(target.id)
+      if (!prepared?.betasHash || !prepared.betas) {
+        cacheKeepDiagnosticsRequests.delete(target.id)
+        return
+      }
+      try {
+        const sentBody = JSON.parse(bodyText)
+        const diagnostics =
+          sentBody && typeof sentBody === 'object' && !Array.isArray(sentBody)
+            ? (sentBody as { diagnostics?: unknown }).diagnostics
+            : undefined
+        const previousMessageId =
+          diagnostics &&
+          typeof diagnostics === 'object' &&
+          !Array.isArray(diagnostics) &&
+          (diagnostics as { previous_message_id?: unknown })
+            .previous_message_id === prepared.previousMessageId
+            ? prepared.previousMessageId
+            : undefined
+        if (previousMessageId === undefined) return
+        observeCacheDiagnosticsMessage({
+          source: 'prewarm_cachekeep',
+          accountId: prepared.accountId,
+          synthetic: prepared.synthetic,
+          betasHash: prepared.betasHash,
+          betas: prepared.betas,
+          requestedModel: prepared.requestedModel,
+          request: {
+            ...prepared,
+            previousMessageId,
+            ttlSent: summarizeCacheTtl(sentBody),
+          },
+          trackSessionId: target.id,
+          status,
+          message: data,
+          receivedAt,
+        })
+      } catch {
+      } finally {
+        cacheKeepDiagnosticsRequests.delete(target.id)
+      }
     },
     prepareHeaders: async (headers, target) => {
       let accessToken: string | undefined
@@ -1292,6 +1596,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           ]),
         )
         if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
+        const prepared = cacheKeepDiagnosticsRequests.get(target.id)
+        if (prepared) {
+          const { betas, betasHash } = await getCacheDiagnosticsBetas(headers)
+          prepared.betas = betas
+          prepared.betasHash = betasHash
+        }
       } catch {
         setOAuthHeaders(headers, accessToken)
       }
@@ -1300,6 +1610,247 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
 
   const recoveryWarmChains = new Map<string, Promise<void>>()
+
+  // -- /claude-prime manager: direct OAuth request to start each account's
+  // five-hour quota window ~60s after reset, exactly once across concurrent
+  // OpenCode processes via atomic marker claim. In-process manager mirrors the
+  // cacheKeep singleton shape; cross-process exclusivity is the marker's job.
+
+  // Obtain a CURRENT main access token via the existing refresh path
+  // (M2). If the cached auth has no access or the token is expired, refresh
+  // first; only fail when the refresh path itself fails. Returns the live
+  // token so the fresh-check and the fire path use the same value.
+  async function getCurrentMainAccessToken(): Promise<string> {
+    if (!latestGetAuth) {
+      throw new Error('prime: main auth loader is not available')
+    }
+    const auth = await latestGetAuth()
+    if (auth.type !== 'oauth') {
+      throw new Error('prime: main account is not an OAuth account')
+    }
+    if (auth.access && (!auth.expires || auth.expires > Date.now())) {
+      return auth.access
+    }
+    if (!latestRefreshMainAccessToken) {
+      throw new Error('prime: main token refresh unavailable')
+    }
+    try {
+      return await latestRefreshMainAccessToken()
+    } catch (error) {
+      if (error instanceof Error) {
+        ;(
+          error as Error & { isPrimeTokenRefresh?: boolean }
+        ).isPrimeTokenRefresh = true
+      }
+      throw error
+    }
+  }
+
+  async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
+    const accessToken = await getCurrentMainAccessToken()
+    const result = await quotaManager.refreshMainWithMetadata(accessToken)
+    return { quota: result.quota, fresh: result.fetched }
+  }
+
+  async function refreshPrimeFallbackQuota(
+    accountId: string,
+  ): Promise<PrimeRefreshResult> {
+    const storage = await loadAccounts(accountStoragePath)
+    const account = storage?.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === accountId &&
+        candidate.enabled !== false &&
+        isOAuthAccount(candidate),
+    )
+    if (!account || !storage) {
+      throw new Error(`prime: OAuth account ${accountId} is unavailable`)
+    }
+    // Reuse the same fallback-manager refresh path used by the
+    // background quota refresh — it persists the refreshed quota to the
+    // state file (M1 persist requirement) and is the SINGLE usage-API
+    // call per tick for fallback fresh-checks. The redundant
+    // `quotaManager.refreshFallback` call was collapsed (R2).
+    const refreshed = await fallbackManager.refreshAccountQuota(
+      account,
+      storage,
+    )
+    await fallbackManager.save(storage, [accountId])
+    if (!refreshed.account.access) {
+      throw new Error(`prime: OAuth account ${accountId} has no access token`)
+    }
+    return {
+      quota: refreshed.account.quota ?? {},
+      fresh: refreshed.fetched,
+    }
+  }
+
+  async function sendPrime(
+    accountId: 'main' | string,
+  ): Promise<PrimeSendResult> {
+    const start = performance.now()
+    let accessToken: string | undefined
+    let resolvedModel: string | undefined
+    try {
+      if (accountId === 'main') {
+        // Use the same refresh path the fresh-check uses, so a missing or
+        // expired access token is refreshed BEFORE the request — not used
+        // as-is. The previous early-return-on-!auth.access made the
+        // refresh arm unreachable (M2).
+        try {
+          accessToken = await getCurrentMainAccessToken()
+        } catch (error) {
+          const isTokenRefresh =
+            error instanceof Error &&
+            (error as Error & { isPrimeTokenRefresh?: boolean })
+              .isPrimeTokenRefresh === true
+          return {
+            ok: false,
+            ...(isTokenRefresh && { reason: 'token-refresh' as const }),
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+        resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
+      } else {
+        const storage = await loadAccounts(accountStoragePath)
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === accountId &&
+            candidate.enabled !== false &&
+            isOAuthAccount(candidate),
+        )
+        if (!account || !storage) {
+          return {
+            ok: false,
+            error: `prime: OAuth account ${accountId} is unavailable`,
+          }
+        }
+        let current = account
+        try {
+          // R2: the fire path refreshes ONLY the token, not the quota.
+          // The fresh-check already performed the single usage-API
+          // call and persisted the result; the fire path reuses the
+          // in-memory quota via the headers / URL contract. This keeps
+          // the cycle at exactly one quota API call per account.
+          current = await fallbackManager.refreshAccount(account, storage)
+        } catch (error) {
+          return {
+            ok: false,
+            reason: 'token-refresh',
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+        accessToken = current.access
+        resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
+      }
+
+      if (!accessToken) {
+        return { ok: false, error: 'prime: no access token available' }
+      }
+
+      const primeBody = buildPrimeRequestBody()
+      const identity = await resolveClaudeCodeIdentity(
+        accessToken,
+        resolvedModel,
+      )
+      const body = await rewriteRequestBody(JSON.stringify(primeBody), {
+        identity,
+      })
+      const headers = new Headers({
+        'content-type': 'application/json',
+      })
+      setOAuthHeaders(headers, accessToken, {
+        body: JSON.parse(body),
+        identity,
+      })
+      headers.delete('content-length')
+      headers.delete('transfer-encoding')
+      // Route through rewriteUrl so the request inherits the canonical
+      // ?beta=true query param and ANTHROPIC_BASE_URL overrides like every
+      // other direct Anthropic call in this codebase. The URL is rendered
+      // back to a string here because the surrounding fetch wrapper and
+      // test mocks expect a string input.
+      const primeRequest = rewriteUrl(PRIME_MESSAGES_URL, { baseURL: '' })
+      const primeUrl =
+        primeRequest.url?.toString() ?? primeRequest.input.toString()
+      const response = await fetch(primeUrl, {
+        method: 'POST',
+        headers,
+        body,
+        signal: AbortSignal.timeout(30_000),
+      })
+      const ms = Math.round(performance.now() - start)
+      if (!response.ok) {
+        const reason =
+          (await response.text().catch(() => '')) || `HTTP ${response.status}`
+        return { ok: false, status: response.status, ms, error: reason }
+      }
+      const data = (await response.json().catch(() => null)) as Record<
+        string,
+        unknown
+      > | null
+      const usageRaw = data?.usage as
+        | { input_tokens?: number; output_tokens?: number }
+        | undefined
+      const usage =
+        usageRaw &&
+        (Number.isFinite(usageRaw.input_tokens) ||
+          Number.isFinite(usageRaw.output_tokens))
+          ? {
+              inputTokens: Number.isFinite(usageRaw.input_tokens)
+                ? usageRaw.input_tokens
+                : undefined,
+              outputTokens: Number.isFinite(usageRaw.output_tokens)
+                ? usageRaw.output_tokens
+                : undefined,
+            }
+          : undefined
+      return { ok: true, status: response.status, ms, ...(usage && { usage }) }
+    } catch (error) {
+      return {
+        ok: false,
+        ms: Math.round(performance.now() - start),
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+
+  const primeManagerOptions: PrimeManagerOptions = {
+    storagePath: accountStoragePath,
+    loadStorage: () => loadAccounts(accountStoragePath),
+    getAccountFingerprint: async (accountId) => {
+      let mainRefreshToken: string | undefined
+      if (accountId === 'main') {
+        try {
+          const auth = await latestGetAuth?.()
+          if (auth?.type === 'oauth') mainRefreshToken = auth.refresh
+        } catch {}
+      }
+      const authLineageId = await getOrCreatePrimeAuthLineageId(
+        accountId,
+        accountStoragePath,
+        mainRefreshToken,
+      )
+      return authLineageId ? tokenFingerprint(authLineageId) : undefined
+    },
+    refreshQuota: async (accountId) => {
+      if (accountId === 'main') return refreshPrimeMainQuota()
+      return refreshPrimeFallbackQuota(accountId)
+    },
+    sendPrime,
+    recordSuccess: (accountId, usage) =>
+      incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
+  }
+  const primeManager: PrimeManager = adoptPrimeManager(
+    accountStoragePath,
+    () => new PrimeManager(primeManagerOptions),
+    {
+      slot: ctx.directory ?? 'default',
+      rebind: (manager) => manager.updateOptions(primeManagerOptions),
+    },
+  )
+  if (isPrimePersistentlyEnabled(initialStorage)) {
+    primeManager.start()
+  }
 
   function warmRecoverySourceAfterOpus(context: FableRequestContext) {
     const sessionId = context.plan.sessionId
@@ -1384,7 +1935,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
   if (!process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL) {
-    setLogLevel(getPersistedLogLevel(initialStorage) ?? 'info')
+    // Trace unless the user pinned a level: the routing/retry/quota path is
+    // what goes wrong in the field, and reproducing it after the fact is far
+    // more expensive than writing it down. Output is buffered and rotated into
+    // a temp file, so leaving it on costs little.
+    setLogLevel(getPersistedLogLevel(initialStorage) ?? 'trace')
   }
 
   let rpcServer: RpcServerHandle | null = null
@@ -1550,6 +2105,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             : undefined,
         trackedSessions: aggregateCacheKeepSessions.length,
       },
+      // Prime section is omitted from the wire when the feature is disabled
+      // so the sidebar reads a clean `prime === undefined` and the expanded
+      // view renders nothing (declutter rule). Enabled writes include
+      // per-account status (next-due / last-primed / cumulative usage).
+      prime: isPrimePersistentlyEnabled(storage)
+        ? {
+            enabled: true,
+            accounts: primeManager.stats(storage),
+          }
+        : undefined,
       fableRecoveries:
         fableRecoveryNotices.size > 0
           ? [...fableRecoveryNotices.values()]
@@ -1653,6 +2218,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   let latestGetAuth: (() => Promise<ResolvedMainAnthropicAuth>) | null = null
   let sidebarMainQuotaRefreshInFlight = false
   let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
+  /**
+   * The background main-refresh tick, exposed for tests.
+   *
+   * Tests used to reach it as `intervalHandlers.at(-1)`, which silently broke
+   * as soon as anything registered an interval afterwards — the call then hit
+   * an unrelated timer and the refresh never ran. Naming it removes the
+   * dependency on registration order.
+   */
+  let mainBackgroundRefreshTick: (() => Promise<void>) | null = null
   // Per-process counter of replayable model requests. Drives the every-N
   // quota refresh cadence (quota.refreshEveryNRequests) for the active route.
   let sessionRequestCount = 0
@@ -1679,9 +2253,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (!storage?.refresh || !error?.tokenHash) return
     const tokenHash = hashRefreshToken(refreshToken)
     if (error.tokenHash === tokenHash) return
-    // Don't clear backoff if the error is still within its retry window —
-    // a new token (from another process) doesn't mean the rate limit is gone.
-    if (error.nextRetryAt && error.nextRetryAt > Date.now()) {
+    // Shared/transient backoffs can remain valid after another process rotates
+    // the token. A permanent invalid_grant is bound to the old refresh token,
+    // however: successful re-login must immediately make the new token usable.
+    if (
+      !isPermanentRefreshError(error) &&
+      error.nextRetryAt &&
+      error.nextRetryAt > Date.now()
+    ) {
       log(
         '[refresh] opencode main oauth keeping backoff despite token rotation',
         {
@@ -1778,7 +2357,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
-        writeSidebarState(updatedStorage, {
+        await writeSidebarState(updatedStorage, {
           activeId: lastSidebarRouting.activeId,
           route: lastSidebarRouting.route,
           mainAccessToken: auth.access,
@@ -1817,57 +2396,101 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       routingAuthoritative: false,
     })
 
-    if (!desktopText || isTuiConnected(notice.sessionId)) return
+    if (desktopText) queueDesktopNotice(notice.sessionId, desktopText)
+  }
+
+  function queueDesktopNotice(sessionId: string, text: string) {
+    if (isTuiConnected(sessionId)) return
     // OpenCode's prompt endpoints run revert cleanup before honoring noReply.
-    // Creating a notification while an assistant is still streaming can race the
-    // active run and enqueue an extra provider turn. Queue it until OpenCode
-    // publishes the assistant's completed message update or becomes idle, then
-    // place it directly before that assistant in ID order. The status probe below
-    // closes the race where both events precede a delayed cache warm/outcome.
-    const queue = pendingDesktopNotices.get(notice.sessionId) ?? []
-    queue.push(desktopText)
+    // OpenCode awaits event handlers before it evaluates the loop exit condition.
+    // Escape the post-idle session update, then probe outside that critical section.
+    const queue = pendingDesktopNotices.get(sessionId) ?? []
+    queue.push(text)
     if (queue.length > 4) queue.splice(0, queue.length - 4)
-    pendingDesktopNotices.delete(notice.sessionId)
-    pendingDesktopNotices.set(notice.sessionId, queue)
+    pendingDesktopNotices.delete(sessionId)
+    pendingDesktopNotices.set(sessionId, queue)
     while (pendingDesktopNotices.size > 128) {
       const oldest = pendingDesktopNotices.keys().next().value
       if (oldest) pendingDesktopNotices.delete(oldest)
       else break
     }
-    void flushDesktopNoticesIfIdle(notice.sessionId)
+    if (desktopNoticeSafeSessions.has(sessionId)) {
+      scheduleDesktopNoticeProbe(sessionId)
+    }
   }
 
-  async function flushDesktopNoticesIfIdle(sessionId: string): Promise<void> {
-    const session = ctx.client.session as PluginSessionClient | undefined
-    if (typeof session?.status !== 'function') return
-
-    try {
-      const response = await Promise.resolve(session.status())
-      const responseRecord =
-        response !== null && typeof response === 'object'
-          ? (response as Record<string, unknown>)
-          : undefined
-      const data =
-        responseRecord && Object.hasOwn(responseRecord, 'data')
-          ? responseRecord.data
-          : responseRecord
-      if (data === null || typeof data !== 'object' || Array.isArray(data))
-        return
-      const status = (data as Record<string, unknown>)[sessionId]
-      if (status === undefined) {
-        await flushDesktopNotices(sessionId)
-        return
-      }
-      if (
-        status !== null &&
-        typeof status === 'object' &&
-        (status as { type?: unknown }).type === 'idle'
-      ) {
-        await flushDesktopNotices(sessionId)
-      }
-    } catch {
-      // Event-driven flushing remains the compatibility path for older hosts.
+  function scheduleDesktopNoticeProbe(sessionId: string, attempt = 0) {
+    if (
+      !pendingDesktopNotices.has(sessionId) ||
+      desktopNoticeProbes.has(sessionId)
+    ) {
+      return
     }
+    desktopNoticeProbes.set(sessionId, attempt)
+    const run = () => {
+      if (desktopNoticeProbes.get(sessionId) !== attempt) return
+      desktopNoticeProbes.delete(sessionId)
+      void flushDesktopNoticesIfIdle(sessionId, attempt)
+    }
+    if (attempt === 0) {
+      setImmediate(run)
+    } else {
+      setTimeout(run, DESKTOP_NOTICE_PROBE_DELAY_MS * attempt)
+    }
+  }
+
+  function rearmDesktopNoticeProbe(sessionId: string, attempt: number) {
+    if (attempt + 1 < DESKTOP_NOTICE_PROBE_LIMIT) {
+      scheduleDesktopNoticeProbe(sessionId, attempt + 1)
+    }
+  }
+
+  async function flushDesktopNoticesIfIdle(sessionId: string, attempt: number) {
+    if (
+      !desktopNoticeSafeSessions.has(sessionId) ||
+      !pendingDesktopNotices.has(sessionId)
+    ) {
+      return
+    }
+    const session = ctx.client.session as PluginSessionClient | undefined
+    if (typeof session?.status === 'function') {
+      try {
+        const response = await Promise.resolve(session.status())
+        const responseRecord =
+          response !== null && typeof response === 'object'
+            ? (response as Record<string, unknown>)
+            : undefined
+        const data =
+          responseRecord && Object.hasOwn(responseRecord, 'data')
+            ? responseRecord.data
+            : responseRecord
+        if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+          rearmDesktopNoticeProbe(sessionId, attempt)
+          return
+        }
+        const status = (data as Record<string, unknown>)[sessionId]
+        // OpenCode 1.17 and 1.18 omit idle sessions from this map.
+        if (
+          status !== undefined &&
+          (!status ||
+            typeof status !== 'object' ||
+            (status as { type?: unknown }).type !== 'idle')
+        ) {
+          rearmDesktopNoticeProbe(sessionId, attempt)
+          return
+        }
+      } catch {
+        rearmDesktopNoticeProbe(sessionId, attempt)
+        return
+      }
+    }
+    // The status request is asynchronous. A new prompt can mark the session busy
+    // while that request is in flight, even if its response still reflects the
+    // preceding idle state. Never let that stale snapshot authorize insertion of
+    // an ignored user message into the active run: OpenCode can adopt it as the
+    // retry parent and dispatch the provider request again.
+    if (!desktopNoticeSafeSessions.has(sessionId)) return
+    await flushDesktopNotices(sessionId)
   }
 
   function flushDesktopNotices(sessionId: string): Promise<void> {
@@ -1877,16 +2500,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const flush = (async () => {
       while (true) {
         const queue = pendingDesktopNotices.get(sessionId)
-        const text = queue?.shift()
+        const text = queue?.[0]
         if (!text) {
           pendingDesktopNotices.delete(sessionId)
           return
         }
         try {
-          await sendIgnoredMessage(ctx, sessionId, text, {
+          const sent = await sendIgnoredMessage(ctx, sessionId, text, {
             noReply: true,
             beforeActiveAssistant: true,
+            canSend: () => desktopNoticeSafeSessions.has(sessionId),
           })
+          if (!sent) return
+          queue.shift()
         } catch (error) {
           logger.warn('fable-fallback', 'Desktop notification failed', {
             session: sessionId,
@@ -2109,6 +2735,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     return executeFastModeCommand({ argumentsText, enabled })
   }
 
+  async function executePersistentStartCommand(
+    argumentsText: string,
+    sessionId?: string,
+  ) {
+    const action = parseLaneStartCommandAction(argumentsText)
+    if (action.type === 'fire') {
+      if (!sessionId) {
+        return '## Claude Start Failed\n\n- OpenCode did not provide a session ID.'
+      }
+      try {
+        await fireLaneStart(ctx.client, sessionId)
+        return executeLaneStartCommand({ argumentsText }).text
+      } catch (error) {
+        return `## Claude Start Failed\n\n- ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+    return executeLaneStartCommand({ argumentsText }).text
+  }
+
   async function executePersistentRoutingCommand(
     argumentsText: string,
     sessionId?: string,
@@ -2143,6 +2788,61 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const storage = await loadAccounts(accountStoragePath)
     const level = getPersistedLogLevel(storage) ?? 'info'
     return executeLoggingCommand({ argumentsText, level })
+  }
+
+  async function executePersistentPrimeCommand(argumentsText: string) {
+    const action = parsePrimeCommandAction(argumentsText)
+    const previous = isPrimePersistentlyEnabled(
+      await loadAccounts(accountStoragePath),
+    )
+    let enabled = previous
+    if (action.type === 'enable') {
+      enabled = true
+      if (!previous) {
+        await setPrimePersistentEnabled(true, accountStoragePath)
+        primeManager.start()
+        logger.info('commands', 'prime changed', { enabled: true })
+      }
+    } else if (action.type === 'disable') {
+      enabled = false
+      if (previous) {
+        await setPrimePersistentEnabled(false, accountStoragePath)
+        primeManager.stop()
+        logger.info('commands', 'prime changed', { enabled: false })
+      }
+    }
+
+    // Publish the new prime section to the sidebar file (M7) so the
+    // expanded Prime row appears on `on` and disappears on `off` without
+    // waiting for the next quota refresh path. The post-mutation storage
+    // IS authoritative; we re-read it so the section payload reflects
+    // the freshly persisted flag.
+    if (action.type === 'enable' || action.type === 'disable') {
+      const reloaded = await loadAccounts(accountStoragePath)
+      if (reloaded && latestGetAuth) {
+        try {
+          const cmdAuth = await latestGetAuth().catch(() => undefined)
+          await writeSidebarState(reloaded, {
+            activeId: lastSidebarRouting.activeId,
+            route: lastSidebarRouting.route,
+            mainAccessToken: cmdAuth?.access,
+            mainRefreshToken: cmdAuth?.refresh,
+            routingAuthoritative: false,
+          })
+        } catch (error) {
+          logger.warn('sidebar', 'prime-toggle sidebar write failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+    }
+
+    const storage = await loadAccounts(accountStoragePath)
+    return executePrimeCommand({
+      argumentsText,
+      enabled,
+      accounts: primeManager.stats(storage),
+    }).text
   }
 
   async function executePersistentAccountCommand(
@@ -2376,6 +3076,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         const account: OAuthAccount = {
           id: randomUUID(),
           type: 'oauth' as const,
+          authLineageId: randomUUID(),
           label: action.label || undefined,
           access: result.access,
           refresh: result.refresh,
@@ -2507,6 +3208,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   ): Promise<OpenDialogPayload> {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
+    if (command === 'claude-start') {
+      const text = await executePersistentStartCommand(args, sessionId)
+      return {
+        command,
+        text,
+        knobs: {},
+      }
+    }
     if (command === 'claude-logging') {
       const text = await executePersistentLoggingCommand(args)
       const storage = await loadAccounts(accountStoragePath)
@@ -2570,6 +3279,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const storage = await loadAccounts(accountStoragePath)
       return { command, text, knobs: { window: getCacheKeepWindow(storage) } }
     }
+    if (command === 'claude-prime') {
+      const text = await executePersistentPrimeCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      const enabled = isPrimePersistentlyEnabled(storage)
+      return {
+        command,
+        text,
+        knobs: {
+          enabled,
+          accounts: primeManager.stats(storage),
+        },
+      }
+    }
+    if (command !== 'claude-killswitch') {
+      const unhandledCommand: never = command
+      throw new Error(`Unhandled command modal: ${unhandledCommand}`)
+    }
+
     const storage = await loadAccounts()
     const config = getKillswitchConfig(storage)
     const accountIds = (storage?.accounts ?? [])
@@ -2719,6 +3446,36 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   }
 
   return {
+    'chat.message': async (
+      {
+        sessionID,
+      }: {
+        sessionID: string
+      },
+      output: { message: { id: string }; parts: unknown[] },
+    ) => {
+      laneStartTracker.observeSyntheticMessage({
+        sessionId: sessionID,
+        messageId: output.message.id,
+        parts: output.parts,
+      })
+    },
+    'chat.headers': async (
+      {
+        sessionID,
+        message,
+      }: {
+        sessionID: string
+        message: { id: string }
+      },
+      output: { headers: Record<string, string> },
+    ) => {
+      laneStartTracker.markHeaders({
+        sessionId: sessionID,
+        messageId: message.id,
+        headers: output.headers,
+      })
+    },
     event: async ({ event }: { event: unknown }) => {
       const value = event as unknown as {
         type?: string
@@ -2727,9 +3484,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           info?: {
             id?: string
             sessionID?: string
-            role?: string
-            finish?: string
-            time?: { completed?: number }
           }
           status?: { type?: string }
         }
@@ -2741,23 +3495,36 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
       if (
         value.type === 'session.status' &&
-        value.properties?.status?.type === 'idle'
+        value.properties?.status?.type !== 'idle'
       ) {
-        await flushDesktopNotices(sessionId)
+        desktopNoticeSafeSessions.delete(sessionId)
       }
 
-      if (
-        value.type === 'message.updated' &&
-        info?.role === 'assistant' &&
-        info.finish !== 'tool-calls' &&
-        typeof info.time?.completed === 'number'
-      ) {
-        await flushDesktopNotices(sessionId)
+      if (value.type === 'session.idle') {
+        // Defer the prompt until after this event handler returns, then verify the
+        // live status map is still idle. OpenCode 1.18 no longer guarantees a
+        // session.updated event after session.idle, so that event cannot be used
+        // as the release signal.
+        desktopNoticeSafeSessions.add(sessionId)
+        while (desktopNoticeSafeSessions.size > 128) {
+          const oldest = desktopNoticeSafeSessions.values().next().value
+          if (oldest) desktopNoticeSafeSessions.delete(oldest)
+          else break
+        }
+        scheduleDesktopNoticeProbe(sessionId)
       }
 
       if (value.type === 'session.deleted') {
+        laneStartTracker.clearSession(sessionId)
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
+        desktopNoticeSafeSessions.delete(sessionId)
+        for (const recoveryKey of pendingRecoveryDesktopNotices.keys()) {
+          if (recoveryKey.startsWith(`${sessionId}\0`)) {
+            pendingRecoveryDesktopNotices.delete(recoveryKey)
+          }
+        }
+        desktopNoticeProbes.delete(sessionId)
       }
     },
     config: async (config: { command?: Record<string, unknown> }) => {
@@ -2777,6 +3544,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           template: CLAUDE_CACHE_KEEP_COMMAND_NAME,
           description:
             'Keep hybrid Claude cache warm always or during a local time window.',
+        },
+        [CLAUDE_PRIME_COMMAND_NAME]: {
+          template: CLAUDE_PRIME_COMMAND_NAME,
+          description:
+            "Start each OAuth account's five-hour quota window after reset.",
+        },
+        [CLAUDE_START_COMMAND_NAME]: {
+          template: CLAUDE_START_COMMAND_NAME,
+          description:
+            'Send a billed one-token synthetic turn to warm and renew the current Claude session cache.',
         },
 
         [CLAUDE_QUOTAS_COMMAND_NAME]: {
@@ -2849,18 +3626,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       arguments: string
       sessionID: string
     }) => {
-      const modalCommands: CommandModalName[] = [
-        'claude-account',
-        'claude-cache',
-        'claude-cachekeep',
-        'claude-quota',
-        'claude-dump',
-        'claude-fast',
-        'claude-routing',
-        'claude-killswitch',
-        'claude-logging',
-      ]
-      if (!modalCommands.includes(input.command as CommandModalName)) return
+      if (!COMMAND_MODAL_NAMES.includes(input.command as CommandModalName))
+        return
       const command = input.command as CommandModalName
       const payload = await buildDialogPayload(
         command,
@@ -2991,7 +3758,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   const deadline = Date.now() + CONCURRENT_MAIN_REFRESH_WAIT_MS
                   while (Date.now() < deadline) {
                     await new Promise((resolve) =>
-                      setTimeout(
+                      runtimeTimers.setTimeout(
                         resolve,
                         CONCURRENT_MAIN_REFRESH_POLL_BASE_MS +
                           jitterMs(CONCURRENT_MAIN_REFRESH_POLL_BASE_MS),
@@ -3007,6 +3774,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       changed &&
                       (!latest.expires || latest.expires > Date.now())
                     ) {
+                      if (previous.refresh && latest.refresh) {
+                        await continueMainPrimeAuthLineageAfterRefresh(
+                          {
+                            previousRefreshToken: previous.refresh,
+                            currentRefreshToken: latest.refresh,
+                          },
+                          accountStoragePath,
+                        )
+                      }
                       log(
                         '[refresh] opencode main oauth joined concurrent refresh',
                         {
@@ -3027,7 +3803,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   try {
                     if (attempt > 0) {
                       const delay = baseDelayMs * 2 ** (attempt - 1)
-                      await new Promise((resolve) => setTimeout(resolve, delay))
+                      await new Promise((resolve) =>
+                        runtimeTimers.setTimeout(resolve, delay),
+                      )
                     }
 
                     // Re-read auth to get the latest refresh token.
@@ -3159,6 +3937,14 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       maxRetries: 0,
                     })
 
+                    console.error(
+                      'DEBUG refresh: freshAuth.sharedAccountId=',
+                      freshAuth.sharedAccountId,
+                      'refreshFp=',
+                      freshAuth.refresh
+                        ? hashRefreshToken(freshAuth.refresh).slice(0, 8)
+                        : undefined,
+                    )
                     if (freshAuth.sharedAccountId) {
                       const persisted = await persistRefreshedSharedOAuth({
                         accountId: freshAuth.sharedAccountId,
@@ -3175,20 +3961,37 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       }
                     }
 
-                    // Mirror the canonical credential into OpenCode's built-in
-                    // auth store so native provider surfaces remain compatible.
-                    // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                    await (client as any).auth.set({
-                      path: {
-                        id: 'anthropic',
+                    await continueMainPrimeAuthLineageAfterRefresh(
+                      {
+                        previousRefreshToken: freshAuth.refresh,
+                        currentRefreshToken: refreshed.refresh,
                       },
-                      body: {
-                        type: 'oauth',
-                        refresh: refreshed.refresh,
-                        access: refreshed.access,
-                        expires: refreshed.expires,
-                      },
-                    })
+                      accountStoragePath,
+                    )
+
+                    try {
+                      // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
+                      await (client as any).auth.set({
+                        path: {
+                          id: 'anthropic',
+                        },
+                        body: {
+                          type: 'oauth',
+                          refresh: refreshed.refresh,
+                          access: refreshed.access,
+                          expires: refreshed.expires,
+                        },
+                      })
+                    } catch (error) {
+                      await continueMainPrimeAuthLineageAfterRefresh(
+                        {
+                          previousRefreshToken: refreshed.refresh,
+                          currentRefreshToken: freshAuth.refresh,
+                        },
+                        accountStoragePath,
+                      )
+                      throw error
+                    }
 
                     await updateMainRefreshState((storage) => {
                       if (!storage?.refresh) return
@@ -3289,15 +4092,41 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
           function startMainBackgroundRefresh() {
             if (mainBackgroundRefreshTimer) {
-              clearInterval(mainBackgroundRefreshTimer)
+              runtimeTimers.clearInterval(mainBackgroundRefreshTimer)
               mainBackgroundRefreshTimer = null
             }
 
             const run = async () => {
+              console.error('DEBUG run: entered')
               try {
                 const storage = await loadAccounts(accountStoragePath)
-                if (!mainRefreshEnabled(storage)) return
+                console.error('DEBUG run: storage loaded')
+                if (!mainRefreshEnabled(storage)) {
+                  console.error('DEBUG run: refresh disabled')
+                  return
+                }
                 const latestAuth = await getAuth()
+                console.error(
+                  'DEBUG run latestAuth:',
+                  JSON.stringify({
+                    type: latestAuth.type,
+                    // Fingerprints, not the tokens themselves: these lines are
+                    // committed, and a debug print is not worth putting a live
+                    // credential into anyone's terminal scrollback or CI log.
+                    accessFp: (latestAuth as any).access
+                      ? hashRefreshToken((latestAuth as any).access).slice(0, 8)
+                      : undefined,
+                    refreshFp: (latestAuth as any).refresh
+                      ? hashRefreshToken((latestAuth as any).refresh).slice(
+                          0,
+                          8,
+                        )
+                      : undefined,
+                    expires: (latestAuth as any).expires,
+                    expiresInMs:
+                      ((latestAuth as any).expires ?? 0) - Date.now(),
+                  }),
+                )
                 if (latestAuth.type !== 'oauth') return
                 await clearStaleMainRefreshError(latestAuth.refresh)
                 if (!latestAuth.expires) return
@@ -3348,6 +4177,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     : undefined,
                 })
               } catch (error) {
+                console.error(
+                  'DEBUG run threw:',
+                  error instanceof Error
+                    ? `${error.message}\n${error.stack}`
+                    : String(error),
+                )
                 logger.warn('refresh', 'opencode main oauth refresh failed', {
                   message:
                     error instanceof Error ? error.message : String(error),
@@ -3355,7 +4190,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
             }
 
-            mainBackgroundRefreshTimer = setInterval(() => {
+            mainBackgroundRefreshTick = run
+            console.error('DEBUG registering mainBackgroundRefreshTimer')
+            mainBackgroundRefreshTimer = runtimeTimers.setInterval(() => {
+              console.error('DEBUG mainRefresh interval handler invoked')
               void run()
             }, MAIN_AUTH_REFRESH_TICK_MS +
               jitterMs(MAIN_AUTH_REFRESH_TICK_JITTER_MS))
@@ -3521,12 +4359,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 rateLimited,
                 overloaded: !rateLimited,
               })
+              const inspectedResponse = new Response(stream, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+              })
+              copyCacheDiagnosticsContext(
+                cacheDiagnosticsResponses,
+                response,
+                inspectedResponse,
+              )
               return {
-                response: new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers,
-                }),
+                response: inspectedResponse,
                 rateLimited,
                 overloaded: !rateLimited,
               }
@@ -3555,12 +4399,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               rateLimited: false,
               overloaded: false,
             })
+            const inspectedResponse = new Response(stream, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            })
+            copyCacheDiagnosticsContext(
+              cacheDiagnosticsResponses,
+              response,
+              inspectedResponse,
+            )
             return {
-              response: new Response(stream, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers,
-              }),
+              response: inspectedResponse,
               rateLimited: false,
               overloaded: false,
             }
@@ -3606,6 +4456,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
             let body = init?.body
+            let streaming = false
+            let dump: DumpHandle | null = null
 
             const originalBytes =
               typeof body === 'string' ? body.length : undefined
@@ -3635,6 +4487,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               if (apiBetas) requestHeaders.set('anthropic-beta', apiBetas)
               else requestHeaders.delete('anthropic-beta')
               if (fastModeRequested) addFastModeBetaHeader(requestHeaders)
+              try {
+                streaming = JSON.parse(body).stream === true
+              } catch {}
               trace?.mark('rewrite_body', {
                 route,
                 ms: roundMs(nowMs() - rewriteStart),
@@ -3649,6 +4504,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               configureApiRouteHeaders(requestHeaders, account)
             }
 
+            const cacheDiagnosticsBetas =
+              await getCacheDiagnosticsBetas(requestHeaders)
             const rewritten = rewriteUrl(input, { baseURL: account.baseURL })
             const sendStart = nowMs()
             let response: Response
@@ -3675,7 +4532,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               throw error
             }
             if (typeof body === 'string') {
-              await dumpDirectRequest({
+              dump = await dumpDirectRequest({
                 affinity: directAffinity,
                 route,
                 status: response.status,
@@ -3686,6 +4543,16 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 headers: requestHeaders,
               })
             }
+            attachCacheDiagnosticsResponse(response, {
+              source: 'turn',
+              accountId: account.id,
+              synthetic: false,
+              ...cacheDiagnosticsBetas,
+              requestedModel: parseRequestModel(body),
+              dump,
+              status: response.status,
+              streaming,
+            })
             trace?.mark('send_headers_received', {
               route,
               ms: roundMs(nowMs() - sendStart),
@@ -3706,6 +4573,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
             oauthAccountId = 'main',
             fableRequest?: FableRequestContext,
+            laneStartRequest = false,
           ) {
             const start = nowMs()
             let requestStorage = currentStorage
@@ -3734,6 +4602,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
             let body = init?.body
+            const previousDiagnosticsMessage = relayAffinity
+              ? cacheDiagnosticsTracker.previousFor(relayAffinity)
+              : null
+            const cacheDiagnosticsPreviousMessageId =
+              previousDiagnosticsMessage?.messageId ?? null
+            let cacheDiagnosticsRequest:
+              | CacheDiagnosticsRequestContext
+              | undefined
+            let streaming = false
+            let directDump: DumpHandle | null = null
+            let relayDump: DumpHandle | null = null
             let modelForIdentity: string | undefined
             if (body && typeof body === 'string') {
               const modelParseStart = nowMs()
@@ -3788,6 +4667,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 hybridStandbyAnchor: standbyCacheAnchor,
                 serverSideFallbackEnabled: fallbackMode === 'server',
                 isSubagent: subagentRequest,
+                laneStart: laneStartRequest,
+                cacheDiagnosticsPreviousMessageId,
                 perf: (stage, data) => {
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data })
                   if (
@@ -3820,11 +4701,43 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
               const headerBodyParseStart = nowMs()
               try {
+                const finalBody = JSON.parse(body) as Record<string, unknown>
                 setOAuthHeaders(requestHeaders, accessToken, {
-                  body: JSON.parse(body),
+                  body: finalBody,
                   identity,
                   agentId,
                 })
+                const diagnostics = finalBody.diagnostics
+                const sentPreviousMessageId =
+                  diagnostics &&
+                  typeof diagnostics === 'object' &&
+                  !Array.isArray(diagnostics) &&
+                  (diagnostics as { previous_message_id?: unknown })
+                    .previous_message_id === cacheDiagnosticsPreviousMessageId
+                    ? cacheDiagnosticsPreviousMessageId
+                    : undefined
+                if (
+                  sentPreviousMessageId !== undefined &&
+                  requestHeaders
+                    .get('anthropic-beta')
+                    ?.split(',')
+                    .map((beta) => beta.trim())
+                    .includes(CACHE_DIAGNOSTICS_BETA)
+                ) {
+                  cacheDiagnosticsRequest = {
+                    sessionId: relayAffinity ?? 'session-unknown',
+                    previousMessageId: sentPreviousMessageId,
+                    ...(previousDiagnosticsMessage
+                      ? {
+                          previousMessageReceivedAt:
+                            previousDiagnosticsMessage.receivedAt,
+                        }
+                      : {}),
+                    isSubagent: subagentRequest,
+                    ttlSent: summarizeCacheTtl(finalBody),
+                  }
+                }
+                streaming = finalBody.stream === true
                 trace?.mark('set_oauth_headers_body_parse', {
                   route,
                   ms: roundMs(nowMs() - headerBodyParseStart),
@@ -3856,6 +4769,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               })
             }
 
+            const cacheDiagnosticsBetas =
+              await getCacheDiagnosticsBetas(requestHeaders)
             const rewritten = rewriteUrl(input)
             if (fableRequest && typeof body === 'string') {
               fableRequest.warmTarget = {
@@ -3881,6 +4796,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   storage,
                   cacheMode: 'hybrid',
                   oauthAccountId,
+                  isSubagent: subagentRequest,
                 })
                 trace?.mark('cachekeep_track', {
                   session: relayAffinity,
@@ -3903,7 +4819,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
                 })
                 if (typeof body === 'string') {
-                  await dumpDirectRequest({
+                  directDump = await dumpDirectRequest({
                     affinity: relayAffinity,
                     route,
                     status: response.status,
@@ -3913,6 +4829,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       fetchInputUrl(rewritten.input),
                     method: fetchMethod(input, init),
                     headers: requestHeaders,
+                    tag: laneStartRequest ? 'start' : undefined,
                   })
                 }
                 return response
@@ -3928,6 +4845,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       fetchInputUrl(rewritten.input),
                     method: fetchMethod(input, init),
                     headers: requestHeaders,
+                    tag: laneStartRequest ? 'start' : undefined,
                   })
                 }
                 throw error
@@ -3951,6 +4869,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               optimisticResponse: relayConfig?.transport === 'websocket',
               onResponseHeaders: (headers) =>
                 harvestQuotaHeaders(headers, served),
+              onDumpCreated: (handle) => {
+                relayDump = handle
+              },
+              dumpTag: laneStartRequest ? 'start' : undefined,
             })
             trace?.mark('send_headers_received', {
               route,
@@ -3961,6 +4883,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             })
 
             if (usedDirectFetch) harvestQuotaHeaders(response.headers, served)
+            attachCacheDiagnosticsResponse(response, {
+              source: laneStartRequest ? 'start' : 'turn',
+              accountId: oauthAccountId,
+              synthetic: laneStartRequest,
+              ...cacheDiagnosticsBetas,
+              requestedModel: parseRequestModel(body),
+              request: cacheDiagnosticsRequest,
+              trackSessionId: relayAffinity ?? undefined,
+              dump: usedDirectFetch ? directDump : relayDump,
+              status: response.status,
+              streaming,
+            })
             return response
           }
 
@@ -4222,38 +5156,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             }
           }
 
-          async function withStickyRetryAfter(
-            response: Response,
-            sessionId: string,
-            retryAfterSeconds: number,
-            streamingRateLimit = false,
-          ) {
-            const headers = new Headers(response.headers)
-            headers.set(
-              'retry-after',
-              String(stickyRetryAfterWithJitter(sessionId, retryAfterSeconds)),
-            )
-            if (streamingRateLimit) {
-              await response.body?.cancel().catch(() => {})
-              headers.set('content-type', 'application/json')
-              return new Response(
-                JSON.stringify({
-                  type: 'error',
-                  error: {
-                    type: 'rate_limit_error',
-                    message:
-                      'Sticky OAuth account five-hour quota resets shortly; retaining session affinity.',
-                  },
-                }),
-                { status: 429, headers },
-              )
-            }
-            return new Response(response.body, {
-              status: response.status,
-              statusText: response.statusText,
-              headers,
-            })
-          }
+          const responseRouteKinds = new WeakMap<Response, 'oauth' | 'api'>()
 
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
@@ -4269,6 +5172,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 access?: string
               }) => void | Promise<void>
               fableRequest?: FableRequestContext
+              laneStartRequest?: boolean
             },
           ) {
             if (!accounts.length) return currentResponse ?? null
@@ -4302,6 +5206,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   storage,
                   account.id,
                   options?.fableRequest,
+                  options?.laneStartRequest,
                 )
               }
               lastResponse = response
@@ -4316,6 +5221,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 fallbackAgain = inspected.rateLimited
               }
               if (!fallbackAgain) {
+                responseRouteKinds.set(
+                  response,
+                  isApiKeyAccount(account) ? 'api' : 'oauth',
+                )
                 await fallbackManager.markUsed(account)
                 await options?.onSuccess?.(account)
                 // Active-route every-N refresh: this fallback just served the
@@ -4355,6 +5264,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             }) => void,
             modelId?: string,
             fableRequest?: FableRequestContext,
+            laneStartRequest = false,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
@@ -4463,6 +5373,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 {
                   onSuccess: onFallbackSuccess,
                   fableRequest,
+                  laneStartRequest,
                 },
               )) ?? currentResponse
             )
@@ -4472,6 +5383,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
               const incomingHeaders = mergeHeaders(input, init)
+              const laneStartRequest =
+                incomingHeaders.get(LANE_START_REQUEST_HEADER) === '1'
+              incomingHeaders.delete(LANE_START_REQUEST_HEADER)
+              init = { ...init, headers: incomingHeaders }
               const sessionId =
                 incomingHeaders.get('x-session-affinity') ||
                 incomingHeaders.get('x-opencode-session')
@@ -4505,9 +5420,28 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     ? initialBody.length
                     : undefined,
               })
-              const wrapResponse = (response: Response) =>
-                createStrippedStream(response, {
+              const wrapResponse = (response: Response) => {
+                const diagnosticsContext =
+                  cacheDiagnosticsResponses.get(response)
+                return createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
+                  laneStart: laneStartRequest,
+                  laneStartOAuthServed:
+                    responseRouteKinds.get(response) !== 'api',
+                  ...(diagnosticsContext
+                    ? diagnosticsContext.streaming
+                      ? {
+                          onMessageStart: (message) =>
+                            observeCacheDiagnosticsResponse(response, message),
+                          onStreamEnd: () => diagnosticsContext.dumpWrite,
+                        }
+                      : {
+                          onMessageResponse: (message) =>
+                            observeCacheDiagnosticsResponse(response, message),
+                          onStreamEnd: () => diagnosticsContext.dumpWrite,
+                          responseMode: 'json' as const,
+                        }
+                    : {}),
                   contentFilterModel: fablePlan?.requestedModel,
                   ...(!fablePlan?.downgraded && fablePlan
                     ? {
@@ -4524,6 +5458,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             fablePlan,
                             fableRequest.warmTarget.oauthAccountId,
                           )
+                          pendingRecoveryDesktopNotices.delete(
+                            fablePlan.recoveryKey,
+                          )
+                          pendingRecoveryDesktopNotices.set(
+                            fablePlan.recoveryKey,
+                            buildSwitchedToOpusNotice(fablePlan.requestedModel),
+                          )
+                          while (pendingRecoveryDesktopNotices.size > 128) {
+                            const oldest = pendingRecoveryDesktopNotices
+                              .keys()
+                              .next().value
+                            if (oldest)
+                              pendingRecoveryDesktopNotices.delete(oldest)
+                            else break
+                          }
                           serverFallbackTargets.delete(fablePlan.recoveryKey)
                           logger.info(
                             'fable-fallback',
@@ -4545,7 +5494,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             },
                             storage,
                             auth,
-                            buildSwitchedToOpusNotice(fablePlan.requestedModel),
                           )
                         },
                       }
@@ -4564,6 +5512,25 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             fableRequest.opusCacheAnchor,
                           )
                           if (!completed.counted) return
+                          const recoveryDesktopText =
+                            pendingRecoveryDesktopNotices.get(
+                              fablePlan.recoveryKey,
+                            )
+                          if (recoveryDesktopText) {
+                            pendingRecoveryDesktopNotices.delete(
+                              fablePlan.recoveryKey,
+                            )
+                            // Ignore any transient idle event emitted between the
+                            // refused source response and OpenCode's Opus retry.
+                            // Queue only after that retry has completed successfully.
+                            desktopNoticeSafeSessions.delete(
+                              fablePlan.sessionId,
+                            )
+                            queueDesktopNotice(
+                              fablePlan.sessionId,
+                              recoveryDesktopText,
+                            )
+                          }
                           logger.info(
                             'fable-fallback',
                             'Opus 4.8 turn completed',
@@ -4627,6 +5594,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       }
                     : {}),
                 })
+              }
               const authStart = nowMs()
               const auth = await getAuth()
               trace.mark('get_auth', {
@@ -4743,8 +5711,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       preferredAccountId,
                       excludeAccountIds,
                     })
+                  const mainPermanentlyUnavailable = isPermanentRefreshError(
+                    stickyRoutes.storage?.refresh?.mainLastRefreshError,
+                  )
                   const incompleteQuotaPool =
-                    stickyRoutes.allRoutes.length === 0 ||
+                    (stickyRoutes.allRoutes.length === 0 &&
+                      !mainPermanentlyUnavailable) ||
                     stickyRoutes.allRoutes.some(
                       (candidate) =>
                         !candidate.quota ||
@@ -4760,6 +5732,23 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     throw new Error(
                       'Sticky-balanced routing is waiting for current OAuth quota snapshots',
                     )
+                  }
+                  if (!resolution) {
+                    const response = createStickyNoRouteResponse({
+                      mainRefreshError:
+                        stickyRoutes.storage?.refresh?.mainLastRefreshError,
+                      fallbackReauthLabels: getFallbackReauthLabels(
+                        stickyRoutes.storage,
+                      ),
+                      routeQuotas: stickyRoutes.allRoutes.flatMap((route) =>
+                        route.quota ? [route.quota] : [],
+                      ),
+                      modelId: routingModelId,
+                    })
+                    trace.done('return_sticky_no_route', {
+                      status: response.status,
+                    })
+                    return response
                   }
                   let route = stickyRoutes.allRoutes.find(
                     (candidate) => candidate.id === resolution?.accountId,
@@ -4789,6 +5778,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         stickyRoutes.storage,
                         selected.id,
                         fableRequest,
+                        laneStartRequest,
                       )
                     const completeRoute = async (
                       selected: StickyOAuthRoute,
@@ -4861,6 +5851,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                           ),
                           sessionId,
                           proactiveQuotaDecision.retryAfterSeconds,
+                          false,
+                          cacheDiagnosticsResponses,
                         ),
                         false,
                       )
@@ -4955,6 +5947,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             sessionId,
                             decision.retryAfterSeconds,
                             inspected.streamingRateLimit,
+                            cacheDiagnosticsResponses,
                           ),
                         )
                       }
@@ -5018,6 +6011,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                                   'sticky-balanced',
                                 ),
                               fableRequest,
+                              laneStartRequest,
                             },
                           )
                           if (apiResponse) {
@@ -5076,6 +6070,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       onSuccess: (account) =>
                         writeCurrentSidebarState(account.id, 'fallback-first'),
                       fableRequest,
+                      laneStartRequest,
                     },
                   )
                   if (fallbackResponse) {
@@ -5275,6 +6270,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         onSuccess: (account) =>
                           writeCurrentSidebarState(account.id, 'fallback'),
                         fableRequest,
+                        laneStartRequest,
                       },
                     )
                     if (fallbackResponse) {
@@ -5418,6 +6414,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       // is wrong once the killswitch hands off to a fallback.
                       onSuccess: (account) =>
                         writeCurrentSidebarState(account.id, 'fallback'),
+                      laneStartRequest,
                     },
                   )
                   // The killswitch is a HARD block: it must never fall through to
@@ -5487,6 +6484,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 storage,
                 'main',
                 fableRequest,
+                laneStartRequest,
               )
               let fallbackServed = false
               const response = await tryFallbackAccounts(
@@ -5503,6 +6501,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 },
                 requestModelId,
                 fableRequest,
+                laneStartRequest,
               )
               if (!fallbackServed) writeCurrentSidebarState('main', 'main')
 
@@ -5595,6 +6594,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         },
       ],
     },
+    __primeManager: primeManager,
+    __quotaManager: quotaManager,
+    __mainBackgroundRefreshTick: () => mainBackgroundRefreshTick?.(),
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }
+
+export const AnthropicAuthPlugin: Plugin = anthropicAuthPlugin

@@ -118,6 +118,80 @@ describe('QuotaManager', () => {
   })
 
   describe('backoff', () => {
+    test('fallback refresh metadata distinguishes cached backoff from a network fetch', async () => {
+      let fetchCalls = 0
+      const fetchMock = mock(() => {
+        fetchCalls += 1
+        if (fetchCalls === 1) {
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(makeQuotaResponse(now))
+      }) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+      const cachedQuota = {
+        five_hour: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          checkedAt: now,
+        },
+      }
+      qm.setFallback(
+        'fallback-1',
+        { quota: cachedQuota, refreshAfter: now, checkedAt: now },
+        'fallback-token',
+      )
+
+      await expect(
+        qm.refreshFallback('fallback-1', 'fallback-token'),
+      ).rejects.toThrow('429')
+      const cached = await qm.refreshFallbackWithMetadata(
+        'fallback-1',
+        'fallback-token',
+      )
+      expect(cached).toEqual({ quota: cachedQuota, fetched: false })
+
+      now += 61_000
+      const fetched = await qm.refreshFallbackWithMetadata(
+        'fallback-1',
+        'fallback-token',
+      )
+      expect(fetched.fetched).toBe(true)
+      expect(fetchCalls).toBe(2)
+    })
+
+    test('main refresh metadata also distinguishes cached backoff from a network fetch', async () => {
+      let fetchCalls = 0
+      const fetchMock = mock(() => {
+        fetchCalls += 1
+        if (fetchCalls === 1) {
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(makeQuotaResponse(now))
+      }) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+      const cachedQuota = {
+        five_hour: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          checkedAt: now,
+        },
+      }
+      qm.setMain('main-token', {
+        quota: cachedQuota,
+        refreshAfter: now,
+        checkedAt: now,
+      })
+
+      await expect(qm.refreshMain('main-token')).rejects.toThrow('429')
+      const cached = await qm.refreshMainWithMetadata('main-token')
+      expect(cached).toEqual({ quota: cachedQuota, fetched: false })
+
+      now += 61_000
+      const fetched = await qm.refreshMainWithMetadata('main-token')
+      expect(fetched.fetched).toBe(true)
+      expect(fetchCalls).toBe(2)
+    })
+
     test('first 429 backs off for 60s', async () => {
       const fetchMock = mock(() =>
         Promise.resolve(new Response('rate limited', { status: 429 })),
@@ -532,6 +606,46 @@ describe('QuotaManager', () => {
 
       expect(qm.getFallback('fallback-1', 'old-fallback-token')).not.toBeNull()
       expect(qm.getFallback('fallback-1', 'new-fallback-token')).toBeNull()
+    })
+
+    test('seedFallbacksFromAccounts preserves freshness for scoped-only quota', () => {
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: { checkIntervalMinutes: 5 },
+        },
+        now: () => 1_000_000,
+      })
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'scoped-only',
+          type: 'oauth',
+          access: 'fallback-token',
+          refresh: 'refresh-token',
+          expires: 2_000_000,
+          quota: {
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 10,
+                remainingPercent: 90,
+                checkedAt: 999_000,
+              },
+            ],
+          },
+        },
+      ])
+
+      expect(qm.getFallback('scoped-only', 'fallback-token')?.checkedAt).toBe(
+        999_000,
+      )
+      expect(
+        qm.isFallbackStale('scoped-only', 'fallback-token', 'claude-fable-5'),
+      ).toBe(false)
     })
 
     test('seedFallbacksFromAccounts updates older in-memory quota from disk', () => {

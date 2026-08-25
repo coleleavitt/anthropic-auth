@@ -4,12 +4,17 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  classifyRetry,
+  createEmptyStorage,
+  createStickyNoRouteResponse,
+  DEFAULT_MAX_RETRIES,
   decideStickyQuotaFailure,
   dumpDirectRequest,
   FAST_MODE_BETA,
   FallbackAccountManager,
   getCache1hPersistentMode,
   getDefaultCacheKeepRegistryDirectory,
+  getFallbackReauthLabels,
   getRelayConfig,
   getRoutingMode,
   getStickyRoutingStatePath,
@@ -24,13 +29,19 @@ import {
   isValidApiBaseURL,
   killswitchPassesPolicy,
   loadAccounts,
+  loadSharedAccountStore,
+  logger,
+  materializeSharedFallbackAccounts,
   mergeAnthropicBetas,
+  nextRetryDelayMs,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  pickSharedAccount,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  recordSharedAccountQuota,
   resolveClaudeCodeIdentity,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
@@ -193,7 +204,10 @@ function mapStopReason(reason: string | null | undefined): StopReason {
 function describeStopReasonFailure(reason: string): string {
   switch (reason) {
     case 'refusal':
-      return 'Anthropic refused this request (stop_reason: refusal). Rephrase the request or try a different model.'
+      // A >200k request on a 1M-capable model returns exactly this when
+      // `context-1m-2025-08-07` is missing — HTTP 200, no content, input
+      // billed in full. With the beta present, 510k answers normally.
+      return 'Anthropic refused this request (stop_reason: refusal). Common causes: a context over 200k without the 1M beta, or content the model declined. Note the input is billed even though no output was produced.'
     case 'model_context_window_exceeded':
       return 'Anthropic stopped early: the request exceeded the model context window (stop_reason: model_context_window_exceeded). Compact or split the conversation.'
     default:
@@ -387,8 +401,24 @@ async function sendAnthropicRequest(options: {
   })
 
   const directFetch = async () => {
+    const startedAt = Date.now()
+    logger.debug('pi.send', 'direct fetch start', {
+      url: input.toString(),
+      route: options.route ?? (options.apiAccount ? 'api' : 'oauth'),
+      oauthAccountId: options.oauthAccountId,
+      bodyBytes: bodyText.length,
+      betas: headers.get('anthropic-beta'),
+    })
     try {
       const response = await fetch(input, init)
+      logger.debug('pi.send', 'direct fetch done', {
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        unifiedStatus: response.headers.get(
+          'anthropic-ratelimit-unified-status',
+        ),
+        retryAfter: response.headers.get('retry-after'),
+      })
       await dumpDirectRequest({
         affinity: relayAffinity,
         route:
@@ -402,6 +432,10 @@ async function sendAnthropicRequest(options: {
       })
       return response
     } catch (error) {
+      logger.warn('pi.send', 'direct fetch threw', {
+        durationMs: Date.now() - startedAt,
+        error: errorText(error),
+      })
       await dumpDirectRequest({
         affinity: relayAffinity,
         route:
@@ -467,6 +501,61 @@ async function firstStreamingError(
   return response
 }
 
+/**
+ * Pi's routing view of the accounts: its own config file plus every account in
+ * the machine-wide shared store.
+ *
+ * Pi takes its primary credential from the shared store but used to read its
+ * fallback list only from `~/.pi/agent/anthropic-auth.json`. That file is
+ * written by `pi` account commands and is simply absent on a machine that
+ * logged in through another tool, so `loadAccounts` returned null and the
+ * router had nothing to rotate to — every 429 became fatal even with several
+ * healthy logins on disk.
+ */
+async function loadRoutingStorage(storagePath: string) {
+  logger.trace('pi.route', 'loadRoutingStorage: start', { storagePath })
+  const storage = await loadAccounts(storagePath)
+  logger.trace('pi.route', 'loadRoutingStorage: sidecar read', {
+    present: storage !== null,
+    sidecarAccounts: storage?.accounts?.length ?? 0,
+  })
+  const loaded = await loadSharedAccountStore().catch((error) => {
+    logger.warn('pi.route', 'shared account store unreadable', {
+      error: errorText(error),
+    })
+    return null
+  })
+  logger.trace('pi.route', 'loadRoutingStorage: shared store read', {
+    source: loaded?.source.type,
+    sharedAccounts: loaded?.store.accounts.length ?? 0,
+  })
+  if (!loaded?.store.accounts.length) {
+    logger.debug('pi.route', 'no shared accounts; using sidecar only')
+    return { storage, mainAccountId: undefined }
+  }
+
+  // The account the shared store would select is the one this request runs as,
+  // so quota observed on the request path belongs to it.
+  const mainAccountId = pickSharedAccount(loaded.store)?.id
+  logger.debug('pi.route', 'shared main selected', {
+    mainAccountId: mainAccountId ?? '(none available)',
+    pinned: loaded.store.current ?? '(unpinned)',
+  })
+  const accounts = materializeSharedFallbackAccounts(
+    storage?.accounts ?? [],
+    loaded.store,
+  )
+  logger.debug('pi.route', 'routing pool built', {
+    fallbacks: accounts.length,
+    ids: accounts.map((account) => account.id),
+  })
+  if (!accounts.length) return { storage, mainAccountId }
+  return {
+    storage: { ...(storage ?? createEmptyStorage()), accounts },
+    mainAccountId,
+  }
+}
+
 async function executeWithFallback(options: {
   model: Model<Api>
   context: Context
@@ -474,7 +563,8 @@ async function executeWithFallback(options: {
   primaryAccessToken: string
   storagePath: string
 }): Promise<Response> {
-  const storage = await loadAccounts(options.storagePath)
+  const { storage, mainAccountId: sharedMainAccountId } =
+    await loadRoutingStorage(options.storagePath)
   const { quotaManager, fallbackManager: manager } = getPiRoutingServices(
     options.storagePath,
     storage,
@@ -605,9 +695,37 @@ async function executeWithFallback(options: {
     return { allRoutes, candidates, retainAccountIds }
   }
 
+  /**
+   * Persist a quota reading against the shared account it describes.
+   *
+   * Selection can only rotate off an exhausted account if something writes the
+   * utilisation down; the probe happens on the request path, so this is where
+   * the observation exists. Failures are swallowed: a routing decision must not
+   * depend on a bookkeeping write.
+   */
+  async function recordQuotaObservation(
+    accountId: string | undefined,
+    quota: OAuthQuotaSnapshot | undefined,
+  ) {
+    if (!accountId || !quota) return
+    const fiveHour = quota.five_hour?.usedPercent
+    const sevenDay = quota.seven_day?.usedPercent
+    if (fiveHour === undefined && sevenDay === undefined) return
+    logger.info('pi.quota', 'recording quota observation', {
+      accountId,
+      fiveHourPercent: fiveHour,
+      sevenDayPercent: sevenDay,
+    })
+    await recordSharedAccountQuota(accountId, {
+      ...(fiveHour !== undefined ? { fiveHourPercent: fiveHour } : {}),
+      ...(sevenDay !== undefined ? { sevenDayPercent: sevenDay } : {}),
+    }).catch(() => {})
+  }
+
   async function primaryQuotaRefreshConfirmsExhausted() {
     try {
       const quota = await quotaManager.refreshMain(options.primaryAccessToken)
+      await recordQuotaObservation(sharedMainAccountId, quota)
       const entry = quotaManager.getMain(options.primaryAccessToken)
       return Boolean(
         entry &&
@@ -653,8 +771,19 @@ async function executeWithFallback(options: {
   async function tryFallbackAccounts(
     routeOptions: { includeApiRoutes?: boolean; apiOnly?: boolean } = {},
   ) {
+    logger.debug('pi.route', 'tryFallbackAccounts: start', {
+      apiOnly: routeOptions.apiOnly === true,
+      includeApiRoutes: routeOptions.includeApiRoutes === true,
+      configured: storage?.accounts?.length ?? 0,
+    })
+    const usableStartedAt = Date.now()
     const usableOAuth = await manager.getUsableFallbackAccounts(storage, {
       modelId: options.model.id,
+    })
+    logger.debug('pi.route', 'usable fallbacks resolved', {
+      usable: usableOAuth.length,
+      ids: usableOAuth.map((account) => account.id),
+      durationMs: Date.now() - usableStartedAt,
     })
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
@@ -684,13 +813,25 @@ async function executeWithFallback(options: {
           apiAccount: account,
         })
       }
-      if (!response) continue
+      if (!response) {
+        logger.trace('pi.route', 'fallback candidate skipped', {
+          id: configured.id,
+        })
+        continue
+      }
 
       const preflight = await firstStreamingError(response)
       if (preflight instanceof Response && preflight.ok) {
+        logger.info('pi.route', 'fallback served the request', {
+          id: account.id,
+        })
         await manager.markUsed(account)
         return preflight
       }
+      logger.debug('pi.route', 'fallback attempt failed', {
+        id: account.id,
+        status: preflight instanceof Response ? preflight.status : 'sse-error',
+      })
       if (
         preflight instanceof Response &&
         !shouldFallbackStatus(preflight.status, storage)
@@ -699,6 +840,7 @@ async function executeWithFallback(options: {
       }
       await response.body?.cancel().catch(() => {})
     }
+    logger.debug('pi.route', 'no fallback could serve the request')
     return null
   }
 
@@ -711,8 +853,11 @@ async function executeWithFallback(options: {
       Buffer.byteLength(JSON.stringify(options.context)),
     )
     let routes = await buildStickyRoutes(options.model.id)
+    const mainPermanentlyUnavailable = isPermanentRefreshError(
+      storage?.refresh?.mainLastRefreshError,
+    )
     const incompleteQuotaPool =
-      routes.allRoutes.length === 0 ||
+      (routes.allRoutes.length === 0 && !mainPermanentlyUnavailable) ||
       routes.allRoutes.some(
         (candidate) =>
           !candidate.quota ||
@@ -741,6 +886,16 @@ async function executeWithFallback(options: {
         syscall: 'sticky-routing',
       })
       throw error
+    }
+    if (!resolution) {
+      return createStickyNoRouteResponse({
+        mainRefreshError: storage?.refresh?.mainLastRefreshError,
+        fallbackReauthLabels: getFallbackReauthLabels(storage),
+        routeQuotas: routes.allRoutes.flatMap((route) =>
+          route.quota ? [route.quota] : [],
+        ),
+        modelId: options.model.id,
+      })
     }
     let route = routes.allRoutes.find(
       (candidate) => candidate.id === resolution?.accountId,
@@ -976,11 +1131,17 @@ async function executeWithFallback(options: {
     if (fallback) return fallback
   }
 
+  logger.debug('pi.route', 'sending on the primary account')
   const primary = await sendAnthropicRequest({
     ...options,
     accessToken: options.primaryAccessToken,
   })
   const primaryPreflight = await firstStreamingError(primary)
+  logger.debug('pi.route', 'primary responded', {
+    status:
+      primaryPreflight instanceof Response ? primaryPreflight.status : 'sse',
+    signal: primaryPreflight instanceof Response ? undefined : primaryPreflight,
+  })
   if (primaryPreflight instanceof Response) {
     if (!shouldFallbackStatus(primaryPreflight.status, storage))
       return primaryPreflight
@@ -988,11 +1149,19 @@ async function executeWithFallback(options: {
 
   const primaryAllowsQuotaFallback =
     primaryResponseAllowsApiFallback(primaryPreflight)
+  logger.debug('pi.route', 'evaluating fallback gates', {
+    primaryAllowsQuotaFallback,
+    routingMode,
+  })
   const allowApiFallback =
     primaryAllowsQuotaFallback && (await primaryQuotaRefreshConfirmsExhausted())
   const allowModelScopedOAuthFallback =
     primaryAllowsQuotaFallback &&
     (await primaryQuotaRefreshConfirmsModelScopeExhausted())
+  logger.debug('pi.route', 'fallback gates resolved', {
+    allowApiFallback,
+    allowModelScopedOAuthFallback,
+  })
 
   if (!fallbackFirst || allowApiFallback || allowModelScopedOAuthFallback) {
     const fallback = await tryFallbackAccounts({
@@ -1007,6 +1176,91 @@ async function executeWithFallback(options: {
   }
 
   return primaryPreflight instanceof Response ? primaryPreflight : primary
+}
+
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error('Aborted'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason ?? new Error('Aborted'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Route a request, retrying the whole routing attempt while the failure looks
+ * transient.
+ *
+ * Retrying at this level rather than around a single `fetch` matters: each
+ * attempt re-runs account selection and quota checks, so a retry after a soft
+ * 429 can land on a different account than the one that was throttled. A hard
+ * rate limit — no billing headroom — is not retried at all, because the next
+ * attempt would fail identically and only delay the error the caller needs.
+ */
+async function executeWithRetry(
+  options: Parameters<typeof executeWithFallback>[0],
+  maxRetries = DEFAULT_MAX_RETRIES,
+): Promise<{ response: Response; bodyText?: string }> {
+  const signal = options.streamOptions?.signal
+  let attempt = 0
+
+  for (;;) {
+    logger.debug('pi.retry', 'attempt start', {
+      attempt,
+      maxRetries,
+      model: options.model.id,
+    })
+    const attemptStartedAt = Date.now()
+    const response = await executeWithFallback(options)
+    logger.debug('pi.retry', 'attempt finished', {
+      attempt,
+      status: response.status,
+      ok: response.ok,
+      durationMs: Date.now() - attemptStartedAt,
+    })
+    if (response.ok) return { response }
+
+    // Non-OK bodies are small JSON errors and are never streamed, so reading
+    // here is cheap and spares the caller a second read of a consumed body.
+    const bodyText = await response.text().catch(() => '')
+    const classification = classifyRetry(
+      response.status,
+      response.headers,
+      bodyText,
+    )
+    logger.debug('pi.retry', 'classified failure', {
+      attempt,
+      status: response.status,
+      retryable: classification.retryable,
+      hardLimitReason: classification.hardLimitReason,
+    })
+    if (!classification.retryable || attempt >= maxRetries || signal?.aborted) {
+      logger.info('pi.retry', 'giving up', {
+        attempt,
+        status: response.status,
+        reason: !classification.retryable
+          ? (classification.hardLimitReason ?? 'not-retryable')
+          : signal?.aborted
+            ? 'aborted'
+            : 'retry-budget-exhausted',
+      })
+      return { response, bodyText }
+    }
+
+    const delayMs = nextRetryDelayMs(response.headers, attempt)
+    logger.info('pi.retry', 'backing off before retry', { attempt, delayMs })
+    await sleep(delayMs, signal)
+    attempt += 1
+  }
 }
 
 export function streamCortexKitAnthropic(
@@ -1025,7 +1279,14 @@ export function streamCortexKitAnthropic(
       if (!accessToken) throw new Error('Missing Anthropic OAuth access token')
 
       const storagePath = getPiAccountStoragePath()
-      const response = await executeWithFallback({
+      logger.info('pi.stream', 'request start', {
+        model: model.id,
+        sessionId: options?.sessionId,
+        contextWindow: model.contextWindow,
+        messages: context.messages?.length ?? 0,
+      })
+      const requestStartedAt = Date.now()
+      const { response, bodyText } = await executeWithRetry({
         model,
         context,
         streamOptions: options,
@@ -1034,10 +1295,18 @@ export function streamCortexKitAnthropic(
       })
 
       if (!response.ok) {
+        logger.warn('pi.stream', 'request failed', {
+          status: response.status,
+          durationMs: Date.now() - requestStartedAt,
+          body: (bodyText ?? '').slice(0, 300),
+        })
         throw new Error(
-          `Anthropic request failed: HTTP ${response.status} ${await response.text()}`,
+          `Anthropic request failed: HTTP ${response.status} ${bodyText ?? ''}`,
         )
       }
+      logger.info('pi.stream', 'streaming response', {
+        durationMs: Date.now() - requestStartedAt,
+      })
 
       const blocks = output.content as Block[]
       for await (const event of parseSse(response)) {

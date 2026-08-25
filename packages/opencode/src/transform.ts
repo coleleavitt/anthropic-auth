@@ -22,10 +22,15 @@ import {
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
+  selectClaudeCodeBetas,
   signRequestBody,
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  applyCacheDiagnosticsOptIn,
+  CACHE_DIAGNOSTICS_BETA,
+} from './cache-diagnostics'
 import { makeByteBoundedMemo } from './sanitize-memo'
 import {
   applyServerSideFallbackToBody,
@@ -33,6 +38,8 @@ import {
   SERVER_SIDE_FALLBACK_BETA,
   type ServerSideFallbackOutcome,
 } from './server-fallback'
+
+export const NON_STREAMING_DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
 
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
@@ -1180,6 +1187,8 @@ export async function rewriteRequestBody(
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
     isSubagent?: boolean
+    laneStart?: boolean
+    cacheDiagnosticsPreviousMessageId?: string | null
   } = {},
 ): Promise<string> {
   try {
@@ -1239,6 +1248,11 @@ export async function rewriteRequestBody(
       hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })
 
+    if (options.laneStart === true) {
+      parsed.max_tokens = 1
+      delete parsed.thinking
+    }
+
     const billingStart = rewriteNowMs()
     const billingHeader =
       Array.isArray(parsed.messages) &&
@@ -1292,6 +1306,16 @@ export async function rewriteRequestBody(
       delete parsed.speed
     }
 
+    if (
+      options.cacheDiagnosticsPreviousMessageId !== undefined &&
+      selectClaudeCodeBetas(parsed).split(',').includes(CACHE_DIAGNOSTICS_BETA)
+    ) {
+      applyCacheDiagnosticsOptIn(
+        parsed,
+        options.cacheDiagnosticsPreviousMessageId,
+      )
+    }
+
     const metadataStart = rewriteNowMs()
     if (options.identity) applyClaudeCodeMetadata(parsed, options.identity)
     options.perf?.('metadata', {
@@ -1334,10 +1358,13 @@ type SseEventSummary = {
   inputJsonDeltaBytes?: number
   signatureDeltaBytes?: number
   redactedThinkingBytes?: number
+  message?: Record<string, unknown>
 }
 
 type SseDiagnosticState = {
   pending: string
+  pendingOverflowCount: number
+  disabled: boolean
   events: number
   parseErrors: number
   eventCounts: Record<string, number>
@@ -1357,6 +1384,8 @@ const sseDiagnosticEncoder = new TextEncoder()
 function createSseDiagnosticState(): SseDiagnosticState {
   return {
     pending: '',
+    pendingOverflowCount: 0,
+    disabled: false,
     events: 0,
     parseErrors: 0,
     eventCounts: {},
@@ -1478,6 +1507,7 @@ function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
   if (usage) {
     summary.stopReason ??= stringField(message, 'stop_reason')
   }
+  if (summary.type === 'message_start' && message) summary.message = message
 
   return summary
 }
@@ -1490,8 +1520,13 @@ function findSseBoundary(value: string) {
   return { index: crlf, length: 4 }
 }
 
-function updateSseDiagnostics(state: SseDiagnosticState, text: string) {
-  if (!text) return
+function updateSseDiagnostics(
+  state: SseDiagnosticState,
+  text: string,
+  maxPendingBytes: number,
+  onEvent?: (summary: SseEventSummary) => void,
+) {
+  if (!text || state.disabled) return
   state.pending += text
 
   while (true) {
@@ -1514,19 +1549,30 @@ function updateSseDiagnostics(state: SseDiagnosticState, text: string) {
     state.signatureDeltaBytes += summary.signatureDeltaBytes ?? 0
     state.redactedThinkingBytes += summary.redactedThinkingBytes ?? 0
     state.last = summary
+    onEvent?.(summary)
     if (summary.dataBytes > 0 && !summary.type && !summary.event) {
       state.parseErrors++
     }
+  }
+
+  if (sseDiagnosticEncoder.encode(state.pending).byteLength > maxPendingBytes) {
+    state.pending = ''
+    state.disabled = true
+    state.pendingOverflowCount++
   }
 }
 
 type SseErrorState = {
   pending: string
+  disabled: boolean
+  resyncCarry: string
 }
 
 type SseFinishState = {
   pending: string
   completed: boolean
+  disabled: boolean
+  resyncCarry: string
 }
 
 type SseFinishUpdate =
@@ -1549,28 +1595,107 @@ export function isTruncatingStopReason(stopReason: string | undefined) {
 }
 
 function createSseFinishState(): SseFinishState {
-  return { pending: '', completed: false }
+  return { pending: '', completed: false, disabled: false, resyncCarry: '' }
 }
 
 function updateSseFinishState(
   state: SseFinishState,
   text: string,
+  maxPendingBytes: number,
 ): SseFinishUpdate | null {
   if (!text || state.completed) return null
+  if (state.disabled) {
+    const window = state.resyncCarry + text
+    const boundary = findSseBoundary(window)
+    if (!boundary) {
+      state.resyncCarry = window.slice(-3)
+      return null
+    }
+    state.disabled = false
+    state.resyncCarry = ''
+    text = window.slice(boundary.index + boundary.length)
+    if (!text) return null
+  }
   state.pending += text
+  let update: SseFinishUpdate | null = null
 
   while (true) {
     const boundary = findSseBoundary(state.pending)
-    if (!boundary) return null
+    if (!boundary) break
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
     const summary = summarizeSseEvent(rawEvent)
     if (summary?.type !== 'message_delta' || !summary.stopReason) continue
     state.completed = true
-    return summary.stopReason === 'refusal'
-      ? { type: 'content-filter' }
-      : { type: 'complete', finishReason: summary.stopReason }
+    update ??=
+      summary.stopReason === 'refusal'
+        ? { type: 'content-filter' }
+        : { type: 'complete', finishReason: summary.stopReason }
   }
+  if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
+    const tail = state.pending
+    state.pending = ''
+    state.disabled = true
+    state.resyncCarry = tail.slice(-3)
+  }
+  return update
+}
+
+type SseLaneStartFinishRewriteState = {
+  pending: string
+  disabled: boolean
+}
+
+function createSseLaneStartFinishRewriteState(): SseLaneStartFinishRewriteState {
+  return { pending: '', disabled: false }
+}
+
+function rewriteLaneStartFinishEvent(rawEvent: string) {
+  const summary = summarizeSseEvent(rawEvent)
+  if (
+    summary?.type !== 'message_delta' ||
+    summary.stopReason !== 'max_tokens'
+  ) {
+    return rawEvent
+  }
+  return rawEvent.replace(/("stop_reason"\s*:\s*)"max_tokens"/, '$1"end_turn"')
+}
+
+function updateSseLaneStartFinishRewriteState(
+  state: SseLaneStartFinishRewriteState,
+  text: string,
+  maxPendingBytes: number,
+  flush = false,
+) {
+  if (!text && !flush) return ''
+  if (state.disabled) return text
+  if (
+    new TextEncoder().encode(state.pending + text).byteLength > maxPendingBytes
+  ) {
+    const passthrough = state.pending + text
+    state.pending = ''
+    state.disabled = true
+    return passthrough
+  }
+  state.pending += text
+  let rewritten = ''
+  while (true) {
+    const boundary = findSseBoundary(state.pending)
+    if (!boundary) break
+    const rawEvent = state.pending.slice(0, boundary.index)
+    const separator = state.pending.slice(
+      boundary.index,
+      boundary.index + boundary.length,
+    )
+    state.pending = state.pending.slice(boundary.index + boundary.length)
+    rewritten += rewriteLaneStartFinishEvent(rawEvent)
+    rewritten += separator
+  }
+  if (flush && state.pending) {
+    rewritten += rewriteLaneStartFinishEvent(state.pending)
+    state.pending = ''
+  }
+  return rewritten
 }
 
 type RetryableAnthropicStreamError = Error & {
@@ -1580,7 +1705,7 @@ type RetryableAnthropicStreamError = Error & {
 }
 
 function createSseErrorState(): SseErrorState {
-  return { pending: '' }
+  return { pending: '', disabled: false, resyncCarry: '' }
 }
 
 function isRetryableAnthropicStreamError(
@@ -1675,9 +1800,23 @@ function retryableAnthropicStreamErrorFromRawEvent(
 function updateSseErrorState(
   state: SseErrorState,
   text: string,
+  maxPendingBytes: number,
 ): RetryableAnthropicStreamError | null {
   if (!text) return null
+  if (state.disabled) {
+    const window = state.resyncCarry + text
+    const boundary = findSseBoundary(window)
+    if (!boundary) {
+      state.resyncCarry = window.slice(-3)
+      return null
+    }
+    state.disabled = false
+    state.resyncCarry = ''
+    text = window.slice(boundary.index + boundary.length)
+    if (!text) return null
+  }
   state.pending += text
+  let retryable: RetryableAnthropicStreamError | null = null
 
   while (true) {
     const boundary = findSseBoundary(state.pending)
@@ -1686,16 +1825,23 @@ function updateSseErrorState(
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
     const error = retryableAnthropicStreamErrorFromRawEvent(rawEvent)
-    if (error) return error
+    retryable ??= error
   }
 
-  return null
+  if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
+    const tail = state.pending
+    state.pending = ''
+    state.disabled = true
+    state.resyncCarry = tail.slice(-3)
+  }
+  return retryable
 }
 
 function sseDiagnosticStats(state: SseDiagnosticState) {
   return {
     sseEvents: state.events,
     ssePendingChars: state.pending.length,
+    ssePendingOverflowCount: state.pendingOverflowCount,
     sseParseErrors: state.parseErrors,
     sseEventCounts: { ...state.eventCounts },
     sseTypeCounts: { ...state.typeCounts },
@@ -1725,6 +1871,12 @@ export function createStrippedStream(
     contentFilterModel?: unknown
     serverSideFallbackModel?: string
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
+    onMessageStart?: (message: Record<string, unknown>) => void
+    onMessageResponse?: (message: Record<string, unknown>) => void
+    onStreamEnd?: () => void | Promise<void>
+    responseMode?: 'json'
+    laneStart?: boolean
+    laneStartOAuthServed?: boolean
   } = {},
 ): Response {
   if (!response.body) return response
@@ -1732,6 +1884,7 @@ export function createStrippedStream(
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  const jsonMode = options.responseMode === 'json'
   let pending = ''
   let chunkCount = 0
   let pullCount = 0
@@ -1742,11 +1895,27 @@ export function createStrippedStream(
   let readerReleased = false
   let lastProgressAt = rewriteNowMs()
   const streamStart = rewriteNowMs()
-  const sseDiagnostics = options.perf ? createSseDiagnosticState() : undefined
+  const sseDiagnostics =
+    options.perf || options.onMessageStart
+      ? createSseDiagnosticState()
+      : undefined
+  let responseText = ''
+  let responseTextBytes = 0
+  let responseTextOverflowed = false
+  const observe = (callback: (() => void) | undefined) => {
+    if (!callback) return
+    try {
+      callback()
+    } catch {}
+  }
   const sseErrors = createSseErrorState()
   const sseFinish =
     options.onContentFilter || options.onComplete || options.onTruncatedFinish
       ? createSseFinishState()
+      : undefined
+  const laneStartFinish =
+    options.laneStart && options.laneStartOAuthServed !== false
+      ? createSseLaneStartFinishRewriteState()
       : undefined
   let contentFilterInvoked = false
   let contentFilterHandled = false
@@ -1762,6 +1931,7 @@ export function createStrippedStream(
   const serverSideFallback = options.serverSideFallbackModel
     ? createServerSideFallbackStreamRewriter({
         requestedModel: options.serverSideFallbackModel,
+        maxPendingBytes: NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
         onOutcome: options.onServerSideFallbackOutcome,
         onRefusalAfterToolUse: options.onContentFilter
           ? () => invokeContentFilter(true)
@@ -1771,7 +1941,11 @@ export function createStrippedStream(
 
   const updateFinish = (text: string) => {
     if (!sseFinish) return null
-    const update = updateSseFinishState(sseFinish, text)
+    const update = updateSseFinishState(
+      sseFinish,
+      text,
+      NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+    )
     if (update?.type === 'content-filter' && options.onContentFilter) {
       return invokeContentFilter()
         ? retryableFableContentFilterError(options.contentFilterModel)
@@ -1784,6 +1958,15 @@ export function createStrippedStream(
     }
     return null
   }
+  const rewriteLaneStartFinish = (text: string, flush = false) =>
+    laneStartFinish
+      ? updateSseLaneStartFinishRewriteState(
+          laneStartFinish,
+          text,
+          NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+          flush,
+        )
+      : text
 
   const releaseReader = () => {
     if (readerReleased) return
@@ -1805,6 +1988,10 @@ export function createStrippedStream(
     inputBytes,
     outputBytes,
     pendingChars: pending.length,
+    sseErrorPending: sseErrors.pending.length,
+    sseFinishPending: sseFinish?.pending.length ?? 0,
+    sseFinishDisabled: sseFinish?.disabled ?? false,
+    serverFallbackPending: serverSideFallback?.pendingLength() ?? 0,
     rewriteMs: rewriteRoundMs(rewriteMs),
     totalMs: rewriteRoundMs(rewriteNowMs() - streamStart),
     ...(sseDiagnostics ? sseDiagnosticStats(sseDiagnostics) : {}),
@@ -1834,16 +2021,56 @@ export function createStrippedStream(
           const readMs = rewriteRoundMs(rewriteNowMs() - readStart)
           if (done) {
             const finalDecoded = decoder.decode()
-            if (sseDiagnostics)
-              updateSseDiagnostics(sseDiagnostics, finalDecoded)
+            if (sseDiagnostics && !jsonMode)
+              updateSseDiagnostics(
+                sseDiagnostics,
+                finalDecoded,
+                NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                (summary) => {
+                  const message = summary.message
+                  if (summary.type === 'message_start' && message)
+                    observe(() => options.onMessageStart?.(message))
+                },
+              )
+            if (jsonMode) {
+              const finalBytes = encoder.encode(finalDecoded).byteLength
+              if (
+                responseTextBytes + finalBytes <=
+                NON_STREAMING_DIAGNOSTICS_MAX_BYTES
+              ) {
+                responseText += finalDecoded
+                responseTextBytes += finalBytes
+              } else {
+                responseTextOverflowed = true
+              }
+            }
+            if (jsonMode && !responseTextOverflowed) {
+              try {
+                const message = JSON.parse(responseText)
+                if (
+                  message &&
+                  typeof message === 'object' &&
+                  !Array.isArray(message)
+                )
+                  observe(() => options.onMessageResponse?.(message))
+              } catch {}
+            }
             const rewriteStart = rewriteNowMs()
             const serverRewritten = serverSideFallback
               ? serverSideFallback.push(finalDecoded) +
                 serverSideFallback.flush()
               : finalDecoded
-            const retryableStreamError =
-              updateSseErrorState(sseErrors, finalDecoded) ??
-              updateFinish(serverRewritten)
+            const laneStartRewritten = rewriteLaneStartFinish(
+              serverRewritten,
+              true,
+            )
+            const retryableStreamError = jsonMode
+              ? updateFinish(laneStartRewritten)
+              : (updateSseErrorState(
+                  sseErrors,
+                  finalDecoded,
+                  NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                ) ?? updateFinish(laneStartRewritten))
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
                 error: retryableStreamError.message,
@@ -1853,7 +2080,7 @@ export function createStrippedStream(
               throw retryableStreamError
             }
             const flushed = splitToolPrefixRewriteBuffer(
-              `${pending}${serverRewritten}`,
+              `${pending}${laneStartRewritten}`,
               true,
             )
             rewriteMs += rewriteNowMs() - rewriteStart
@@ -1864,6 +2091,11 @@ export function createStrippedStream(
             }
             logProgress('stream_tool_prefix_rewrite', { readMs })
             releaseReader()
+            if (options.onStreamEnd) {
+              try {
+                await options.onStreamEnd()
+              } catch {}
+            }
             controller.close()
             return
           }
@@ -1871,14 +2103,41 @@ export function createStrippedStream(
           chunkCount++
           inputBytes += value.byteLength
           const decoded = decoder.decode(value, { stream: true })
-          if (sseDiagnostics) updateSseDiagnostics(sseDiagnostics, decoded)
+          if (jsonMode) {
+            const decodedBytes = value.byteLength
+            if (
+              responseTextBytes + decodedBytes <=
+              NON_STREAMING_DIAGNOSTICS_MAX_BYTES
+            ) {
+              responseText += decoded
+              responseTextBytes += decodedBytes
+            } else {
+              responseTextOverflowed = true
+            }
+          }
+          if (sseDiagnostics && !jsonMode)
+            updateSseDiagnostics(
+              sseDiagnostics,
+              decoded,
+              NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+              (summary) => {
+                const message = summary.message
+                if (summary.type === 'message_start' && message)
+                  observe(() => options.onMessageStart?.(message))
+              },
+            )
           const rewriteStart = rewriteNowMs()
           const serverRewritten = serverSideFallback
             ? serverSideFallback.push(decoded)
             : decoded
-          const retryableStreamError =
-            updateSseErrorState(sseErrors, decoded) ??
-            updateFinish(serverRewritten)
+          const laneStartRewritten = rewriteLaneStartFinish(serverRewritten)
+          const retryableStreamError = jsonMode
+            ? updateFinish(laneStartRewritten)
+            : (updateSseErrorState(
+                sseErrors,
+                decoded,
+                NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+              ) ?? updateFinish(laneStartRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               error: retryableStreamError.message,
@@ -1891,7 +2150,7 @@ export function createStrippedStream(
             await cancelReader(retryableStreamError)
             throw retryableStreamError
           }
-          const text = pending + serverRewritten
+          const text = pending + laneStartRewritten
           const rewritten = splitToolPrefixRewriteBuffer(text)
           rewriteMs += rewriteNowMs() - rewriteStart
           pending = rewritten.pending

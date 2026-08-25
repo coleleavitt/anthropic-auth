@@ -2,7 +2,28 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 1.20.0
+
+### Minor Changes
+
+- Add opt-in `/claude-prime` scheduling that sends a minimal Haiku 4.5 request shortly after each OAuth account's five-hour quota reset so each window starts immediately.
+- Add the OpenCode-only `/claude-start` command for an explicit synthetic one-token turn through the current session's normal model, routing, cache, and request pipeline.
+- Capture Anthropic cache diagnostics in versioned `MC-CACHE-DIAG ` debug records and sanitized dump artifacts, preserving provider response IDs across normal requests and CacheKeep prewarms.
+- Fix Pi OAuth billing rejection by relocating its documentation paragraph from top-level `system[]` to a cached block before the first user's text, with a safe whole-prompt fallback for unknown future Pi prompt layouts, and expose Claude Opus 5 in Pi's provider catalog.
+
+### Patch Changes
+
+- Deliver OpenCode Desktop recovery notices without triggering an extra billed provider turn on OpenCode 1.18 and newer, including holding the switch notice until the first successful Opus recovery response and revalidating the idle delivery lease after asynchronous status and message-history reads so a racing prompt cannot adopt the notice as its retry parent.
+- Retry failed CacheKeep prewarms while the last confirmed cache can still be alive, and serialize overlapping manager ticks to avoid duplicate requests.
+- Preserve fresh scoped-only fallback quota snapshots, permanent refresh-error classification across lock contention, and explicit re-login guidance for unusable fallback accounts.
+- Finalize response-artifact writes before transformed streams complete, recover the first same-session request byte-diff baseline from disk after a restart, sweep stale partial dump files even below the size cap, and evict complete request artifact groups when enforcing that cap.
+- Update OpenCode, OpenTUI, Pi SDK, Miniflare, Biome, TypeScript, and CI dependencies, including OpenCode 1.18 and OpenTUI 0.5 compatibility fixes.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing quota priming, cache diagnostics, and explicit lane starts.
+
+Thanks to [@unspecd-dev](https://github.com/unspecd-dev) for diagnosing and contributing the Pi request-shape and Opus 5 changes.
+
+## 1.19.1
 
 ### Minor Changes
 
@@ -16,6 +37,11 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Keep deterministic Opus 4.8 recovery armed as a backstop when Anthropic's server-side safety policy still returns a refusal, while stripping the server-fallback opt-in from source-model prewarms.
 - Preserve completed tool calls when a served fallback later refuses, continuing with the existing tool result instead of replaying potentially non-idempotent tools.
 - Close a stale refresh-lock eviction gap by serializing post-failure acquisition through the owner-checked marker and atomically renaming the stale lock, validated with repeated 1,000-round contention tests.
+- Return an explicit authentication or quota response when sticky-balanced routing has no eligible account in OpenCode or Pi instead of falling through to an excluded main account.
+- Clear a permanent, token-bound `invalid_grant` state immediately after the main OpenCode account is re-authenticated, while retaining shared transient and rate-limit backoffs.
+- Keep TUI preferences live updates working when Bun cannot create a directory watcher (for example, `EBADF`) by running the polling fallback independently, and capture the baseline before returning so an immediate first update cannot be absorbed.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for the server-fallback recovery contribution.
 
 ## 1.19.0
 

@@ -38,6 +38,46 @@ export const REQUIRED_BETAS = [OAUTH_BETA, 'interleaved-thinking-2025-05-14']
 export const EFFORT_BETA = 'effort-2025-11-24'
 export const FAST_MODE_BETA = 'fast-mode-2026-02-01'
 
+/**
+ * Unlocks the 1M-token context window. Claude Code gates it on a `[1m]` marker
+ * in the model id (`IA()` in the 2.1.241 bundle) and treats the window as 1e6
+ * only when this beta is present for a model that supports it.
+ *
+ * Without it a request over ~200k input is refused outright — the response
+ * carries `stop_reason: "refusal"` and no content, while still billing the
+ * full input.
+ */
+export const CONTEXT_1M_BETA = 'context-1m-2025-08-07'
+
+/** Explicit `[1m]` marker, the same signal Claude Code keys on. */
+const CONTEXT_1M_MARKER = /\[1m\]/i
+
+/**
+ * Model families that accept {@link CONTEXT_1M_BETA}. Kept as prefixes so a
+ * dated release id (`claude-opus-4-8-20260101`) matches its family.
+ */
+const CONTEXT_1M_MODEL_PREFIXES = [
+  'claude-opus-5',
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-opus-4-6',
+  'claude-sonnet-5',
+  'claude-sonnet-4-6',
+  'claude-sonnet-4-5',
+  'claude-fable-5',
+  'claude-mythos-5',
+] as const
+
+/** Whether `modelId` should carry the 1M context beta. */
+export function modelSupportsContext1m(modelId: unknown): boolean {
+  if (typeof modelId !== 'string' || !modelId.trim()) return false
+  if (CONTEXT_1M_MARKER.test(modelId)) return true
+  const normalized = modelId.trim().toLowerCase()
+  return CONTEXT_1M_MODEL_PREFIXES.some((prefix) =>
+    normalized.startsWith(prefix),
+  )
+}
+
 export function mergeAnthropicBetas(
   existing: string | null | undefined,
   betas: string[],

@@ -20,6 +20,9 @@ import {
   drainSidebarWrites,
   FIVE_HOUR_MS,
   formatFallbackModelLabel,
+  formatPrimeAccountValue,
+  formatPrimeCost,
+  formatPrimeTime,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
@@ -50,6 +53,65 @@ async function pathExists(path: string): Promise<boolean> {
 const quota = (used: number): AccountQuota => ({
   five_hour: { usedPercent: used, remainingPercent: 100 - used },
   seven_day: { usedPercent: used, remainingPercent: 100 - used },
+})
+
+describe('prime display formatters', () => {
+  test('formats time and cost consistently for sidebar and dialog consumers', () => {
+    expect(formatPrimeTime(0)).toBe(
+      new Date(0).toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    )
+    expect(formatPrimeCost(0)).toBe('0')
+    expect(formatPrimeCost(0.000025)).toBe('2.50e-5')
+    expect(formatPrimeCost(0.125)).toBe('0.1250')
+  })
+
+  test('formats one sidebar value per prime account', () => {
+    const nextDueAt = Date.now() + 60 * 60_000
+    const lastPrimedAt = Date.now() - 60_000
+
+    expect(
+      formatPrimeAccountValue({
+        id: 'main',
+        label: 'main',
+        nextDueAt,
+      }),
+    ).toEqual({ text: formatPrimeTime(nextDueAt), hasError: false })
+    expect(
+      formatPrimeAccountValue({
+        id: 'work-alt',
+        label: 'work-alt',
+        lastPrimedAt,
+        lastResult: 'ok',
+        usage: { count: 3, inputTokens: 60, outputTokens: 3, since: 1 },
+        estimatedCostUsd: 0.000075,
+      }),
+    ).toEqual({
+      text: `primed ${formatPrimeTime(lastPrimedAt)} \u2713`,
+      hasError: false,
+    })
+    expect(
+      formatPrimeAccountValue({
+        id: 'work-alt',
+        label: 'work-alt',
+        usage: { count: 3, inputTokens: 60, outputTokens: 3, since: 1 },
+        estimatedCostUsd: 0.000075,
+      }),
+    ).toEqual({ text: '\u2713 3 \u2248 $7.50e-5', hasError: false })
+    expect(
+      formatPrimeAccountValue({
+        id: 'broken',
+        label: 'broken',
+        lastResult: 'error',
+      }),
+    ).toEqual({ text: 'err', hasError: true })
+    expect(formatPrimeAccountValue({ id: 'idle', label: 'idle' })).toEqual({
+      text: '\u2014',
+      hasError: false,
+    })
+  })
 })
 
 function make(overrides: Partial<SidebarState>): SidebarState {
@@ -872,6 +934,67 @@ describe('normalizeSidebarState', () => {
     expect(out.cacheKeep).toBeUndefined()
   })
 
+  test('prime defaults to undefined when non-object', () => {
+    const out = normalizeSidebarState({ prime: 'bad' })
+    expect(out.prime).toBeUndefined()
+  })
+
+  test('prime defaults to undefined when enabled is non-boolean', () => {
+    const out = normalizeSidebarState({ prime: { enabled: 'yes' } })
+    expect(out.prime).toBeUndefined()
+  })
+
+  test('prime drops accounts with non-string id', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          { id: 'main' }, // no label → dropped
+          { id: 123, label: 'numeric' },
+          { id: 'work', label: 'work' },
+        ],
+      },
+    })
+    expect(out.prime?.accounts).toEqual([{ id: 'work', label: 'work' }])
+  })
+
+  test('prime drops account with non-finite nextDueAt and preserves null', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          { id: 'main', label: 'main', nextDueAt: 'soon' },
+          { id: 'work', label: 'work', nextDueAt: null },
+        ],
+      },
+    })
+    expect(out.prime?.accounts?.[0]?.nextDueAt).toBeUndefined()
+    expect(out.prime?.accounts?.[1]?.nextDueAt).toBeNull()
+  })
+
+  test('prime drops invalid lastPrimedAt / lastResult / usage / cost', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          {
+            id: 'main',
+            label: 'main',
+            lastPrimedAt: 'never',
+            lastResult: 'unknown',
+            usage: { count: -1, inputTokens: 0, outputTokens: 0, since: -5 },
+            estimatedCostUsd: 'cheap',
+          },
+        ],
+      },
+    })
+    const acct = out.prime?.accounts?.[0]
+    expect(acct?.lastPrimedAt).toBeUndefined()
+    expect(acct?.lastResult).toBeUndefined()
+    expect(acct?.usage).toBeUndefined()
+    expect(acct?.estimatedCostUsd).toBeUndefined()
+  })
+
   test('route defaults when non-string', () => {
     const out = normalizeSidebarState({ route: 42 })
     expect(out.route).toBe(DEFAULT_SIDEBAR_STATE.route)
@@ -1070,21 +1193,24 @@ describe('setSidebarState cross-process writes', () => {
 
     let child: ReturnType<typeof Bun.spawn> | undefined
     let paused = false
-    __setSidebarStateWriteTestHooks({
-      beforeRename: async () => {
-        if (paused) return
-        paused = true
-        const stale = new Date(Date.now() - 3_000)
-        await utimes(lockDir, stale, stale)
-        const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
-        child = Bun.spawn([
-          process.execPath,
-          '--eval',
-          `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
-        ])
-        expect(await child.exited).toBe(0)
+    __setSidebarStateWriteTestHooks(
+      {
+        beforeRename: async () => {
+          if (paused) return
+          paused = true
+          const stale = new Date(Date.now() - 3_000)
+          await utimes(lockDir, stale, stale)
+          const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
+          child = Bun.spawn([
+            process.execPath,
+            '--eval',
+            `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
+          ])
+          expect(await child.exited).toBe(0)
+        },
       },
-    })
+      stateFile,
+    )
 
     try {
       await setSidebarState(staleWriter, stateFile, {
@@ -1098,7 +1224,7 @@ describe('setSidebarState cross-process writes', () => {
       expect(written.activeId).toBe('successor-routing')
       expect(written.route).toBe('successor-route')
     } finally {
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       child?.kill()
       await rm(stateDir, { recursive: true, force: true })
     }
@@ -1137,21 +1263,25 @@ describe('setSidebarState cross-process writes', () => {
 
       let child: ReturnType<typeof Bun.spawn> | undefined
       let paused = false
-      __setSidebarStateWriteTestHooks({
-        afterRename: async () => {
-          if (paused) return
-          paused = true
-          const stale = new Date(Date.now() - 3_000)
-          await utimes(lockDir, stale, stale)
-          const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
-          child = Bun.spawn([
-            process.execPath,
-            '--eval',
-            `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
-          ])
-          expect(await child.exited).toBe(0)
+      __setSidebarStateWriteTestHooks(
+        {
+          afterRename: async () => {
+            if (paused) return
+            paused = true
+            const stale = new Date(Date.now() - 3_000)
+            await utimes(lockDir, stale, stale)
+            const moduleUrl = new URL('../sidebar-state.ts', import.meta.url)
+              .href
+            child = Bun.spawn([
+              process.execPath,
+              '--eval',
+              `import { setSidebarState } from ${JSON.stringify(moduleUrl)}; await setSidebarState(${JSON.stringify(successor)}, ${JSON.stringify(stateFile)})`,
+            ])
+            expect(await child.exited).toBe(0)
+          },
         },
-      })
+        stateFile,
+      )
 
       try {
         await setSidebarState(staleWriter, stateFile, {
@@ -1183,7 +1313,7 @@ describe('setSidebarState cross-process writes', () => {
         expect(written.main.quota.five_hour.usedPercent).toBe(80)
         expect(written.fastMode).toBe(true)
       } finally {
-        __setSidebarStateWriteTestHooks(null)
+        __setSidebarStateWriteTestHooks(null, stateFile)
         child?.kill()
         await rm(stateDir, { recursive: true, force: true })
       }
@@ -1215,11 +1345,14 @@ describe('setSidebarState cross-process writes', () => {
       await mkdir(stateDir, { recursive: true })
       await writeFile(stateFile, originalContents)
       await mkdir(lockDir)
-      __setSidebarStateWriteTestHooks({
-        lockBudgetMs: 20,
-        lockRetryMinMs: 1,
-        lockRetryMaxMs: 1,
-      })
+      __setSidebarStateWriteTestHooks(
+        {
+          lockBudgetMs: 20,
+          lockRetryMinMs: 1,
+          lockRetryMaxMs: 1,
+        },
+        stateFile,
+      )
 
       try {
         await setSidebarState(staleWriter, stateFile, {
@@ -1236,7 +1369,7 @@ describe('setSidebarState cross-process writes', () => {
         expect(drained).toBe(true)
         expect(await readFile(stateFile, 'utf8')).toBe(originalContents)
       } finally {
-        __setSidebarStateWriteTestHooks(null)
+        __setSidebarStateWriteTestHooks(null, stateFile)
         await rm(stateDir, { recursive: true, force: true })
       }
     })
@@ -1264,23 +1397,26 @@ describe('setSidebarState cross-process writes', () => {
     await writeFile(stateFile, JSON.stringify(initial))
 
     let child: ReturnType<typeof Bun.spawn> | undefined
-    __setSidebarStateWriteTestHooks({
-      afterMergeRead: async () => {
-        const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
-        const script = `
+    __setSidebarStateWriteTestHooks(
+      {
+        afterMergeRead: async () => {
+          const moduleUrl = new URL('../sidebar-state.ts', import.meta.url).href
+          const script = `
           import { setSidebarState } from ${JSON.stringify(moduleUrl)}
           await setSidebarState(${JSON.stringify(foreign)}, ${JSON.stringify(stateFile)})
         `
-        child = Bun.spawn([process.execPath, '--eval', script], {
-          stdout: 'pipe',
-          stderr: 'pipe',
-        })
-        await Promise.race([
-          child.exited,
-          new Promise((resolve) => setTimeout(resolve, 50)),
-        ])
+          child = Bun.spawn([process.execPath, '--eval', script], {
+            stdout: 'pipe',
+            stderr: 'pipe',
+          })
+          await Promise.race([
+            child.exited,
+            new Promise((resolve) => setTimeout(resolve, 50)),
+          ])
+        },
       },
-    })
+      stateFile,
+    )
 
     try {
       await setSidebarState(nonAuthoritative, stateFile, {
@@ -1296,9 +1432,48 @@ describe('setSidebarState cross-process writes', () => {
       expect(written.activeId).toBe('foreign-routing')
       expect(written.route).toBe('foreign-route')
     } finally {
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       child?.kill()
       await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('scopes write hooks to their state file', async () => {
+    const firstStateFile = sidebarTestPath('hook-scope-first')
+    const secondStateFile = sidebarTestPath('hook-scope-second')
+    await mkdir(join(firstStateFile, '..'), { recursive: true })
+    await mkdir(join(secondStateFile, '..'), { recursive: true })
+    let firstAcquisitions = 0
+    let secondAcquisitions = 0
+    __setSidebarStateWriteTestHooks(
+      {
+        onLockAcquired: () => {
+          firstAcquisitions++
+        },
+      },
+      firstStateFile,
+    )
+    __setSidebarStateWriteTestHooks(
+      {
+        onLockAcquired: () => {
+          secondAcquisitions++
+        },
+      },
+      secondStateFile,
+    )
+
+    let release: (() => Promise<void>) | null = null
+    try {
+      release = await __acquireSidebarStateLockForTest(firstStateFile)
+      expect(release).toBeFunction()
+      expect(firstAcquisitions).toBe(1)
+      expect(secondAcquisitions).toBe(0)
+    } finally {
+      await release?.()
+      __setSidebarStateWriteTestHooks(null, firstStateFile)
+      __setSidebarStateWriteTestHooks(null, secondStateFile)
+      await rm(join(firstStateFile, '..'), { recursive: true, force: true })
+      await rm(join(secondStateFile, '..'), { recursive: true, force: true })
     }
   })
 
@@ -1338,9 +1513,7 @@ describe('setSidebarState cross-process writes', () => {
         acquisitions++
       },
     }
-    ;(__setSidebarStateWriteTestHooks as (hooks: RaceHooks | null) => void)(
-      hooks,
-    )
+    __setSidebarStateWriteTestHooks(hooks, stateFile)
 
     let firstRelease: (() => Promise<void>) | null = null
     let secondRelease: (() => Promise<void>) | null = null
@@ -1355,7 +1528,7 @@ describe('setSidebarState cross-process writes', () => {
     } finally {
       await firstRelease?.()
       await secondRelease?.()
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       await rm(stateDir, { recursive: true, force: true })
     }
   })
@@ -1409,9 +1582,7 @@ describe('setSidebarState cross-process writes', () => {
         await resumed
       },
     }
-    ;(__setSidebarStateWriteTestHooks as (hooks: ReleaseHooks | null) => void)(
-      hooks,
-    )
+    __setSidebarStateWriteTestHooks(hooks, stateFile)
 
     let firstRelease: (() => Promise<void>) | null = null
     let secondRelease: (() => Promise<void>) | null = null
@@ -1438,13 +1609,14 @@ describe('setSidebarState cross-process writes', () => {
       resumeRelease()
       await firstReleaseResult
 
-      ;(
-        __setSidebarStateWriteTestHooks as (hooks: ReleaseHooks | null) => void
-      )({
-        lockBudgetMs: 20,
-        lockRetryMinMs: 5,
-        lockRetryMaxMs: 5,
-      })
+      __setSidebarStateWriteTestHooks(
+        {
+          lockBudgetMs: 20,
+          lockRetryMinMs: 5,
+          lockRetryMaxMs: 5,
+        },
+        stateFile,
+      )
       thirdRelease = await __acquireSidebarStateLockForTest(stateFile)
       expect(thirdRelease).toBeNull()
       expect(await pathExists(lockDir)).toBe(true)
@@ -1452,7 +1624,7 @@ describe('setSidebarState cross-process writes', () => {
       resumeRelease()
       await thirdRelease?.()
       await secondRelease?.()
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       await rm(stateDir, { recursive: true, force: true })
     }
   })
@@ -1532,12 +1704,15 @@ describe('setSidebarState cross-process writes', () => {
     const renameReleased = new Promise<void>((resolve) => {
       releaseRename = resolve
     })
-    __setSidebarStateWriteTestHooks({
-      beforeRename: async () => {
-        enteredRename()
-        await renameReleased
+    __setSidebarStateWriteTestHooks(
+      {
+        beforeRename: async () => {
+          enteredRename()
+          await renameReleased
+        },
       },
-    })
+      stateFile,
+    )
 
     try {
       const write = setSidebarState(next, stateFile)
@@ -1558,7 +1733,7 @@ describe('setSidebarState cross-process writes', () => {
       expect(visible.activeId).toBe('next')
     } finally {
       releaseRename()
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       await rm(stateDir, { recursive: true, force: true })
     }
   })
@@ -1576,22 +1751,25 @@ describe('setSidebarState cross-process writes', () => {
     const replacementLock: {
       release: (() => Promise<void>) | null
     } = { release: null }
-    __setSidebarStateWriteTestHooks({
-      beforeRename: async () => {
-        const stale = new Date(Date.now() - 3_000)
-        await utimes(lockDir, stale, stale)
-        replacementLock.release =
-          await __acquireSidebarStateLockForTest(stateFile)
-        expect(replacementLock.release).toBeFunction()
-        await writeFile(stateFile, JSON.stringify(replacement))
+    __setSidebarStateWriteTestHooks(
+      {
+        beforeRename: async () => {
+          const stale = new Date(Date.now() - 3_000)
+          await utimes(lockDir, stale, stale)
+          replacementLock.release =
+            await __acquireSidebarStateLockForTest(stateFile)
+          expect(replacementLock.release).toBeFunction()
+          await writeFile(stateFile, JSON.stringify(replacement))
+        },
       },
-    })
+      stateFile,
+    )
 
     try {
       await setSidebarState(staleWriter, stateFile)
       expect(JSON.parse(await readFile(stateFile, 'utf8'))).toEqual(replacement)
     } finally {
-      __setSidebarStateWriteTestHooks(null)
+      __setSidebarStateWriteTestHooks(null, stateFile)
       await replacementLock.release?.()
       await rm(stateDir, { recursive: true, force: true })
     }

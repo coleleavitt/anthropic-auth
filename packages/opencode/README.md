@@ -22,7 +22,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
 | Runtime state | `~/.config/opencode/anthropic-auth-state.json` | next to the Pi sidecar as `anthropic-auth-state.json` |
-| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump`, `/claude-killswitch` | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
+| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-prime`, `/claude-start`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump`, `/claude-killswitch` | `/claude-cache`, `/claude-cachekeep`, `/claude-prime` (status only), `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
 | Fallback accounts, quota routing, killswitch, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
 
 ## What CortexKit adds over the original plugin
@@ -33,6 +33,8 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Quota-aware routing**: skip main or fallback accounts when their 5-hour or 7-day Claude quota falls below your configured minimum.
 - **Persistent Claude cache controls**: manage Anthropic 1-hour prompt caching from `/claude-cache` with explicit, automatic, or hybrid modes.
 - **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
+- **Quota window priming**: opt in with `/claude-prime on` to start each 5-hour quota window about one minute after it resets instead of waiting for the next normal prompt.
+- **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
 - **Fable/Opus 5 safety fallback**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
@@ -50,7 +52,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.
-- Add `/claude-cache`, `/claude-cachekeep`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands.
+- Add `/claude-cache`, `/claude-cachekeep`, `/claude-prime`, `/claude-start`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands.
 - Optionally relay large requests through a Cloudflare Worker owned by the user.
 
 ## Install
@@ -234,6 +236,9 @@ The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-
 
 Runtime data is stored separately in `anthropic-auth-state.json`: token-refresh backoff, quota snapshots, quota API backoff, custom API-route keys, and a compatibility mirror used by existing routing code. Canonical OAuth and first-party Anthropic API-key credentials live in `~/.anthropic-accounts/accounts.json`. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
+## OpenCode lane-start setting
+
+
 ## Fallback accounts
 
 Fallback accounts are separate Claude OAuth accounts or Anthropic-compatible API-key routes managed by this plugin. By default, the main account is tried first unless quota policy says it is currently unusable. Fallbacks are then tried in sidecar order when the primary request returns a configured fallback status.
@@ -411,6 +416,112 @@ Cache keepalive only tracks requests when `/claude-cache` is enabled in `hybrid`
 Request bodies, headers, and tokens remain in memory. A lease-backed file under the system temporary directory shares only session IDs and cache timing for cross-instance status; records from stopped processes disappear from status after about three minutes.
 
 Pre-warm requests preserve explicit cache anchors but remove response-only fields that Anthropic rejects with `max_tokens: 0`, such as streaming, enabled thinking, structured output format, and forced/any tool choice. The feature works only while OpenCode or Pi is running and the machine is awake, and cache writes are still billed when the cache entry is no longer warm.
+
+## Claude quota window priming
+
+Quota-window priming is off by default. OpenCode controls it with:
+
+```text
+/claude-prime
+/claude-prime on
+/claude-prime off
+```
+
+When enabled, the plugin watches each OAuth account's 5-hour quota reset. About one minute after a confirmed reset, it sends one minimal `claude-haiku-4-5` request so the next window starts without waiting for a normal prompt. Usage is measured from response accounting.
+
+Scheduled fires happen only after the quota window has reset. If an idle account has no cached reset time, the plugin sends one bootstrap request to establish its first observed window. Atomic temporary-file claims ensure that multiple OpenCode processes sharing the same account config send only one request per account and reset.
+
+Prime marker identities live in `anthropic-auth-state.json`. Plugin-owned refresh rotations preserve the main account's lineage, while a host credential replacement creates a new lineage. An existing main lineage without a refresh-token binding attaches to the current credential on its first check without changing identity. On upgrade, an existing fallback account receives an identity during its first prime check; that one-time marker change can send one extra request in the current window.
+
+Pi exposes `/claude-prime` as a status-only command. Its `on` and `off` arguments are ignored; enable or disable priming from OpenCode.
+
+## OpenCode lane start
+
+`/claude-start` is an OpenCode-only command. It queues one synthetic turn for the current session:
+
+```text
+/claude-start
+```
+
+The bare command fires immediately. The synthetic prompt uses the session's current model, agent, and variant, then travels through the ordinary quota, routing, cache, relay, signing, and response pipeline. OpenCode shapes that OAuth request to `max_tokens: 1` while keeping streaming enabled, and correlates the request by its synthetic message ID. A queued modal is a request to start the turn, not a provider-success claim.
+
+> [!IMPORTANT]
+> This is a real billed request. The one-token limit reduces generated output only; Anthropic still charges for prompt-cache reads and any new cache writes. Use it when you plan to resume the session before the refreshed cache expires.
+
+Pi does not expose this command.
+
+### Cache diagnostics (beta)
+
+The `cache-diagnosis-2026-04-07` beta is measure-only. It asks Anthropic to report prompt-cache diagnostics; it does not change cache controls or routing. OpenCode captures the provider's top-level response ID as an opaque string and sends it as `diagnostics.previous_message_id` on the next request in the same session. The first request sends `null`.
+
+The `MC-CACHE-DIAG ` line is a versioned, one-line JSON record. Records and their beta side-channel are emitted only at debug level; use `/claude-logging debug` to capture them. Because emission is gated on the runtime log level, an empty record stream is ambiguous between a quiet system and a level below debug — liveness checks must cross-reference an independent activity witness (billing, usage rows, or dumps) instead of reading silence as absence of cache traffic. Version `2` contains these fields:
+
+| Field | Type | Source |
+| --- | --- | --- |
+| `v` | `2` | Capture schema |
+| `source` | string | Observation path; known values are `"turn"`, `"start"`, and `"prewarm_cachekeep"`, but consumers must tolerate future values |
+| `synthetic` | boolean | Whether this observation was generated by plugin machinery rather than a real turn |
+| `account_id` | string | Persisted plugin-internal OAuth account identifier used by routing and the sidebar; stable across restarts and token refreshes, so consumers may key timelines on it. Opaque mixed key space (the main account is a sentinel string, fallbacks are UUIDs) — never validate its shape |
+| `betas_hash` | 16-character lowercase hex | xxHash64 (seed `0`) of the sorted `anthropic-beta` list actually sent, truncated to its first 16 hexadecimal characters |
+| `requested_model` | string, optional | Sent request-body model, present only when it differs from the served Anthropic response model |
+| `session_id` | string | OpenCode session affinity |
+| `ts_ms_received` | integer | Local response receipt time |
+| `model` | string | Anthropic response |
+| `is_subagent` | boolean | Original request context |
+| `ttl_sent` | `"1h" \| "5m" \| null` | Last valid cache breakpoint in the sent body |
+| `cache_read` | number | `usage.cache_read_input_tokens` |
+| `cache_creation` | number | `usage.cache_creation_input_tokens` |
+| `input_tokens` | number | `usage.input_tokens` |
+| `ephemeral_5m_tokens` | number | `usage.cache_creation.ephemeral_5m_input_tokens` |
+| `ephemeral_1h_tokens` | number | `usage.cache_creation.ephemeral_1h_input_tokens` |
+| `message_id` | string | Anthropic response top-level `id` |
+| `previous_message_id` | string \| null | Sent `diagnostics.previous_message_id` |
+| `diag_state` | `"absent" \| "server_null" \| "pending" \| "populated"` | Anthropic response envelope |
+| `miss_reason` | string, optional | `diagnostics.cache_miss_reason.type` |
+| `cache_missed_input_tokens` | number, optional | `diagnostics.cache_miss_reason.cache_missed_input_tokens` |
+
+`cache_missed_input_tokens` is a byte-derived, pre-tokenization magnitude indicator, not a token count: it can differ from and occasionally exceed `input_tokens`, so never difference it against usage fields.
+
+All required usage counters must be finite, non-negative numbers. A malformed required counter rejects the whole record rather than emitting a partial receipt.
+
+Consumers classifying these records should check `cache_read` before `miss_reason`: `cache_read > 0` is a fact and `miss_reason` is an interpretation, and facts win. On multi-turn agent traffic a populated `*_changed` reason routinely coexists with a full prefix hit (each turn appends messages), so a populated-first classifier inverts every such record into a false miss.
+
+Known sources map to `synthetic` as follows:
+
+| `source` | `synthetic` |
+| --- | --- |
+| `turn` | `false` |
+| `start` | `true` |
+| `prewarm_cachekeep` | `true` |
+
+Lane-start cache observations therefore appear as ordinary `MC-CACHE-DIAG ` records with `source: "start"`; the row above is the diagnostics-side companion to the `/claude-start` pipeline described earlier.
+
+`synthetic` wins on conflict. A disagreement for a known source is an emitter defect: OpenCode writes one warning and still emits the record with the supplied `synthetic` value. Unknown future sources have no mapping and must not be rejected by consumers.
+
+The first observation of each `betas_hash` in a process also writes `MC-CACHE-DIAG-BETAS {"hash":"…","betas":[…]}` at debug level on the `cache-diagnostics` logger channel. Its sorted beta list makes an observed hash interpretable without reconstructing headers; repeated hashes do not emit another side-channel line.
+
+The trailing space in `MC-CACHE-DIAG ` is load-bearing: a record line has a space after `MC-CACHE-DIAG`, while the beta side-channel line has a hyphen. Do not trim the delimiter or write a trimming consumer. `grep -c "MC-CACHE-DIAG"` over-counts because it includes beta lines; count records with `grep -c "MC-CACHE-DIAG "` or an anchored equivalent.
+
+The four diagnostic states are:
+
+| State | Response shape |
+| --- | --- |
+| `absent` | No `diagnostics` property |
+| `server_null` | `diagnostics: null` |
+| `pending` | `diagnostics.cache_miss_reason: null` |
+| `populated` | An object `diagnostics.cache_miss_reason` with a non-empty string `type`, including `"unavailable"` |
+
+Only valid Message envelopes produce an `MC-CACHE-DIAG ` record. Malformed or error responses are not mapped to `absent`; they retain ordinary response handling and dumps. `ttl_sent` is reduced from the last valid breakpoint in the actual body sent. A short-gap `previous_message_not_found` result is also recorded as a canary when the previous provider ID was captured less than five minutes earlier.
+
+`unavailable` is expected when any prompt-affecting parameter changes between requests. This includes the active Anthropic beta-header set; structured-output requests use a different beta set and can therefore produce `unavailable`. Diagnostics are scoped to the provider's cache fingerprint, organization, and workspace. Fingerprints expire, so a later request can miss after a long gap even when the body is unchanged. These records measure the result; they do not guarantee a cache hit.
+
+Diagnostics comparison requires a cacheable prefix. Requests below the model's cacheable minimum or without cache breakpoints return `diagnostics: null` even when the request genuinely changed; consumers must gate interpretation of `null` on observed cache activity.
+
+`diag_state` is always a string and never JSON null: `absent | server_null | pending | populated`.
+
+Version 1 records come from the unversioned-source era and cannot distinguish prewarms from turns; consumers must treat their source as unknown and cannot split machinery from traffic retroactively. Version 2 always states the source.
+
+When request dumps are enabled, each response gets a `.response.json` artifact containing status and parsed response metadata, but no response content. Lane-start requests are tagged `-start-`; CacheKeep prewarms retain `-prewarm-cachekeep-`. If Prime prewarming is enabled in a build that supports it, those artifacts use `-prewarm-prime`. Treat request bodies and related dump files as sensitive local debugging data.
 
 ## Claude fast mode
 

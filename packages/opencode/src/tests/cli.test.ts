@@ -123,15 +123,74 @@ describe('CLI api add', () => {
 })
 
 describe('CLI login', () => {
-  test('continues from label prompt to OAuth callback prompt and saves account', async () => {
+  test('names the account from the profile endpoint with no label given', async () => {
+    // The whole point of the profile lookup: `login` with no argument names
+    // itself after whoever actually signed in, so the caller never has to
+    // retype an address the API already knows.
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const prompt = async () =>
+      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
+    const exchange = async (): Promise<{
+      type: 'success'
+      access: string
+      refresh: string
+      expires: number
+    }> => ({
+      type: 'success',
+      access: 'cli-access',
+      refresh: 'cli-refresh',
+      expires: Date.now() + 3600 * 1000,
+    })
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.includes('/api/oauth/profile')) {
+        return new Response(
+          JSON.stringify({
+            account: { uuid: 'acct-uuid', email: 'from-profile@example.com' },
+            organization: { uuid: 'org-uuid' },
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof fetch
+
+    const logs: string[] = []
+    const origLog = console.log
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(String).join(' '))
+    }
+    try {
+      await withAccountEnv(accountPath, {}, () =>
+        // No label argument at all.
+        login(undefined, { prompt, exchange }),
+      )
+    } finally {
+      console.log = origLog
+      globalThis.fetch = originalFetch
+    }
+
+    expect(logs.join('\n')).toContain(
+      'Saved fallback account "from-profile@example.com"',
+    )
+    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(storage.accounts[0]).toMatchObject({
+      id: 'from-profile@example.com',
+      enabled: true,
+    })
+  })
+
+  test('names the account from the grant email and saves it', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
 
     // Real authorize() (exercises PKCE + state + the printed URL); exchange()
-    // is the network boundary, stubbed to return canned tokens. The prompt
-    // returns the label first, then the pasted callback code.
+    // is the network boundary, stubbed to return canned tokens. The only
+    // prompt is the pasted callback code: the grant reports who signed in, so
+    // asking the user to retype it would only invite a mismatch.
     const asked: string[] = []
     const promptAnswers = [
-      'cli-label',
       'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
     ]
     let askIndex = 0
@@ -149,6 +208,7 @@ describe('CLI login', () => {
       access: string
       refresh: string
       expires: number
+      email: string
     }> => {
       exchangeArgs = { input, verifier }
       return {
@@ -156,6 +216,7 @@ describe('CLI login', () => {
         access: 'cli-access',
         refresh: 'cli-refresh',
         expires: Date.now() + 3600 * 1000,
+        email: 'signed-in@example.com',
       }
     }
 
@@ -175,9 +236,8 @@ describe('CLI login', () => {
     const stdout = logs.join('\n')
     // The real authorize() URL was printed and carries a generated state.
     expect(stdout).toMatch(/[?&]state=[A-Za-z0-9_-]{43}/)
-    // The callback-code prompt and label prompt both fired, in order.
+    // Only the callback-code prompt fired; no label was asked for.
     expect(asked).toEqual([
-      'Fallback account label (optional): ',
       'Paste the full callback URL or authorization code here: ',
     ])
     // exchange received the real authorize() verifier and the pasted code.
@@ -185,13 +245,15 @@ describe('CLI login', () => {
       'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
     )
     expect(exchangeArgs?.verifier).toBeString()
-    expect(stdout).toContain('Saved fallback account "cli-label"')
+    expect(stdout).toContain('Saved fallback account "signed-in@example.com"')
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.accounts).toHaveLength(1)
+    // The id is the signed-in email, so a later re-login updates this account
+    // in place instead of stacking a second copy under a fresh random id.
     expect(storage.accounts[0]).toMatchObject({
-      id: 'cli-label',
-      label: 'cli-label',
+      id: 'signed-in@example.com',
+      label: 'signed-in@example.com',
       enabled: true,
     })
     expect(storage.accounts[0].access).toBeUndefined()
@@ -200,10 +262,13 @@ describe('CLI login', () => {
     const runtimeState = JSON.parse(
       await readFile(getAccountStatePath(accountPath), 'utf8'),
     )
-    expect(runtimeState.accounts['cli-label']).toMatchObject({
+    expect(runtimeState.accounts['signed-in@example.com']).toMatchObject({
       access: 'cli-access',
       refresh: 'cli-refresh',
     })
+    expect(
+      runtimeState.accounts['signed-in@example.com'].authLineageId,
+    ).toMatch(/^[0-9a-f-]{36}$/)
   })
 
   test('preserves an account committed while the interactive OAuth flow is open', async () => {

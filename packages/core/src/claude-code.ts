@@ -6,8 +6,10 @@ import {
   CLAUDE_CODE_STAINLESS_PACKAGE_VERSION,
   CLAUDE_CODE_STAINLESS_RUNTIME_VERSION,
   CLAUDE_CODE_VERSION,
+  CONTEXT_1M_BETA,
   EFFORT_BETA,
   FAST_MODE_BETA,
+  modelSupportsContext1m,
 } from './constants.ts'
 import {
   type DeviceIdentityOptions,
@@ -25,8 +27,13 @@ const identityCache = new Map<string, ClaudeCodeIdentity>()
 let installationDeviceId = randomBytes(32).toString('hex')
 let installationDeviceIdPromise: Promise<string> | null = null
 
-function setBounded<K, V>(map: Map<K, V>, key: K, value: V) {
-  if (!map.has(key) && map.size >= IDENTITY_CACHE_LIMIT) {
+export function setBounded<K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  limit = IDENTITY_CACHE_LIMIT,
+) {
+  if (!map.has(key) && map.size >= limit) {
     const oldest = map.keys().next().value
     if (oldest !== undefined) map.delete(oldest)
   }
@@ -205,13 +212,13 @@ const CLAUDE_CODE_BASE_BETAS = [
   'prompt-caching-scope-2026-01-05',
   EFFORT_BETA,
   'extended-cache-ttl-2025-04-11',
+  'cache-diagnosis-2026-04-07',
 ] as const
 
 export const CLAUDE_CODE_FULL_AGENT_BETAS = [
   ...CLAUDE_CODE_BASE_BETAS,
   'advisor-tool-2026-03-01',
   'advanced-tool-use-2025-11-20',
-  'cache-diagnosis-2026-04-07',
 ] as const
 
 const CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS = [
@@ -250,6 +257,9 @@ export function selectClaudeCodeBetas(
     : [...CLAUDE_CODE_BASE_BETAS]
 
   if (body?.speed === 'fast') selected.push(FAST_MODE_BETA)
+  // A 1M-capable model without this beta is capped at ~200k: anything larger
+  // comes back as `stop_reason: "refusal"` with no content, billed in full.
+  if (modelSupportsContext1m(body?.model)) selected.push(CONTEXT_1M_BETA)
   for (const beta of extraBetas) {
     const trimmed = beta.trim()
     if (trimmed) selected.push(trimmed)

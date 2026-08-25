@@ -5,11 +5,14 @@ import {
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
   CLAUDE_FABLE_MYTHOS_5_PRICING,
+  claimSharedAccountRefresh,
   exchange,
   findSharedAccountByCredential,
   type LoadedSharedAccountStore,
   loadSharedAccountStore,
+  logger,
   refreshClaudeOAuthToken,
+  releaseSharedAccountRefresh,
   resolveAnthropicModelCatalog,
   resolveModelCost,
   type SharedAnthropicAccount,
@@ -168,6 +171,7 @@ export const FALLBACK_MODEL_CATALOG: CatalogModel[] = [
       cacheWrite: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheWrite5m,
     },
   })),
+  fallbackModel('claude-opus-5', 'Claude Opus 5', 1_000_000, 128_000),
   fallbackModel('claude-opus-4-8', 'Claude Opus 4.8', 1_000_000, 128_000),
   fallbackModel('claude-opus-4-5', 'Claude Opus 4.5', 200_000, 64_000),
   fallbackModel('claude-sonnet-4-5', 'Claude Sonnet 4.5', 200_000, 64_000),
@@ -224,6 +228,9 @@ export async function resolvePiModelCatalog(): Promise<CatalogModel[]> {
   return resolved.models
 }
 
+/** Bounded like the CLI's refresh lock retry (5 attempts, jittered waits). */
+const REFRESH_CLAIM_MAX_ATTEMPTS = 5
+
 export async function refreshAnthropicToken(
   credentials: OAuthCredentials,
 ): Promise<OAuthCredentials> {
@@ -245,10 +252,67 @@ export async function refreshAnthropicToken(
     sharedAccount?.credential.type === 'oauth'
       ? sharedAccount.credential.refresh_expires_at
       : undefined
-  const refreshed = await refreshClaudeOAuthToken({
-    refreshToken: credentials.refresh,
-    refreshTokenExpiresAt: refreshExpiry,
-  })
+
+  // Anthropic revokes the whole token family when a refresh token is presented
+  // twice, so the network call has to be serialised across processes. Claiming
+  // first — and re-reading under the claim — is what stops two agents sharing
+  // this store from spending the same token and killing the account. The store
+  // CAS below is not enough on its own: by the time it runs, both POSTs have
+  // already reached Anthropic.
+  let leaseId: string | undefined
+  if (sharedAccount) {
+    for (let attempt = 0; ; attempt += 1) {
+      const claim = await claimSharedAccountRefresh(
+        sharedAccount.id,
+        credentials.refresh,
+        {},
+      )
+      if (claim.status === 'claimed') {
+        leaseId = claim.leaseId
+        break
+      }
+      if (claim.status === 'already-refreshed') {
+        logger.info('pi.refresh', 'another process already rotated the token', {
+          accountId: sharedAccount.id,
+        })
+        return {
+          refresh: claim.credential.refresh,
+          access: claim.credential.access,
+          expires: claim.credential.expires_at,
+        }
+      }
+      if (claim.status === 'unknown-account') break
+      if (attempt >= REFRESH_CLAIM_MAX_ATTEMPTS) {
+        logger.warn('pi.refresh', 'refresh claim timed out; proceeding alone', {
+          accountId: sharedAccount.id,
+        })
+        break
+      }
+      // Matches the CLI's lock retry: bounded attempts, jittered waits.
+      logger.debug('pi.refresh', 'refresh claim held by another process', {
+        accountId: sharedAccount.id,
+        attempt,
+      })
+      await new Promise((resolve) =>
+        setTimeout(resolve, 1_000 + Math.random() * 1_000),
+      )
+    }
+  }
+
+  let refreshed: Awaited<ReturnType<typeof refreshClaudeOAuthToken>>
+  try {
+    refreshed = await refreshClaudeOAuthToken({
+      refreshToken: credentials.refresh,
+      refreshTokenExpiresAt: refreshExpiry,
+    })
+  } catch (error) {
+    if (sharedAccount && leaseId) {
+      await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
+        () => {},
+      )
+    }
+    throw error
+  }
 
   if (sharedAccount) {
     const persisted = await updateSharedAccountStore((store) => {
@@ -267,6 +331,7 @@ export async function refreshAnthropicToken(
       current.credential.refresh_expires_at =
         refreshed.refreshTokenExpiresAt ?? current.credential.refresh_expires_at
       current.last_error = undefined
+      current.refresh_lease = undefined
       return true
     })
     if (!persisted.result) {

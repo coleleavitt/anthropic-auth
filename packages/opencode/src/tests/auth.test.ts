@@ -254,6 +254,7 @@ describe('refreshClaudeOAuthToken', () => {
 
     const result = await refreshClaudeOAuthToken({
       refreshToken: 'old-refresh',
+      authLineageId: 'stable-lineage',
       now: () => 1_000,
       fetchImpl: mock((input: string | URL | Request, init?: RequestInit) => {
         capturedUrl = String(input)
@@ -289,6 +290,7 @@ describe('refreshClaudeOAuthToken', () => {
       refresh: 'old-refresh',
       expires: 3_601_000,
       expiresIn: 3600,
+      authLineageId: 'stable-lineage',
     })
   })
 
@@ -359,14 +361,13 @@ describe('refreshClaudeOAuthToken', () => {
     let calls = 0
     const setTimeoutMock = mock((handler: () => unknown) => {
       handler()
-      return 0
-    })
-    // @ts-expect-error — mock override for testing
-    globalThis.setTimeout = setTimeoutMock
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
 
     const result = await refreshClaudeOAuthToken({
       refreshToken: 'old-refresh',
       baseDelayMs: 25,
+      setTimeoutImpl: setTimeoutMock,
       fetchImpl: mock(() => {
         calls += 1
         if (calls === 1) {

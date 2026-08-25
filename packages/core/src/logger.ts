@@ -23,7 +23,11 @@ function parseLogLevel(value: string | undefined): LogLevel | null {
 }
 
 const envLevel = parseLogLevel(process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL)
-let currentLevel: LogLevel = envLevel ?? 'info'
+// Trace by default: the routing/retry/quota path is the thing that goes wrong
+// in the field, and reproducing it after the fact is expensive. The log is
+// buffered, rotated, and written to a temp file, so the cost of leaving it on
+// is bounded. Override with OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL.
+let currentLevel: LogLevel = envLevel ?? 'trace'
 
 export function setLogLevel(level: LogLevel): void {
   currentLevel = level

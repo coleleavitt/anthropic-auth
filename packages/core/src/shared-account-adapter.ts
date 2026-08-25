@@ -270,16 +270,39 @@ export function materializeSharedFallbackAccounts(
   now = Date.now(),
 ) {
   const main = pickSharedAccount(store, now)
-  const sharedIds = new Set(store.accounts.map((account) => account.id))
-  const existingById = new Map(
-    legacyAccounts.map((account) => [account.id, account]),
+  const sharedById = new Map(
+    store.accounts
+      .filter((account) => account.id !== main?.id)
+      .map((account) => [account.id, account] as const),
   )
-  const sharedFallbacks = store.accounts.flatMap((account) => {
-    if (account.id === main?.id) return []
-    return [sharedAccountToFallback(account, existingById.get(account.id))]
-  })
-  const legacyOnly = legacyAccounts.filter(
-    (account) => !sharedIds.has(account.id),
-  )
-  return [...sharedFallbacks, ...legacyOnly]
+
+  // Fallback order IS routing priority — the router walks `storage.accounts` in
+  // order — and the reconciled list is written back to the account config file,
+  // so any reordering here is both live and permanent. Emitting shared-backed
+  // accounts first sank every account the shared store cannot carry (a
+  // non-first-party API-key route, say) to the end of the user's list and then
+  // persisted that demotion. Walk the configured order instead.
+  const emitted = new Set<string>()
+  const ordered: FallbackAccount[] = []
+  for (const legacy of legacyAccounts) {
+    const shared = sharedById.get(legacy.id)
+    if (shared) {
+      ordered.push(sharedAccountToFallback(shared, legacy))
+      emitted.add(shared.id)
+      continue
+    }
+    // An entry promoted to the shared main is served as main, never as its own
+    // fallback.
+    if (main && legacy.id === main.id) continue
+    ordered.push(legacy)
+  }
+
+  // Shared accounts the config has never seen keep their store order, appended
+  // after everything the user explicitly configured.
+  for (const account of store.accounts) {
+    if (account.id === main?.id || emitted.has(account.id)) continue
+    ordered.push(sharedAccountToFallback(account, undefined))
+  }
+
+  return ordered
 }

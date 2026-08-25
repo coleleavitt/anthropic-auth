@@ -10,6 +10,7 @@ import {
   discoverNativeClaudeCredentials,
   exchange,
   fallbackAccountToShared,
+  fetchOAuthAccountIdentity,
   generateRelayToken,
   getAccountStoragePath,
   importNativeClaudeAccount,
@@ -316,8 +317,10 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   const ask = deps.prompt ?? prompt
   const authorizeImpl = deps.authorize ?? authorize
   const exchangeImpl = deps.exchange ?? exchange
-  const label =
-    labelArg?.trim() || (await ask('Fallback account label (optional): '))
+  // No label prompt: the token grant reports the signed-in account's email, so
+  // asking the user to retype it only invites a mismatch between the label and
+  // the account they actually authenticated as.
+  const label = labelArg?.trim()
   const startLoopback = deps.startLoopback ?? startOAuthLoopbackSession
   let loopback: Awaited<ReturnType<typeof startOAuthLoopbackSession>> | null =
     null
@@ -371,11 +374,32 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     throw new Error('Authentication failed')
   }
 
+  // Ask Anthropic who just signed in rather than inferring it. The grant only
+  // carries `account.email_address` when it happens to include it, while the
+  // profile endpoint always does — so this is what lets `login` name itself
+  // with no argument, and lets a re-login land on the row it supersedes.
+  const identity = await fetchOAuthAccountIdentity({
+    accessToken: result.access,
+  })
+
+  // A credential that cannot run inference is useless for routing, and the
+  // failure would otherwise surface much later as an opaque 403.
+  if (result.scopes?.length && !result.scopes.includes('user:inference')) {
+    throw new Error(
+      `Authentication succeeded but the granted scopes do not include user:inference (got: ${result.scopes.join(' ')})`,
+    )
+  }
+
   const now = Date.now()
+  // Prefer the profile email, then the grant's: both are stable across
+  // re-logins, so signing in again updates the existing account instead of
+  // stacking a second copy under a fresh random id.
+  const derivedId = label || identity.email || result.email
   const account: OAuthAccount = {
-    id: label || crypto.randomUUID(),
-    label: label || undefined,
+    id: derivedId || crypto.randomUUID(),
+    label: derivedId || undefined,
     type: 'oauth',
+    authLineageId: crypto.randomUUID(),
     access: result.access,
     refresh: result.refresh,
     expires: result.expires,
@@ -391,24 +415,27 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   )
   const sharedAccount = fallbackAccountToShared(account, existingSharedAccount)
   if (sharedAccount.credential.type === 'oauth') {
-    if (result.email) sharedAccount.email = result.email
+    if (identity.email ?? result.email) {
+      sharedAccount.email = identity.email ?? result.email
+    }
     if (result.scopes) sharedAccount.credential.scopes = result.scopes
-    if (result.accountId) {
+    const accountUuid = result.accountId ?? identity.accountUuid
+    if (accountUuid) {
+      const email = identity.email ?? result.email
       sharedAccount.credential.account = {
-        uuid: result.accountId,
-        ...(result.email ? { email_address: result.email } : {}),
+        uuid: accountUuid,
+        ...(email ? { email_address: email } : {}),
       }
     }
-    if (result.organizationId) {
-      sharedAccount.credential.organization = {
-        uuid: result.organizationId,
-      }
+    const organizationUuid = result.organizationId ?? identity.organizationUuid
+    if (organizationUuid) {
+      sharedAccount.credential.organization = { uuid: organizationUuid }
     }
   }
   await upsertSharedAccount(sharedAccount)
   await addAccountPersistent(account)
 
-  console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
+  console.log(`\nSaved fallback account${derivedId ? ` "${derivedId}"` : ''}.`)
 }
 
 /**

@@ -223,6 +223,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session relay/dump:alpha'),
+        dumpTag: 'start',
         body: JSON.stringify({
           model: 'claude-sonnet-4-6',
           stream: true,
@@ -249,9 +250,9 @@ describe('relay client', () => {
       expect(metaPath).toBeString()
       expect(bodyPath).toBeString()
       expect(relayPath).toBeString()
-      expect(metaPath).toInclude('session-relay-dump-alpha')
-      expect(bodyPath).toInclude('session-relay-dump-alpha')
-      expect(relayPath).toInclude('session-relay-dump-alpha')
+      expect(metaPath).toInclude('session-relay-dump-alpha-start-http-p1-')
+      expect(bodyPath).toInclude('session-relay-dump-alpha-start-http-p1-')
+      expect(relayPath).toInclude('session-relay-dump-alpha-start-http-p1-')
 
       const meta = JSON.parse(
         await readFile(`${getDumpDirectory()}/${metaPath}`, 'utf8'),
@@ -262,6 +263,7 @@ describe('relay client', () => {
         systemCount: 2,
         cch: 'abcde',
       })
+      expect(meta.tag).toBe('start')
       expect(
         await readFile(`${getDumpDirectory()}/${bodyPath}`, 'utf8'),
       ).toContain('first')
@@ -279,6 +281,46 @@ describe('relay client', () => {
       } else {
         process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
       }
+      await rm(dumpDir, { recursive: true, force: true })
+    }
+  })
+
+  test('reports the created HTTP relay dump handle without replacing the response', async () => {
+    const originalFetch = globalThis.fetch
+    const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = await mkdtemp(
+      join(tmpdir(), 'anthropic-auth-relay-handle-'),
+    )
+    setDumpEnabled(true)
+    globalThis.fetch = mock(
+      async () => new Response('relay', { status: 201 }),
+    ) as unknown as typeof fetch
+    const handles: unknown[] = []
+    try {
+      const response = await sendViaRelay({
+        config,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-handle'),
+        body: '{}',
+        fallback: async () => new Response('direct'),
+        onDumpCreated: (handle) => {
+          handles.push(handle)
+          throw new Error('observer failure')
+        },
+      })
+      expect(response.status).toBe(201)
+      expect(handles).toHaveLength(1)
+      expect((handles[0] as { responsePath: string }).responsePath).toEndWith(
+        '.response.json',
+      )
+    } finally {
+      const dumpDir = getDumpDirectory()
+      resetDumpState()
+      globalThis.fetch = originalFetch
+      if (originalDumpDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
       await rm(dumpDir, { recursive: true, force: true })
     }
   })
@@ -1491,13 +1533,11 @@ describe('relay client', () => {
 
   test('websocket keepalive resets pre-response timeout', async () => {
     const originalWebSocket = globalThis.WebSocket
-    const originalSetTimeout = globalThis.setTimeout
-    const originalClearTimeout = globalThis.clearTimeout
     const timeouts: Array<{ id: number; ms?: number }> = []
     const cleared: number[] = []
     let nextTimerId = 1
 
-    globalThis.setTimeout = ((
+    const setTimeoutMock = ((
       _: Parameters<typeof setTimeout>[0],
       ms?: number,
     ) => {
@@ -1505,7 +1545,7 @@ describe('relay client', () => {
       timeouts.push({ id, ms })
       return id
     }) as unknown as typeof setTimeout
-    globalThis.clearTimeout = ((id?: number) => {
+    const clearTimeoutMock = ((id?: number) => {
       if (typeof id === 'number') cleared.push(id)
     }) as unknown as typeof clearTimeout
 
@@ -1579,12 +1619,12 @@ describe('relay client', () => {
         headers: headers('session-relay-keepalive'),
         body: 'body',
         fallback: async () => new Response('direct'),
+        setTimeoutImpl: setTimeoutMock,
+        clearTimeoutImpl: clearTimeoutMock,
       })
       expect(response.status).toBe(200)
     } finally {
       globalThis.WebSocket = originalWebSocket
-      globalThis.setTimeout = originalSetTimeout
-      globalThis.clearTimeout = originalClearTimeout
     }
 
     expect(timeouts.map((timeout) => timeout.ms)).toEqual([
@@ -1688,6 +1728,7 @@ describe('relay client', () => {
     const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-dump-test-'))
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
     const sentPayloads: unknown[] = []
+    const handles: unknown[] = []
     setDumpEnabled(true)
 
     class DumpingWebSocket extends EventTarget {
@@ -1756,6 +1797,7 @@ describe('relay client', () => {
         headers: headers('session-relay-ws-dump-exact'),
         body: JSON.stringify({ messages: ['one'] }),
         fallback: async () => new Response('direct'),
+        onDumpCreated: (handle) => handles.push(handle),
       })
 
       const files = await readdir(getDumpDirectory())
@@ -1776,6 +1818,10 @@ describe('relay client', () => {
       expect(relay).toMatchObject({ protocol: 2, mode: 'full_sync' })
       expect(relay.id).toBeString()
       expect(meta.relayBytes).toBe(JSON.stringify(sentPayloads[0]).length)
+      expect(handles).toHaveLength(1)
+      expect((handles[0] as { responsePath: string }).responsePath).toEndWith(
+        '.response.json',
+      )
     } finally {
       resetDumpState()
       globalThis.WebSocket = originalWebSocket

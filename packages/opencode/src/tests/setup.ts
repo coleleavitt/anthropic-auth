@@ -13,6 +13,10 @@ process.once('exit', () => {
 process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_VERSION_CHECK = '1'
 process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = testDir
 process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(testDir, 'anthropic-auth.json')
+// Isolate the shared account store + model catalog so credential reconciliation
+// never reads or writes a developer's real ~/.anthropic-accounts state in tests.
+process.env.ANTHROPIC_ACCOUNTS_FILE = join(testDir, 'accounts.json')
+process.env.ANTHROPIC_MODEL_CATALOG_FILE = join(testDir, 'model-catalog.json')
 process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
   testDir,
   'sidebar-state.json',

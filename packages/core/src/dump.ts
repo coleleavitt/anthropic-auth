@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   readdir,
+  readFile,
   rename,
   unlink,
   writeFile,
@@ -29,7 +30,8 @@ const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
 const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
 const DUMP_SWEEP_NEWNESS_FLOOR_MS = 60 * 1000
 const DUMP_PARTIAL_STALE_MS = 10 * 60 * 1000
-const DUMP_ARTIFACT_SUFFIX_PATTERN = /\.(body|meta|relay|request)\.json$/
+const DUMP_ARTIFACT_SUFFIX_PATTERN =
+  /\.(body|meta|relay|request|response)\.json$/
 // Earlier builds emitted five-digit counters; current counters grow without truncation.
 const DUMP_ARTIFACT_ID_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-\d{5,}-(.+)$/
@@ -40,6 +42,11 @@ const DIRECT_DUMP_PATTERN = new RegExp(
 const RELAY_DUMP_PATTERN = new RegExp(
   `^${DUMP_SEGMENT_PATTERN}{1,80}-(?:http|websocket)-p[12]-(?:full_sync|patch)$`,
 )
+const DIRECT_DUMP_SUFFIX_PATTERN = new RegExp(
+  `^-direct(?:-${DUMP_SEGMENT_PATTERN}{1,80})?$`,
+)
+const RELAY_DUMP_SUFFIX_PATTERN =
+  /^-(?:http|websocket)-p[12]-(?:full_sync|patch)$/
 
 let dumpEnabled = false
 let nextDumpId = 0
@@ -53,6 +60,13 @@ export type DumpCommandAction =
   | { type: 'enable' }
   | { type: 'disable' }
   | { type: 'usage' }
+
+export type DumpTag = 'cachekeep' | 'start'
+
+export type DumpHandle = {
+  responsePath: string
+  tag?: DumpTag
+}
 
 export function isDumpEnabled() {
   return dumpEnabled
@@ -163,6 +177,7 @@ export async function sweepDumpDirectory(options: {
       size: number
       mtimeMs: number
       partial: boolean
+      artifactGroup?: string
     }[] = []
 
     await Promise.all(
@@ -179,6 +194,12 @@ export async function sweepDumpDirectory(options: {
             size: stats.size,
             mtimeMs: stats.mtimeMs,
             partial,
+            ...(!partial && {
+              artifactGroup: entry.name.replace(
+                DUMP_ARTIFACT_SUFFIX_PATTERN,
+                '',
+              ),
+            }),
           })
         } catch {
           // Files can disappear while concurrent dump requests finish.
@@ -187,19 +208,9 @@ export async function sweepDumpDirectory(options: {
     )
 
     let totalBytes = files.reduce((total, file) => total + file.size, 0)
-    files.sort(
-      (left, right) =>
-        left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path),
-    )
-
     let removed = 0
     let freedBytes = 0
-    for (const file of files) {
-      if (protectedPaths.has(resolve(file.path))) continue
-      const ageMs = now - file.mtimeMs
-      const stalePartial = file.partial && ageMs >= partialStaleMs
-      if (!stalePartial && totalBytes <= maxBytes) continue
-      if (file.partial ? !stalePartial : ageMs < minAgeMs) continue
+    const removeFile = async (file: (typeof files)[number]) => {
       try {
         await unlink(file.path)
         totalBytes -= file.size
@@ -208,6 +219,49 @@ export async function sweepDumpDirectory(options: {
       } catch {
         // Dump cleanup is best-effort and must not affect request handling.
       }
+    }
+
+    // Partials are not usable dump records. Reclaim stale ones independently,
+    // including while the completed-artifact set is already below the cap.
+    const partials = files
+      .filter((file) => file.partial)
+      .sort(
+        (left, right) =>
+          left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path),
+      )
+    for (const file of partials) {
+      if (protectedPaths.has(resolve(file.path))) continue
+      if (now - file.mtimeMs < partialStaleMs) continue
+      await removeFile(file)
+    }
+
+    const artifactGroups = new Map<
+      string,
+      { files: (typeof files)[number][]; newestMtimeMs: number }
+    >()
+    for (const file of files) {
+      if (file.partial || !file.artifactGroup) continue
+      const group = artifactGroups.get(file.artifactGroup) ?? {
+        files: [],
+        newestMtimeMs: 0,
+      }
+      group.files.push(file)
+      group.newestMtimeMs = Math.max(group.newestMtimeMs, file.mtimeMs)
+      artifactGroups.set(file.artifactGroup, group)
+    }
+
+    const completedGroups = [...artifactGroups.entries()].sort(
+      ([leftName, left], [rightName, right]) =>
+        left.newestMtimeMs - right.newestMtimeMs ||
+        leftName.localeCompare(rightName),
+    )
+    for (const [, group] of completedGroups) {
+      if (totalBytes <= maxBytes) break
+      if (now - group.newestMtimeMs < minAgeMs) continue
+      if (group.files.some((file) => protectedPaths.has(resolve(file.path)))) {
+        continue
+      }
+      for (const file of group.files) await removeFile(file)
     }
 
     if (removed > 0) {
@@ -289,13 +343,15 @@ function shortAffinity(affinity: string) {
   return affinity.length <= 16 ? affinity : `${affinity.slice(0, 12)}…`
 }
 
-function dumpFileSessionSegment(affinity: string) {
+function dumpFileSessionSegment(affinity: string, maxLength = 80) {
   const normalized = affinity
     .trim()
     .replace(/[^a-zA-Z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '')
   if (!normalized) return 'session-unknown'
-  return normalized.length <= 80 ? normalized : normalized.slice(0, 80)
+  return normalized.length <= maxLength
+    ? normalized
+    : normalized.slice(0, maxLength)
 }
 
 function dumpRequestSegment(input: {
@@ -311,6 +367,12 @@ function dumpRequestSegment(input: {
   return `direct${route}`
 }
 
+function dumpTagSegment(tag: DumpTag | undefined) {
+  if (tag === 'cachekeep') return '-prewarm-cachekeep'
+  if (tag === 'start') return '-start'
+  return ''
+}
+
 function directDumpPreviousKey(input: {
   affinity?: string | null
   route?: string
@@ -319,6 +381,87 @@ function directDumpPreviousKey(input: {
   const affinity = input.affinity?.trim()
   if (affinity) return `session:${affinity}`
   return `request:${input.route ?? 'direct'}:${input.url ?? ''}`
+}
+
+function dumpBodyTagForAffinity(
+  name: string,
+  affinity: string,
+): DumpTag | null | undefined {
+  if (!name.endsWith('.body.json')) return undefined
+  const stem = name.replace(DUMP_ARTIFACT_SUFFIX_PATTERN, '')
+  const requestPath = DUMP_ARTIFACT_ID_PATTERN.exec(stem)?.[1]
+  if (
+    !requestPath ||
+    (!DIRECT_DUMP_PATTERN.test(requestPath) &&
+      !RELAY_DUMP_PATTERN.test(requestPath))
+  ) {
+    return undefined
+  }
+
+  const cachekeepTag = dumpTagSegment('cachekeep')
+  const candidates: Array<{ prefix: string; tag: DumpTag | null }> = [
+    { prefix: dumpFileSessionSegment(affinity), tag: null },
+    {
+      prefix: `${dumpFileSessionSegment(affinity, 80 - cachekeepTag.length)}${cachekeepTag}`,
+      tag: 'cachekeep',
+    },
+  ]
+  for (const candidate of candidates) {
+    if (!requestPath.startsWith(`${candidate.prefix}-`)) continue
+    const suffix = requestPath.slice(candidate.prefix.length)
+    if (
+      DIRECT_DUMP_SUFFIX_PATTERN.test(suffix) ||
+      RELAY_DUMP_SUFFIX_PATTERN.test(suffix)
+    ) {
+      return candidate.tag
+    }
+  }
+  return undefined
+}
+
+async function loadLatestDumpBody(input: {
+  affinity?: string | null
+}): Promise<string | undefined> {
+  const affinity = input.affinity?.trim()
+  if (!affinity) return undefined
+
+  const dumpDir = getDumpDirectory()
+  let names: string[]
+  try {
+    names = await readdir(dumpDir)
+  } catch {
+    return undefined
+  }
+  const candidates = names
+    .map((name) => ({ name, tag: dumpBodyTagForAffinity(name, affinity) }))
+    .filter(
+      (candidate): candidate is { name: string; tag: DumpTag | null } =>
+        candidate.tag !== undefined,
+    )
+    .sort((a, b) => b.name.localeCompare(a.name))
+  for (const candidate of candidates) {
+    try {
+      const path = join(dumpDir, candidate.name)
+      const metadataPath = path.replace(/\.body\.json$/, '.meta.json')
+      if (!(await lstat(path)).isFile()) continue
+      const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as {
+        session?: unknown
+        tag?: unknown
+      }
+      if (
+        metadata.session !== shortAffinity(affinity) ||
+        (candidate.tag === null
+          ? metadata.tag != null
+          : metadata.tag !== candidate.tag)
+      ) {
+        continue
+      }
+      return await readFile(path, 'utf8')
+    } catch {
+      // A concurrent sweep can remove the newest artifact; try its predecessor.
+    }
+  }
+  return undefined
 }
 
 function rememberDirectDumpBody(key: string, bodyText: string) {
@@ -467,32 +610,38 @@ async function dumpRequest(input: {
   previousBodyText?: string
   payload?: unknown
   relayBytes?: number
+  tag?: DumpTag
   request?: {
     url?: string
     method?: string
     headers?: DumpHeaders
   }
 }) {
-  if (!dumpEnabled) return
+  if (!dumpEnabled) return null
   nextDumpId += 1
   const affinity = input.affinity?.trim() || 'session-unknown'
-  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(6, '0')}-${dumpFileSessionSegment(affinity)}-${dumpRequestSegment(input)}`
+  const tagSegment = dumpTagSegment(input.tag)
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(6, '0')}-${dumpFileSessionSegment(affinity, 80 - tagSegment.length)}${tagSegment}-${dumpRequestSegment(input)}`
   const dumpDir = getDumpDirectory()
   const prefix = join(dumpDir, id)
   const files: {
     body: string
     metadata: string
+    response: string
     relay?: string
     request?: string
   } = {
     body: `${prefix}.body.json`,
     metadata: `${prefix}.meta.json`,
+    response: `${prefix}.response.json`,
   }
   if (input.payload !== undefined) files.relay = `${prefix}.relay.json`
   if (input.request !== undefined) files.request = `${prefix}.request.json`
 
   try {
     await mkdir(dumpDir, { recursive: true })
+    const previousBodyText =
+      input.previousBodyText ?? (await loadLatestDumpBody(input))
     const metadata = {
       id,
       createdAt: new Date().toISOString(),
@@ -503,10 +652,11 @@ async function dumpRequest(input: {
       route: input.route,
       status: input.status,
       error: input.error,
+      tag: input.tag,
       bodyBytes: input.bodyText.length,
       relayBytes: input.relayBytes,
       bodyHash: hashText(input.bodyText),
-      diff: diffSummary(input.previousBodyText, input.bodyText),
+      diff: diffSummary(previousBodyText, input.bodyText),
       body: bodyStructureSummary(input.bodyText),
       files,
     }
@@ -551,6 +701,11 @@ async function dumpRequest(input: {
     relayLog(
       `dump failed: ${error instanceof Error ? error.message : String(error)}`,
     )
+    return null
+  }
+  return {
+    responsePath: files.response,
+    ...(input.tag ? { tag: input.tag } : {}),
   }
 }
 
@@ -563,11 +718,12 @@ export async function dumpDirectRequest(input: {
   url?: string
   method?: string
   headers?: DumpHeaders
-}) {
-  if (!dumpEnabled) return
+  tag?: DumpTag
+}): Promise<DumpHandle | null> {
+  if (!dumpEnabled) return null
   const previousKey = directDumpPreviousKey(input)
   const previousBodyText = directDumpPreviousBodies.get(previousKey)
-  await dumpRequest({
+  const handle = await dumpRequest({
     affinity: input.affinity,
     transport: 'direct',
     route: input.route,
@@ -580,8 +736,10 @@ export async function dumpDirectRequest(input: {
       method: input.method,
       headers: input.headers,
     },
+    tag: input.tag,
   })
   rememberDirectDumpBody(previousKey, input.bodyText)
+  return handle
 }
 
 export async function dumpRelayRequest(input: {
@@ -594,8 +752,9 @@ export async function dumpRelayRequest(input: {
   previousBodyText?: string
   payload: unknown
   relayBytes: number
-}) {
-  await dumpRequest({
+  tag?: DumpTag
+}): Promise<DumpHandle | null> {
+  return dumpRequest({
     affinity: input.affinity,
     transport: input.transport,
     protocol: input.protocol,
@@ -605,5 +764,37 @@ export async function dumpRelayRequest(input: {
     previousBodyText: input.previousBodyText,
     payload: input.payload,
     relayBytes: input.relayBytes,
+    tag: input.tag,
   })
+}
+
+export async function dumpResponseArtifact(
+  handle: DumpHandle | null,
+  input: { status: number; message: unknown },
+): Promise<void> {
+  if (!handle) return
+  const message =
+    input.message != null &&
+    typeof input.message === 'object' &&
+    !Array.isArray(input.message)
+      ? (input.message as Record<string, unknown>)
+      : {}
+  const artifact: Record<string, unknown> = { status: input.status }
+  if (typeof message.id === 'string' && message.id.length > 0)
+    artifact.message_id = message.id
+  if (typeof message.model === 'string' && message.model.length > 0)
+    artifact.model = message.model
+  if (Object.hasOwn(message, 'usage')) artifact.usage = message.usage
+  if (Object.hasOwn(message, 'diagnostics'))
+    artifact.diagnostics = message.diagnostics
+  try {
+    await writeDumpFile(
+      handle.responsePath,
+      `${JSON.stringify(artifact, null, 2)}\n`,
+    )
+  } catch (error) {
+    relayLog(
+      `dump response failed: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
 }

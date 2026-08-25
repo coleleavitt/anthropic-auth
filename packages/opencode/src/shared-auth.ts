@@ -192,11 +192,15 @@ function resolveOpenCodeAuth(
   }
   if (auth.type !== 'oauth') return null
   const access = nonEmpty(auth.access)
-  if (!access) return null
+  const refresh = nonEmpty(auth.refresh)
+  // Keep an OAuth credential that carries only a refresh token (no live access
+  // token yet): the downstream refresh path mints the access token before use.
+  // Dropping it here would strip the credential the prime and refresh flows need.
+  if (!access && !refresh) return null
   return {
     type: 'oauth',
-    access,
-    refresh: nonEmpty(auth.refresh),
+    access: access ?? '',
+    refresh,
     expires:
       typeof auth.expires === 'number' ? auth.expires : Number.MAX_SAFE_INTEGER,
     refreshTokenExpiresAt: auth.refreshTokenExpiresAt,
@@ -248,11 +252,16 @@ export async function reconcileAnthropicAuth(input: {
       hostOwnsSharedMain &&
       ((hostCredential.type === 'oauth' &&
         sharedMainBeforeUpdate.credential.type === 'oauth' &&
-        hostCredential.expires_at >=
-          sharedMainBeforeUpdate.credential.expires_at &&
-        (hostCredential.access !== sharedMainBeforeUpdate.credential.access ||
-          hostCredential.refresh !==
-            sharedMainBeforeUpdate.credential.refresh)) ||
+        // A different refresh token is a rotation the host performed, not a
+        // regression to an older credential, so it is adopted regardless of
+        // expiry. Gating it on `expires_at >=` meant a freshly rotated token
+        // with a shorter lifetime than the stale stored one was rejected, and
+        // the store kept serving a credential the host had already replaced.
+        (hostCredential.refresh !== sharedMainBeforeUpdate.credential.refresh ||
+          (hostCredential.expires_at >=
+            sharedMainBeforeUpdate.credential.expires_at &&
+            hostCredential.access !==
+              sharedMainBeforeUpdate.credential.access))) ||
         (hostCredential.type === 'api_key' &&
           sharedMainBeforeUpdate.credential.type === 'api_key' &&
           hostCredential.key !== sharedMainBeforeUpdate.credential.key)),
@@ -357,8 +366,38 @@ export async function reconcileAnthropicAuth(input: {
           !hostStableAccountId &&
           account.id === 'opencode-main')),
   )
+  // The stored copy of the host's own session drifts from the host in both
+  // directions: it keeps the previous expiry after the host's token has aged
+  // out, and it keeps a stale one after the host's has moved forward. Either
+  // way the host is the authority on its own session, and serving the stored
+  // expiry instead makes the request path mis-judge whether a refresh is due.
+  //
+  // A genuine host rotation has already been written into the store by
+  // `shouldUpdateSharedMain` above, so by this point the two agree and this
+  // stays false — a rotated credential keeps its canonical `shared` provenance.
+  const hostOAuth =
+    input.openCodeAuth.type === 'oauth' ? input.openCodeAuth : undefined
+  const hostMirrorsSharedMain = Boolean(
+    sharedMain &&
+      hostOwnsSharedMain &&
+      hostOAuth &&
+      sharedMain.credential.type === 'oauth' &&
+      hostOAuth.refresh === sharedMain.credential.refresh &&
+      // A host session carrying no access token at all is the strongest
+      // possible statement that its token is gone. `credentialFromOpenCodeAuth`
+      // returns null for that shape (it needs access + refresh + a numeric
+      // expiry), so read the host auth directly rather than via
+      // `hostCredential`, which would be null exactly when it matters most.
+      (!hostOAuth.access?.trim() ||
+        (typeof hostOAuth.expires === 'number' &&
+          hostOAuth.expires !== sharedMain.credential.expires_at)),
+  )
+
   return {
     auth:
+      (hostMirrorsSharedMain
+        ? resolveOpenCodeAuth(input.openCodeAuth)
+        : null) ??
       (sharedMain ? resolveSharedAccount(sharedMain) : null) ??
       (hostBlockedByDisabledSharedAccount
         ? null
