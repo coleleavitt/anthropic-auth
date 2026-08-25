@@ -3553,7 +3553,14 @@ export class FallbackAccountManager {
     let changed = false
 
     for (const account of storage.accounts) {
-      if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (account.enabled === false || !isOAuthAccount(account)) {
+        logger.debug('accounts.fallback', 'candidate excluded', {
+          id: account.id,
+          reason:
+            account.enabled === false ? 'disabled' : 'not an oauth account',
+        })
+        continue
+      }
       try {
         let next = account
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -3589,16 +3596,24 @@ export class FallbackAccountManager {
         // Single source of truth: evaluate quota policy from the unified
         // QuotaManager cache (the same source as the staleness check above) so
         // an active-route refresh that updated only the cache is not ignored.
-        if (
-          this.accountPassesQuotaPolicy(
-            this.quotaPolicyAccount(next),
-            storage,
-            {
-              modelId: options.modelId,
-            },
-          )
+        const passes = this.accountPassesQuotaPolicy(
+          this.quotaPolicyAccount(next),
+          storage,
+          { modelId: options.modelId },
         )
-          usable.push(next)
+        // The single most consequential verdict in routing, and previously
+        // silent in both directions: an account rejected here never appears in
+        // the pool, so a log that only shows the survivors cannot explain why
+        // the request went where it did.
+        logger.debug('accounts.fallback', 'quota policy verdict', {
+          id: next.id,
+          passes,
+          staleWhenChecked: stale,
+          fiveHourUsedPercent: next.quota?.five_hour?.usedPercent,
+          sevenDayUsedPercent: next.quota?.seven_day?.usedPercent,
+          modelId: options.modelId,
+        })
+        if (passes) usable.push(next)
       } catch (error) {
         if (
           canUseCachedQuotaAfterRefreshError(
@@ -3630,10 +3645,28 @@ export class FallbackAccountManager {
           !failClosedOnUnknownQuota(storage) &&
           quotaSnapshotPassesModelScope(account.quota, options.modelId)
         ) {
+          logger.debug('accounts.fallback', 'admitted on unknown quota', {
+            id: account.id,
+            error: formatErrorMessage(error),
+            reason:
+              'fail-open: quota unknown and not configured to fail closed',
+          })
           usable.push(account)
+        } else {
+          logger.debug('accounts.fallback', 'candidate excluded', {
+            id: account.id,
+            reason: 'refresh or quota lookup failed',
+            error: formatErrorMessage(error),
+          })
         }
       }
     }
+
+    logger.debug('accounts.fallback', 'usable pool resolved', {
+      considered: storage.accounts.length,
+      usable: usable.length,
+      ids: usable.map((account) => account.id),
+    })
 
     if (changed) await this.save(storage)
     return usable
