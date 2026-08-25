@@ -7,6 +7,8 @@
   ],
   "scripts": {
     "build": "cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
+    "doctor": "bun scripts/doctor-install.ts",
+    "doctor:fix": "bun scripts/doctor-install.ts --fix",
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "extract": "bun scripts/extract-system-prompt.ts",
