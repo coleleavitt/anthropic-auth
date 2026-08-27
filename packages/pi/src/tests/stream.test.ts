@@ -1039,6 +1039,60 @@ describe('Pi routes from the shared account store', () => {
     expect(messageTokens.length).toBe(1)
   })
 
+  test('does not hand out a shared credential that already expired', async () => {
+    // Observed: the shared main's access token had expired 35 hours earlier.
+    // Nothing on this path refreshes it, so every request shipped a ~944KB body
+    // to earn a guaranteed 401 before routing moved on.
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-expired-main-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+    const expired = sharedOAuthAccount('expired-main', 'a')
+    expired.credential.expires_at = Date.now() - 35 * 60 * 60_000
+    await writeSharedStore([expired, sharedOAuthAccount('live-shared', 'c')])
+
+    const messageTokens: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (!url.includes('/v1/messages')) {
+          return Promise.resolve(new Response(HEALTHY_USAGE, { status: 200 }))
+        }
+        messageTokens.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+
+    // No host key, so the credential must come from the shared store.
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      sessionId: 'ses_pi_expired_main',
+    })
+    const terminalTypes: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminalTypes.push(event.type)
+    }
+
+    expect(terminalTypes).toEqual(['done'])
+    // The expired token was never presented; the live account supplied it.
+    expect(
+      messageTokens.some((token) => token.includes(expired.credential.access)),
+    ).toBe(false)
+    expect(messageTokens.some((token) => token.includes('c'.repeat(24)))).toBe(
+      true,
+    )
+  })
+
   test('leaves routing untouched when the shared store is empty', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-shared-empty-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')

@@ -580,12 +580,53 @@ async function sharedAccessToken(): Promise<string | undefined> {
     return null
   })
   if (!loaded) return undefined
-  const account = pickSharedAccount(loaded.store)
-  if (account?.credential.type !== 'oauth') return undefined
+
+  // This token is used as a bearer directly — nothing on this path refreshes
+  // it. `pickSharedAccount` only judges quota and cooldown, so it will happily
+  // return an account whose access token expired days ago: every request then
+  // ships its full body to earn a guaranteed 401. Skip expired credentials and
+  // take the next usable account instead.
+  const now = Date.now()
+  let candidate = pickSharedAccount(loaded.store, now)
+  if (candidate && !oauthCredentialIsLive(candidate, now)) {
+    logger.warn('pi.stream', 'shared main credential is expired; skipping', {
+      accountId: candidate.id,
+      expiredForMs:
+        candidate.credential.type === 'oauth' &&
+        typeof candidate.credential.expires_at === 'number'
+          ? now - candidate.credential.expires_at
+          : undefined,
+    })
+    candidate = loaded.store.accounts.find(
+      (account) =>
+        account.id !== candidate?.id && oauthCredentialIsLive(account, now),
+    )
+  }
+  if (candidate?.credential.type !== 'oauth') {
+    logger.error('pi.stream', 'no shared account has a live access token', {
+      accounts: loaded.store.accounts.length,
+    })
+    return undefined
+  }
   logger.info('pi.stream', 'using a shared-store credential', {
-    accountId: account.id,
+    accountId: candidate.id,
   })
-  return account.credential.access || undefined
+  return candidate.credential.access || undefined
+}
+
+/** An OAuth account whose access token is present and not past its expiry. */
+function oauthCredentialIsLive(
+  account: {
+    credential: { type: string; access?: string; expires_at?: unknown }
+  },
+  now: number,
+) {
+  const credential = account.credential
+  if (credential.type !== 'oauth' || !credential.access) return false
+  // A missing expiry is treated as live: the server is the authority, and
+  // refusing to try would strand an otherwise usable credential.
+  if (typeof credential.expires_at !== 'number') return true
+  return credential.expires_at > now
 }
 
 async function loadRoutingStorage(storagePath: string) {
