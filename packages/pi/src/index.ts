@@ -20,6 +20,7 @@ import {
   resolveModelCost,
   type SharedAnthropicAccount,
   startOAuthLoopbackSession,
+  tokenFingerprint,
   updateSharedAccountStore,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -185,19 +186,33 @@ const SHARED_CREDENTIAL_ADOPTION_SKEW_MS = 60_000
 
 function currentSharedAccount(
   store: LoadedSharedAccountStore['store'],
+  now = Date.now(),
 ): SharedAnthropicAccount | undefined {
-  return (
-    store.accounts.find(
-      (entry) => entry.id === store.current && entry.enabled !== false,
-    ) ?? store.accounts.find((entry) => entry.enabled !== false)
-  )
+  const enabled = store.accounts.filter((entry) => entry.enabled !== false)
+  const named = enabled.find((entry) => entry.id === store.current)
+  if (named && sharedCredentialIsLive(named, now)) return named
+  // `current` was unset or points at a dead credential. The old fallback took
+  // the first enabled account regardless of health, which picked an account
+  // whose access token had expired 35 hours earlier — so adoption declined it
+  // and the caller spent its own (revoked) refresh token instead, on every
+  // request. Prefer an account that can actually serve.
+  return enabled.find((entry) => sharedCredentialIsLive(entry, now)) ?? named
+}
+
+/** An enabled OAuth account whose access token has not expired. */
+function sharedCredentialIsLive(account: SharedAnthropicAccount, now: number) {
+  const credential = account.credential
+  if (credential.type !== 'oauth' || !credential.access) return false
+  return credential.expires_at > now
 }
 
 async function currentSharedAccessToken(): Promise<string | undefined> {
   const loaded = await loadSharedAccountStore().catch(() => null)
   if (!loaded) return undefined
-  const credential = currentSharedAccount(loaded.store)?.credential
-  return credential?.type === 'oauth' ? credential.access : undefined
+  const account = currentSharedAccount(loaded.store)
+  if (!account || !sharedCredentialIsLive(account, Date.now())) return undefined
+  const credential = account.credential
+  return credential.type === 'oauth' ? credential.access : undefined
 }
 
 /**
@@ -233,6 +248,28 @@ export async function resolvePiModelCatalog(): Promise<CatalogModel[]> {
 
 /** Bounded like the CLI's refresh lock retry (5 attempts, jittered waits). */
 const REFRESH_CLAIM_MAX_ATTEMPTS = 5
+
+/**
+ * Refresh tokens Anthropic has already rejected with `invalid_grant`.
+ *
+ * The shared store records this per account, but the host can hand us a
+ * credential that is not in the store at all — Pi keeps its own auth file, and
+ * calls `refreshToken` before every request. When that token's family is
+ * revoked there is nothing to look it up by, so the store's dead-token guard
+ * never fires and the same dead token is re-presented on every single request:
+ * 156 rejected refreshes in one hour, observed. `invalid_grant` is terminal —
+ * no retry can succeed — so remember the fingerprint and fail fast instead.
+ *
+ * Process-local by design: the store already persists this for accounts it
+ * knows, and a token absent from the store has no durable home. That is enough
+ * to stop the hammering, which happens within one long-lived agent process.
+ */
+const deadRefreshFingerprints = new Set<string>()
+
+/** Exposed so tests can assert the guard without a live OAuth endpoint. */
+export function forgetDeadRefreshTokens() {
+  deadRefreshFingerprints.clear()
+}
 
 export async function refreshAnthropicToken(
   credentials: OAuthCredentials,
@@ -347,6 +384,23 @@ export async function refreshAnthropicToken(
     }
   }
 
+  const refreshFp = tokenFingerprint(credentials.refresh)
+  if (deadRefreshFingerprints.has(refreshFp)) {
+    logger.error('refresh.spend', 'skipping a known-dead refresh token', {
+      refreshFp: refreshFp.slice(0, 8),
+      accountId: sharedAccount?.id,
+      selfPid: process.pid,
+    })
+    if (sharedAccount && leaseId) {
+      await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
+        () => {},
+      )
+    }
+    throw new Error(
+      'Anthropic refresh token was revoked; re-login is required (run `/login anthropic` in Pi, or `opencode-anthropic-auth login`)',
+    )
+  }
+
   let refreshed: Awaited<ReturnType<typeof refreshClaudeOAuthToken>>
   try {
     refreshed = await refreshClaudeOAuthToken({
@@ -354,15 +408,15 @@ export async function refreshAnthropicToken(
       refreshTokenExpiresAt: refreshExpiry,
     })
   } catch (error) {
-    if (
-      sharedAccount &&
-      error instanceof Error &&
-      error.message.includes('invalid_grant')
-    ) {
-      await markSharedRefreshTokenDead(
-        sharedAccount.id,
-        credentials.refresh,
-      ).catch(() => {})
+    if (error instanceof Error && error.message.includes('invalid_grant')) {
+      // Terminal for this token whether or not the store knows the account.
+      deadRefreshFingerprints.add(refreshFp)
+      if (sharedAccount) {
+        await markSharedRefreshTokenDead(
+          sharedAccount.id,
+          credentials.refresh,
+        ).catch(() => {})
+      }
     }
     if (sharedAccount && leaseId) {
       await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(

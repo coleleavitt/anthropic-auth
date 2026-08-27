@@ -8,7 +8,10 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
-import cortexKitPiAnthropicAuth, { refreshAnthropicToken } from '../index'
+import cortexKitPiAnthropicAuth, {
+  forgetDeadRefreshTokens,
+  refreshAnthropicToken,
+} from '../index'
 
 const originalFetch = globalThis.fetch
 const originalStorePath = process.env.ANTHROPIC_ACCOUNTS_FILE
@@ -221,5 +224,121 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
       contextWindow: 1_000_000,
       maxTokens: 128_000,
     })
+  })
+})
+
+describe('a revoked refresh token is only presented once', () => {
+  test('stops re-presenting a token Anthropic rejected with invalid_grant', async () => {
+    // Observed in production: Pi holds its own credential, which is not in the
+    // shared store, so the store's dead-token guard could never match it. When
+    // that family was revoked the same token was presented on every request —
+    // 156 rejected refreshes in one hour — and each failure surfaced to the
+    // user as "Authentication failed for anthropic".
+    forgetDeadRefreshTokens()
+    const directory = await mkdtemp(join(tmpdir(), 'pi-dead-refresh-'))
+    tempDirectories.push(directory)
+    // A path that does not exist: the store is empty, mirroring a host whose
+    // credential Pi holds privately.
+    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'absent.json')
+
+    let tokenPosts = 0
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      if (url.includes('/v1/oauth/token')) {
+        tokenPosts += 1
+        return new Response(
+          '{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}',
+          { status: 400 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof fetch
+
+    const credentials = {
+      refresh: `sk-ant-ort01-${'z'.repeat(24)}`,
+      access: `sk-ant-oat01-${'z'.repeat(24)}`,
+      expires: Date.now() - 60_000,
+    }
+
+    const failures: string[] = []
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await refreshAnthropicToken(credentials).catch((error: Error) =>
+        failures.push(error.message),
+      )
+    }
+
+    // Every call still fails — the token really is dead — but only the first
+    // one reaches Anthropic.
+    expect(failures).toHaveLength(5)
+    expect(tokenPosts).toBe(1)
+    expect(failures.at(-1)).toContain('revoked')
+  })
+})
+
+describe('shared credential adoption skips dead accounts', () => {
+  test('adopts a live account when the first enabled one has expired', async () => {
+    // The chain behind the outage: `current` was unset, so account selection
+    // fell back to the first enabled account — whose access token had expired
+    // 35 hours earlier. Adoption declined it, and the caller then spent its own
+    // revoked refresh token instead of using one of five healthy logins.
+    forgetDeadRefreshTokens()
+    const directory = await mkdtemp(join(tmpdir(), 'pi-adopt-live-'))
+    tempDirectories.push(directory)
+    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
+
+    const oauth = (id: string, suffix: string, expiresAt: number) => ({
+      id,
+      label: id,
+      email: `${id}@example.com`,
+      credential: {
+        type: 'oauth' as const,
+        access: `sk-ant-oat01-${suffix.repeat(24)}`,
+        refresh: `sk-ant-ort01-${suffix.repeat(24)}`,
+        expires_at: expiresAt,
+        scopes: ['user:inference'],
+      },
+      enabled: true,
+      created_at: '2026-08-27T00:00:00.000Z',
+    })
+
+    await saveSharedAccountStore({
+      version: 1,
+      // No `current`, and the first account is long expired.
+      accounts: [
+        oauth('expired-first', 'a', Date.now() - 35 * 60 * 60_000),
+        oauth('live-second', 'b', Date.now() + 6 * 60 * 60_000),
+      ],
+    })
+
+    let tokenPosts = 0
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      if (url.includes('/v1/oauth/token')) {
+        tokenPosts += 1
+        return new Response('{"error": "invalid_grant"}', { status: 400 })
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof fetch
+
+    // A credential Pi holds privately, absent from the store and revoked.
+    const adopted = await refreshAnthropicToken({
+      refresh: `sk-ant-ort01-${'z'.repeat(24)}`,
+      access: `sk-ant-oat01-${'z'.repeat(24)}`,
+      expires: Date.now() - 60_000,
+    })
+
+    // The live account's credential was adopted; the dead token was never spent.
+    expect(adopted.access).toContain('b'.repeat(24))
+    expect(tokenPosts).toBe(0)
   })
 })
