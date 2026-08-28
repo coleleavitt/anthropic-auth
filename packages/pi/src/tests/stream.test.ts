@@ -1164,6 +1164,53 @@ describe('Pi routes from the shared account store', () => {
     )
   })
 
+  test('surfaces a refusal instead of reporting the turn as served', async () => {
+    // `streaming response` is logged before the SSE loop runs, so a refused
+    // turn used to look exactly like a served one in the log: the request
+    // appeared to succeed and the error only reached the caller. The stream
+    // must still fail, and the failure must carry the stop reason.
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-refusal-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response(HEALTHY_USAGE, { status: 200 }))
+      }
+      // HTTP 200, content-free, refused — input billed, no output produced.
+      return Promise.resolve(
+        new Response(
+          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":120000,"output_tokens":0}}}\n\n' +
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"input_tokens":120000,"output_tokens":0}}\n\n' +
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_refusal',
+    })
+    const terminal: { type: string; message?: string }[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminal.push({
+          type: event.type,
+          message: (event as { error?: { errorMessage?: string } }).error
+            ?.errorMessage,
+        })
+    }
+
+    expect(terminal.map((entry) => entry.type)).toEqual(['error'])
+    expect(terminal[0]?.message ?? '').toContain('refusal')
+  })
+
   test('leaves routing untouched when the shared store is empty', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-shared-empty-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')

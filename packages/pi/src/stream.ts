@@ -1821,13 +1821,34 @@ export function streamCortexKitAnthropic(
           const rawStopReason = event.delta?.stop_reason
           if (rawStopReason) {
             output.stopReason = mapStopReason(String(rawStopReason))
-            if (output.stopReason === 'error')
+            if (output.stopReason === 'error') {
               output.errorMessage = describeStopReasonFailure(
                 String(rawStopReason),
               )
+              // `streaming response` is logged before this loop runs, so
+              // without this a refused turn is indistinguishable from a served
+              // one in the log — the request appears to succeed and the error
+              // only ever reaches the caller. Report the token counts too: they
+              // are what decide whether a refusal is a context-size problem or
+              // a genuine content decline.
+              logger.error('pi.stream', 'stream ended with a failing stop', {
+                stopReason: String(rawStopReason),
+                model: model.id,
+                sessionId: options?.sessionId,
+                messages: context.messages?.length ?? 0,
+                inputTokens: event.usage?.input_tokens,
+                outputTokens: event.usage?.output_tokens,
+                contextWindow: model.contextWindow,
+              })
+            }
           }
           updateUsage(model, output, event.usage)
         } else if (event.type === 'error') {
+          logger.error('pi.stream', 'stream carried an error frame', {
+            model: model.id,
+            sessionId: options?.sessionId,
+            event: JSON.stringify(event).slice(0, 300),
+          })
           throw new Error(JSON.stringify(event))
         }
       }
