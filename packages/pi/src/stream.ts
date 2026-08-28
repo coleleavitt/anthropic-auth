@@ -257,6 +257,8 @@ type AnthropicEvent = {
   index?: number
   content_block?: Record<string, unknown>
   delta?: Record<string, unknown>
+  /** Present on `type: "error"` frames: `{type, message, details}`. */
+  error?: { type?: string; message?: string }
   message?: { usage?: Record<string, number> }
   usage?: Record<string, number>
 }
@@ -533,6 +535,15 @@ export function primaryResponseAllowsApiFallback(preflight: Response | string) {
   )
 }
 
+/**
+ * Streamed error types worth rotating to another account. Anything else is the
+ * caller's business and is surfaced as-is rather than burning the pool.
+ */
+const ROTATABLE_STREAM_ERRORS: ReadonlySet<string> = new Set([
+  'rate_limit_error',
+  'overloaded_error',
+])
+
 async function firstStreamingError(
   response: Response,
 ): Promise<Response | string> {
@@ -540,12 +551,26 @@ async function firstStreamingError(
   const clone = response.clone()
   try {
     for await (const event of parseSse(clone as unknown as Response)) {
-      if (
-        event.type === 'error' &&
-        typeof event.delta?.type === 'string' &&
-        event.delta.type === 'rate_limit_error'
-      ) {
-        return 'rate_limit_error'
+      if (event.type === 'error') {
+        // Anthropic reports a rate limit on a *200* whose stream opens with
+        // `{"type":"error","error":{"type":"rate_limit_error",...}}`. This read
+        // `event.delta.type` — a field that only exists on content deltas — so
+        // the match never fired: the 200 was treated as a served request and
+        // the error text was streamed to the caller instead of rotating to a
+        // healthy account. `retryAfter` is absent on these, and the status
+        // never reaches `classifyRetry`, so this peek is the only thing
+        // standing between an out-of-credits account and a failed turn.
+        const errorType = event.error?.type ?? event.delta?.type
+        if (
+          typeof errorType === 'string' &&
+          ROTATABLE_STREAM_ERRORS.has(errorType)
+        ) {
+          logger.warn('pi.route', 'stream opened with a rotatable error', {
+            errorType,
+            message: event.error?.message,
+          })
+          return errorType
+        }
       }
       return response
     }

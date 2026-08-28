@@ -1093,6 +1093,77 @@ describe('Pi routes from the shared account store', () => {
     )
   })
 
+  test('rotates when a 200 stream opens with a rate_limit_error', async () => {
+    // Anthropic signals an out-of-credits account with HTTP 200 whose SSE
+    // stream opens with an error frame — no 429, no retry-after, so nothing in
+    // the status path ever sees it. The detector read `delta.type` instead of
+    // `error.type`, so the match never fired and this error text was streamed
+    // straight to the caller as a failed turn.
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-sse-ratelimit-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+    await writeSharedStore([
+      sharedOAuthAccount('main-shared', 'a'),
+      sharedOAuthAccount('healthy-shared', 'c'),
+    ])
+
+    const RATE_LIMITED_STREAM =
+      'event: error\ndata: {"type":"error","error":{"details":null,"type":"rate_limit_error","message":"Rate limited"}}\n\n'
+
+    const seenTokens: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (!url.includes('/v1/messages')) {
+          return Promise.resolve(new Response(HEALTHY_USAGE, { status: 200 }))
+        }
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        seenTokens.push(authorization)
+        // A 200 carrying a rate-limit error, exactly as observed in production.
+        if (authorization.includes('main-access')) {
+          return Promise.resolve(
+            new Response(RATE_LIMITED_STREAM, {
+              status: 200,
+              headers: {
+                'anthropic-ratelimit-unified-status': 'allowed',
+                'anthropic-ratelimit-unified-overage-status': 'rejected',
+                'anthropic-ratelimit-unified-overage-disabled-reason':
+                  'out_of_credits',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_sse_ratelimit',
+    })
+    const terminalTypes: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminalTypes.push(event.type)
+    }
+
+    // The rate-limited stream did not end the turn; a healthy account served it.
+    expect(terminalTypes).toEqual(['done'])
+    expect(seenTokens.some((token) => token.includes('sk-ant-oat01-'))).toBe(
+      true,
+    )
+  })
+
   test('leaves routing untouched when the shared store is empty', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-shared-empty-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
