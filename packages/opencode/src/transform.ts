@@ -1840,10 +1840,47 @@ function retryableAnthropicStreamErrorFromRawEvent(
   return retryableAnthropicStreamError(errorType, message)
 }
 
+type RelayUpstreamStatus = {
+  status: number
+  source: 'relay_status_field' | 'relay_message_parse'
+}
+
+function relayUpstreamStatusFromRawEvent(
+  rawEvent: string,
+): RelayUpstreamStatus | undefined {
+  if (!rawEvent.includes('relay_upstream_error')) return undefined
+
+  const dataLines: string[] = []
+  for (const line of rawEvent.split(/\r?\n/)) {
+    if (line.startsWith('data:')) {
+      const value = line.slice('data:'.length)
+      dataLines.push(value.startsWith(' ') ? value.slice(1) : value)
+    }
+  }
+  if (!dataLines.length) return undefined
+
+  try {
+    const data = asDiagnosticRecord(JSON.parse(dataLines.join('\n')))
+    const error = asDiagnosticRecord(data?.error)
+    if (stringField(error, 'type') !== 'relay_upstream_error') return undefined
+    const status = error?.status
+    if (typeof status === 'number' && Number.isInteger(status))
+      return { status, source: 'relay_status_field' }
+    const message = stringField(error, 'message')
+    const match = message?.match(/HTTP\s+(\d{3})\b/i)
+    return match
+      ? { status: Number(match[1]), source: 'relay_message_parse' }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function updateSseErrorState(
   state: SseErrorState,
   text: string,
   maxPendingBytes: number,
+  onRelayUpstreamError?: (status: RelayUpstreamStatus) => void,
 ): RetryableAnthropicStreamError | null {
   if (!text) return null
   if (state.disabled) {
@@ -1867,6 +1904,8 @@ function updateSseErrorState(
 
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
+    const relayStatus = relayUpstreamStatusFromRawEvent(rawEvent)
+    if (relayStatus !== undefined) onRelayUpstreamError?.(relayStatus)
     const error = retryableAnthropicStreamErrorFromRawEvent(rawEvent)
     retryable ??= error
   }
@@ -1919,6 +1958,7 @@ export function createStrippedStream(
       stopReason?: string
     }) => void
     onMessageResponse?: (message: Record<string, unknown>) => void
+    onRelayUpstreamError?: (status: RelayUpstreamStatus) => void
     onStreamEnd?: () => void | Promise<void>
     responseMode?: 'json'
     laneStart?: boolean
@@ -2124,6 +2164,7 @@ export function createStrippedStream(
                   sseErrors,
                   finalDecoded,
                   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                  options.onRelayUpstreamError,
                 ) ?? updateFinish(laneStartRewritten))
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
@@ -2203,6 +2244,7 @@ export function createStrippedStream(
                 sseErrors,
                 decoded,
                 NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                options.onRelayUpstreamError,
               ) ?? updateFinish(laneStartRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {

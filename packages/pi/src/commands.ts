@@ -7,6 +7,7 @@ import {
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   createEmptyStorage,
+  detectClaustrumConnection,
   executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
@@ -27,6 +28,7 @@ import {
   isFastModePersistentlyEnabled,
   isPrimePersistentlyEnabled,
   loadAccounts,
+  parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
@@ -264,9 +266,14 @@ export function registerCommands(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const path = getPiAccountStoragePath()
       const storage = await loadAccounts(path)
+      const action = parseAccountCommandAction(args ?? '')
       const result = executeAccountCommand({
         argumentsText: args ?? '',
         storage: storage ?? createEmptyStorage(),
+        claustrum:
+          action.type === 'status'
+            ? await detectClaustrumConnection()
+            : undefined,
       })
 
       if (!result.updated) {

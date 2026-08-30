@@ -29,12 +29,19 @@ import {
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
+  type ClaustrumConnector,
+  type ClaustrumCredentialCache,
+  ClaustrumCredentialError,
+  type ClaustrumReporterSource,
+  clearClaustrumRefreshErrorPersistent,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
+  connectClaustrumCredentialCache,
   createEmptyStorage,
   createStickyNoRouteResponse,
   type DumpHandle,
   decideStickyQuotaFailure,
+  detectClaustrumConnection,
   dumpDirectRequest,
   dumpResponseArtifact,
   exchange,
@@ -48,6 +55,7 @@ import {
   executeLoggingCommand,
   executePrimeCommand,
   executeRoutingCommand,
+  FALLBACK_BACKGROUND_TICK_MS,
   FallbackAccountManager,
   fetchOAuthAccountProfile,
   formatOAuthAccountTier,
@@ -66,6 +74,7 @@ import {
   getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
+  getRefreshBeforeExpiryMs,
   getRelayConfig,
   getRoutingMode,
   getStickyRoutingStatePath,
@@ -83,6 +92,7 @@ import {
   isClaudeFable51Model,
   isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
+  isClaustrumEnabledForAccount,
   isCostZeroingEnabled,
   isDumpPersistentlyEnabled,
   isFastModeEnabled,
@@ -123,6 +133,7 @@ import {
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
+  primeStorageFingerprint,
   QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
   type QuotaEntry,
@@ -212,6 +223,7 @@ import {
   pushNotification,
 } from './rpc/notifications.ts'
 import {
+  type AccountDialogAccount,
   type ApplyRequest,
   type ApplyResult,
   COMMAND_MODAL_NAMES,
@@ -634,6 +646,15 @@ type FableRequestContext = {
   standbyBridgeLogged?: boolean
 }
 
+type ClaustrumAccessResolution = {
+  accessToken?: string
+  served?: {
+    accountId: string
+    handle: string
+    recordVersion: number
+  }
+}
+
 type StickyOAuthRoute = {
   id: string
   access: string
@@ -641,6 +662,7 @@ type StickyOAuthRoute = {
   identity: IdentityState
   order: number
   account?: OAuthAccount
+  claustrum?: ClaustrumAccessResolution
 }
 
 type MainQuotaIdentityBinding = {
@@ -811,22 +833,74 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   ) as T
 }
 
-type PluginRuntimeTimerOverrides = Partial<{
+type PluginRuntimeOverrides = Partial<{
   setTimeout: typeof globalThis.setTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
+  claustrumConnector: ClaustrumConnector
+  claustrumNow: () => number
+  clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
 }>
+
+// Keep boot above the resident IPC fast path, but never let a stale-marked
+// refresh turn a vault treadmill into a seconds-long plugin-start delay.
+const CLAUSTRUM_WARMUP_TIMEOUT_MS = 100
+const CLAUSTRUM_TRANSIENT_WARM_BACKOFF_MS = 5_000
+const CLAUSTRUM_REAUTH_WARM_BACKOFF_MS = FALLBACK_BACKGROUND_TICK_MS
+
+function getConfiguredClaustrumConnectionFile(): string | undefined {
+  const configured =
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE?.trim()
+  return configured || undefined
+}
+
+function claustrumAccessToken(
+  credential: Awaited<ReturnType<ClaustrumCredentialCache['get']>>,
+): string | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(credential.payload)
+  } catch {
+    const payload = credential.payload.trim()
+    return payload || undefined
+  }
+  if (!parsed || typeof parsed !== 'object') return undefined
+  const record = parsed as {
+    access_token?: unknown
+    access?: unknown
+  }
+  if (typeof record.access_token === 'string') return record.access_token
+  if (typeof record.access === 'string') return record.access
+  return undefined
+}
+
+function usableClaustrumAccessToken(
+  credential: Awaited<ReturnType<ClaustrumCredentialCache['get']>> | undefined,
+  now: number,
+): string | undefined {
+  if (!credential) return undefined
+  const accessToken = claustrumAccessToken(credential)
+  if (!accessToken) return undefined
+  if (credential.expiresAtMs !== null && credential.expiresAtMs <= now) {
+    return undefined
+  }
+  return accessToken
+}
 
 const anthropicAuthPlugin = async (
   ctx: Parameters<Plugin>[0],
-  timerOverrides: PluginRuntimeTimerOverrides = {},
+  runtimeOverrides: PluginRuntimeOverrides = {},
 ) => {
   const runtimeTimers = {
     setTimeout: globalThis.setTimeout,
     setInterval: globalThis.setInterval,
     clearInterval: globalThis.clearInterval,
-    ...timerOverrides,
+    ...runtimeOverrides,
   }
+  const claustrumNow = runtimeOverrides.claustrumNow ?? Date.now
+  const clearClaustrumRefreshErrorPersistentImpl =
+    runtimeOverrides.clearClaustrumRefreshErrorPersistent ??
+    clearClaustrumRefreshErrorPersistent
   startEventLoopLagMonitor()
   const { client } = ctx
   const profileFetch = globalThis.fetch
@@ -1517,14 +1591,323 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  let claustrumCredentialCache: ClaustrumCredentialCache | null = null
+  const claustrumBlockedAccounts = new Set<string>()
+  const claustrumReauthAccounts = new Set<string>()
+  const claustrumWarmScheduled = new Set<string>()
+  const claustrumWarmBackoffUntil = new Map<string, number>()
+  let claustrumConnectBackoffUntil = 0
+  const claustrumAccounts = initialStorage
+    ? initialStorage.accounts.filter(
+        (account): account is OAuthAccount =>
+          isOAuthAccount(account) &&
+          account.enabled !== false &&
+          Boolean(account.claustrumHandle) &&
+          isClaustrumEnabledForAccount(initialStorage, account.id),
+      )
+    : []
+
+  const isFallbackAccountVaultServed = (
+    accountId: string,
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+  ): boolean => {
+    if (!storage || claustrumBlockedAccounts.has(accountId)) return false
+    if (!isClaustrumEnabledForAccount(storage, accountId)) return false
+    const account = storage.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === accountId &&
+        candidate.enabled !== false &&
+        isOAuthAccount(candidate),
+    )
+    const handle = account?.claustrumHandle
+    if (!handle) return false
+    const cached = claustrumCredentialCache?.peek(handle)
+    return Boolean(cached && usableClaustrumAccessToken(cached, claustrumNow()))
+  }
+
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
+    isFallbackAccountVaultServed,
+    isFallbackAccountVaultEnabled: (accountId, storage) => {
+      if (!isClaustrumEnabledForAccount(storage, accountId)) return false
+      const account = storage.accounts.find(
+        (candidate): candidate is OAuthAccount =>
+          candidate.id === accountId && isOAuthAccount(candidate),
+      )
+      return account?.enabled !== false && Boolean(account?.claustrumHandle)
+    },
+    onBackgroundRefresh: refreshVaultBackedFallbacks,
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
     onFallbackStorageChanged: () => {
       void refreshSidebarQuota().catch(() => {})
     },
   })
+
+  const clearClaustrumRefreshError = async (
+    accountId: string,
+    handle: string,
+  ) => {
+    await clearClaustrumRefreshErrorPersistentImpl(
+      accountId,
+      handle,
+      accountStoragePath,
+    )
+  }
+
+  const clearServedClaustrumRefreshError = (served: {
+    accountId: string
+    handle: string
+  }) => {
+    void loadAccounts(accountStoragePath)
+      .then((storage) => {
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === served.accountId && isOAuthAccount(candidate),
+        )
+        // A local refresh can persist an error after this warm cache was populated;
+        // a detached fresh read keeps the locked clear conditional without putting
+        // locks on the response path.
+        if (!account?.lastRefreshError) return
+        return clearClaustrumRefreshError(served.accountId, served.handle)
+      })
+      .catch((error) => {
+        logger.warn('claustrum', 'failed to clear stale refresh error', {
+          accountId: served.accountId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+  }
+
+  const markClaustrumCredentialReady = async (
+    accountId: string,
+    handle?: string,
+  ) => {
+    claustrumBlockedAccounts.delete(accountId)
+    claustrumReauthAccounts.delete(accountId)
+    if (handle) claustrumWarmBackoffUntil.delete(handle)
+    if (handle) {
+      await clearClaustrumRefreshError(accountId, handle).catch((error) => {
+        logger.warn('claustrum', 'failed to clear stale refresh error', {
+          accountId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    }
+  }
+  const handleClaustrumCredentialError = (
+    accountId: string,
+    error: unknown,
+    handle?: string,
+  ) => {
+    if (!(error instanceof ClaustrumCredentialError)) return
+    if (error.action === 'gone') claustrumBlockedAccounts.add(accountId)
+    if (error.action === 'reauth') {
+      claustrumReauthAccounts.add(accountId)
+    }
+    if (error.action === 'reduce_and_retry') {
+      claustrumCredentialCache?.reduceMinTtlMs()
+    }
+    if ((error.action === 'retry' || error.action === 'reauth') && handle) {
+      claustrumWarmBackoffUntil.set(
+        handle,
+        claustrumNow() +
+          (error.action === 'reauth'
+            ? CLAUSTRUM_REAUTH_WARM_BACKOFF_MS
+            : CLAUSTRUM_TRANSIENT_WARM_BACKOFF_MS),
+      )
+    }
+  }
+
+  async function ensureClaustrumCredentialCache(): Promise<ClaustrumCredentialCache | null> {
+    if (claustrumCredentialCache) return claustrumCredentialCache
+    const now = claustrumNow()
+    if (now < claustrumConnectBackoffUntil) return null
+    claustrumConnectBackoffUntil = now + CLAUSTRUM_TRANSIENT_WARM_BACKOFF_MS
+    const identity = {
+      project_root: ctx.directory ?? process.cwd(),
+      harness: 'opencode',
+      session: `store-${primeStorageFingerprint(accountStoragePath)}`,
+    }
+    try {
+      claustrumCredentialCache = await connectClaustrumCredentialCache({
+        enabled: true,
+        identity,
+        ...(getConfiguredClaustrumConnectionFile() && {
+          connectionFile: getConfiguredClaustrumConnectionFile(),
+        }),
+        ...(runtimeOverrides.claustrumConnector && {
+          connector: runtimeOverrides.claustrumConnector,
+        }),
+        now: claustrumNow,
+      })
+      return claustrumCredentialCache
+    } catch (error) {
+      logger.warn('claustrum', 'credential cache unavailable', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      claustrumCredentialCache = null
+      return null
+    }
+  }
+
+  async function refreshVaultBackedFallbacks(initial = false): Promise<void> {
+    let cache = claustrumCredentialCache
+    const storage = await loadAccounts(accountStoragePath)
+    if (!storage) return
+    const minTtlMs = getRefreshBeforeExpiryMs(storage) + 30 * 60_000
+    let sidebarChanged = false
+
+    for (const account of storage.accounts) {
+      if (
+        account.enabled === false ||
+        !isOAuthAccount(account) ||
+        !account.claustrumHandle ||
+        !isClaustrumEnabledForAccount(storage, account.id)
+      )
+        continue
+      const handle = account.claustrumHandle
+      if (!cache) cache = await ensureClaustrumCredentialCache()
+      if (
+        initial &&
+        cache &&
+        usableClaustrumAccessToken(cache.peek(handle), claustrumNow())
+      ) {
+        continue
+      }
+      const sidecarNearExpiry =
+        !account.access ||
+        !account.expires ||
+        account.expires - claustrumNow() <= getRefreshBeforeExpiryMs(storage)
+      const custodyOverrideRefresh = async (reason: string) => {
+        if (
+          refreshBackoffActive(
+            account.lastRefreshError,
+            account.id,
+            claustrumNow(),
+          )
+        ) {
+          return
+        }
+        logger.warn('refresh', 'custody override: local fallback refresh', {
+          accountId: account.id,
+          reason,
+        })
+        await fallbackManager
+          .refreshAccount(account, storage, { persistError: true })
+          .catch((error) => {
+            logger.warn('refresh', 'custody override local refresh failed', {
+              accountId: account.id,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          })
+      }
+      if (!cache) {
+        if (sidecarNearExpiry) {
+          await custodyOverrideRefresh('vault unavailable')
+        }
+        continue
+      }
+      if (initial && !cache.peek(handle)) {
+        if (sidecarNearExpiry) {
+          await custodyOverrideRefresh('vault warmup pending')
+          sidebarChanged = true
+        }
+        continue
+      }
+      try {
+        const credential = await cache.get(handle, minTtlMs)
+        if (!usableClaustrumAccessToken(credential, claustrumNow())) {
+          log('[refresh] vault fallback credential unusable', {
+            accountId: account.id,
+            handle,
+            minTtlMs,
+          })
+          if (sidecarNearExpiry) {
+            await custodyOverrideRefresh('vault credential unavailable')
+          }
+        } else {
+          await markClaustrumCredentialReady(account.id, handle)
+        }
+        sidebarChanged = true
+      } catch (error) {
+        handleClaustrumCredentialError(account.id, error, handle)
+        sidebarChanged = true
+        const action =
+          error instanceof ClaustrumCredentialError ? error.action : 'retry'
+        if (action === 'reauth' || sidecarNearExpiry) {
+          await custodyOverrideRefresh(
+            action === 'reauth' ? 'vault reauth' : 'vault unavailable',
+          )
+        }
+      }
+    }
+    if (sidebarChanged) void refreshSidebarQuota().catch(() => {})
+  }
+  if (claustrumAccounts.length > 0) {
+    try {
+      const claustrumIdentity = {
+        project_root: ctx.directory ?? process.cwd(),
+        harness: 'opencode',
+        session: `store-${primeStorageFingerprint(accountStoragePath)}`,
+      }
+      claustrumCredentialCache = await connectClaustrumCredentialCache({
+        enabled: true,
+        identity: claustrumIdentity,
+        ...(getConfiguredClaustrumConnectionFile() && {
+          connectionFile: getConfiguredClaustrumConnectionFile(),
+        }),
+        ...(runtimeOverrides.claustrumConnector && {
+          connector: runtimeOverrides.claustrumConnector,
+        }),
+        now: claustrumNow,
+      })
+      const cache = claustrumCredentialCache
+      if (cache) {
+        // Warm before auth hooks are exposed; request handling only peeks and
+        // refreshes asynchronously, so an expiry-skew vault refresh cannot
+        // delay a response.
+        const warmup = Promise.all(
+          claustrumAccounts.map(async (account) => {
+            const handle = account.claustrumHandle
+            if (!handle) return
+            try {
+              const credential = await cache.get(handle)
+              if (usableClaustrumAccessToken(credential, claustrumNow())) {
+                await markClaustrumCredentialReady(account.id, handle)
+              }
+            } catch (error) {
+              handleClaustrumCredentialError(account.id, error, handle)
+              logger.warn('claustrum', 'credential warmup failed', {
+                accountId: account.id,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
+          }),
+        )
+        let timedOut = false
+        const timeout = new Promise<void>((resolve) => {
+          const timer = globalThis.setTimeout(() => {
+            timedOut = true
+            resolve()
+          }, CLAUSTRUM_WARMUP_TIMEOUT_MS)
+          if ('unref' in timer) timer.unref()
+        })
+        await Promise.race([warmup, timeout])
+        if (timedOut) {
+          logger.warn('claustrum', 'credential warmup timed out', {
+            accounts: claustrumAccounts.length,
+            timeoutMs: CLAUSTRUM_WARMUP_TIMEOUT_MS,
+          })
+        }
+      }
+    } catch (error) {
+      logger.warn('claustrum', 'credential cache unavailable', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      claustrumCredentialCache = null
+    }
+  }
   const fallbackRefreshReady = fallbackManager.startBackgroundRefresh()
   const cacheDiagnosticsTracker = new CacheDiagnosticsTracker()
   const cacheDiagnosticsBetaTracker = new CacheDiagnosticsBetaTracker()
@@ -1546,6 +1929,10 @@ const anthropicAuthPlugin = async (
   const cacheDiagnosticsResponses = new WeakMap<
     Response,
     CacheDiagnosticsResponse
+  >()
+  const claustrumServedCredentials = new WeakMap<
+    Response,
+    { accountId: string; handle: string; recordVersion: number }
   >()
   const cacheKeepDiagnosticsRequests = new Map<
     string,
@@ -2350,6 +2737,11 @@ const anthropicAuthPlugin = async (
               Date.now(),
             ) &&
             isPermanentRefreshError(account.lastRefreshError),
+          vaultReauth:
+            claustrumReauthAccounts.has(account.id) &&
+            Boolean(
+              account.access && account.expires && account.expires > Date.now(),
+            ),
           enabled: account.enabled !== false,
         })),
       activeId: options.activeId,
@@ -3295,6 +3687,12 @@ const anthropicAuthPlugin = async (
     const result = executeAccountCommand({
       argumentsText,
       storage: storage ?? { version: 1, accounts: [] },
+      claustrum:
+        action.type === 'status'
+          ? await detectClaustrumConnection(
+              getConfiguredClaustrumConnectionFile(),
+            )
+          : undefined,
     })
 
     if (result.updated) {
@@ -3359,6 +3757,34 @@ const anthropicAuthPlugin = async (
     return { text: result.text, accounts }
   }
 
+  async function buildAccountDialogProjection(): Promise<{
+    accounts: AccountDialogAccount[]
+    claustrumDetection: string
+  }> {
+    const storage = await loadAccounts(accountStoragePath)
+    const accounts = buildAccountList(storage ?? createEmptyStorage()).map(
+      (account) => ({
+        ...account,
+        claustrumGate:
+          account.role === 'main'
+            ? ('na' as const)
+            : isClaustrumEnabledForAccount(
+                  storage ?? createEmptyStorage(),
+                  account.id,
+                )
+              ? ('on' as const)
+              : ('off' as const),
+        vaultServed:
+          account.role === 'fallback' &&
+          isFallbackAccountVaultServed(account.id, storage),
+      }),
+    )
+    const detection = await detectClaustrumConnection(
+      getConfiguredClaustrumConnectionFile(),
+    )
+    return { accounts, claustrumDetection: detection.status }
+  }
+
   async function buildDialogPayload(
     command: CommandModalName,
     args: string,
@@ -3385,8 +3811,10 @@ const anthropicAuthPlugin = async (
     }
     if (command === 'claude-account') {
       const result = await executePersistentAccountCommand(args, sessionId)
+      const accountProjection = await buildAccountDialogProjection()
       const knobs: Record<string, unknown> = {
-        accounts: result.accounts,
+        accounts: accountProjection.accounts,
+        claustrumDetection: accountProjection.claustrumDetection,
       }
       if ('knobs' in result && result.knobs) {
         Object.assign(knobs, result.knobs)
@@ -4589,6 +5017,142 @@ const anthropicAuthPlugin = async (
             return response
           }
 
+          function claustrumWarmBackoffActive(handle: string): boolean {
+            const retryAt = claustrumWarmBackoffUntil.get(handle)
+            if (retryAt === undefined) return false
+            if (claustrumNow() >= retryAt) {
+              claustrumWarmBackoffUntil.delete(handle)
+              return false
+            }
+            return true
+          }
+
+          function resolveClaustrumAccess(
+            account: OAuthAccount,
+            storage: Awaited<ReturnType<typeof loadAccounts>>,
+          ): ClaustrumAccessResolution {
+            const handle = account.claustrumHandle
+            if (
+              !handle ||
+              !storage ||
+              !isClaustrumEnabledForAccount(storage, account.id) ||
+              claustrumBlockedAccounts.has(account.id)
+            ) {
+              return { accessToken: account.access }
+            }
+
+            const cache = claustrumCredentialCache
+            if (!cache) {
+              if (
+                account.access &&
+                account.expires !== undefined &&
+                account.expires > claustrumNow()
+              ) {
+                return { accessToken: account.access }
+              }
+              return {}
+            }
+
+            const cached = cache.peek(handle)
+            const cachedAccess = usableClaustrumAccessToken(
+              cached,
+              claustrumNow(),
+            )
+            if (cached && cachedAccess) {
+              return {
+                accessToken: cachedAccess,
+                served: {
+                  accountId: account.id,
+                  handle,
+                  recordVersion: cached.recordVersion,
+                },
+              }
+            }
+
+            // Never send an expired vault value; the sidecar is only a
+            // bounded degradation path while the detached refresh completes.
+            // Defer the refresh until selection has captured sidecar provenance;
+            // the detached refresh must never turn an expired peek into a report.
+            if (!claustrumWarmBackoffActive(handle)) {
+              scheduleClaustrumWarm(account.id, handle)
+            }
+            if (
+              account.access &&
+              account.expires !== undefined &&
+              account.expires > claustrumNow()
+            ) {
+              return { accessToken: account.access }
+            }
+            return {}
+          }
+
+          async function warmClaustrumCredential(
+            accountId: string,
+            handle: string,
+          ): Promise<void> {
+            const cache = claustrumCredentialCache
+            if (!cache) return
+            try {
+              const credential = await cache.get(handle)
+              if (usableClaustrumAccessToken(credential, claustrumNow())) {
+                await markClaustrumCredentialReady(accountId, handle)
+              }
+            } catch (error) {
+              handleClaustrumCredentialError(accountId, error, handle)
+              logger.warn('claustrum', 'credential refresh failed', {
+                accountId,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
+          }
+
+          function scheduleClaustrumWarm(accountId: string, handle: string) {
+            if (claustrumWarmScheduled.has(handle)) return
+            claustrumWarmScheduled.add(handle)
+            runtimeTimers.setTimeout(() => {
+              claustrumWarmScheduled.delete(handle)
+              void warmClaustrumCredential(accountId, handle)
+            }, 0)
+          }
+
+          async function reportClaustrumAuthFailure(
+            served: {
+              accountId: string
+              handle: string
+              recordVersion: number
+            },
+            reporterSource: ClaustrumReporterSource = 'direct',
+          ): Promise<void> {
+            const cache = claustrumCredentialCache
+            if (!cache) return
+            const current = cache.peek(served.handle)
+            // Version match makes reports single-shot per served version. Accepted
+            // tradeoff: an unrelated cache eviction also suppresses a genuine
+            // report (worst case one delayed cycle until the next served 401).
+            if (!current || current.recordVersion !== served.recordVersion)
+              return
+            try {
+              await cache.reportAuthFailure(
+                served.handle,
+                401,
+                {
+                  recordVersion: served.recordVersion,
+                },
+                reporterSource,
+              )
+            } catch (error) {
+              handleClaustrumCredentialError(
+                served.accountId,
+                error,
+                served.handle,
+              )
+              logger.warn('claustrum', 'failed to report credential failure', {
+                accountId: served.accountId,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
+          }
+
           async function sendWithAccessToken(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -4601,8 +5165,10 @@ const anthropicAuthPlugin = async (
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
             mainQuotaIdentity?: MainQuotaIdentityBinding,
+            claustrumResolution?: ClaustrumAccessResolution,
           ) {
             const start = nowMs()
+            const servedClaustrumCredential = claustrumResolution?.served
             let requestStorage = currentStorage
             const getRequestStorage = async () => {
               requestStorage ??= await loadAccounts(accountStoragePath)
@@ -4918,6 +5484,12 @@ const anthropicAuthPlugin = async (
               status: response.status,
               streaming,
             })
+            if (servedClaustrumCredential) {
+              claustrumServedCredentials.set(
+                response,
+                servedClaustrumCredential,
+              )
+            }
             return response
           }
 
@@ -5007,6 +5579,7 @@ const anthropicAuthPlugin = async (
             const usable: Array<OAuthAccount | ApiKeyAccount> = []
             for (const account of storageArg?.accounts ?? []) {
               if (isOAuthAccount(account)) {
+                if (claustrumBlockedAccounts.has(account.id)) continue
                 const usableAccount = usableOAuthById.get(account.id)
                 if (usableAccount) {
                   usable.push(usableAccount)
@@ -5103,10 +5676,14 @@ const anthropicAuthPlugin = async (
               latestStorage?.accounts ?? []
             ).entries()) {
               if (stored.enabled === false || !isOAuthAccount(stored)) continue
+              if (claustrumBlockedAccounts.has(stored.id)) continue
               const account = usableById.get(stored.id) ?? stored
+              const credential = resolveClaustrumAccess(account, latestStorage)
+              const servedByClaustrum = Boolean(credential.served)
               if (
-                !account.access ||
-                isPermanentRefreshError(account.lastRefreshError)
+                !credential.accessToken ||
+                (!servedByClaustrum &&
+                  isPermanentRefreshError(account.lastRefreshError))
               )
                 continue
               let accountQuota = getFallbackQuota(account)
@@ -5121,18 +5698,19 @@ const anthropicAuthPlugin = async (
                 try {
                   accountQuota = await quotaManager.refreshFallback(
                     account.id,
-                    account.access,
+                    credential.accessToken,
                     account,
                   )
                 } catch {}
               }
               allRoutes.push({
                 id: account.id,
-                access: account.access,
+                access: credential.accessToken,
                 quota: accountQuota,
                 identity: { kind: 'known', accountId: account.id },
                 order: index + 1,
                 account,
+                claustrum: credential,
               })
             }
 
@@ -5145,12 +5723,18 @@ const anthropicAuthPlugin = async (
                   route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
                     ? latestStorage?.refresh?.mainLastRefreshError
                     : route.account?.lastRefreshError
+                const sidecarRefreshError = !route.claustrum?.served
                 const accountIdentity =
                   route.identity.kind === 'known'
                     ? route.identity.accountId
                     : undefined
-                if (isPermanentRefreshError(refreshError)) return []
                 if (
+                  sidecarRefreshError &&
+                  isPermanentRefreshError(refreshError)
+                )
+                  return []
+                if (
+                  sidecarRefreshError &&
                   refreshBackoffActive(
                     refreshError,
                     accountIdentity,
@@ -5196,17 +5780,20 @@ const anthropicAuthPlugin = async (
                   route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
                     ? latestStorage?.refresh?.mainLastRefreshError
                     : route.account?.lastRefreshError
+                const sidecarRefreshError = !route.claustrum?.served
                 const accountIdentity =
                   route.identity.kind === 'known'
                     ? route.identity.accountId
                     : undefined
                 if (
-                  isPermanentRefreshError(refreshError) ||
-                  (refreshBackoffActive(
-                    refreshError,
-                    accountIdentity,
-                    Date.now(),
-                  ) &&
+                  (sidecarRefreshError &&
+                    isPermanentRefreshError(refreshError)) ||
+                  (sidecarRefreshError &&
+                    refreshBackoffActive(
+                      refreshError,
+                      accountIdentity,
+                      Date.now(),
+                    ) &&
                     (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
                       !usableIds.has(route.id)))
                 )
@@ -5241,7 +5828,8 @@ const anthropicAuthPlugin = async (
                       input.requestedModelId,
                     ) &&
                       (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
-                        usableIds.has(route.id))))
+                        usableIds.has(route.id) ||
+                        Boolean(route.claustrum?.served))))
                 return passes
                   ? [
                       {
@@ -5300,12 +5888,15 @@ const anthropicAuthPlugin = async (
                   options?.fableRequest,
                 )
               } else {
-                const access = account.access
-                if (!access) continue
+                const claustrumResolution = resolveClaustrumAccess(
+                  account,
+                  storage,
+                )
+                if (!claustrumResolution.accessToken) continue
                 response = await sendWithAccessToken(
                   input,
                   init,
-                  access,
+                  claustrumResolution.accessToken,
                   trace,
                   `fallback_${index}`,
                   storage,
@@ -5313,7 +5904,13 @@ const anthropicAuthPlugin = async (
                   account.authLineageId,
                   options?.fableRequest,
                   options?.laneStartRequest,
+                  undefined,
+                  claustrumResolution,
                 )
+              }
+              const servedClaustrum = claustrumServedCredentials.get(response)
+              if (response.status === 401 && servedClaustrum) {
+                await reportClaustrumAuthFailure(servedClaustrum, 'direct')
               }
               lastResponse = response
               let fallbackAgain = shouldFallbackStatus(response.status, storage)
@@ -5332,6 +5929,9 @@ const anthropicAuthPlugin = async (
                   isApiKeyAccount(account) ? 'api' : 'oauth',
                 )
                 await fallbackManager.markUsed(account)
+                if (servedClaustrum) {
+                  clearServedClaustrumRefreshError(servedClaustrum)
+                }
                 await options?.onSuccess?.(account)
                 // Active-route every-N refresh: this fallback just served the
                 // request, so keep its quota fresh on the same cadence as main.
@@ -5546,6 +6146,11 @@ const anthropicAuthPlugin = async (
                           responseMode: 'json' as const,
                         }
                     : {}),
+                  onRelayUpstreamError: ({ status, source }) => {
+                    if (status !== 401) return
+                    const served = claustrumServedCredentials.get(response)
+                    if (served) void reportClaustrumAuthFailure(served, source)
+                  },
                   contentFilterModel: fablePlan?.requestedModel,
                   ...(!fablePlan?.downgraded && fablePlan
                     ? {
@@ -5903,6 +6508,7 @@ const anthropicAuthPlugin = async (
                         selected.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
                           ? requestMainQuotaIdentity
                           : undefined,
+                        selected.claustrum,
                       )
                     const completeRoute = async (
                       selected: StickyOAuthRoute,
@@ -5911,6 +6517,11 @@ const anthropicAuthPlugin = async (
                     ) => {
                       if (markUsed && selected.account) {
                         await fallbackManager.markUsed(selected.account)
+                      }
+                      if (markUsed && selected.claustrum?.served) {
+                        clearServedClaustrumRefreshError(
+                          selected.claustrum.served,
+                        )
                       }
                       await writeCurrentSidebarState(
                         selected.id,
@@ -5995,12 +6606,37 @@ const anthropicAuthPlugin = async (
 
                     if (inspected.response.status === 401) {
                       const authRouteId = route.id
+                      const servedClaustrum = claustrumServedCredentials.get(
+                        inspected.response,
+                      )
                       try {
                         if (authRouteId === STICKY_ROUTING_MAIN_ACCOUNT_ID) {
                           auth.access = await refreshMainAccessToken(
                             route.access,
                           )
                           route = { ...route, access: auth.access }
+                        } else if (servedClaustrum) {
+                          await reportClaustrumAuthFailure(
+                            servedClaustrum,
+                            'direct',
+                          )
+                          const refreshedClaustrum = route.account
+                            ? resolveClaustrumAccess(
+                                route.account,
+                                stickyRoutes.storage,
+                              )
+                            : undefined
+                          if (refreshedClaustrum?.accessToken) {
+                            route = {
+                              ...route,
+                              access: refreshedClaustrum.accessToken,
+                              claustrum: refreshedClaustrum,
+                            }
+                          } else {
+                            // A cold vault must yield to the next route while its
+                            // detached refresh repopulates the cache.
+                            permanentAuthFailure = true
+                          }
                         } else if (route.account && stickyRoutes.storage) {
                           const refreshed =
                             await fallbackManager.refreshAccount(
@@ -6016,14 +6652,19 @@ const anthropicAuthPlugin = async (
                             }
                           }
                         }
-                        await inspected.response.body?.cancel().catch(() => {})
-                        inspected = await inspectResponse(
-                          await sendRoute(route),
-                        )
-                        if (!inspected.routeFailure) {
-                          return completeRoute(route, inspected.response)
+                        if (!permanentAuthFailure) {
+                          await inspected.response.body
+                            ?.cancel()
+                            .catch(() => {})
+                          inspected = await inspectResponse(
+                            await sendRoute(route),
+                          )
+                          if (!inspected.routeFailure) {
+                            return completeRoute(route, inspected.response)
+                          }
+                          permanentAuthFailure =
+                            inspected.response.status === 401
                         }
-                        permanentAuthFailure = inspected.response.status === 401
                       } catch (error) {
                         const latest = await loadAccounts(accountStoragePath)
                         const refreshError =
@@ -6676,6 +7317,7 @@ const anthropicAuthPlugin = async (
       },
       dispose: async () => {
         await quotaHeaderFeedRegistry?.dispose()
+        claustrumCredentialCache?.close()
       },
       methods: [
         {
@@ -6740,6 +7382,7 @@ const anthropicAuthPlugin = async (
     __primeManager: primeManager,
     __quotaManager: quotaManager,
     __fallbackRefreshReady: fallbackRefreshReady,
+    __claustrumCredentialCache: claustrumCredentialCache,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }
