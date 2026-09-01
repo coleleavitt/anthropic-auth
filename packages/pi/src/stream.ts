@@ -70,9 +70,9 @@ import {
   type ThinkingContent,
   type ToolCall,
 } from '@earendil-works/pi-ai'
-
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
 import { getPiAccountStoragePath } from './paths.ts'
+import { refreshAnthropicToken } from './shared-refresh.ts'
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -628,6 +628,13 @@ async function sharedAccessToken(): Promise<string | undefined> {
     )
   }
   if (candidate?.credential.type !== 'oauth') {
+    // Every access token is expired, which is not the same as having no
+    // credential: refresh tokens live for weeks and outlast their access
+    // tokens by design, so the store is usually one rotation away from
+    // healthy. Giving up here told the user to re-login while six accounts
+    // held refresh tokens valid for another three weeks.
+    const refreshed = await refreshExpiredSharedAccount(loaded.store, now)
+    if (refreshed) return refreshed
     logger.error('pi.stream', 'no shared account has a live access token', {
       accounts: loaded.store.accounts.length,
     })
@@ -637,6 +644,51 @@ async function sharedAccessToken(): Promise<string | undefined> {
     accountId: candidate.id,
   })
   return candidate.credential.access || undefined
+}
+
+/**
+ * Spend a refresh token to revive the store when no access token is live.
+ *
+ * Tries accounts in turn because a single revoked login must not strand the
+ * healthy ones — that is the failure this exists to prevent. The refresh call
+ * carries the cross-process lease, the dead-token guard and the store write,
+ * so each attempt here is just a call.
+ */
+async function refreshExpiredSharedAccount(
+  store: Awaited<ReturnType<typeof loadSharedAccountStore>>['store'],
+  now: number,
+): Promise<string | undefined> {
+  const candidates = store.accounts.filter(
+    (account) =>
+      account.enabled !== false &&
+      account.credential.type === 'oauth' &&
+      account.credential.refresh &&
+      // A refresh token past its own expiry buys a guaranteed rejection.
+      (typeof account.credential.refresh_expires_at !== 'number' ||
+        account.credential.refresh_expires_at > now),
+  )
+  for (const account of candidates) {
+    if (account.credential.type !== 'oauth') continue
+    try {
+      const rotated = await refreshAnthropicToken({
+        refresh: account.credential.refresh,
+        access: account.credential.access,
+        expires: account.credential.expires_at,
+      })
+      if (rotated.access) {
+        logger.info('pi.stream', 'revived the shared store by refreshing', {
+          accountId: account.id,
+        })
+        return rotated.access
+      }
+    } catch (error) {
+      logger.warn('pi.stream', 'shared account refresh failed; trying next', {
+        accountId: account.id,
+        error: errorText(error),
+      })
+    }
+  }
+  return undefined
 }
 
 /** An OAuth account whose access token is present and not past its expiry. */

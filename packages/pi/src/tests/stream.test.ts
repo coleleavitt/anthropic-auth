@@ -1304,6 +1304,27 @@ describe('Pi credential fallback', () => {
             : input instanceof URL
               ? input.toString()
               : input.url
+        if (url.includes('/v1/oauth/token')) {
+          const body = String(init?.body ?? '')
+          // The 'r' fixture stands in for a revoked login.
+          if (body.includes('sk-ant-ort01-rrr')) {
+            return Promise.resolve(
+              new Response(JSON.stringify({ error: 'invalid_grant' }), {
+                status: 400,
+              }),
+            )
+          }
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                access_token: 'sk-ant-oat01-refreshed',
+                refresh_token: 'sk-ant-ort01-rotated',
+                expires_in: 3600,
+              }),
+              { status: 200 },
+            ),
+          )
+        }
         if (!url.includes('/v1/messages')) {
           return Promise.resolve(new Response('{}', { status: 200 }))
         }
@@ -1341,6 +1362,43 @@ describe('Pi credential fallback', () => {
     expect(seenTokens.some((token) => token.includes('sk-ant-oat01-'))).toBe(
       true,
     )
+  })
+
+  function expiredSharedOAuthAccount(id: string, suffix: string) {
+    const account = sharedOAuthAccount(id, suffix)
+    account.credential.expires_at = Date.now() - 60 * 60_000
+    return {
+      ...account,
+      credential: {
+        ...account.credential,
+        refresh_expires_at: Date.now() + 21 * 24 * 60 * 60_000,
+      },
+    }
+  }
+
+  test('refreshes an expired shared account instead of demanding a re-login', async () => {
+    // Observed: six accounts whose access tokens had just expired, every one
+    // holding a refresh token good for another three weeks. The fallback read
+    // "no usable credential" and told the user to log in again.
+    await writeSharedStore([expiredSharedOAuthAccount('shared-expired', 'a')])
+
+    const { terminalTypes, seenTokens } = await runWithoutHostKey()
+
+    expect(terminalTypes).toEqual(['done'])
+    expect(seenTokens.some((token) => token.includes('refreshed'))).toBe(true)
+  })
+
+  test('tries the next account when one refresh token is revoked', async () => {
+    // A single dead login must not strand the healthy accounts beside it.
+    await writeSharedStore([
+      expiredSharedOAuthAccount('shared-revoked', 'r'),
+      expiredSharedOAuthAccount('shared-healthy', 'h'),
+    ])
+
+    const { terminalTypes, seenTokens } = await runWithoutHostKey()
+
+    expect(terminalTypes).toEqual(['done'])
+    expect(seenTokens.some((token) => token.includes('refreshed'))).toBe(true)
   })
 
   test('names both stores when neither holds a credential', async () => {
