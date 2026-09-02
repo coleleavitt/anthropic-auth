@@ -14,8 +14,32 @@ const source = JSON.parse(
   paths: Record<string, string>
 }
 
+function rejectSource(reason: string): never {
+  console.error(`INVALID SOURCE.json: ${reason}`)
+  process.exit(1)
+}
+
+if (!source.repo) rejectSource('repo is missing')
+if (!source.ref) rejectSource('ref is missing')
+if (!/^[0-9a-f]{40}$/.test(source.ref)) {
+  rejectSource('ref must be a 40-hex SHA')
+}
+const paths = Object.entries(source.paths ?? {})
+if (paths.length === 0) rejectSource('paths must contain at least one entry')
+
+for (const [name] of paths) {
+  try {
+    await readFile(join(fixtureDir, `${name}.json`))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      rejectSource(`vendored file is missing: ${name}.json`)
+    }
+    throw error
+  }
+}
+
 let drifted = false
-for (const [name, sourcePath] of Object.entries(source.paths)) {
+for (const [name, sourcePath] of paths) {
   const url = `https://raw.githubusercontent.com/${source.repo}/${source.ref}/${sourcePath}`
   const response = await fetch(url)
   if (!response.ok) {
