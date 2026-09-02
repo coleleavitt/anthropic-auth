@@ -12,6 +12,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __setLogTestSink,
   type AccountStorage,
   acquireRefreshFileLock,
   addAccountPersistent,
@@ -39,6 +40,7 @@ import {
   isPrimePersistentlyEnabled,
   type KillswitchThresholds,
   killswitchPassesPolicy,
+  type LogTestRecord,
   loadAccounts,
   mergeHeaderQuotaSnapshot,
   mergeMainQuotaErrorClearedAt,
@@ -1584,7 +1586,7 @@ describe('account storage', () => {
       type: 'oauth',
       access: 'access-before',
       refresh: 'refresh-before',
-      expires: 1_000,
+      expires: 10_000,
       lastRefreshedAt: 100,
     })
     await saveAccounts(storage, accountPath)
@@ -1758,7 +1760,7 @@ describe('account storage', () => {
       type: 'oauth',
       access: 'access-before',
       refresh: 'refresh-before',
-      expires: 1_000,
+      expires: 10_000,
     })
     await saveAccounts(seeded, accountPath)
 
@@ -2934,6 +2936,347 @@ describe('account storage', () => {
 })
 
 describe('FallbackAccountManager', () => {
+  test('only prunes runtime account state for a genuinely empty account config', async () => {
+    const cases = [
+      {
+        name: 'real id',
+        configAccounts: [{ id: 'fallback-1' }],
+        expectedIds: ['fallback-1'],
+      },
+      { name: 'empty', configAccounts: [], expectedIds: [] },
+      {
+        name: 'entries without ids',
+        configAccounts: [{}],
+        expectedIds: ['fallback-1'],
+      },
+      {
+        name: 'entries with non-string ids',
+        configAccounts: [{ id: 123 }],
+        expectedIds: ['fallback-1'],
+      },
+    ]
+
+    for (const testCase of cases) {
+      const storage = baseStorage()
+      storage.accounts.push({
+        id: 'fallback-1',
+        type: 'oauth',
+        access: 'access',
+        refresh: 'refresh',
+        expires: 1_000,
+      })
+      await saveAccounts(storage)
+      await writeFile(
+        accountPath,
+        JSON.stringify({ version: 1, accounts: testCase.configAccounts }),
+        'utf8',
+      )
+
+      await saveAccountState(storage, accountPath, { accounts: true })
+
+      const state = JSON.parse(
+        await readFile(getAccountStatePath(accountPath), 'utf8'),
+      ) as { accounts?: Record<string, { refresh?: string }> }
+      expect(Object.keys(state.accounts ?? {}), testCase.name).toEqual(
+        testCase.expectedIds,
+      )
+      if (testCase.expectedIds.length > 0) {
+        expect(state.accounts?.['fallback-1']?.refresh, testCase.name).toBe(
+          'refresh',
+        )
+      }
+    }
+  })
+
+  test('quota 401 force retry refreshes plain accounts but skips vault accounts', async () => {
+    const plainPath = accountPath
+    const plainStorage = baseStorage()
+    plainStorage.accounts.push({
+      id: 'plain-quota-401',
+      type: 'oauth',
+      access: 'plain-access',
+      refresh: 'plain-refresh',
+      expires: 10_000,
+    })
+    await saveAccounts(plainStorage, plainPath)
+
+    let plainQuotaCalls = 0
+    let plainTokenCalls = 0
+    const plainFetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('/api/oauth/usage')) {
+          plainQuotaCalls += 1
+          if (plainQuotaCalls === 1) {
+            return Promise.resolve(
+              new Response('expired access', { status: 401 }),
+            )
+          }
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 10 },
+                seven_day: { utilization: 20 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        if (url.includes('/v1/oauth/token')) {
+          plainTokenCalls += 1
+          expect(JSON.parse(String(init?.body))).toMatchObject({
+            refresh_token: 'plain-refresh',
+          })
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                access_token: 'plain-refreshed-access',
+                refresh_token: 'plain-refreshed-refresh',
+                expires_in: 3_600,
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      },
+    ) as unknown as typeof fetch
+    const plainManager = new FallbackAccountManager({
+      configPath: plainPath,
+      fetchImpl: plainFetch,
+      now: () => 1_000,
+    })
+
+    const plainAccount = expectOAuthAccount(
+      (await loadAccounts(plainPath))?.accounts[0],
+    )
+    await expect(
+      plainManager.refreshAccountQuota(plainAccount, plainStorage),
+    ).resolves.toMatchObject({
+      account: { access: 'plain-refreshed-access' },
+    })
+    expect(plainQuotaCalls).toBe(2)
+    expect(plainTokenCalls).toBe(1)
+
+    const vaultPath = join(tempDir, 'vault-quota-401.json')
+    const vaultStorage = baseStorage()
+    vaultStorage.accounts.push({
+      id: 'vault-quota-401',
+      type: 'oauth',
+      access: 'vault-sidecar-access',
+      refresh: 'vault-sidecar-refresh',
+      expires: 1_000,
+      claustrumHandle: 'vault-quota-401-handle',
+    })
+    await saveAccounts(vaultStorage, vaultPath)
+
+    let vaultQuotaCalls = 0
+    let vaultTokenCalls = 0
+    const vaultFetch = mock((input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('/api/oauth/usage')) {
+        vaultQuotaCalls += 1
+        if (vaultQuotaCalls === 1) {
+          return Promise.resolve(
+            new Response('expired access', { status: 401 }),
+          )
+        }
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (url.includes('/v1/oauth/token')) {
+        vaultTokenCalls += 1
+        return Promise.resolve(
+          new Response('{"error":"invalid_grant"}', { status: 400 }),
+        )
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }) as unknown as typeof fetch
+    const vaultManager = new FallbackAccountManager({
+      configPath: vaultPath,
+      fetchImpl: vaultFetch,
+      now: () => 1_000,
+      isFallbackAccountVaultServed: (id) => id === 'vault-quota-401',
+      isFallbackAccountVaultEnabled: (id) => id === 'vault-quota-401',
+      resolveFallbackAccessToken: () => ({
+        token: 'vault-quota-401-fixture-token',
+        source: 'vault' as const,
+      }),
+    })
+    const vaultAccount = expectOAuthAccount(
+      (await loadAccounts(vaultPath))?.accounts[0],
+    )
+
+    await expect(
+      vaultManager.refreshAccountQuota(vaultAccount, vaultStorage),
+    ).rejects.toThrow('Claude quota check failed: 401')
+    expect(vaultQuotaCalls).toBe(1)
+    expect(vaultTokenCalls).toBe(0)
+    expect(
+      expectOAuthAccount((await loadAccounts(vaultPath))?.accounts[0])
+        .lastRefreshError,
+    ).toBeUndefined()
+  })
+
+  test('quota polling uses a resident vault credential before an expired sidecar credential', async () => {
+    const storage = baseStorage()
+    const vaultToken = 'vault-quota-fixture-token'
+    storage.accounts.push({
+      id: 'vault-quota-token-source',
+      type: 'oauth',
+      access: 'expired-sidecar-token',
+      refresh: 'sidecar-refresh',
+      expires: 999,
+      claustrumHandle: 'vault-quota-token-source-handle',
+    })
+    await saveAccounts(storage)
+
+    const authorizations: string[] = []
+    const fetchImpl = mock(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl,
+      now: () => 1_000,
+      isFallbackAccountVaultEnabled: (id: string) =>
+        id === 'vault-quota-token-source',
+      isFallbackAccountVaultServed: (id: string) =>
+        id === 'vault-quota-token-source',
+      resolveFallbackAccessToken: () => ({
+        token: vaultToken,
+        source: 'vault' as const,
+      }),
+    } as never)
+    const account = expectOAuthAccount((await loadAccounts())?.accounts[0])
+
+    await manager.refreshAccountQuota(account, storage)
+
+    expect(authorizations).toEqual([`Bearer ${vaultToken}`])
+  })
+
+  test('vault-cold quota polling skips an expired sidecar after one resolver lookup', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'vault-cold-quota',
+      type: 'oauth',
+      access: 'expired-sidecar-token',
+      refresh: 'sidecar-refresh',
+      expires: 999,
+      claustrumHandle: 'vault-cold-quota-handle',
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 500 },
+        seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt: 500 },
+      },
+    })
+    await saveAccounts(storage)
+
+    let resolverCalls = 0
+    let usageCalls = 0
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl: mock(() => {
+        usageCalls += 1
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }) as unknown as typeof fetch,
+      now: () => 1_000,
+      isFallbackAccountVaultEnabled: (id: string) => id === 'vault-cold-quota',
+      resolveFallbackAccessToken: () => {
+        resolverCalls += 1
+        return undefined
+      },
+    } as never)
+    const account = expectOAuthAccount((await loadAccounts())?.accounts[0])
+
+    const result = await manager.refreshAccountQuota(account, storage)
+
+    expect(result.fetched).toBe(false)
+    expect(usageCalls).toBe(0)
+    expect(resolverCalls).toBe(1)
+    expect(account.lastQuotaRefreshError).toBeUndefined()
+  })
+
+  test('expired non-vault fallback refreshes before polling quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'expired-non-vault-quota',
+      type: 'oauth',
+      access: 'expired-sidecar-token',
+      refresh: 'sidecar-refresh',
+      expires: 999,
+    })
+    await saveAccounts(storage)
+
+    const operations: string[] = []
+    const fetchImpl = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('/v1/oauth/token')) {
+          operations.push('refresh')
+          expect(JSON.parse(String(init?.body)).refresh_token).toBe(
+            'sidecar-refresh',
+          )
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                access_token: 'refreshed-sidecar-token',
+                refresh_token: 'refreshed-sidecar-refresh',
+                expires_in: 3_600,
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        if (url.includes('/api/oauth/usage')) {
+          operations.push('usage')
+          expect(new Headers(init?.headers).get('authorization')).toBe(
+            'Bearer refreshed-sidecar-token',
+          )
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 10 },
+                seven_day: { utilization: 20 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      },
+    ) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl,
+      now: () => 1_000,
+    })
+    const account = expectOAuthAccount((await loadAccounts())?.accounts[0])
+
+    await manager.refreshAccountQuota(account, storage)
+
+    expect(operations).toEqual(['refresh', 'usage'])
+  })
+
   test('refreshes expired fallback tokens and persists rotation', async () => {
     const storage = baseStorage()
     storage.accounts.push({
@@ -4006,6 +4349,71 @@ describe('FallbackAccountManager', () => {
 
     expect(fetchImpl).toHaveBeenCalled()
     expect(fired).toBe(1)
+  })
+
+  test('vault-cold background quota ticks persist and notify only after an actual change', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'vault-cold-background-quota',
+      type: 'oauth',
+      access: 'expired-sidecar-access',
+      refresh: 'sidecar-refresh',
+      expires: 999,
+      claustrumHandle: 'vault-cold-background-handle',
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1 },
+        seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt: 1 },
+      },
+    })
+    await saveAccounts(storage)
+
+    let vaultAccess: string | undefined
+    let usageCalls = 0
+    let saves = 0
+    let notifications = 0
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      now: () => 50_000_000,
+      fetchImpl: mock(() => {
+        usageCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 30 },
+              seven_day: { utilization: 40 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }) as unknown as typeof fetch,
+      isFallbackAccountVaultEnabled: (id: string) =>
+        id === 'vault-cold-background-quota',
+      resolveFallbackAccessToken: () =>
+        vaultAccess
+          ? { token: vaultAccess, source: 'vault' as const }
+          : undefined,
+      onFallbackStorageChanged: () => {
+        notifications += 1
+      },
+    })
+    manager.save = mock(async () => {
+      saves += 1
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+    await manager.refreshQuotaForDueAccounts()
+    await manager.refreshQuotaForDueAccounts()
+
+    expect(usageCalls).toBe(0)
+    expect(saves).toBe(0)
+    expect(notifications).toBe(0)
+
+    vaultAccess = 'resident-vault-access'
+    await manager.refreshQuotaForDueAccounts()
+
+    expect(usageCalls).toBe(1)
+    expect(saves).toBe(1)
+    expect(notifications).toBe(1)
   })
 
   test('refreshes fallback token and retries quota check after stale access token 401', async () => {
@@ -6595,5 +7003,248 @@ describe('getOrCreatePrimeAuthLineageId', () => {
 
     expect(lineage).toBe('existing-main-lineage')
     expect(await readFile(statePath, 'utf8')).toBe(persisted)
+  })
+})
+
+describe('vault-served fallback refresh gating', () => {
+  function dueAccount(
+    id: string,
+    refresh: string,
+    quota?: OAuthQuotaSnapshot,
+    claustrumHandle?: string,
+  ): OAuthAccount {
+    return {
+      id,
+      type: 'oauth',
+      access: `${id}-access`,
+      refresh,
+      expires: 1_000,
+      ...(quota ? { quota } : {}),
+      ...(claustrumHandle ? { claustrumHandle } : {}),
+    }
+  }
+
+  function passingQuota(checkedAt: number): OAuthQuotaSnapshot {
+    return {
+      five_hour: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt,
+      },
+    }
+  }
+
+  function refreshResponse(accountId: string): Response {
+    return new Response(
+      JSON.stringify({
+        access_token: `${accountId}-refreshed-access`,
+        refresh_token: `${accountId}-refreshed-refresh`,
+        expires_in: 86_400,
+      }),
+      { status: 200 },
+    )
+  }
+
+  test('background refresh skips a vault-served account while refreshing a plain OAuth control', async () => {
+    const storage = baseStorage()
+    const checkedAt = 1_500
+    storage.claustrum = {
+      accounts: {
+        'vault-served': { enabled: true },
+      },
+    }
+    storage.accounts.push(
+      dueAccount(
+        'vault-served',
+        'vault-refresh',
+        passingQuota(checkedAt),
+        'handle-vault-served',
+      ),
+      dueAccount('plain-control', 'plain-refresh', passingQuota(checkedAt)),
+    )
+    await saveAccounts(storage, accountPath)
+
+    const refreshTokens: string[] = []
+    const fetchImpl = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        expect(String(input)).toBe('https://platform.claude.com/v1/oauth/token')
+        const refreshToken = (
+          JSON.parse(String(init?.body)) as { refresh_token: string }
+        ).refresh_token
+        refreshTokens.push(refreshToken)
+        if (refreshToken === 'vault-refresh') {
+          return new Response('{"error":"invalid_grant"}', { status: 400 })
+        }
+        return refreshResponse('plain-control')
+      },
+    ) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl,
+      now: () => 2_000,
+      isFallbackAccountVaultServed: (accountId: string) =>
+        accountId === 'vault-served',
+    } as never)
+
+    await manager.startBackgroundRefresh()
+    manager.stopBackgroundRefresh()
+
+    const saved = await loadAccounts(accountPath)
+    const vault = expectOAuthAccount(
+      saved?.accounts.find((account) => account.id === 'vault-served'),
+    )
+    const plain = expectOAuthAccount(
+      saved?.accounts.find((account) => account.id === 'plain-control'),
+    )
+    expect(refreshTokens).toEqual(['plain-refresh'])
+    expect(vault.access).toBe('vault-served-access')
+    expect(vault.lastRefreshError).toBeUndefined()
+    expect(plain.access).toBe('plain-control-refreshed-access')
+  })
+
+  test('request-path fallback selection skips a vault-served account while refreshing a plain OAuth control', async () => {
+    const storage = baseStorage()
+    storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+    storage.claustrum = {
+      accounts: {
+        'vault-served': { enabled: true },
+      },
+    }
+    storage.accounts.push(
+      dueAccount(
+        'vault-served',
+        'vault-refresh',
+        undefined,
+        'handle-vault-served',
+      ),
+      dueAccount('plain-control', 'plain-refresh'),
+    )
+    await saveAccounts(storage, accountPath)
+
+    const refreshTokens: string[] = []
+    const fetchImpl = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        expect(String(input)).toBe('https://platform.claude.com/v1/oauth/token')
+        const refreshToken = (
+          JSON.parse(String(init?.body)) as { refresh_token: string }
+        ).refresh_token
+        refreshTokens.push(refreshToken)
+        if (refreshToken === 'vault-refresh') {
+          return new Response('{"error":"invalid_grant"}', { status: 400 })
+        }
+        return refreshResponse('plain-control')
+      },
+    ) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl,
+      now: () => 2_000,
+      isFallbackAccountVaultServed: (accountId: string) =>
+        accountId === 'vault-served',
+    } as never)
+
+    const usable = await manager.getUsableFallbackAccounts()
+    const saved = await loadAccounts(accountPath)
+    const vault = expectOAuthAccount(
+      saved?.accounts.find((account) => account.id === 'vault-served'),
+    )
+
+    expect(refreshTokens).toEqual(['plain-refresh'])
+    expect(usable.map((account) => account.id)).toEqual([
+      'vault-served',
+      'plain-control',
+    ])
+    expect(vault.lastRefreshError).toBeUndefined()
+  })
+
+  test('a vault-enabled account whose vault is unavailable still refreshes locally', async () => {
+    const storage = baseStorage()
+    storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+    storage.claustrum = {
+      accounts: {
+        'vault-served': { enabled: true },
+        'vault-unavailable': { enabled: true },
+      },
+    }
+    storage.accounts.push(
+      dueAccount(
+        'vault-served',
+        'vault-refresh',
+        undefined,
+        'handle-vault-served',
+      ),
+      dueAccount(
+        'vault-unavailable',
+        'outage-refresh',
+        undefined,
+        'handle-vault-unavailable',
+      ),
+    )
+    await saveAccounts(storage, accountPath)
+
+    const refreshTokens: string[] = []
+    const logs: LogTestRecord[] = []
+    __setLogTestSink((record) => logs.push(record))
+    try {
+      const fetchImpl = mock(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          expect(String(input)).toBe(
+            'https://platform.claude.com/v1/oauth/token',
+          )
+          const refreshToken = (
+            JSON.parse(String(init?.body)) as { refresh_token: string }
+          ).refresh_token
+          refreshTokens.push(refreshToken)
+          if (refreshToken === 'vault-refresh') {
+            return new Response('{"error":"invalid_grant"}', { status: 400 })
+          }
+          return refreshResponse('vault-unavailable')
+        },
+      ) as unknown as typeof fetch
+
+      const manager = new FallbackAccountManager({
+        configPath: accountPath,
+        fetchImpl,
+        now: () => 2_000,
+        isFallbackAccountVaultServed: (accountId: string) =>
+          accountId === 'vault-served',
+        isFallbackAccountVaultEnabled: (accountId: string) =>
+          accountId === 'vault-unavailable',
+      } as never)
+
+      await manager.getUsableFallbackAccounts()
+
+      const saved = await loadAccounts(accountPath)
+      const served = expectOAuthAccount(
+        saved?.accounts.find((account) => account.id === 'vault-served'),
+      )
+      const unavailable = expectOAuthAccount(
+        saved?.accounts.find((account) => account.id === 'vault-unavailable'),
+      )
+      expect(refreshTokens).toEqual(['outage-refresh'])
+      expect(served.access).toBe('vault-served-access')
+      expect(served.lastRefreshError).toBeUndefined()
+      expect(unavailable.access).toBe('vault-unavailable-refreshed-access')
+      expect(logs).toContainEqual(
+        expect.objectContaining({
+          level: 'warn',
+          channel: 'refresh',
+          message: 'custody override: local fallback refresh',
+          payload: {
+            accountId: 'vault-unavailable',
+            reason: 'vault credential unavailable',
+          },
+        }),
+      )
+    } finally {
+      __setLogTestSink(null)
+    }
   })
 })
