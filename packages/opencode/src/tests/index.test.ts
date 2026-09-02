@@ -165,6 +165,144 @@ function createFallbackStorage(
   }
 }
 
+async function runStickyDnsBackoffScenario(options: {
+  tokenExpiresAt: number
+  refreshErrorCheckedAt: number
+  refreshErrorNextRetryAt: number
+  refreshErrorRetryCount: number
+}) {
+  const now = Date.now()
+  const cachedAt = now - 60 * 60_000
+  const fableQuota = (remainingPercent: number, checkedAt: number) => ({
+    checkedAt,
+    five_hour: {
+      usedPercent: 4,
+      remainingPercent: 96,
+      checkedAt,
+      resetsAt: new Date(now + 60 * 60_000).toISOString(),
+    },
+    seven_day: {
+      usedPercent: 18,
+      remainingPercent: 82,
+      checkedAt,
+      resetsAt: new Date(now + 3 * 24 * 60 * 60_000).toISOString(),
+    },
+    scoped: [
+      {
+        id: 'claude-weekly-scoped-fable',
+        title: 'Fable only',
+        modelName: 'Fable',
+        usedPercent: 100 - remainingPercent,
+        remainingPercent,
+        checkedAt,
+        resetsAt: new Date(now + 3 * 24 * 60 * 60_000).toISOString(),
+      },
+    ],
+  })
+  await useTempAccountFile(
+    createFallbackStorage({
+      routing: { mode: 'sticky-balanced' },
+      quota: {
+        enabled: true,
+        checkIntervalMinutes: 5,
+        minimumRemaining: { five_hour: 1, seven_day: 1 },
+        failClosedOnUnknownQuota: true,
+        mainQuota: fableQuota(0, now),
+        mainQuotaCheckedAt: now,
+        mainQuotaToken: tokenFingerprint('main-access'),
+      },
+      accounts: [
+        {
+          id: 'dns-backed-off',
+          type: 'oauth',
+          access: 'initial-fallback-access',
+          refresh: 'fallback-refresh',
+          expires: options.tokenExpiresAt,
+          lastRefreshError: {
+            message: 'getaddrinfo ENOTFOUND platform.claude.com',
+            checkedAt: options.refreshErrorCheckedAt,
+            nextRetryAt: options.refreshErrorNextRetryAt,
+            retryCount: options.refreshErrorRetryCount,
+            accountIdentity: 'dns-backed-off',
+            permanent: false,
+          },
+          quota: fableQuota(64, cachedAt),
+        },
+      ],
+    }),
+  )
+  const tokenRequests: string[] = []
+  const messageAuthorizations: string[] = []
+  globalThis.fetch = mock((input: any, init?: RequestInit) => {
+    const url = extractUrl(input)
+    const authorization = new Headers(init?.headers).get('authorization') ?? ''
+    if (url.includes('/v1/oauth/token')) {
+      tokenRequests.push(url)
+      return Promise.resolve(
+        Response.json({
+          access_token: 'refreshed-fallback-access',
+          refresh_token: 'refreshed-fallback-refresh',
+          expires_in: 8 * 60 * 60,
+        }),
+      )
+    }
+    if (url.includes('/api/oauth/usage')) {
+      return Promise.resolve(
+        Response.json({
+          five_hour: {
+            utilization: 4,
+            resets_at: new Date(now + 60 * 60_000).toISOString(),
+          },
+          seven_day: {
+            utilization: 18,
+            resets_at: new Date(now + 3 * 24 * 60 * 60_000).toISOString(),
+          },
+          limits: [
+            {
+              kind: 'weekly_scoped',
+              group: 'weekly',
+              percent: 36,
+              resets_at: new Date(now + 3 * 24 * 60 * 60_000).toISOString(),
+              scope: { model: { display_name: 'Fable' } },
+            },
+          ],
+        }),
+      )
+    }
+    if (url.includes('/claude_cli/bootstrap')) {
+      return Promise.resolve(
+        Response.json({ oauth_account: { account_uuid: 'dns-backed-off' } }),
+      )
+    }
+    if (url.includes('/v1/messages')) {
+      messageAuthorizations.push(authorization)
+    }
+    return Promise.resolve(new Response('{}', { status: 200 }))
+  }) as unknown as typeof fetch
+
+  const plugin = await getPlugin()
+  const result = await plugin.auth.loader(
+    () =>
+      Promise.resolve({
+        type: 'oauth' as const,
+        access: 'main-access',
+        refresh: 'main-refresh',
+        expires: now + 8 * 60 * 60_000,
+      }),
+    { models: {} },
+  )
+  const response = await result.fetch(MESSAGES_URL, {
+    method: 'POST',
+    headers: { 'x-session-affinity': 'dns-backed-off-fable' },
+    body: JSON.stringify({
+      model: 'claude-fable-5',
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'hello' }],
+    }),
+  })
+  return { response, tokenRequests, messageAuthorizations }
+}
+
 async function expectUnknownQuotaAdmissionBlocked(storage: AccountStorage) {
   const now = Date.now()
   storage.quota = {
@@ -8647,6 +8785,38 @@ describe('auth.loader', () => {
 
     expect(response.status).toBe(429)
     expect(messageRequests).toEqual([])
+  })
+
+  test('sticky-balanced routes with a valid fallback token during transient DNS refresh backoff', async () => {
+    const now = Date.now()
+    const result = await runStickyDnsBackoffScenario({
+      tokenExpiresAt: now + 3 * 60 * 60_000,
+      refreshErrorCheckedAt: now,
+      refreshErrorNextRetryAt: now + 24 * 60 * 60_000,
+      refreshErrorRetryCount: 1,
+    })
+
+    expect(result.response.status).toBe(200)
+    expect(result.tokenRequests).toEqual([])
+    expect(result.messageAuthorizations).toEqual([
+      'Bearer initial-fallback-access',
+    ])
+  })
+
+  test('sticky-balanced refreshes an expired fallback after repeated DNS failures', async () => {
+    const now = Date.now()
+    const result = await runStickyDnsBackoffScenario({
+      tokenExpiresAt: now - 60_000,
+      refreshErrorCheckedAt: now - 6 * 60_000,
+      refreshErrorNextRetryAt: now + 54 * 60_000,
+      refreshErrorRetryCount: 7,
+    })
+
+    expect(result.response.status).toBe(200)
+    expect(result.tokenRequests).toHaveLength(1)
+    expect(result.messageAuthorizations).toEqual([
+      'Bearer refreshed-fallback-access',
+    ])
   })
 
   test('concurrent refresh with token rotation should not cause cascading failures', async () => {

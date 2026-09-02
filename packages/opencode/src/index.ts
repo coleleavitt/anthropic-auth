@@ -5073,6 +5073,9 @@ const anthropicAuthPlugin = async (
               })
             }
 
+            const usableIds = new Set(
+              usableFallbacks.map((account) => account.id),
+            )
             const retainAccountIds = new Set(
               allRoutes.flatMap((route) => {
                 const refreshError =
@@ -5089,7 +5092,9 @@ const anthropicAuthPlugin = async (
                     refreshError,
                     accountIdentity,
                     Date.now(),
-                  )
+                  ) &&
+                  (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
+                    !usableIds.has(route.id))
                 )
                   return []
                 if (
@@ -5122,9 +5127,6 @@ const anthropicAuthPlugin = async (
                 return [route.id]
               }),
             )
-            const usableIds = new Set(
-              usableFallbacks.map((account) => account.id),
-            )
             const candidates: StickyRouteCandidate[] = allRoutes.flatMap(
               (route) => {
                 const refreshError =
@@ -5137,11 +5139,13 @@ const anthropicAuthPlugin = async (
                     : undefined
                 if (
                   isPermanentRefreshError(refreshError) ||
-                  refreshBackoffActive(
+                  (refreshBackoffActive(
                     refreshError,
                     accountIdentity,
                     Date.now(),
-                  )
+                  ) &&
+                    (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
+                      !usableIds.has(route.id)))
                 )
                   return []
                 const accountId =
