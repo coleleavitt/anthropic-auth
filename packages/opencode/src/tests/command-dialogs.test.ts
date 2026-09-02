@@ -66,6 +66,21 @@ describe('buildAccountDialogOption', () => {
     expect(option.title).toContain('vault cold')
     expect(option.title).not.toContain('handle')
   })
+
+  test('renders the main account gate placeholder as n/a', () => {
+    const option = buildAccountDialogOption({
+      id: 'main',
+      label: 'Main',
+      role: 'main',
+      enabled: true,
+      quotaPercent: null,
+      claustrumGate: 'na',
+      vaultServed: false,
+    })
+
+    expect(option.title).toContain('gate n/a')
+    expect(option.title).toContain('vault n/a')
+  })
 })
 
 describe('buildPrimeStatusRows', () => {

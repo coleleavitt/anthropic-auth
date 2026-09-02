@@ -1592,6 +1592,7 @@ const anthropicAuthPlugin = async (
   }
 
   let claustrumCredentialCache: ClaustrumCredentialCache | null = null
+  const claustrumAuthFailureReports = new Map<string, Promise<void>>()
   const claustrumBlockedAccounts = new Set<string>()
   const claustrumReauthAccounts = new Set<string>()
   const claustrumWarmScheduled = new Set<string>()
@@ -5131,25 +5132,46 @@ const anthropicAuthPlugin = async (
             // report (worst case one delayed cycle until the next served 401).
             if (!current || current.recordVersion !== served.recordVersion)
               return
+            const key = `${served.handle}\0${served.recordVersion}`
+            const pending = claustrumAuthFailureReports.get(key)
+            if (pending) {
+              await pending
+              return
+            }
+            const report = (async () => {
+              try {
+                await cache.reportAuthFailure(
+                  served.handle,
+                  401,
+                  {
+                    recordVersion: served.recordVersion,
+                  },
+                  reporterSource,
+                )
+              } catch (error) {
+                handleClaustrumCredentialError(
+                  served.accountId,
+                  error,
+                  served.handle,
+                )
+                logger.warn(
+                  'claustrum',
+                  'failed to report credential failure',
+                  {
+                    accountId: served.accountId,
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  },
+                )
+              }
+            })()
+            claustrumAuthFailureReports.set(key, report)
             try {
-              await cache.reportAuthFailure(
-                served.handle,
-                401,
-                {
-                  recordVersion: served.recordVersion,
-                },
-                reporterSource,
-              )
-            } catch (error) {
-              handleClaustrumCredentialError(
-                served.accountId,
-                error,
-                served.handle,
-              )
-              logger.warn('claustrum', 'failed to report credential failure', {
-                accountId: served.accountId,
-                error: error instanceof Error ? error.message : String(error),
-              })
+              await report
+            } finally {
+              if (claustrumAuthFailureReports.get(key) === report) {
+                claustrumAuthFailureReports.delete(key)
+              }
             }
           }
 

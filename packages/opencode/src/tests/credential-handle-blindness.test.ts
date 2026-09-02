@@ -323,13 +323,123 @@ describe('credential-handle blindness', () => {
 
     const logs: Array<Record<string, unknown>> = []
     __setLogTestSink((record) => logs.push(record as Record<string, unknown>))
-    const calls: string[] = []
-    const reportParams: unknown[] = []
+    try {
+      const calls: string[] = []
+      const reportParams: unknown[] = []
+      const connector = async () =>
+        ({
+          call: async (_moduleId: string, method: string, params: unknown) => {
+            calls.push(method)
+            if (method === 'credential.get') {
+              return {
+                result: {
+                  payload: Array.from(
+                    new TextEncoder().encode(
+                      JSON.stringify({ access_token: 'vault-access' }),
+                    ),
+                  ),
+                  expires_at_ms: Date.now() + 60_000,
+                  record_version: 17,
+                },
+              }
+            }
+            if (method === 'credential.report_auth_failure')
+              reportParams.push(params)
+            throw new Error('report failed')
+          },
+          close: () => {},
+        }) as never
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response('{}', { status: 401 })),
+      ) as unknown as typeof fetch
+
+      const plugin = await (
+        AnthropicAuthPlugin as unknown as (
+          ctx: { client: unknown },
+          runtimeOverrides: { claustrumConnector: typeof connector },
+        ) => Promise<any>
+      )(
+        { client: { auth: { set: mock(() => Promise.resolve()) } } },
+        { claustrumConnector: connector },
+      )
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+
+      const response = await result.fetch(
+        'https://api.anthropic.com/v1/messages',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-5',
+            messages: [{ role: 'user', content: 'report failure log blind' }],
+          }),
+        },
+      )
+      await response.text()
+      await plugin.dispose?.()
+
+      expect(response.status).toBe(401)
+      expect(calls).toContain('credential.get')
+      expect(calls).toContain('credential.report_auth_failure')
+      expect(reportParams).toEqual([
+        {
+          handle: HANDLE_SENTINEL,
+          provider_status: 401,
+          record_version: 17,
+          reporter_source: 'direct',
+        },
+      ])
+      expect(JSON.stringify(reportParams)).not.toContain('vault-access')
+      expect(
+        logs.some((record) => JSON.stringify(record).includes(HANDLE_SENTINEL)),
+      ).toBe(false)
+    } finally {
+      __setLogTestSink(null)
+    }
+  })
+
+  test('deduplicates concurrent reports by served handle and record version', async () => {
+    const accountDir = await mkdtemp(
+      join(tmpdir(), 'opencode-handle-report-dedupe-'),
+    )
+    accountDirs.push(accountDir)
+    const accountPath = join(accountDir, 'anthropic-auth.json')
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
+
+    const fallbackAccount = {
+      ...accountWithHandle(),
+      access: 'fallback-access',
+      expires: Date.now() + 5 * 60 * 60 * 1000,
+    }
+    await saveAccounts(
+      {
+        version: 1,
+        routing: { mode: 'fallback-first' },
+        quota: { enabled: false, failClosedOnUnknownQuota: false },
+        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        accounts: [fallbackAccount],
+      } as never,
+      accountPath,
+    )
+
+    const reports: Array<Record<string, unknown>> = []
+    const firstReportStarted = Promise.withResolvers<void>()
+    const releaseFirstReport = Promise.withResolvers<void>()
+    const version18Warm = Promise.withResolvers<void>()
+    let credentialVersion = 17
     const connector = async () =>
       ({
         call: async (_moduleId: string, method: string, params: unknown) => {
-          calls.push(method)
           if (method === 'credential.get') {
+            if (credentialVersion === 18) version18Warm.resolve()
             return {
               result: {
                 payload: Array.from(
@@ -338,18 +448,26 @@ describe('credential-handle blindness', () => {
                   ),
                 ),
                 expires_at_ms: Date.now() + 60_000,
-                record_version: 17,
+                record_version: credentialVersion,
               },
             }
           }
-          if (method === 'credential.report_auth_failure')
-            reportParams.push(params)
-          throw new Error('report failed')
+          if (method === 'credential.report_auth_failure') {
+            reports.push(params as Record<string, unknown>)
+            if (reports.length === 1) {
+              firstReportStarted.resolve()
+              await releaseFirstReport.promise
+            }
+            return { result: { ok: true } }
+          }
+          throw new Error(`unexpected method: ${method}`)
         },
         close: () => {},
       }) as never
+
+    let responseStatus = 401
     globalThis.fetch = mock(() =>
-      Promise.resolve(new Response('{}', { status: 401 })),
+      Promise.resolve(new Response('{}', { status: responseStatus })),
     ) as unknown as typeof fetch
 
     const plugin = await (
@@ -371,36 +489,35 @@ describe('credential-handle blindness', () => {
         }),
       { models: {} },
     )
-
-    const response = await result.fetch(
-      'https://api.anthropic.com/v1/messages',
-      {
+    const request = () =>
+      result.fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         body: JSON.stringify({
           model: 'claude-sonnet-4-5',
-          messages: [{ role: 'user', content: 'report failure log blind' }],
+          messages: [{ role: 'user', content: 'report dedupe' }],
         }),
-      },
-    )
-    await response.text()
+      })
+
+    const concurrentPromises = [request(), request()]
+    await firstReportStarted.promise
+    expect(reports).toHaveLength(1)
+    releaseFirstReport.resolve()
+    const concurrent = await Promise.all(concurrentPromises)
+    await Promise.all(concurrent.map((response) => response.text()))
+
+    credentialVersion = 18
+    responseStatus = 200
+    const coldResponse = await request()
+    await coldResponse.text()
+    await version18Warm.promise
+
+    responseStatus = 401
+    const differentVersionResponse = await request()
+    await differentVersionResponse.text()
     await plugin.dispose?.()
 
-    expect(response.status).toBe(401)
-    expect(calls).toContain('credential.get')
-    expect(calls).toContain('credential.report_auth_failure')
-    expect(reportParams).toEqual([
-      {
-        handle: HANDLE_SENTINEL,
-        provider_status: 401,
-        record_version: 17,
-        reporter_source: 'direct',
-      },
-    ])
-    expect(JSON.stringify(reportParams)).not.toContain('vault-access')
-    expect(
-      logs.some((record) => JSON.stringify(record).includes(HANDLE_SENTINEL)),
-    ).toBe(false)
-    __setLogTestSink(null)
+    expect(reports).toHaveLength(2)
+    expect(reports.map((report) => report.record_version)).toEqual([17, 18])
   })
 
   test('dump body, metadata, response, and transport capture stay blind to tokens', async () => {

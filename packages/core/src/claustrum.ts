@@ -251,25 +251,27 @@ export class ClaustrumClient {
 
   async #reconnect(): Promise<void> {
     if (this.#closed) throw new Error('Claustrum client is closed')
+    if (this.#reconnecting) {
+      await this.#reconnecting
+      return
+    }
     const now = Date.now()
     if (now < this.#nextReconnectAt) {
       throw new Error('Claustrum client reconnect is backed off')
     }
-    if (!this.#reconnecting) {
-      this.#nextReconnectAt = now + CLAUSTRUM_CREDENTIAL_REFRESH_BACKOFF_MS
-      this.#reconnecting = this.#connector({
-        connectionFile: this.#connectionFile,
-        handshakeTimeoutMs: this.#handshakeTimeoutMs,
+    this.#nextReconnectAt = now + CLAUSTRUM_CREDENTIAL_REFRESH_BACKOFF_MS
+    this.#reconnecting = this.#connector({
+      connectionFile: this.#connectionFile,
+      handshakeTimeoutMs: this.#handshakeTimeoutMs,
+    })
+      .then((client) => {
+        const previous = this.#client
+        this.#client = client
+        previous.close()
       })
-        .then((client) => {
-          const previous = this.#client
-          this.#client = client
-          previous.close()
-        })
-        .finally(() => {
-          this.#reconnecting = null
-        })
-    }
+      .finally(() => {
+        this.#reconnecting = null
+      })
     await this.#reconnecting
   }
 }

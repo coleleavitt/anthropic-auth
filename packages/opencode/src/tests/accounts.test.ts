@@ -6972,54 +6972,59 @@ describe('vault-served fallback refresh gating', () => {
     const refreshTokens: string[] = []
     const logs: LogTestRecord[] = []
     __setLogTestSink((record) => logs.push(record))
-    const fetchImpl = mock(
-      async (input: string | URL | Request, init?: RequestInit) => {
-        expect(String(input)).toBe('https://platform.claude.com/v1/oauth/token')
-        const refreshToken = (
-          JSON.parse(String(init?.body)) as { refresh_token: string }
-        ).refresh_token
-        refreshTokens.push(refreshToken)
-        if (refreshToken === 'vault-refresh') {
-          return new Response('{"error":"invalid_grant"}', { status: 400 })
-        }
-        return refreshResponse('vault-unavailable')
-      },
-    ) as unknown as typeof fetch
-
-    const manager = new FallbackAccountManager({
-      configPath: accountPath,
-      fetchImpl,
-      now: () => 2_000,
-      isFallbackAccountVaultServed: (accountId: string) =>
-        accountId === 'vault-served',
-      isFallbackAccountVaultEnabled: (accountId: string) =>
-        accountId === 'vault-unavailable',
-    } as never)
-
-    await manager.getUsableFallbackAccounts()
-
-    const saved = await loadAccounts(accountPath)
-    const served = expectOAuthAccount(
-      saved?.accounts.find((account) => account.id === 'vault-served'),
-    )
-    const unavailable = expectOAuthAccount(
-      saved?.accounts.find((account) => account.id === 'vault-unavailable'),
-    )
-    expect(refreshTokens).toEqual(['outage-refresh'])
-    expect(served.access).toBe('vault-served-access')
-    expect(served.lastRefreshError).toBeUndefined()
-    expect(unavailable.access).toBe('vault-unavailable-refreshed-access')
-    expect(logs).toContainEqual(
-      expect.objectContaining({
-        level: 'warn',
-        channel: 'refresh',
-        message: 'custody override: local fallback refresh',
-        payload: {
-          accountId: 'vault-unavailable',
-          reason: 'vault credential unavailable',
+    try {
+      const fetchImpl = mock(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          expect(String(input)).toBe(
+            'https://platform.claude.com/v1/oauth/token',
+          )
+          const refreshToken = (
+            JSON.parse(String(init?.body)) as { refresh_token: string }
+          ).refresh_token
+          refreshTokens.push(refreshToken)
+          if (refreshToken === 'vault-refresh') {
+            return new Response('{"error":"invalid_grant"}', { status: 400 })
+          }
+          return refreshResponse('vault-unavailable')
         },
-      }),
-    )
-    __setLogTestSink(null)
+      ) as unknown as typeof fetch
+
+      const manager = new FallbackAccountManager({
+        configPath: accountPath,
+        fetchImpl,
+        now: () => 2_000,
+        isFallbackAccountVaultServed: (accountId: string) =>
+          accountId === 'vault-served',
+        isFallbackAccountVaultEnabled: (accountId: string) =>
+          accountId === 'vault-unavailable',
+      } as never)
+
+      await manager.getUsableFallbackAccounts()
+
+      const saved = await loadAccounts(accountPath)
+      const served = expectOAuthAccount(
+        saved?.accounts.find((account) => account.id === 'vault-served'),
+      )
+      const unavailable = expectOAuthAccount(
+        saved?.accounts.find((account) => account.id === 'vault-unavailable'),
+      )
+      expect(refreshTokens).toEqual(['outage-refresh'])
+      expect(served.access).toBe('vault-served-access')
+      expect(served.lastRefreshError).toBeUndefined()
+      expect(unavailable.access).toBe('vault-unavailable-refreshed-access')
+      expect(logs).toContainEqual(
+        expect.objectContaining({
+          level: 'warn',
+          channel: 'refresh',
+          message: 'custody override: local fallback refresh',
+          payload: {
+            accountId: 'vault-unavailable',
+            reason: 'vault credential unavailable',
+          },
+        }),
+      )
+    } finally {
+      __setLogTestSink(null)
+    }
   })
 })

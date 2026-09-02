@@ -239,7 +239,7 @@ async function startFakeDaemon(
       return Promise.race([
         goodbyeSeen.then(() => true),
         new Promise<boolean>((resolve) =>
-          setTimeout(() => resolve(false), 100),
+          setTimeout(() => resolve(false), 2_000),
         ),
       ])
     },
@@ -405,6 +405,51 @@ describe('ClaustrumClient', () => {
       client.call('claustrum', 'credential.get', { handle: 'h' }),
     ).resolves.toEqual({ result: { ok: true } })
     expect(connections).toBe(2)
+  })
+
+  test('shares an in-flight reconnect between concurrent terminal failures', async () => {
+    let connections = 0
+    const first = {
+      call: async () => {
+        throw new SubcCallError(
+          'terminal',
+          'resident route wedged',
+          'route_wedged',
+        )
+      },
+      close: () => {},
+    }
+    const second = {
+      call: async () => ({ result: { ok: true } }),
+      close: () => {},
+    }
+    const reconnect = Promise.withResolvers<void>()
+    const client = await connectClaustrumClient({
+      connectionFile: '/tmp/unused-claustrum-connection.json',
+      connector: async () => {
+        connections += 1
+        if (connections === 1) return first as never
+        await reconnect.promise
+        return second as never
+      },
+    })
+    clients.push(client)
+
+    const firstCall = client.call('claustrum', 'credential.get', {
+      handle: 'h',
+    })
+    const secondCall = client.call('claustrum', 'credential.get', {
+      handle: 'h',
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(connections).toBe(2)
+    reconnect.resolve()
+    await expect(Promise.all([firstCall, secondCall])).resolves.toEqual([
+      { result: { ok: true } },
+      { result: { ok: true } },
+    ])
   })
 
   test('keeps the connection-file key behind owner-only permissions', async () => {

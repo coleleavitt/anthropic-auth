@@ -55,7 +55,7 @@ export function buildAccountDialogOption(account: AccountDialogAccount) {
       ? ` ${Math.round(account.quotaPercent)}%`
       : ' \u2013%'
   const status = !account.enabled ? ' (disabled)' : ''
-  const gate = ` · gate ${account.claustrumGate}`
+  const gate = ` · gate ${account.claustrumGate === 'na' ? 'n/a' : account.claustrumGate}`
   const vault =
     account.role === 'main'
       ? ' · vault n/a'
