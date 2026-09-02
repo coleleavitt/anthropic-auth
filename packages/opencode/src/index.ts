@@ -3974,14 +3974,6 @@ const anthropicAuthPlugin = async (
                       maxRetries: 0,
                     })
 
-                    console.error(
-                      'DEBUG refresh: freshAuth.sharedAccountId=',
-                      freshAuth.sharedAccountId,
-                      'refreshFp=',
-                      freshAuth.refresh
-                        ? hashRefreshToken(freshAuth.refresh).slice(0, 8)
-                        : undefined,
-                    )
                     if (freshAuth.sharedAccountId) {
                       const persisted = await persistRefreshedSharedOAuth({
                         accountId: freshAuth.sharedAccountId,
@@ -4141,36 +4133,12 @@ const anthropicAuthPlugin = async (
             }
 
             const run = async () => {
-              console.error('DEBUG run: entered')
               try {
                 const storage = await loadAccounts(accountStoragePath)
-                console.error('DEBUG run: storage loaded')
                 if (!mainRefreshEnabled(storage)) {
-                  console.error('DEBUG run: refresh disabled')
                   return
                 }
                 const latestAuth = await getAuth()
-                console.error(
-                  'DEBUG run latestAuth:',
-                  JSON.stringify({
-                    type: latestAuth.type,
-                    // Fingerprints, not the tokens themselves: these lines are
-                    // committed, and a debug print is not worth putting a live
-                    // credential into anyone's terminal scrollback or CI log.
-                    accessFp: (latestAuth as any).access
-                      ? hashRefreshToken((latestAuth as any).access).slice(0, 8)
-                      : undefined,
-                    refreshFp: (latestAuth as any).refresh
-                      ? hashRefreshToken((latestAuth as any).refresh).slice(
-                          0,
-                          8,
-                        )
-                      : undefined,
-                    expires: (latestAuth as any).expires,
-                    expiresInMs:
-                      ((latestAuth as any).expires ?? 0) - Date.now(),
-                  }),
-                )
                 if (latestAuth.type !== 'oauth') return
                 await clearStaleMainRefreshError(latestAuth.refresh)
                 if (!latestAuth.expires) return
@@ -4221,12 +4189,6 @@ const anthropicAuthPlugin = async (
                     : undefined,
                 })
               } catch (error) {
-                console.error(
-                  'DEBUG run threw:',
-                  error instanceof Error
-                    ? `${error.message}\n${error.stack}`
-                    : String(error),
-                )
                 logger.warn('refresh', 'opencode main oauth refresh failed', {
                   message:
                     error instanceof Error ? error.message : String(error),
@@ -4235,9 +4197,7 @@ const anthropicAuthPlugin = async (
             }
 
             mainBackgroundRefreshTick = run
-            console.error('DEBUG registering mainBackgroundRefreshTimer')
             mainBackgroundRefreshTimer = runtimeTimers.setInterval(() => {
-              console.error('DEBUG mainRefresh interval handler invoked')
               void run()
             }, MAIN_AUTH_REFRESH_TICK_MS +
               jitterMs(MAIN_AUTH_REFRESH_TICK_JITTER_MS))
