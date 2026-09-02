@@ -115,6 +115,7 @@ import {
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
   mergeMainQuotaErrorClearedAt,
+  mergeMainRefreshErrorClearedAt,
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
@@ -1993,6 +1994,7 @@ const anthropicAuthPlugin = async (
             account.lastRefreshError,
             account.id,
             claustrumNow(),
+            account.refresh ? tokenFingerprint(account.refresh) : undefined,
           )
         ) {
           return
@@ -2842,6 +2844,7 @@ const anthropicAuthPlugin = async (
     activeId?: string
     route: string
     mainAccessToken?: string
+    mainRefreshToken?: string
     routingAuthoritative?: boolean
     useHydratedProfiles?: boolean
     skipFallbackQuotaSeed?: boolean
@@ -2912,6 +2915,9 @@ const anthropicAuthPlugin = async (
               mainRefreshError,
               mainAccountId ?? storage?.mainAccountId,
               Date.now(),
+              options.mainRefreshToken
+                ? tokenFingerprint(options.mainRefreshToken)
+                : undefined,
             )
           : false,
         refreshBackoffUntil: mainRefreshError?.nextRetryAt,
@@ -2943,6 +2949,7 @@ const anthropicAuthPlugin = async (
               account.lastRefreshError,
               account.id,
               Date.now(),
+              tokenFingerprint(account.refresh),
             ) &&
             isPermanentRefreshError(account.lastRefreshError),
           vaultReauth:
@@ -3058,6 +3065,7 @@ const anthropicAuthPlugin = async (
       activeId: lastSidebarRouting.activeId,
       route: lastSidebarRouting.route,
       mainAccessToken: access,
+      mainRefreshToken: undefined,
       routingAuthoritative: false,
     })
   }
@@ -3121,14 +3129,27 @@ const anthropicAuthPlugin = async (
     return storage?.refresh?.enabled !== false
   }
 
-  async function clearStaleMainRefreshError(accountIdentity?: string) {
+  async function clearStaleMainRefreshError(
+    accountIdentity?: string,
+    currentRefreshTokenFingerprint?: string,
+  ) {
     if (!accountIdentity) return
     const storage = await loadAccounts(accountStoragePath)
     const error = storage?.refresh?.mainLastRefreshError
     if (!storage?.refresh || !error) return
-    if (!error.accountIdentity || error.accountIdentity === accountIdentity)
-      return
+    const identityChanged =
+      Boolean(error.accountIdentity) &&
+      error.accountIdentity !== accountIdentity
+    const refreshTokenChanged =
+      Boolean(error.refreshTokenFingerprint) &&
+      Boolean(currentRefreshTokenFingerprint) &&
+      error.refreshTokenFingerprint !== currentRefreshTokenFingerprint
+    if (!identityChanged && !refreshTokenChanged) return
     storage.refresh.mainLastRefreshError = undefined
+    storage.refresh.mainRefreshErrorClearedAt = mergeMainRefreshErrorClearedAt(
+      storage.refresh.mainRefreshErrorClearedAt,
+      Date.now(),
+    )
     if (!mainQuotaIdentityAccessToken?.startsWith('sk-ant-oat')) {
       const quotaError = storage.quota?.mainLastQuotaApiError
       if (quotaError && quotaError.accountIdentity !== mainQuotaAccountId) {
@@ -3243,6 +3264,7 @@ const anthropicAuthPlugin = async (
           activeId: lastSidebarRouting.activeId,
           route: lastSidebarRouting.route,
           mainAccessToken: auth.access,
+          mainRefreshToken: auth.refresh,
           routingAuthoritative: false,
         })
       } catch {
@@ -3273,6 +3295,7 @@ const anthropicAuthPlugin = async (
       activeId: lastSidebarRouting.activeId,
       route: lastSidebarRouting.route,
       mainAccessToken: auth.access,
+      mainRefreshToken: auth.refresh,
       routingAuthoritative: false,
     })
 
@@ -3503,6 +3526,7 @@ const anthropicAuthPlugin = async (
       activeId: lastSidebarRouting.activeId,
       route: lastSidebarRouting.route,
       mainAccessToken: auth.access,
+      mainRefreshToken: auth.refresh,
       routingAuthoritative: false,
     })
   }
@@ -3940,6 +3964,45 @@ const anthropicAuthPlugin = async (
           id: updatedId,
           label: account?.label,
         })
+      } else if (result.updated.action === 'reset-backoff') {
+        const mainIdentity = mainAccountId ?? storage?.mainAccountId
+        storage = storage ?? createEmptyStorage()
+        storage.refresh = storage.refresh ?? {}
+        storage.refresh.mainLastRefreshError = undefined
+        storage.refresh.mainRefreshErrorClearedAt =
+          mergeMainRefreshErrorClearedAt(
+            storage.refresh.mainRefreshErrorClearedAt,
+            Date.now(),
+          )
+        const quotaError = storage.quota?.mainLastQuotaApiError
+        if (
+          !quotaError?.accountIdentity ||
+          !mainIdentity ||
+          quotaError.accountIdentity === mainIdentity
+        ) {
+          const clearedGeneration = quotaManager.clearMainBackoff()
+          storage.quota = storage.quota ?? {}
+          storage.quota.mainLastQuotaApiError = undefined
+          storage.quota.mainQuotaErrorGeneration = Math.max(
+            storage.quota.mainQuotaErrorGeneration ?? 0,
+            clearedGeneration ?? quotaManager.getMainQuotaErrorGeneration(),
+          )
+          storage.quota.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+            storage.quota.mainQuotaErrorClearedAt,
+            quotaManager.getMainQuotaErrorClearedAt() ?? Date.now(),
+          )
+        }
+        await saveAccountState(storage, accountStoragePath, {
+          mainRefresh: true,
+          mainQuota: true,
+        })
+        logger.info(
+          'commands',
+          'main OAuth refresh and quota backoff cleared',
+          {
+            mainIdentity,
+          },
+        )
       }
 
       const updatedStorage = await loadAccounts(accountStoragePath)
@@ -3950,6 +4013,7 @@ const anthropicAuthPlugin = async (
             activeId: lastSidebarRouting.activeId,
             route: lastSidebarRouting.route,
             mainAccessToken: auth.access,
+            mainRefreshToken: auth.refresh,
             routingAuthoritative: false,
           })
         } catch {
@@ -4614,6 +4678,7 @@ const anthropicAuthPlugin = async (
                             mainError,
                             mainAccountId ?? storage?.mainAccountId,
                             Date.now(),
+                            tokenFingerprint(freshAuth.refresh),
                           )
                         : false,
                       retryCount: mainError?.retryCount,
@@ -4625,6 +4690,7 @@ const anthropicAuthPlugin = async (
                         mainError,
                         mainAccountId ?? storage?.mainAccountId,
                         Date.now(),
+                        tokenFingerprint(freshAuth.refresh),
                       )
                     ) {
                       log(
@@ -4791,6 +4857,8 @@ const anthropicAuthPlugin = async (
                             now: Date.now(),
                             accountIdentity:
                               mainAccountId ?? storage.mainAccountId,
+                            refreshTokenFingerprint:
+                              tokenFingerprint(failedRefreshToken),
                             previous: storage.refresh.mainLastRefreshError,
                           })
                       })
@@ -4852,6 +4920,9 @@ const anthropicAuthPlugin = async (
                 if (latestAuth.type !== 'oauth') return
                 await clearStaleMainRefreshError(
                   mainAccountId ?? storage?.mainAccountId,
+                  latestAuth.refresh
+                    ? tokenFingerprint(latestAuth.refresh)
+                    : undefined,
                 )
                 if (!latestAuth.expires) return
                 const expiresInMs = latestAuth.expires - Date.now()
@@ -4868,6 +4939,9 @@ const anthropicAuthPlugin = async (
                     storage?.refresh?.mainLastRefreshError,
                     mainAccountId ?? storage?.mainAccountId,
                     Date.now(),
+                    latestAuth.refresh
+                      ? tokenFingerprint(latestAuth.refresh)
+                      : undefined,
                   )
                 ) {
                   log(
@@ -5761,6 +5835,7 @@ const anthropicAuthPlugin = async (
                     account.lastRefreshError,
                     account.id,
                     Date.now(),
+                    tokenFingerprint(account.refresh),
                   ) &&
                   storageArg?.quota?.failClosedOnUnknownQuota !== true &&
                   !quotaSnapshotHasStandardWindows(getFallbackQuota(account))
@@ -5795,6 +5870,7 @@ const anthropicAuthPlugin = async (
           async function buildStickyOAuthRoutes(input: {
             storage: AccountStorage | null
             mainAccessToken: string
+            mainRefreshToken?: string
             requestedModelId?: string
             mainQuotaIdentity?: MainQuotaIdentityBinding
           }) {
@@ -5909,6 +5985,13 @@ const anthropicAuthPlugin = async (
                     refreshError,
                     accountIdentity,
                     Date.now(),
+                    route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                      ? input.mainRefreshToken
+                        ? tokenFingerprint(input.mainRefreshToken)
+                        : undefined
+                      : route.account?.refresh
+                        ? tokenFingerprint(route.account.refresh)
+                        : undefined,
                   ) &&
                   (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
                     !usableIds.has(route.id))
@@ -5963,6 +6046,13 @@ const anthropicAuthPlugin = async (
                       refreshError,
                       accountIdentity,
                       Date.now(),
+                      route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                        ? input.mainRefreshToken
+                          ? tokenFingerprint(input.mainRefreshToken)
+                          : undefined
+                        : route.account?.refresh
+                          ? tokenFingerprint(route.account.refresh)
+                          : undefined,
                     ) &&
                     (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
                       !usableIds.has(route.id)))
@@ -6508,7 +6598,10 @@ const anthropicAuthPlugin = async (
                 }
                 requestMainQuotaIdentity = resolution
               }
-              await clearStaleMainRefreshError(mainAccountId)
+              await clearStaleMainRefreshError(
+                mainAccountId,
+                auth.refresh ? tokenFingerprint(auth.refresh) : undefined,
+              )
               const loadStart = nowMs()
               const storage = await loadAccounts()
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
@@ -6603,6 +6696,7 @@ const anthropicAuthPlugin = async (
                   let stickyRoutes = await buildStickyOAuthRoutes({
                     storage,
                     mainAccessToken: auth.access,
+                    mainRefreshToken: auth.refresh,
                     requestedModelId: routingModelId,
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
@@ -6919,6 +7013,7 @@ const anthropicAuthPlugin = async (
                       stickyRoutes = await buildStickyOAuthRoutes({
                         storage: stickyRoutes.storage,
                         mainAccessToken: auth.access,
+                        mainRefreshToken: auth.refresh,
                         requestedModelId: routingModelId,
                         mainQuotaIdentity: requestMainQuotaIdentity,
                       })
@@ -7065,6 +7160,7 @@ const anthropicAuthPlugin = async (
                     mainRefreshError,
                     mainAccountId ?? refreshStorage?.mainAccountId,
                     Date.now(),
+                    auth.refresh ? tokenFingerprint(auth.refresh) : undefined,
                   )
                 ) {
                   log('[refresh] opencode main oauth request skipped backoff', {
