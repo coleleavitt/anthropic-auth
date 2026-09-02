@@ -13,6 +13,7 @@ import {
   isCustodyTombstoneOAuth,
   isCustodyTombstoneValue,
   isPermanentRefreshError,
+  isValidCustodyHandle,
   loadAccounts,
   readCustodyHandles,
   saveAccounts,
@@ -29,9 +30,22 @@ const tombstoneFixture = JSON.parse(
     oauth: { provider: string; entry: Record<string, unknown> }
   }
 }
+type GoldenHandleFixture = {
+  providers: Array<{
+    provider: string
+    shape: string
+    serve: string
+    accounts: Array<{
+      label: string
+      handle: string
+      credential_id: string
+      superseded?: string[]
+    }>
+  }>
+}
 const handlesFixture = JSON.parse(
   readFileSync(join(fixtureDir, 'handles.json'), 'utf8'),
-)
+) as GoldenHandleFixture
 
 const oauthFixture = tombstoneFixture.fixtures.oauth
 const apiFixture = tombstoneFixture.fixtures.api
@@ -174,6 +188,7 @@ describe('Claustrum custody tombstones', () => {
       (provider: { provider: string }) =>
         provider.provider === oauthFixture.provider,
     )
+    if (!anthropicSource) throw new Error('missing anthropic fixture')
     const anthropic = readCustodyHandles(handlesFixture, oauthFixture.provider)
     expect(anthropic).toEqual({
       provider: anthropicSource.provider,
@@ -192,9 +207,17 @@ describe('Claustrum custody tombstones', () => {
       ),
     })
     const deepseek = readCustodyHandles(handlesFixture, apiFixture.provider)
-    expect(deepseek.accounts[1]).not.toHaveProperty('superseded')
-    expect(deepseek.accounts[1]).toMatchObject({
-      handle: handlesFixture.providers[0].accounts[1].handle,
+    const deepseekBackup = deepseek.accounts[1]
+    if (!deepseekBackup) throw new Error('missing deepseek backup fixture')
+    expect(deepseekBackup).not.toHaveProperty('superseded')
+    const deepseekSource = handlesFixture.providers.find(
+      (provider) => provider.provider === apiFixture.provider,
+    )
+    if (!deepseekSource?.accounts[1]) {
+      throw new Error('missing deepseek backup fixture')
+    }
+    expect(deepseekBackup).toMatchObject({
+      handle: deepseekSource.accounts[1].handle,
     })
   })
 
@@ -238,6 +261,72 @@ describe('Claustrum custody tombstones', () => {
     ).toThrow(
       `Missing custody handles for provider ${oauthFixture.provider}-missing`,
     )
+  })
+
+  test('rejects prototype provider ids without polluting Object.prototype', () => {
+    const malicious = JSON.parse(
+      '{"providers":[{"provider":"__proto__","accounts":[]}]}',
+    )
+    expect(() => readCustodyHandles(malicious, '__proto__')).toThrow()
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined()
+  })
+
+  test('filters invalid labels and short handles while accepting golden handles', () => {
+    const fixture = structuredClone(handlesFixture) as {
+      providers: Array<{
+        provider: string
+        accounts: Array<Record<string, unknown>>
+      }>
+    }
+    const anthropic = fixture.providers.find(
+      (provider) => provider.provider === oauthFixture.provider,
+    )
+    if (!anthropic) throw new Error('missing anthropic fixture')
+    const account = anthropic.accounts[0]
+    if (!account) throw new Error('missing anthropic account fixture')
+    const invalidLabels = [
+      'constructor',
+      'Uppercase',
+      'with space',
+      'a'.repeat(65),
+    ]
+    anthropic.accounts = invalidLabels.map((label) => ({ ...account, label }))
+    anthropic.accounts.push({
+      ...account,
+      handle: `ckh_${apiFixture.provider}_main`,
+    })
+    expect(readCustodyHandles(fixture, oauthFixture.provider).accounts).toEqual(
+      [],
+    )
+
+    for (const provider of handlesFixture.providers) {
+      const parsed = readCustodyHandles(handlesFixture, provider.provider)
+      expect(parsed.accounts).toHaveLength(provider.accounts.length)
+      for (const sourceAccount of provider.accounts) {
+        expect(isValidCustodyHandle(sourceAccount.handle)).toBe(true)
+        expect(sourceAccount.handle).toHaveLength(47)
+        for (const superseded of sourceAccount.superseded ?? []) {
+          expect(isValidCustodyHandle(superseded)).toBe(true)
+          expect(superseded).toHaveLength(47)
+        }
+      }
+    }
+
+    const allHandles = handlesFixture.providers.flatMap((provider) =>
+      provider.accounts.flatMap((account) => [
+        account.handle,
+        ...(account.superseded ?? []),
+      ]),
+    )
+    expect(allHandles.some((handle) => /[A-Z]/.test(handle))).toBe(true)
+    expect(allHandles.some((handle) => /[-_]/.test(handle))).toBe(true)
+    const validHandle = allHandles[0]
+    if (!validHandle) throw new Error('missing custody handle fixture')
+    expect(isValidCustodyHandle(validHandle.slice(0, -1))).toBe(false)
+    expect(isValidCustodyHandle(`${validHandle}A`)).toBe(false)
+    expect(isValidCustodyHandle(`${validHandle.slice(0, -1)}+`)).toBe(false)
+    expect(isValidCustodyHandle(`${validHandle.slice(0, -1)}/`)).toBe(false)
+    expect(isValidCustodyHandle(`${validHandle.slice(0, -1)}=`)).toBe(false)
   })
 
   test('main loader rejects the tombstone without network or refresh state', async () => {

@@ -168,15 +168,37 @@ export type CustodyHandleManifest = {
   accounts: CustodyHandleAccount[]
 }
 
+const CUSTODY_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
+// The suffix is base64url for 256 CSPRNG bits; its charset is not fixture-derived.
+const CUSTODY_HANDLE_PATTERN = /^ckh_[A-Za-z0-9_-]{43}$/
+const RESERVED_CUSTODY_IDS = new Set(['__proto__', 'constructor', 'prototype'])
+
+function isCustodyId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    CUSTODY_ID_PATTERN.test(value) &&
+    !RESERVED_CUSTODY_IDS.has(value)
+  )
+}
+
+export function isValidCustodyHandle(value: unknown): value is string {
+  return typeof value === 'string' && CUSTODY_HANDLE_PATTERN.test(value)
+}
+
 export function readCustodyHandles(
   json: unknown,
   provider: string,
 ): CustodyHandleManifest {
+  if (!isCustodyId(provider)) {
+    throw new Error(`Invalid custody provider id ${provider}`)
+  }
   const providers =
     isRecord(json) && Array.isArray(json.providers) ? json.providers : []
   const source = providers.find(
     (entry): entry is Record<string, unknown> =>
-      isRecord(entry) && entry.provider === provider,
+      isRecord(entry) &&
+      Object.hasOwn(entry, 'provider') &&
+      entry.provider === provider,
   )
   if (!source || !Array.isArray(source.accounts)) {
     throw new Error(`Missing custody handles for provider ${provider}`)
@@ -188,8 +210,13 @@ export function readCustodyHandles(
     accounts: source.accounts.flatMap((entry) => {
       if (!isRecord(entry)) return []
       if (
+        !Object.hasOwn(entry, 'label') ||
+        !Object.hasOwn(entry, 'handle') ||
+        !Object.hasOwn(entry, 'credential_id') ||
         typeof entry.label !== 'string' ||
         typeof entry.handle !== 'string' ||
+        !isCustodyId(entry.label) ||
+        !isValidCustodyHandle(entry.handle) ||
         typeof entry.credential_id !== 'string'
       )
         return []
