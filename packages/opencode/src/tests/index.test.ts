@@ -3122,23 +3122,25 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test('does not report a 401 when expiry-aware fallback serves a fresh sidecar token', async () => {
+    let now = 1_000
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-expired-sidecar-401',
       claustrum: { accounts: { 'fallback-1': { enabled: true } } },
     } as never)
     const connector = connectorFor(calls, () =>
-      credentialResponse('vault-expiring-access', 61, Date.now() + 1),
+      credentialResponse('vault-expiring-access', 61, 1_010),
     )
     await useTempAccountFile(storage)
+    const authorizations: string[] = []
     globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
       if (
         extractUrl(input as string | URL | Request).includes('/v1/messages')
       ) {
-        if (
-          new Headers(init?.headers).get('authorization') ===
-          'Bearer main-access'
-        ) {
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        authorizations.push(authorization)
+        if (authorization === 'Bearer main-access') {
           return Promise.resolve(new Response('{}', { status: 200 }))
         }
         return Promise.resolve(new Response('{}', { status: 401 }))
@@ -3147,6 +3149,7 @@ describe('fallback Claustrum credential resolution', () => {
     }) as unknown as typeof fetch
     const plugin = await getPlugin(undefined, undefined, {
       claustrumConnector: connector,
+      claustrumNow: () => now,
     })
     const result = await plugin.auth.loader(
       () =>
@@ -3158,10 +3161,14 @@ describe('fallback Claustrum credential resolution', () => {
         }),
       { models: {} },
     )
-    await Bun.sleep(10)
+    now = 2_000
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
+    expect(authorizations).toEqual([
+      'Bearer stored-fallback-access',
+      'Bearer main-access',
+    ])
     expect(
       calls.some((call) => call.method === 'credential.report_auth_failure'),
     ).toBe(false)

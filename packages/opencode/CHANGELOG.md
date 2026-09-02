@@ -10,6 +10,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 - Add an opt-in host-local feed for sanitized response-header quota observations so another local CortexKit process can consume fresh account state without polling Anthropic's rate-limited usage endpoint.
 - Add Claude Fable 5.1 and limited-access Mythos 5.1 to the model catalogue and extend quota routing, server fallback, deterministic recovery, cache warming, and sidebar naming to Fable 5.1.
 - Preserve OAuth Fable 5.1 prompt-cache prefixes across per-turn effort changes, expose native effort variants, and add explicit `account-default`, `error`, or `drop_block` thinking-prefix behavior in sidecar config.
+- Add opt-in Claustrum custody for fallback OAuth credentials, with vault-owned refresh, cache-only request-path reads, version-fenced 401 reporting, sidecar failover, and custody status in account UI.
 
 ### Patch Changes
 
@@ -19,8 +20,9 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 - Keep the plugin entrypoint limited to the plugin factory so OpenCode cannot invoke internal request-policy helpers as plugins.
 - Update OpenTUI Core and Solid together to 0.5.7.
 - Match Claude Code 2.1.258 request identity and final-body `cch` signing, keep the billing suffix stable through in-process session compaction, and apply configured Fable 5.1 thinking-prefix behavior only when replaying signed or redacted thinking.
+- Reject provider-bound Claustrum custody tombstones locally before OAuth refresh without persisting a permanent auth failure, and ensure shutdown closes any replacement transport that finishes connecting after the Claustrum client is closed.
 
-Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity, the host-local quota feed, Fable/Mythos 5.1 support, and Claude Code identity compatibility.
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity, the host-local quota feed, Fable/Mythos 5.1 support, Claude Code identity compatibility, and Claustrum fallback custody and tombstone guards.
 
 ## 1.20.0
 

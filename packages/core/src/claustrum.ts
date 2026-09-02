@@ -390,6 +390,10 @@ export class ClaustrumClient {
       handshakeTimeoutMs: this.#handshakeTimeoutMs,
     })
       .then((client) => {
+        if (this.#closed) {
+          client.close()
+          throw new Error('Claustrum client is closed')
+        }
         const previous = this.#client
         this.#client = client
         previous.close()

@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Add an opt-in OpenCode host-local feed for sanitized response-header quota observations so another local CortexKit process can consume fresh account state without polling Anthropic's rate-limited usage endpoint.
 - Add Claude Fable 5.1 and limited-access Mythos 5.1 across the shared model catalogue, OpenCode request/routing/recovery paths, and Pi provider catalogue.
 - Preserve OAuth Fable 5.1 prompt-cache prefixes across mid-conversation effort changes in OpenCode and Pi, and expose explicit `account-default`, `error`, or `drop_block` thinking-prefix mismatch behavior in sidecar config.
+- Add opt-in OpenCode Claustrum custody for fallback OAuth credentials, with vault-owned refresh, cache-only request-path reads, version-fenced 401 reporting, sidecar failover, and custody status in account UI.
 
 ### Patch Changes
 
@@ -20,8 +21,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Keep the OpenCode plugin entrypoint limited to the plugin factory so the host cannot invoke internal request-policy helpers as plugins.
 - Update OpenTUI Core and Solid together to 0.5.7 and `@tsconfig/bun` to 1.0.11.
 - Match Claude Code 2.1.258 request identity and final-body `cch` signing, keep the billing suffix stable through in-process session compaction, and apply configured Fable 5.1 thinking-prefix behavior only when replaying signed or redacted thinking in OpenCode or Pi.
+- Reject provider-bound Claustrum custody tombstones locally before OAuth refresh without persisting a permanent auth failure, and ensure shutdown closes any replacement transport that finishes connecting after the Claustrum client is closed.
 
-Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity, the host-local quota feed, Fable/Mythos 5.1 support, and Claude Code identity compatibility.
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity, the host-local quota feed, Fable/Mythos 5.1 support, Claude Code identity compatibility, and Claustrum fallback custody and tombstone guards.
 
 ## 1.20.0
 

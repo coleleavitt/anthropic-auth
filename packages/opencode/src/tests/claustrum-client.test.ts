@@ -452,6 +452,48 @@ describe('ClaustrumClient', () => {
     ])
   })
 
+  test('closes a replacement client when close wins an in-flight reconnect', async () => {
+    let connections = 0
+    let replacementCloses = 0
+    const reconnectStarted = Promise.withResolvers<void>()
+    const releaseReconnect = Promise.withResolvers<void>()
+    const first = {
+      call: async () => {
+        throw new SubcCallError(
+          'terminal',
+          'resident route wedged',
+          'route_wedged',
+        )
+      },
+      close: () => {},
+    }
+    const replacement = {
+      call: async () => ({ result: { ok: true } }),
+      close: () => {
+        replacementCloses += 1
+      },
+    }
+    const client = await connectClaustrumClient({
+      connectionFile: '/tmp/unused-claustrum-connection.json',
+      connector: async () => {
+        connections += 1
+        if (connections === 1) return first as never
+        reconnectStarted.resolve()
+        await releaseReconnect.promise
+        return replacement as never
+      },
+    })
+    clients.push(client)
+
+    const call = client.call('claustrum', 'credential.get', { handle: 'h' })
+    await reconnectStarted.promise
+    client.close()
+    releaseReconnect.resolve()
+
+    await expect(call).rejects.toThrow('Claustrum client is closed')
+    expect(replacementCloses).toBe(1)
+  })
+
   test('keeps the connection-file key behind owner-only permissions', async () => {
     const daemon = await startFakeDaemon()
     const connectionFile = await makeConnectionFile(daemon.port)
