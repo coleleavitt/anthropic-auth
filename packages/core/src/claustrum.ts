@@ -116,6 +116,94 @@ export async function detectClaustrumConnection(
   }
 }
 
+export const CUSTODY_TOMBSTONE_PREFIX = 'claustrum-tombstone:v1:'
+
+export function custodyTombstoneKey(provider: string): string {
+  return `${CUSTODY_TOMBSTONE_PREFIX}${provider}`
+}
+
+export function isCustodyTombstoneValue(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith(CUSTODY_TOMBSTONE_PREFIX)
+}
+
+export function isCustodyTombstoneOAuth(
+  auth: unknown,
+  provider: string,
+): boolean {
+  if (!isRecord(auth) || auth.type !== 'oauth') return false
+  const key = custodyTombstoneKey(provider)
+  return auth.refresh === key && auth.access === key
+}
+
+export class CustodyTombstoneRefreshError extends Error {
+  readonly code = 'custody_tombstone_refresh'
+
+  constructor(public readonly provider: string) {
+    super(
+      `${provider} main slot is vault-custodied; local refresh is forbidden — the vault-served main path is not yet implemented`,
+    )
+    this.name = 'CustodyTombstoneRefreshError'
+  }
+}
+
+export function assertNotCustodyTombstone(
+  refreshToken: unknown,
+  provider: string,
+): void {
+  if (isCustodyTombstoneValue(refreshToken)) {
+    throw new CustodyTombstoneRefreshError(provider)
+  }
+}
+
+export type CustodyHandleAccount = {
+  label: string
+  handle: string
+  credentialId: string
+}
+
+export type CustodyHandleManifest = {
+  provider: string
+  serve: string
+  shape: string
+  accounts: CustodyHandleAccount[]
+}
+
+export function readCustodyHandles(
+  json: unknown,
+  provider: string,
+): CustodyHandleManifest {
+  const providers =
+    isRecord(json) && Array.isArray(json.providers) ? json.providers : []
+  const source = providers.find(
+    (entry): entry is Record<string, unknown> =>
+      isRecord(entry) && entry.provider === provider,
+  )
+  if (!source || !Array.isArray(source.accounts)) {
+    throw new Error(`Missing custody handles for provider ${provider}`)
+  }
+  return {
+    provider: String(source.provider),
+    serve: String(source.serve),
+    shape: String(source.shape),
+    accounts: source.accounts.flatMap((entry) => {
+      if (!isRecord(entry)) return []
+      if (
+        typeof entry.label !== 'string' ||
+        typeof entry.handle !== 'string' ||
+        typeof entry.credential_id !== 'string'
+      )
+        return []
+      return [
+        {
+          label: entry.label,
+          handle: entry.handle,
+          credentialId: entry.credential_id,
+        },
+      ]
+    }),
+  }
+}
+
 export type ClaustrumClientOptions = {
   connectionFile?: string
   handshakeTimeoutMs?: number
