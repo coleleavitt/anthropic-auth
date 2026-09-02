@@ -63,8 +63,9 @@ const MAX_GENERATIONS = 3
 function rotateLogFile(): void {
   try {
     if (!fs.existsSync(LOG_FILE)) return
-    const stat = fs.statSync(LOG_FILE)
-    if (stat.size < MAX_FILE_SIZE) return
+    const stat = fs.lstatSync(LOG_FILE)
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size < MAX_FILE_SIZE)
+      return
   } catch {
     return
   }
@@ -243,6 +244,40 @@ export const logger = {
   },
 }
 
+/**
+ * Append to a user-private regular file without following a final-component
+ * symlink. Logging remains best-effort: unsafe paths and filesystem failures
+ * return false instead of affecting the request path.
+ */
+export function secureAppendLogFile(logFile: string, data: string): boolean {
+  let fd: number | undefined
+  try {
+    fd = fs.openSync(
+      logFile,
+      fs.constants.O_APPEND |
+        fs.constants.O_CREAT |
+        fs.constants.O_WRONLY |
+        fs.constants.O_NOFOLLOW,
+      0o600,
+    )
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile()) return false
+    fs.fchmodSync(fd, 0o600)
+    fs.writeSync(fd, data)
+    return true
+  } catch {
+    return false
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch {
+        // Logging cleanup must never throw.
+      }
+    }
+  }
+}
+
 // -- Buffered writes ------------------------------------------------------
 
 const isTestEnv = process.env.NODE_ENV === 'test'
@@ -262,7 +297,7 @@ function flush(): void {
   buffer = []
   try {
     rotateLogFile()
-    fs.appendFileSync(LOG_FILE, data)
+    secureAppendLogFile(LOG_FILE, data)
   } catch {
     // Logging must never throw.
   }

@@ -129,7 +129,13 @@ export async function writeDumpFile(path: string, contents: string) {
     const partialPath = `${path}.${nonce}.partial`
     let created = false
     try {
-      await writeFile(partialPath, contents, { encoding: 'utf8', flag: 'wx' })
+      // Dump bodies contain prompt/session content, so the artifact is created
+      // user-only rather than inheriting the process umask.
+      await writeFile(partialPath, contents, {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: 0o600,
+      })
       created = true
       await rename(partialPath, path)
       return true
@@ -639,7 +645,7 @@ async function dumpRequest(input: {
   if (input.request !== undefined) files.request = `${prefix}.request.json`
 
   try {
-    await mkdir(dumpDir, { recursive: true })
+    await mkdir(dumpDir, { recursive: true, mode: 0o700 })
     const previousBodyText =
       input.previousBodyText ?? (await loadLatestDumpBody(input))
     const metadata = {

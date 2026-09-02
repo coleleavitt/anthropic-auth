@@ -7,6 +7,7 @@ import {
   readdir,
   readFile,
   rm,
+  stat,
   symlink,
   unlink,
   utimes,
@@ -620,4 +621,25 @@ test('does not follow a pre-planted predictable partial symlink', async () => {
   expect(await readFile(targetFile, 'utf8')).toBe('do not overwrite')
   expect(await readFile(finalFile, 'utf8')).toBe('safe dump content')
   expect((await lstat(finalFile)).isSymbolicLink()).toBe(false)
+})
+
+test('creates dump artifacts and the dump directory user-only', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+
+  await dumpDirectRequest({
+    affinity: 'ses-perms',
+    bodyText: '{"messages":[{"role":"user","content":"secret prompt"}]}',
+  })
+
+  const names = await readdir(dumpDir)
+  expect(names.length).toBeGreaterThan(0)
+  for (const name of names) {
+    expect((await stat(join(dumpDir, name))).mode & 0o777).toBe(0o600)
+  }
+  expect((await stat(dumpDir)).mode & 0o777).toBe(0o700)
 })
