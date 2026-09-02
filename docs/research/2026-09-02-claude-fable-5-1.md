@@ -81,6 +81,8 @@ A three-turn OAuth Fable 5.1 probe changed effort with empty system messages car
 
 CortexKit now includes the mid-conversation beta on every OAuth Fable 5.1 request so the beta set itself remains stable across a session. OpenCode derives changes from per-user model variants; Pi derives them from `thinking_level_change` entries. Both fold the current effort into a newly compacted prefix and begin a fresh transition timeline. Mythos 5.1, older models, and API-key routes remain outside this behavior.
 
+A live OpenCode 1.18.25 session exposed a host-boundary flaw in the initial OpenCode adapter: the plugin recorded effort changes by assistant-record count, but OpenCode lowered 413 pre-transition assistant records into only 160 Anthropic assistant messages. The request therefore sent top-level `xhigh` with no transition marker. OpenCode now tags the actual effort-changing user records with nonce-bound HMAC-authenticated text markers before host lowering and carries a signed request plan on the current user turn. The fetch transform authenticates and removes the markers, inserts system effort messages at the surviving user boundaries, and fails locally if marker counts, nonces, or plan cardinality do not correlate. Marker text is gone before cache lookback, billing suffix derivation, dumps, `cch` signing, and transport.
+
 ## PR assessment
 
 ### PR #179

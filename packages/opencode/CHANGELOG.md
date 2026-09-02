@@ -13,6 +13,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Patch Changes
 
+- Preserve Fable 5.1 effort transitions when OpenCode host lowering collapses tool-heavy or compacted assistant records by correlating authenticated user-boundary markers instead of assistant-record counts.
 - Coalesce main OAuth refreshes across project plugin instances and let sticky 401 recovery adopt a concurrently rotated valid credential instead of refreshing it again.
 - Treat DNS lookup failures as transient OAuth refresh failures with a fixed five-minute retry interval—including already-persisted long backoffs—and keep sticky-balanced fallback routes usable while their current access token remains valid.
 - Keep the plugin entrypoint limited to the plugin factory so OpenCode cannot invoke internal request-policy helpers as plugins.

@@ -47,6 +47,10 @@ import {
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  EFFORT_MARKER_PREFIX,
+  EFFORT_PLAN_MARKER_PREFIX,
+} from '../effort-history'
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
@@ -3011,7 +3015,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     globalThis.fetch = originalFetch
   })
 
-  test('carries message variants into the OAuth body and strips the internal header', async () => {
+  test('preserves effort boundaries when OpenCode lowers multiple assistant records into one message', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -3053,6 +3057,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     const messages = [
       {
         info: {
+          id: 'msg_effort_low',
           role: 'user',
           sessionID: 'ses_effort',
           model: {
@@ -3061,14 +3066,27 @@ describe('Fable 5.1 request-scoped effort history', () => {
             variant: 'low',
           },
         },
-        parts: [],
+        parts: [{ type: 'text', text: 'first' }],
       },
       {
-        info: { role: 'assistant', sessionID: 'ses_effort' },
+        info: {
+          id: 'msg_effort_step_1',
+          role: 'assistant',
+          sessionID: 'ses_effort',
+        },
         parts: [],
       },
       {
         info: {
+          id: 'msg_effort_step_2',
+          role: 'assistant',
+          sessionID: 'ses_effort',
+        },
+        parts: [],
+      },
+      {
+        info: {
+          id: 'msg_effort_high',
           role: 'user',
           sessionID: 'ses_effort',
           model: {
@@ -3077,13 +3095,16 @@ describe('Fable 5.1 request-scoped effort history', () => {
             variant: 'high',
           },
         },
-        parts: [],
+        parts: [{ type: 'text', text: 'second' }],
       },
     ]
     await plugin['experimental.chat.messages.transform']({}, { messages })
+    const loweredUserContent = messages[3]?.parts
+      .filter((part) => part.type === 'text')
+      .map((part) => ({ type: 'text', text: part.text }))
     const output = { headers: {} as Record<string, string> }
     await plugin['chat.headers'](
-      { sessionID: 'ses_effort', message: { id: 'msg_effort' } },
+      { sessionID: 'ses_effort', message: { id: 'msg_effort_high' } },
       output,
     )
 
@@ -3116,17 +3137,31 @@ describe('Fable 5.1 request-scoped effort history', () => {
               { type: 'text', text: 'answer' },
             ],
           },
-          { role: 'user', content: 'second' },
+          { role: 'user', content: loweredUserContent },
         ],
       }),
     })
 
     expect(sentBody?.output_config).toEqual({ effort: 'low' })
-    expect(sentBody?.messages[2]).toEqual({
-      role: 'system',
-      content: [],
-      output_config: { effort: 'high' },
-    })
+    expect(sentBody?.messages).toEqual([
+      { role: 'user', content: 'first' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'trace', signature: 'sig' },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+      {
+        role: 'system',
+        content: [],
+        output_config: { effort: 'high' },
+      },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'second' }],
+      },
+    ])
     expect(sentBody?.thinking.block_binding).toEqual({
       prefix_mismatch_behavior: 'error',
     })
@@ -3136,7 +3171,152 @@ describe('Fable 5.1 request-scoped effort history', () => {
     expect(sentHeaders?.get('anthropic-beta')).toContain(
       'thinking-binding-controls-2026-08-01',
     )
-    expect(sentHeaders?.has('x-cortexkit-effort-history')).toBe(false)
+    expect(
+      [...(sentHeaders?.keys() ?? [])].some((header) =>
+        header.startsWith('x-cortexkit-effort'),
+      ),
+    ).toBe(false)
+  })
+
+  test('fails locally when authenticated effort markers cannot be correlated', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        refresh: {
+          enabled: false,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 30,
+        },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+      }),
+    )
+    let messagesCalled = false
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url = extractUrl(input)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({
+            oauth_account: { account_uuid: 'effort-account' },
+          }),
+        )
+      }
+      if (url.includes('/v1/messages')) messagesCalled = true
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const markedMessages = [
+      {
+        info: {
+          id: 'msg_marked_low',
+          role: 'user',
+          sessionID: 'ses_effort_invalid',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-fable-5-1',
+            variant: 'low',
+          },
+        },
+        parts: [{ type: 'text', text: 'low effort' }],
+      },
+      {
+        info: {
+          id: 'msg_marked_assistant',
+          role: 'assistant',
+          sessionID: 'ses_effort_invalid',
+        },
+        parts: [],
+      },
+      {
+        info: {
+          id: 'msg_marked_high',
+          role: 'user',
+          sessionID: 'ses_effort_invalid',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-fable-5-1',
+            variant: 'high',
+          },
+        },
+        parts: [{ type: 'text', text: 'high effort' }],
+      },
+    ]
+    await plugin['experimental.chat.messages.transform'](
+      {},
+      { messages: markedMessages },
+    )
+    const internalTexts = markedMessages[2]?.parts.flatMap((part) =>
+      typeof part.text === 'string' ? [part.text] : [],
+    )
+    const transitionMarker = internalTexts?.find((text) =>
+      text.startsWith(EFFORT_MARKER_PREFIX),
+    )
+    const planMarker = internalTexts?.find((text) =>
+      text.startsWith(EFFORT_PLAN_MARKER_PREFIX),
+    )
+    expect(transitionMarker).toBeString()
+    expect(planMarker).toBeString()
+
+    const auth = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const send = (sessionId: string, internal: Array<string | undefined>) =>
+      auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': sessionId },
+        body: JSON.stringify({
+          model: 'claude-fable-5-1',
+          output_config: { effort: 'high' },
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'correlation failure' },
+                ...internal.map((text) => ({ type: 'text', text })),
+              ],
+            },
+          ],
+        }),
+      })
+
+    const missingTransition = await send('ses_effort_missing_transition', [
+      planMarker,
+    ])
+    expect(missingTransition.status).toBe(400)
+    expect((await missingTransition.json()).error.message).toBe(
+      'Fable 5.1 effort marker correlation failed: expected 1, found 0',
+    )
+
+    const duplicatePlan = await send('ses_effort_duplicate_plan', [
+      transitionMarker,
+      planMarker,
+      planMarker,
+    ])
+    expect(duplicatePlan.status).toBe(400)
+    expect((await duplicatePlan.json()).error.message).toBe(
+      'Multiple internal Fable 5.1 effort marker plans',
+    )
+
+    const missingPlan = await send('ses_effort_missing_plan', [
+      transitionMarker,
+    ])
+    expect(missingPlan.status).toBe(400)
+    expect((await missingPlan.json()).error.message).toBe(
+      'Missing internal Fable 5.1 effort marker plan',
+    )
+    expect(messagesCalled).toBe(false)
   })
 })
 

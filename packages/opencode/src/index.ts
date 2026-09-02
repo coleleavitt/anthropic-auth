@@ -100,7 +100,6 @@ import {
   loadAccounts,
   log,
   logger,
-  type MidConversationEffortTransition,
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
   mergeMainQuotaErrorClearedAt,
@@ -183,10 +182,8 @@ import {
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
 import {
-  collectOpenCodeEffortHistory,
-  EFFORT_HISTORY_HEADER,
-  parseEffortHistory,
-  serializeEffortHistory,
+  EffortMarkerCorrelationError,
+  markOpenCodeEffortTransitions,
 } from './effort-history.ts'
 import {
   FableFallbackManager,
@@ -249,6 +246,24 @@ const HTTP_COOKIES_TYPE_ID = '~effect/http/Cookies'
 const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
 const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
 const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
+
+function effortMarkerFailureResponse(
+  error: EffortMarkerCorrelationError,
+): Response {
+  return new Response(
+    JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: error.message,
+      },
+    }),
+    {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    },
+  )
+}
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
@@ -896,10 +911,6 @@ const anthropicAuthPlugin = async (
   )
   const fableFallbackManager = new FableFallbackManager()
   const laneStartTracker = new LaneStartTracker()
-  const effortHistoryBySession = new Map<
-    string,
-    MidConversationEffortTransition[]
-  >()
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const pendingRecoveryDesktopNotices = new Map<string, string>()
@@ -3608,17 +3619,10 @@ const anthropicAuthPlugin = async (
       _input: Record<string, never>,
       output: { messages: { info?: unknown }[] },
     ) => {
-      const history = collectOpenCodeEffortHistory(
-        output.messages as Parameters<typeof collectOpenCodeEffortHistory>[0],
+      markOpenCodeEffortTransitions(
+        output.messages as Parameters<typeof markOpenCodeEffortTransitions>[0],
+        randomUUID(),
       )
-      if (!history) return
-      effortHistoryBySession.delete(history.sessionId)
-      effortHistoryBySession.set(history.sessionId, history.transitions)
-      while (effortHistoryBySession.size > 128) {
-        const oldest = effortHistoryBySession.keys().next().value
-        if (oldest) effortHistoryBySession.delete(oldest)
-        else break
-      }
     },
     'chat.message': async (
       {
@@ -3649,14 +3653,6 @@ const anthropicAuthPlugin = async (
         messageId: message.id,
         headers: output.headers,
       })
-      const effortHistory = serializeEffortHistory(
-        effortHistoryBySession.get(sessionID) ?? [],
-      )
-      if (effortHistory) {
-        output.headers[EFFORT_HISTORY_HEADER] = effortHistory
-      } else {
-        delete output.headers[EFFORT_HISTORY_HEADER]
-      }
     },
     event: async ({ event }: { event: unknown }) => {
       const value = event as unknown as {
@@ -3698,7 +3694,6 @@ const anthropicAuthPlugin = async (
 
       if (value.type === 'session.deleted') {
         laneStartTracker.clearSession(sessionId)
-        effortHistoryBySession.delete(sessionId)
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
         desktopNoticeSafeSessions.delete(sessionId)
@@ -4481,7 +4476,6 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
-            requestHeaders.delete(EFFORT_HISTORY_HEADER)
             let body = init?.body
             let streaming = false
             let dump: DumpHandle | null = null
@@ -4498,14 +4492,22 @@ const anthropicAuthPlugin = async (
                   return false
                 }
               })()
-              body = await rewriteRequestBody(body, {
-                cache1hEnabled: !subagentRequest && isCache1hEnabled(),
-                cache1hMode: getCache1hMode(),
-                fastModeEnabled: fastModeRequested,
-                sessionId: directAffinity || undefined,
-                perf: (stage, data) =>
-                  trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
-              })
+              try {
+                body = await rewriteRequestBody(body, {
+                  cache1hEnabled: !subagentRequest && isCache1hEnabled(),
+                  cache1hMode: getCache1hMode(),
+                  fastModeEnabled: fastModeRequested,
+                  sessionId: directAffinity || undefined,
+                  midConversationEffortEnabled: false,
+                  perf: (stage, data) =>
+                    trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
+                })
+              } catch (error) {
+                if (error instanceof EffortMarkerCorrelationError) {
+                  return effortMarkerFailureResponse(error)
+                }
+                throw error
+              }
               configureApiRouteHeaders(requestHeaders, account)
               requestHeaders.set(
                 'anthropic-beta',
@@ -4613,13 +4615,9 @@ const anthropicAuthPlugin = async (
               requestHeaders.get('x-session-affinity') ||
               requestHeaders.get('x-opencode-session')
             const subagentRequest = isSubagentRequest(requestHeaders)
-            const effortTransitions = parseEffortHistory(
-              requestHeaders.get(EFFORT_HISTORY_HEADER),
-            )
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
-            requestHeaders.delete(EFFORT_HISTORY_HEADER)
             let body = init?.body
             const previousDiagnosticsMessage = relayAffinity
               ? cacheDiagnosticsTracker.previousFor(relayAffinity)
@@ -4679,39 +4677,48 @@ const anthropicAuthPlugin = async (
                   oauthAccountId
                   ? fableRequest.plan.standbyCacheAnchor
                   : undefined
-              body = await rewriteRequestBody(body, {
-                cache1hEnabled: cacheEnabled,
-                cache1hMode: cacheMode,
-                fastModeEnabled: fastModeRequested,
-                identity,
-                sessionId: relayAffinity || undefined,
-                thinkingPrefixMismatchBehavior:
-                  getThinkingPrefixMismatchBehavior(await getRequestStorage()),
-                effortTransitions,
-                hybridStandbyAnchor: standbyCacheAnchor,
-                serverSideFallbackEnabled: fallbackMode === 'server',
-                laneStart: laneStartRequest,
-                cacheDiagnosticsPreviousMessageId,
-                perf: (stage, data) => {
-                  trace?.mark(`rewrite_body_${stage}`, { route, ...data })
-                  if (
-                    stage === 'cache_strategy' &&
-                    data?.standbyBridgeApplied === true &&
-                    fableRequest &&
-                    !fableRequest.standbyBridgeLogged
-                  ) {
-                    fableRequest.standbyBridgeLogged = true
-                    logger.info(
-                      'fable-fallback',
-                      'restored standby Opus cache bridge',
-                      {
-                        session: fableRequest.plan.sessionId,
-                        distanceBlocks: data?.standbyDistanceBlocks,
-                      },
-                    )
-                  }
-                },
-              })
+              try {
+                body = await rewriteRequestBody(body, {
+                  cache1hEnabled: cacheEnabled,
+                  cache1hMode: cacheMode,
+                  fastModeEnabled: fastModeRequested,
+                  identity,
+                  sessionId: relayAffinity || undefined,
+                  thinkingPrefixMismatchBehavior:
+                    getThinkingPrefixMismatchBehavior(
+                      await getRequestStorage(),
+                    ),
+                  midConversationEffortEnabled: true,
+                  hybridStandbyAnchor: standbyCacheAnchor,
+                  serverSideFallbackEnabled: fallbackMode === 'server',
+                  laneStart: laneStartRequest,
+                  cacheDiagnosticsPreviousMessageId,
+                  perf: (stage, data) => {
+                    trace?.mark(`rewrite_body_${stage}`, { route, ...data })
+                    if (
+                      stage === 'cache_strategy' &&
+                      data?.standbyBridgeApplied === true &&
+                      fableRequest &&
+                      !fableRequest.standbyBridgeLogged
+                    ) {
+                      fableRequest.standbyBridgeLogged = true
+                      logger.info(
+                        'fable-fallback',
+                        'restored standby Opus cache bridge',
+                        {
+                          session: fableRequest.plan.sessionId,
+                          distanceBlocks: data?.standbyDistanceBlocks,
+                        },
+                      )
+                    }
+                  },
+                })
+              } catch (error) {
+                if (error instanceof EffortMarkerCorrelationError) {
+                  return effortMarkerFailureResponse(error)
+                }
+                throw error
+              }
               if (
                 fableRequest?.plan.downgraded &&
                 cacheEnabled &&

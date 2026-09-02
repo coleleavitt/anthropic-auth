@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
-  applyMidConversationOutputConfig,
   applyThinkingBindingControls,
   buildBillingHeaderValue,
   type Cache1hMode,
@@ -23,7 +22,6 @@ import {
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   MID_CONVERSATION_OUTPUT_CONFIG_BETA,
-  type MidConversationEffortTransition,
   mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
@@ -41,6 +39,10 @@ import {
   applyCacheDiagnosticsOptIn,
   CACHE_DIAGNOSTICS_BETA,
 } from './cache-diagnostics'
+import {
+  applyOpenCodeEffortMarkers,
+  EffortMarkerCorrelationError,
+} from './effort-history'
 import { makeByteBoundedMemo } from './sanitize-memo'
 import {
   applyServerSideFallbackToBody,
@@ -1229,7 +1231,7 @@ export async function rewriteRequestBody(
     identity?: ClaudeCodeIdentity
     sessionId?: string
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
-    effortTransitions?: readonly MidConversationEffortTransition[]
+    midConversationEffortEnabled?: boolean
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
@@ -1299,7 +1301,10 @@ export async function rewriteRequestBody(
       delete parsed.thinking
     }
 
-    applyMidConversationOutputConfig(parsed, options.effortTransitions ?? [])
+    applyOpenCodeEffortMarkers(
+      parsed,
+      options.midConversationEffortEnabled === true,
+    )
     applyThinkingBindingControls(
       parsed,
       options.thinkingPrefixMismatchBehavior ?? 'account-default',
@@ -1395,7 +1400,8 @@ export async function rewriteRequestBody(
     })
 
     return signed
-  } catch {
+  } catch (error) {
+    if (error instanceof EffortMarkerCorrelationError) throw error
     return body
   }
 }

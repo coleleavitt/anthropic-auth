@@ -126,7 +126,7 @@ anthropic-auth/
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing, prime status, and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
-- `packages/opencode/src/effort-history.ts`: Derives bounded request-scoped Fable 5.1 effort transitions from OpenCode user variants, folding reordered compaction tails into the new prefix
+- `packages/opencode/src/effort-history.ts`: Carries bounded Fable 5.1 effort transitions across OpenCode host lowering with nonce-bound HMAC-authenticated user-boundary and request-plan markers, folds reordered compaction tails into the new prefix, strips markers before dispatch, and fails locally on correlation loss
 - `packages/opencode/src/tui-preferences.ts`: Comment-preserving JSONC preference reads/writes plus live reload through content-checked directory events and an independent polling fallback for missed events or `fs.watch` construction failures
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
 - `packages/pi/src/convert.ts`: Pi-to-Anthropic request conversion, including session-stable Claude Code billing suffixes, same-origin thinking-signature replay, configurable Fable 5.1 compaction behavior, mid-conversation effort markers, and `redacted_thinking` mapping
