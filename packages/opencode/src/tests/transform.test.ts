@@ -10,7 +10,10 @@ import {
   THINKING_BINDING_CONTROLS_BETA,
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
-import { markOpenCodeEffortTransitions } from '../effort-history'
+import {
+  encodeOpenCodeEffortPlan,
+  markOpenCodeEffortTransitions,
+} from '../effort-history'
 import {
   createServerSideFallbackStreamRewriter,
   SERVER_FALLBACK_MARKER_TEXT,
@@ -559,7 +562,6 @@ describe('setOAuthHeaders', () => {
   })
 
   test('rewrites Fable 5.1 effort history without changing the cached prefix', async () => {
-    const nonce = '00000000-0000-4000-8000-000000000000'
     const sourceMessages = [
       {
         info: {
@@ -596,12 +598,12 @@ describe('setOAuthHeaders', () => {
         parts: [{ type: 'text', text: 'second' }],
       },
     ]
-    const marked = markOpenCodeEffortTransitions(sourceMessages, nonce)
+    const marked = markOpenCodeEffortTransitions(sourceMessages)
     expect(marked).not.toBeNull()
     const internalMarkers = sourceMessages[2]?.parts
       .slice(1)
       .flatMap((part) => (typeof part.text === 'string' ? [part.text] : []))
-    expect(internalMarkers).toHaveLength(2)
+    expect(internalMarkers).toHaveLength(1)
     const body = JSON.parse(
       await rewriteRequestBody(
         JSON.stringify({
@@ -622,7 +624,12 @@ describe('setOAuthHeaders', () => {
             },
           ],
         }),
-        { midConversationEffortEnabled: true },
+        {
+          midConversationEffortEnabled: true,
+          midConversationEffortPlan: encodeOpenCodeEffortPlan(
+            marked as NonNullable<typeof marked>,
+          ),
+        },
       ),
     )
 
@@ -661,7 +668,12 @@ describe('setOAuthHeaders', () => {
             },
           ],
         }),
-        { midConversationEffortEnabled: false },
+        {
+          midConversationEffortEnabled: false,
+          midConversationEffortPlan: encodeOpenCodeEffortPlan(
+            marked as NonNullable<typeof marked>,
+          ),
+        },
       ),
     )
     expect(apiBody.output_config).toEqual({ effort: 'high' })

@@ -1232,6 +1232,7 @@ export async function rewriteRequestBody(
     sessionId?: string
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     midConversationEffortEnabled?: boolean
+    midConversationEffortPlan?: string
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
@@ -1304,6 +1305,7 @@ export async function rewriteRequestBody(
     applyOpenCodeEffortMarkers(
       parsed,
       options.midConversationEffortEnabled === true,
+      options.midConversationEffortPlan,
     )
     applyThinkingBindingControls(
       parsed,

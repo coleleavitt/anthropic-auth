@@ -47,10 +47,7 @@ import {
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import {
-  EFFORT_MARKER_PREFIX,
-  EFFORT_PLAN_MARKER_PREFIX,
-} from '../effort-history'
+import { EFFORT_MARKER_PREFIX } from '../effort-history'
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
@@ -3178,7 +3175,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     ).toBe(false)
   })
 
-  test('fails locally when authenticated effort markers cannot be correlated', async () => {
+  test('fails locally when request-correlated effort markers cannot be validated', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -3256,11 +3253,18 @@ describe('Fable 5.1 request-scoped effort history', () => {
     const transitionMarker = internalTexts?.find((text) =>
       text.startsWith(EFFORT_MARKER_PREFIX),
     )
-    const planMarker = internalTexts?.find((text) =>
-      text.startsWith(EFFORT_PLAN_MARKER_PREFIX),
-    )
     expect(transitionMarker).toBeString()
-    expect(planMarker).toBeString()
+    const correlatedHeaders = { headers: {} as Record<string, string> }
+    await plugin['chat.headers'](
+      {
+        sessionID: 'ses_effort_invalid',
+        message: { id: 'msg_marked_high' },
+      },
+      correlatedHeaders,
+    )
+    const effortPlanHeader =
+      correlatedHeaders.headers['x-cortexkit-effort-plan']
+    expect(effortPlanHeader).toBeString()
 
     const auth = await plugin.auth.loader(
       () =>
@@ -3272,10 +3276,19 @@ describe('Fable 5.1 request-scoped effort history', () => {
         }),
       { models: {} },
     )
-    const send = (sessionId: string, internal: Array<string | undefined>) =>
+    const send = (
+      sessionId: string,
+      internal: Array<string | undefined>,
+      includeEffortPlan = true,
+    ) =>
       auth.fetch(MESSAGES_URL, {
         method: 'POST',
-        headers: { 'x-session-affinity': sessionId },
+        headers: {
+          'x-session-affinity': sessionId,
+          ...(includeEffortPlan && effortPlanHeader
+            ? { 'x-cortexkit-effort-plan': effortPlanHeader }
+            : {}),
+        },
         body: JSON.stringify({
           model: 'claude-fable-5-1',
           output_config: { effort: 'high' },
@@ -3291,30 +3304,29 @@ describe('Fable 5.1 request-scoped effort history', () => {
         }),
       })
 
-    const missingTransition = await send('ses_effort_missing_transition', [
-      planMarker,
-    ])
-    expect(missingTransition.status).toBe(400)
-    expect((await missingTransition.json()).error.message).toBe(
+    const missingRequestPlan = await send(
+      'ses_effort_missing_request_plan',
+      [transitionMarker],
+      false,
+    )
+    expect(missingRequestPlan.status).toBe(400)
+    expect((await missingRequestPlan.json()).error.message).toBe(
+      'Missing or invalid internal Fable 5.1 effort request plan',
+    )
+
+    const missingAllMarkers = await send('ses_effort_missing_all', [])
+    expect(missingAllMarkers.status).toBe(400)
+    expect((await missingAllMarkers.json()).error.message).toBe(
       'Fable 5.1 effort marker correlation failed: expected 1, found 0',
     )
 
-    const duplicatePlan = await send('ses_effort_duplicate_plan', [
+    const duplicateTransition = await send('ses_effort_duplicate_transition', [
       transitionMarker,
-      planMarker,
-      planMarker,
-    ])
-    expect(duplicatePlan.status).toBe(400)
-    expect((await duplicatePlan.json()).error.message).toBe(
-      'Multiple internal Fable 5.1 effort marker plans',
-    )
-
-    const missingPlan = await send('ses_effort_missing_plan', [
       transitionMarker,
     ])
-    expect(missingPlan.status).toBe(400)
-    expect((await missingPlan.json()).error.message).toBe(
-      'Missing internal Fable 5.1 effort marker plan',
+    expect(duplicateTransition.status).toBe(400)
+    expect((await duplicateTransition.json()).error.message).toBe(
+      'Multiple internal Fable 5.1 effort markers on one user boundary',
     )
     expect(messagesCalled).toBe(false)
   })

@@ -182,8 +182,10 @@ import {
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
 import {
+  EFFORT_PLAN_REQUEST_HEADER,
   EffortMarkerCorrelationError,
   markOpenCodeEffortTransitions,
+  OpenCodeEffortPlanTracker,
 } from './effort-history.ts'
 import {
   FableFallbackManager,
@@ -911,6 +913,7 @@ const anthropicAuthPlugin = async (
   )
   const fableFallbackManager = new FableFallbackManager()
   const laneStartTracker = new LaneStartTracker()
+  const effortPlanTracker = new OpenCodeEffortPlanTracker()
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const pendingRecoveryDesktopNotices = new Map<string, string>()
@@ -3619,10 +3622,22 @@ const anthropicAuthPlugin = async (
       _input: Record<string, never>,
       output: { messages: { info?: unknown }[] },
     ) => {
-      markOpenCodeEffortTransitions(
-        output.messages as Parameters<typeof markOpenCodeEffortTransitions>[0],
-        randomUUID(),
+      const messages = output.messages as Parameters<
+        typeof markOpenCodeEffortTransitions
+      >[0]
+      const plan = markOpenCodeEffortTransitions(messages)
+      if (plan) {
+        effortPlanTracker.record(plan)
+        return
+      }
+      const currentUser = messages.findLast(
+        (message) => message.info?.role === 'user',
       )
+      const sessionId = currentUser?.info?.sessionID
+      const messageId = currentUser?.info?.id
+      if (typeof sessionId === 'string' && typeof messageId === 'string') {
+        effortPlanTracker.clear(sessionId, messageId)
+      }
     },
     'chat.message': async (
       {
@@ -3649,6 +3664,11 @@ const anthropicAuthPlugin = async (
       output: { headers: Record<string, string> },
     ) => {
       laneStartTracker.markHeaders({
+        sessionId: sessionID,
+        messageId: message.id,
+        headers: output.headers,
+      })
+      effortPlanTracker.markHeaders({
         sessionId: sessionID,
         messageId: message.id,
         headers: output.headers,
@@ -4473,9 +4493,12 @@ const anthropicAuthPlugin = async (
               requestHeaders.get('x-session-affinity') ||
               requestHeaders.get('x-opencode-session')
             const subagentRequest = isSubagentRequest(requestHeaders)
+            const effortPlanHeader =
+              requestHeaders.get(EFFORT_PLAN_REQUEST_HEADER) ?? undefined
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
+            requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
             let body = init?.body
             let streaming = false
             let dump: DumpHandle | null = null
@@ -4499,6 +4522,7 @@ const anthropicAuthPlugin = async (
                   fastModeEnabled: fastModeRequested,
                   sessionId: directAffinity || undefined,
                   midConversationEffortEnabled: false,
+                  midConversationEffortPlan: effortPlanHeader,
                   perf: (stage, data) =>
                     trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
                 })
@@ -4615,9 +4639,12 @@ const anthropicAuthPlugin = async (
               requestHeaders.get('x-session-affinity') ||
               requestHeaders.get('x-opencode-session')
             const subagentRequest = isSubagentRequest(requestHeaders)
+            const effortPlanHeader =
+              requestHeaders.get(EFFORT_PLAN_REQUEST_HEADER) ?? undefined
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
+            requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
             let body = init?.body
             const previousDiagnosticsMessage = relayAffinity
               ? cacheDiagnosticsTracker.previousFor(relayAffinity)
@@ -4689,6 +4716,7 @@ const anthropicAuthPlugin = async (
                       await getRequestStorage(),
                     ),
                   midConversationEffortEnabled: true,
+                  midConversationEffortPlan: effortPlanHeader,
                   hybridStandbyAnchor: standbyCacheAnchor,
                   serverSideFallbackEnabled: fallbackMode === 'server',
                   laneStart: laneStartRequest,
