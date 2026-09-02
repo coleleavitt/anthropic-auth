@@ -1,0 +1,167 @@
+# Instincts generated from https://github.com/coleleavitt/anthropic-auth
+# Generated: 2026-09-02T10:14:52.447Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: anthropic-auth-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/anthropic-auth
+---
+
+# Anthropic Auth Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat, fix, test
+
+## Evidence
+
+- 5 commits analyzed
+- Detected conventional commit pattern
+- Examples: fix: cap transient OAuth network refresh backoff, feat: add Claude Fable and Mythos 5.1 support (#179, #180)
+
+---
+id: anthropic-auth-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/anthropic-auth
+---
+
+# Anthropic Auth Commit Length
+
+## Action
+
+Write moderate-length commit messages (~58 characters)
+
+## Evidence
+
+- Average commit message length: 58 chars
+- Based on 5 commits
+
+---
+id: anthropic-auth-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/anthropic-auth
+---
+
+# Anthropic Auth Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: anthropic-auth-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/anthropic-auth
+---
+
+# Anthropic Auth Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: anthropic-auth-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/anthropic-auth
+---
+
+# Anthropic Auth Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: anthropic-auth-test-framework
+trigger: "when writing tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/anthropic-auth
+---
+
+# Anthropic Auth Test Framework
+
+## Action
+
+Use jest as the test framework
+
+## Evidence
+
+- Test framework detected: jest
+- File pattern: *.test.ts
+
+---
+id: anthropic-auth-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/anthropic-auth
+---
+
+# Anthropic Auth Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: anthropic-auth-test-types
+trigger: "when planning tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/anthropic-auth
+---
+
+# Anthropic Auth Test Types
+
+## Action
+
+Write unit, integration, e2e tests to match project standards
+
+## Evidence
+
+- Test types detected: unit, integration, e2e
+- Coverage config: no
+
