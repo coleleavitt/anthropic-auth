@@ -33,6 +33,7 @@ import {
   type ClaustrumCredentialCache,
   ClaustrumCredentialError,
   type ClaustrumReporterSource,
+  CustodyTombstoneRefreshError,
   clearClaustrumRefreshErrorPersistent,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
@@ -94,6 +95,7 @@ import {
   isClaudeOpus5Model,
   isClaustrumEnabledForAccount,
   isCostZeroingEnabled,
+  isCustodyTombstoneOAuth,
   isDumpPersistentlyEnabled,
   isFastModeEnabled,
   isFastModePersistentlyEnabled,
@@ -4482,6 +4484,14 @@ const anthropicAuthPlugin = async (
         latestGetAuth = getAuth
         const auth = await getAuth()
         if (auth.type === 'oauth') {
+          if (isCustodyTombstoneOAuth(auth, 'anthropic')) {
+            logger.error(
+              'auth',
+              'custody tombstone on main slot; vault-served main not implemented',
+            )
+            // This branch becomes the vault path in the takeover PR.
+            throw new CustodyTombstoneRefreshError('anthropic')
+          }
           mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
           if (auth.access) {
             await resolveMainQuotaAccountIdentity(auth.access)

@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
+import { CustodyTombstoneRefreshError } from './claustrum.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
@@ -3685,6 +3686,7 @@ function recordRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (error instanceof CustodyTombstoneRefreshError) return
   const existing = existingRefreshBackoffError(error)
   if (existing) {
     account.lastRefreshError = existing
@@ -3703,6 +3705,7 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (error instanceof CustodyTombstoneRefreshError) return
   if (isQuotaPolicyAuthError(error) || existingRefreshBackoffError(error))
     return
   account.lastQuotaRefreshError = buildQuotaOperationError({
