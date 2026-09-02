@@ -1,6 +1,6 @@
 {
   "repo": "legion-works/claustrum",
-  "ref": "86ce2a08d75ed670114a0f2008b411285131ce29",
+  "ref": "0e9dee77cb91e762d31a9ccb502728a69f09bcbe",
   "paths": {
     "tombstone": "packages/opencode/golden/tombstone.json",
     "handles": "packages/opencode/golden/handles.json"
