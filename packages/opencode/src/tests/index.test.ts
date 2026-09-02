@@ -1587,6 +1587,68 @@ describe('fallback Claustrum credential resolution', () => {
     expect(control?.lastRefreshError).toBeUndefined()
   })
 
+  test('custody override ignores a stale backoff after the sidecar refresh token rotates', async () => {
+    const now = Date.now()
+    const storage = fallbackWithClaustrum({
+      claustrumHandle: 'handle-rotated-sidecar',
+      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+    })
+    const account = storage.accounts[0] as OAuthAccount
+    account.expires = now - 1
+    account.refresh = 'rotated-sidecar-refresh'
+    account.lastRefreshError = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_grant"}'),
+      now,
+      accountIdentity: account.id,
+      refreshTokenFingerprint: tokenFingerprint('superseded-refresh'),
+    })
+    await useTempAccountFile(storage)
+
+    const calls: CredentialCall[] = []
+    const connector = connectorFor(calls, (method) => {
+      if (method === 'credential.get') throw new Error('vault unavailable')
+      return { result: {} }
+    })
+    let tokenCalls = 0
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        tokenCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'rotated-sidecar-access',
+              refresh_token: 'rotated-sidecar-refresh-2',
+              expires_in: 86_400,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+      claustrumNow: () => now,
+    })
+    for (let attempt = 0; attempt < 50 && tokenCalls === 0; attempt++) {
+      await Bun.sleep(10)
+    }
+
+    expect(tokenCalls).toBe(1)
+    let refreshed: OAuthAccount | undefined
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const saved = await loadAccounts(process.env.OPENCODE_ANTHROPIC_AUTH_FILE)
+      refreshed = saved?.accounts[0] as OAuthAccount | undefined
+      if (refreshed?.access === 'rotated-sidecar-access') break
+      await Bun.sleep(10)
+    }
+    expect(refreshed?.access).toBe('rotated-sidecar-access')
+    expect(refreshed?.lastRefreshError).toBeUndefined()
+    await plugin.dispose?.()
+  })
+
   test('attempts local refresh when a resident vault credential is expired during an outage', async () => {
     let claustrumClock = 0
     const storage = fallbackWithClaustrum({
@@ -1595,6 +1657,12 @@ describe('fallback Claustrum credential resolution', () => {
     })
     const account = storage.accounts[0] as OAuthAccount
     account.expires = Date.now() - 1
+    account.lastRefreshError = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_grant"}'),
+      now: Date.now(),
+      accountIdentity: account.id,
+      refreshTokenFingerprint: tokenFingerprint('superseded-refresh'),
+    })
     await useTempAccountFile(storage)
 
     const calls: CredentialCall[] = []
