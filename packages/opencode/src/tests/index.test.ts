@@ -2834,6 +2834,15 @@ describe('provider.models', () => {
       output: 128_000,
     })
     expect(result?.['claude-mythos-5']?.name).toBe('Claude Mythos 5')
+    expect(result?.['claude-fable-5-1']?.name).toBe('Claude Fable 5.1')
+    expect(result?.['claude-fable-5']?.release_date).toBe('2026-06-09')
+    expect(result?.['claude-fable-5-1']?.release_date).toBe('2026-09-01')
+    expect(result?.['claude-fable-5-1']?.cost).toEqual({
+      input: 0,
+      output: 0,
+      cache: { read: 0, write: 0 },
+    })
+    expect(result?.['claude-mythos-5-1']?.name).toBe('Claude Mythos 5.1')
     expect(models['claude-opus-4-8'].cost).toEqual({
       input: 5,
       output: 25,
@@ -2841,7 +2850,7 @@ describe('provider.models', () => {
     })
   })
 
-  test('keeps Anthropic API-key model costs unchanged and prices Fable 5', async () => {
+  test('keeps Anthropic API-key model costs unchanged and prices Fable 5/5.1', async () => {
     const plugin = await getPlugin()
     const models = {
       'claude-opus-4-8': {
@@ -2875,6 +2884,11 @@ describe('provider.models', () => {
       input: 10,
       output: 50,
       cache: { read: 1, write: 12.5 },
+    })
+    expect(result?.['claude-fable-5-1']?.cost).toEqual({
+      input: 10,
+      output: 50,
+      cache: { read: 0.25, write: 12.5 },
     })
   })
 
@@ -10710,7 +10724,7 @@ describe('auth.loader', () => {
     expect(responseText).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
   })
 
-  test('uses Anthropic server-side fallback by default and reports fallback and restoration transitions', async () => {
+  test('uses Anthropic server-side fallback for Fable 5.1 and reports transitions', async () => {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await useTempAccountFile(
       createFallbackStorage({
@@ -10733,7 +10747,7 @@ describe('auth.loader', () => {
         index: 0,
         content_block: {
           type: 'fallback',
-          from: { model: 'claude-fable-5' },
+          from: { model: 'claude-fable-5-1' },
           to: { model: 'claude-opus-5' },
         },
       }),
@@ -10757,7 +10771,7 @@ describe('auth.loader', () => {
           iterations: [
             {
               type: 'message',
-              model: 'claude-fable-5',
+              model: 'claude-fable-5-1',
               input_tokens: 100,
               output_tokens: 0,
             },
@@ -10775,7 +10789,7 @@ describe('auth.loader', () => {
     const restoredSse = [
       frame('message_start', {
         type: 'message_start',
-        message: { id: 'msg_restored', model: 'claude-fable-5' },
+        message: { id: 'msg_restored', model: 'claude-fable-5-1' },
       }),
       frame('content_block_start', {
         type: 'content_block_start',
@@ -10796,7 +10810,7 @@ describe('auth.loader', () => {
           iterations: [
             {
               type: 'message',
-              model: 'claude-fable-5',
+              model: 'claude-fable-5-1',
               input_tokens: 100,
               output_tokens: 2,
             },
@@ -10834,7 +10848,7 @@ describe('auth.loader', () => {
           agent: 'Alfonso - CTO',
           model: {
             providerID: 'anthropic',
-            modelID: 'claude-fable-5',
+            modelID: 'claude-fable-5-1',
             variant: 'xhigh',
           },
         },
@@ -10845,7 +10859,7 @@ describe('auth.loader', () => {
           role: 'assistant',
           agent: 'Alfonso - CTO',
           providerID: 'anthropic',
-          modelID: 'claude-fable-5',
+          modelID: 'claude-fable-5-1',
           variant: 'xhigh',
         },
       },
@@ -10865,7 +10879,7 @@ describe('auth.loader', () => {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses_server_fallback' },
       body: JSON.stringify({
-        model: 'claude-fable-5',
+        model: 'claude-fable-5-1',
         stream: true,
         messages: [{ role: 'user', content: 'hello' }],
       }),
@@ -10889,7 +10903,7 @@ describe('auth.loader', () => {
       ),
     )
     expect(switched.fableRecoveries?.[0]).toMatchObject({
-      requestedModelId: 'claude-fable-5',
+      requestedModelId: 'claude-fable-5-1',
       targetModelId: 'claude-opus-5',
       remaining: 0,
     })
@@ -10985,7 +10999,7 @@ describe('auth.loader', () => {
       ),
     )
     expect(restored.fableRecoveries?.[0]?.requestedModelId).toBe(
-      'claude-fable-5',
+      'claude-fable-5-1',
     )
     await plugin.event?.({
       event: {
@@ -11005,7 +11019,7 @@ describe('auth.loader', () => {
         body: expect.objectContaining({
           parts: [
             expect.objectContaining({
-              text: expect.stringContaining('Returning to Fable 5'),
+              text: expect.stringContaining('Returning to Fable 5.1'),
             }),
           ],
         }),
