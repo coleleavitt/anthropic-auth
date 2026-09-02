@@ -374,6 +374,54 @@ describe('cross-process main quota backoff', () => {
     managerB.updateStorage(finalStorage)
     expect(managerB.isBackedOff()).toBe(false)
   })
+
+  test('a stale main refresh error cannot resurrect a refresh clear', async () => {
+    const error = {
+      message: 'invalid_grant',
+      checkedAt: 900_000,
+      nextRetryAt: 1_060_000,
+      retryCount: 1,
+      accountIdentity: 'main-slot',
+      permanent: true,
+    }
+    await saveAccounts(
+      {
+        ...baseStorage(),
+        mainAccountId: 'main-slot',
+        refresh: { ...baseStorage().refresh, mainLastRefreshError: error },
+      },
+      accountPath,
+    )
+    const staleWriterStorage = (await loadAccounts(accountPath))!
+    const clearWriterStorage = (await loadAccounts(accountPath))!
+    clearWriterStorage.refresh = {
+      ...clearWriterStorage.refresh,
+      mainLastRefreshError: undefined,
+      mainRefreshErrorClearedAt: 1_000_200,
+    }
+    await saveAccountState(clearWriterStorage, accountPath, {
+      mainRefresh: true,
+    })
+
+    await saveAccountState(staleWriterStorage, accountPath, {
+      mainRefresh: true,
+    })
+    expect(
+      (await loadAccounts(accountPath))?.refresh?.mainLastRefreshError,
+    ).toBeUndefined()
+
+    staleWriterStorage.refresh = {
+      ...staleWriterStorage.refresh,
+      mainLastRefreshError: { ...error, checkedAt: 1_000_300 },
+    }
+    await saveAccountState(staleWriterStorage, accountPath, {
+      mainRefresh: true,
+    })
+    expect(
+      (await loadAccounts(accountPath))?.refresh?.mainLastRefreshError
+        ?.checkedAt,
+    ).toBe(1_000_300)
+  })
 })
 
 beforeEach(async () => {
@@ -3708,28 +3756,114 @@ describe('FallbackAccountManager', () => {
     expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
   })
 
-  test('stable identity backoff survives refresh-token rotation and releases after expiry', () => {
+  test('background fallback refresh retries after a permanent backoff belongs to an older refresh token', async () => {
+    const now = Date.now()
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-rotated',
+      type: 'oauth',
+      authLineageId: 'fallback-lineage',
+      access: 'old-access',
+      refresh: 'current-refresh',
+      expires: now - 1,
+      lastRefreshError: {
+        message: 'Claude OAuth refresh failed: 400 — invalid_grant',
+        checkedAt: now - 1_000,
+        nextRetryAt: now + 24 * 60 * 60_000,
+        retryCount: 1,
+        accountIdentity: 'fallback-rotated',
+        refreshTokenFingerprint: tokenFingerprint('failed-refresh'),
+        status: 400,
+        permanent: true,
+      },
+    })
+    await saveAccounts(storage)
+    let tokenRefreshCalls = 0
+    const fetchImpl = mock((input: Request | string) => {
+      if (String(input).includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+        return Promise.resolve(
+          Response.json({
+            access_token: 'refreshed-access',
+            refresh_token: 'refreshed-refresh',
+            expires_in: 8 * 60 * 60,
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshDueAccounts()
+
+    expect(tokenRefreshCalls).toBe(1)
+  })
+
+  test('refresh backoff releases only when the refresh token fingerprint changes', () => {
     const first = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited'),
       now: 1_000,
       accountIdentity: 'fallback-1',
-      refreshToken: 'old-refresh',
-    } as never)
-    const second = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
-      now: first.nextRetryAt ?? 2_000,
-      accountIdentity: 'fallback-1',
-      refreshToken: 'rotated-refresh',
-      previous: first,
+      refreshTokenFingerprint: tokenFingerprint('old-refresh'),
     } as never)
 
-    expect(second.retryCount).toBe(2)
     expect(
-      refreshBackoffActive(second, 'fallback-1', (second.nextRetryAt ?? 0) - 1),
-    ).toBe(true)
-    expect(
-      refreshBackoffActive(second, 'fallback-1', second.nextRetryAt ?? 0),
+      refreshBackoffActive(
+        first,
+        'fallback-1',
+        (first.nextRetryAt ?? 0) - 1,
+        tokenFingerprint('rotated-refresh'),
+      ),
     ).toBe(false)
+    expect(
+      refreshBackoffActive(
+        first,
+        'fallback-1',
+        (first.nextRetryAt ?? 0) - 1,
+        tokenFingerprint('old-refresh'),
+      ),
+    ).toBe(true)
+  })
+
+  test('refresh retry counts reset when the refresh token fingerprint changes', () => {
+    const first = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1_000,
+      accountIdentity: 'fallback-1',
+      refreshTokenFingerprint: tokenFingerprint('old-refresh'),
+    })
+    const rotated = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 2_000,
+      accountIdentity: 'fallback-1',
+      refreshTokenFingerprint: tokenFingerprint('new-refresh'),
+      previous: { ...first, retryCount: 6 },
+    })
+
+    expect(rotated.retryCount).toBe(1)
+  })
+
+  test('fingerprint-less permanent errors hold through token rotation on the same identity', () => {
+    const legacy = {
+      message: 'Claude OAuth refresh failed: 400 — invalid_grant',
+      checkedAt: 1_000,
+      nextRetryAt: 1_000 + 24 * 60 * 60_000,
+      retryCount: 1,
+      accountIdentity: 'fallback-1',
+      permanent: true,
+    }
+
+    expect(
+      refreshBackoffActive(
+        legacy,
+        'fallback-1',
+        legacy.nextRetryAt - 1,
+        tokenFingerprint('rotated-refresh'),
+      ),
+    ).toBe(true)
   })
 
   test('stable identity backoff does not transfer to a different account', () => {
@@ -3749,7 +3883,12 @@ describe('FallbackAccountManager', () => {
 
     expect(other.retryCount).toBe(1)
     expect(
-      refreshBackoffActive(other, 'fallback-1', (other.nextRetryAt ?? 0) - 1),
+      refreshBackoffActive(
+        other,
+        'fallback-1',
+        (other.nextRetryAt ?? 0) - 1,
+        undefined,
+      ),
     ).toBe(false)
   })
 
@@ -3762,7 +3901,12 @@ describe('FallbackAccountManager', () => {
     } as never)
 
     expect(
-      refreshBackoffActive(error, undefined, (error.nextRetryAt ?? 0) - 1),
+      refreshBackoffActive(
+        error,
+        undefined,
+        (error.nextRetryAt ?? 0) - 1,
+        undefined,
+      ),
     ).toBe(true)
   })
 
@@ -3790,6 +3934,7 @@ describe('FallbackAccountManager', () => {
         persistedLongBackoff,
         'fallback-1',
         1_000 + 5 * 60_000 - 1,
+        undefined,
       ),
     ).toBe(true)
     expect(
@@ -3797,6 +3942,7 @@ describe('FallbackAccountManager', () => {
         persistedLongBackoff,
         'fallback-1',
         1_000 + 5 * 60_000,
+        undefined,
       ),
     ).toBe(false)
 
@@ -3903,7 +4049,12 @@ describe('FallbackAccountManager', () => {
     expect(upgraded.accountIdentity).toBe('fallback-1')
     expect(upgraded.tokenHash).toBeUndefined()
     expect(
-      refreshBackoffActive(legacy, 'fallback-1', (legacy.nextRetryAt ?? 0) - 1),
+      refreshBackoffActive(
+        legacy,
+        'fallback-1',
+        (legacy.nextRetryAt ?? 0) - 1,
+        undefined,
+      ),
     ).toBe(true)
   })
 

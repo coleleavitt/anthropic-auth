@@ -14,6 +14,7 @@ import {
 import { parseJsonRedacted } from './json.ts'
 import { type LogLevel, log, logger } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -115,6 +116,8 @@ export type AccountOperationError = {
   retryCount?: number
   accountIdentity?: string
   tokenHash?: string
+  /** Fingerprint of the refresh token that produced this error. */
+  refreshTokenFingerprint?: string
   /**
    * HTTP status of the underlying refresh/quota failure, when known. Lets
    * consumers distinguish a permanently-dead token (400 invalid_grant →
@@ -245,6 +248,7 @@ export type AccountStorage = {
     intervalMinutes?: number
     refreshBeforeExpiryMinutes?: number
     mainLastRefreshError?: AccountOperationError
+    mainRefreshErrorClearedAt?: number
     mainRefreshLeaseId?: string
     mainRefreshLeaseUntil?: number
     mainRefreshLeaseTokenHash?: string
@@ -365,6 +369,7 @@ export type AccountRuntimeState = {
     quotaErrorGeneration?: number
     quotaErrorClearedAt?: number
     lastRefreshError?: AccountOperationError
+    refreshErrorClearedAt?: number
     refreshLeaseId?: string
     refreshLeaseUntil?: number
     refreshLeaseTokenHash?: string
@@ -616,6 +621,11 @@ function normalizeOperationError(
         : undefined,
     tokenHash:
       typeof value.tokenHash === 'string' ? value.tokenHash : undefined,
+    refreshTokenFingerprint:
+      typeof value.refreshTokenFingerprint === 'string' &&
+      value.refreshTokenFingerprint.trim()
+        ? value.refreshTokenFingerprint.trim()
+        : undefined,
     // Preserve the dead-token discriminators across save/load. Without these,
     // a retry-exhausted transient (permanent=false, 24h backoff) would lose its
     // flag on reload and the 24h-delay heuristic would wrongly re-classify it
@@ -943,6 +953,15 @@ export function mergeMainQuotaErrorClearedAt(
   return Math.max(existing, incoming)
 }
 
+export function mergeMainRefreshErrorClearedAt(
+  existing: number | undefined,
+  incoming: number | undefined,
+): number | undefined {
+  if (incoming === undefined || !Number.isFinite(incoming)) return existing
+  if (existing === undefined || !Number.isFinite(existing)) return incoming
+  return Math.max(existing, incoming)
+}
+
 function accountCredentialTimestamp(value: Record<string, unknown>): number {
   return Math.max(
     numericField(value.lastRefreshedAt),
@@ -1030,6 +1049,12 @@ function mergeConfigAndState(
     mainState.quotaErrorClearedAt >= 0
       ? mainState.quotaErrorClearedAt
       : undefined
+  const mainRefreshErrorClearedAt =
+    typeof mainState?.refreshErrorClearedAt === 'number' &&
+    Number.isFinite(mainState.refreshErrorClearedAt) &&
+    mainState.refreshErrorClearedAt >= 0
+      ? mainState.refreshErrorClearedAt
+      : undefined
   const configQuotaError = quotaConfig.mainLastQuotaApiError
   const mainLastQuotaApiError =
     mainState?.lastQuotaApiError ??
@@ -1039,6 +1064,15 @@ function mergeConfigAndState(
     configQuotaError.checkedAt <= mainQuotaErrorClearedAt
       ? undefined
       : configQuotaError)
+  const configRefreshError = refreshConfig.mainLastRefreshError
+  const mainLastRefreshError =
+    mainState?.lastRefreshError ??
+    (mainRefreshErrorClearedAt !== undefined &&
+    isRecord(configRefreshError) &&
+    typeof configRefreshError.checkedAt === 'number' &&
+    configRefreshError.checkedAt <= mainRefreshErrorClearedAt
+      ? undefined
+      : configRefreshError)
 
   const accounts = Array.isArray(configValue.accounts)
     ? configValue.accounts.map((account) => {
@@ -1063,7 +1097,8 @@ function mergeConfigAndState(
     },
     refresh: objectWithDefinedEntries({
       ...refreshConfig,
-      mainLastRefreshError: mainRefreshSource.lastRefreshError,
+      mainLastRefreshError,
+      mainRefreshErrorClearedAt: mainRefreshSource.refreshErrorClearedAt,
       mainRefreshLeaseId: mainRefreshSource.refreshLeaseId,
       mainRefreshLeaseUntil: mainRefreshSource.refreshLeaseUntil,
       mainRefreshLeaseTokenHash: mainRefreshSource.refreshLeaseTokenHash,
@@ -1756,7 +1791,12 @@ function applyMainQuotaStatePatch(
     ) {
       state.main.quotaErrorGeneration = incomingGeneration
     }
-  } else if (incomingError) {
+  } else if (
+    incomingError &&
+    typeof incomingError.checkedAt === 'number' &&
+    Number.isFinite(incomingError.checkedAt) &&
+    incomingError.checkedAt > existingObservedAt
+  ) {
     const acceptsByObservation =
       incomingErrorObservedAt !== undefined &&
       incomingErrorObservedAt > existingObservedAt
@@ -1831,7 +1871,32 @@ function applyMainRefreshStatePatch(
   storage: AccountStorage,
 ) {
   state.main = state.main ?? {}
-  state.main.lastRefreshError = storage.refresh?.mainLastRefreshError
+  const incomingError = storage.refresh?.mainLastRefreshError
+  const incomingClearedAt = storage.refresh?.mainRefreshErrorClearedAt
+  const existingErrorObservedAt = state.main.lastRefreshError?.checkedAt
+  const existingClearedAt = state.main.refreshErrorClearedAt
+  const existingObservedAt = Math.max(
+    existingErrorObservedAt ?? 0,
+    existingClearedAt ?? 0,
+  )
+  if (
+    incomingError === undefined &&
+    incomingClearedAt !== undefined &&
+    incomingClearedAt >= existingObservedAt
+  ) {
+    state.main.lastRefreshError = undefined
+    state.main.refreshErrorClearedAt = mergeMainRefreshErrorClearedAt(
+      existingClearedAt,
+      incomingClearedAt,
+    )
+  } else if (
+    incomingError &&
+    typeof incomingError.checkedAt === 'number' &&
+    Number.isFinite(incomingError.checkedAt) &&
+    incomingError.checkedAt > existingObservedAt
+  ) {
+    state.main.lastRefreshError = incomingError
+  }
   state.main.refreshLeaseId = storage.refresh?.mainRefreshLeaseId
   state.main.refreshLeaseUntil = storage.refresh?.mainRefreshLeaseUntil
   state.main.refreshLeaseTokenHash = storage.refresh?.mainRefreshLeaseTokenHash
@@ -2761,10 +2826,12 @@ export function buildRefreshOperationError(input: {
   error: unknown
   now: number
   accountIdentity: string | undefined
+  refreshTokenFingerprint?: string
   previous?: AccountOperationError
 }): AccountOperationError {
   const previousRetryCount =
-    input.previous?.accountIdentity === input.accountIdentity
+    input.previous?.accountIdentity === input.accountIdentity &&
+    input.previous?.refreshTokenFingerprint === input.refreshTokenFingerprint
       ? (input.previous?.retryCount ?? 0)
       : 0
   const retryCount = previousRetryCount + 1
@@ -2808,6 +2875,7 @@ export function buildRefreshOperationError(input: {
     nextRetryAt: input.now + delay,
     retryCount,
     accountIdentity: input.accountIdentity,
+    refreshTokenFingerprint: input.refreshTokenFingerprint,
     status,
     permanent: status === 400 && isInvalidGrant,
   }
@@ -2859,10 +2927,18 @@ export function refreshBackoffActive(
   error: AccountOperationError | undefined,
   accountIdentity: string | undefined,
   now: number,
+  currentRefreshTokenFingerprint: string | undefined,
 ) {
   if (!error) return false
   const retryAt = effectiveRefreshRetryAt(error)
   if (!retryAt || retryAt <= now) return false
+  if (
+    error.refreshTokenFingerprint &&
+    currentRefreshTokenFingerprint &&
+    error.refreshTokenFingerprint !== currentRefreshTokenFingerprint
+  ) {
+    return false
+  }
   if (!error.accountIdentity) return true
   if (!accountIdentity) return true
   return error.accountIdentity === accountIdentity
@@ -3700,6 +3776,7 @@ function recordRefreshError(
     error,
     now,
     accountIdentity: account.id,
+    refreshTokenFingerprint: tokenFingerprint(account.refresh),
     previous: account.lastRefreshError,
   })
 }
@@ -3874,7 +3951,12 @@ export class FallbackAccountManager {
           const refreshError = next.lastRefreshError
           if (
             refreshError &&
-            refreshBackoffActive(refreshError, next.id, this.now())
+            refreshBackoffActive(
+              refreshError,
+              next.id,
+              this.now(),
+              tokenFingerprint(next.refresh),
+            )
           ) {
             throw createRefreshBackoffActiveError(refreshError, this.now())
           }
@@ -3939,7 +4021,12 @@ export class FallbackAccountManager {
           }
         } else if (
           !failClosedOnUnknownQuota(storage) &&
-          !refreshBackoffActive(next.lastRefreshError, next.id, this.now()) &&
+          !refreshBackoffActive(
+            next.lastRefreshError,
+            next.id,
+            this.now(),
+            tokenFingerprint(next.refresh),
+          ) &&
           quotaSnapshotPassesModelScope(next.quota, options.modelId)
         ) {
           usable.push(next)
@@ -3998,7 +4085,12 @@ export class FallbackAccountManager {
       )
         continue
       if (
-        refreshBackoffActive(account.lastRefreshError, account.id, this.now())
+        refreshBackoffActive(
+          account.lastRefreshError,
+          account.id,
+          this.now(),
+          tokenFingerprint(account.refresh),
+        )
       ) {
         // Backoff skips are steady-state while a fallback account is waiting for
         // its next retry. Logging every background tick from every OpenCode
@@ -4044,7 +4136,12 @@ export class FallbackAccountManager {
           !this.isFallbackAccountVaultServed(next.id, storage)
         ) {
           if (
-            refreshBackoffActive(next.lastRefreshError, next.id, this.now())
+            refreshBackoffActive(
+              next.lastRefreshError,
+              next.id,
+              this.now(),
+              tokenFingerprint(next.refresh),
+            )
           ) {
             continue
           }
@@ -4094,7 +4191,12 @@ export class FallbackAccountManager {
           const refreshError = next.lastRefreshError
           if (
             refreshError &&
-            refreshBackoffActive(refreshError, next.id, this.now())
+            refreshBackoffActive(
+              refreshError,
+              next.id,
+              this.now(),
+              tokenFingerprint(next.refresh),
+            )
           ) {
             throw createRefreshBackoffActiveError(refreshError, this.now())
           }
@@ -4201,7 +4303,12 @@ export class FallbackAccountManager {
       const refreshError = latestAccount.lastRefreshError
       if (
         refreshError &&
-        refreshBackoffActive(refreshError, latestAccount.id, this.now())
+        refreshBackoffActive(
+          refreshError,
+          latestAccount.id,
+          this.now(),
+          tokenFingerprint(latestAccount.refresh),
+        )
       ) {
         updateStoredAccount(storage, latestAccount)
         throw createRefreshBackoffActiveError(refreshError, this.now())

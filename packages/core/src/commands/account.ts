@@ -12,6 +12,7 @@ export type AccountCommandAction =
   | { type: 'remove'; id: string }
   | { type: 'move-up'; id: string }
   | { type: 'move-down'; id: string }
+  | { type: 'reset-backoff' }
   | {
       type: 'add-apikey'
       apiKey: string
@@ -37,6 +38,7 @@ export function parseAccountCommandAction(
   if (action === 'remove' && rest) return { type: 'remove', id: rest }
   if (action === 'move-up' && rest) return { type: 'move-up', id: rest }
   if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
+  if (action === 'reset-backoff' && !rest) return { type: 'reset-backoff' }
 
   if (action === 'add-apikey' && rest) {
     let remaining = rest
@@ -163,6 +165,7 @@ const USAGE_TEXT = [
   '  /claude-account remove <id>           Remove a fallback account',
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
+  '  /claude-account reset-backoff          Clear main OAuth refresh and quota backoff',
   '  /claude-account add-apikey <key>      Add an API key fallback account',
   '  /claude-account add-oauth-start       Start OAuth device flow',
   '  /claude-account add-oauth-finish <code>  Complete OAuth flow',
@@ -176,7 +179,7 @@ export function executeAccountCommand(input: {
   text: string
   updated?: {
     id: string
-    action: 'enable' | 'disable' | 'remove' | 'reorder'
+    action: 'enable' | 'disable' | 'remove' | 'reorder' | 'reset-backoff'
     enabled?: boolean
     previousOrder?: string[]
     newOrder?: string[]
@@ -217,6 +220,12 @@ export function executeAccountCommand(input: {
   }
   if (action.type === 'add-oauth-finish') {
     return { text: 'add-oauth-finish' }
+  }
+  if (action.type === 'reset-backoff') {
+    return {
+      text: 'Main OAuth refresh and quota backoff cleared.',
+      updated: { id: 'main', action: 'reset-backoff' },
+    }
   }
 
   const id = action.id

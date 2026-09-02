@@ -11708,6 +11708,149 @@ describe('auth.loader', () => {
     })
   })
 
+  test('background refresh retries after a permanent main backoff belongs to an older refresh token', async () => {
+    const now = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        mainAccountId: 'main-account-id',
+        quota: { enabled: false },
+        refresh: {
+          enabled: true,
+          refreshBeforeExpiryMinutes: 30,
+          mainLastRefreshError: {
+            message: 'Claude OAuth refresh failed: 400 — invalid_grant',
+            checkedAt: now - 1_000,
+            nextRetryAt: now + 24 * 60 * 60_000,
+            retryCount: 1,
+            accountIdentity: 'main-account-id',
+            refreshTokenFingerprint: tokenFingerprint('failed-refresh'),
+            status: 400,
+            permanent: true,
+          },
+        },
+      }),
+    )
+    const intervalHandlers: Array<() => void> = []
+    const setIntervalMock = mock((handler: () => void) => {
+      intervalHandlers.push(handler)
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+    let tokenRefreshCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+        return Promise.resolve(
+          Response.json({
+            refresh_token: 'refreshed-refresh',
+            access_token: 'refreshed-access',
+            expires_in: 8 * 60 * 60,
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient, undefined, {
+      setInterval: setIntervalMock,
+      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'current-access',
+          refresh: 'current-refresh',
+          expires: now + 5 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    for (const handler of intervalHandlers) handler()
+    await waitForMockCall(mockClient.auth.set)
+
+    expect(tokenRefreshCalls).toBe(1)
+    expect(mockClient.auth.set).toHaveBeenCalledTimes(1)
+    expect(
+      (await loadAccounts())?.refresh?.mainLastRefreshError,
+    ).toBeUndefined()
+  })
+
+  test('reset-backoff clears a legacy main latch before the next background refresh', async () => {
+    const now = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        mainAccountId: 'main-account-id',
+        quota: { enabled: false },
+        refresh: {
+          enabled: true,
+          refreshBeforeExpiryMinutes: 30,
+          mainLastRefreshError: {
+            message: 'Claude OAuth refresh failed: 400 — invalid_grant',
+            checkedAt: now - 1_000,
+            nextRetryAt: now + 24 * 60 * 60_000,
+            retryCount: 1,
+            accountIdentity: 'main-account-id',
+            status: 400,
+            permanent: true,
+          },
+        },
+      }),
+    )
+    const intervalHandlers: Array<() => void> = []
+    const setIntervalMock = mock((handler: () => void) => {
+      intervalHandlers.push(handler)
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+    let tokenRefreshCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+        return Promise.resolve(
+          Response.json({
+            refresh_token: 'refreshed-refresh',
+            access_token: 'refreshed-access',
+            expires_in: 8 * 60 * 60,
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient, undefined, {
+      setInterval: setIntervalMock,
+      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'current-access',
+          refresh: 'current-refresh',
+          expires: now + 5 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: 'reset-backoff',
+        sessionID: 'session-1',
+      }),
+    )
+    for (const handler of intervalHandlers) handler()
+    await waitForMockCall(mockClient.auth.set)
+
+    expect(tokenRefreshCalls).toBe(1)
+    expect(
+      (await loadAccounts())?.refresh?.mainLastRefreshError,
+    ).toBeUndefined()
+  })
+
   test('background refresh uses a four-hour minimum window for main oauth', async () => {
     await useTempAccountFile(
       createFallbackStorage({
