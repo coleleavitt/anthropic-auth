@@ -382,6 +382,37 @@ beforeEach(async () => {
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
 })
 
+test('does not echo secrets from corrupt account stores', async () => {
+  const expectRedactedCorruption = async (path: string, content: string) => {
+    await writeFile(path, content, 'utf8')
+    let caught: unknown
+    try {
+      await loadAccounts(accountPath)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught instanceof Error).toBe(true)
+    const error = caught as Error
+    expect(error.message.includes('CANARY')).toBe(false)
+    expect(String(error.cause ?? '').includes('CANARY')).toBe(false)
+    expect(error.message).not.toContain('Unexpected identifier')
+    expect(error.message).toContain(path)
+    expect(error.message).toContain('fix or remove it')
+  }
+
+  await writeFile(accountPath, JSON.stringify(baseStorage()), 'utf8')
+  await expectRedactedCorruption(
+    getAccountStatePath(accountPath),
+    '{"main":{"access":sk-ant-oat-CANARY-SECRET-0000}}',
+  )
+
+  await expectRedactedCorruption(
+    accountPath,
+    '{"main":{"claustrumHandle":claustrumHandle-CANARY-SECRET-0000}}',
+  )
+})
+
 afterEach(async () => {
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   await rm(tempDir, { recursive: true, force: true })

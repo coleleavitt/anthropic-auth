@@ -11,6 +11,7 @@ import {
   CLAUDE_CODE_VERSION,
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
+import { parseJsonRedacted } from './json.ts'
 import { type LogLevel, log, logger } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 
@@ -907,7 +908,10 @@ async function readJsonIfPresent(path: string): Promise<{
   value: unknown
 }> {
   try {
-    return { exists: true, value: JSON.parse(await readFile(path, 'utf8')) }
+    return {
+      exists: true,
+      value: parseJsonRedacted(await readFile(path, 'utf8')),
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { exists: false, value: null }
