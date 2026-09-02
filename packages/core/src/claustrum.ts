@@ -542,6 +542,10 @@ export class ClaustrumCredentialCache {
     return this.#cache.get(handle)
   }
 
+  seedForTest(handle: string, credential: ClaustrumCredential): void {
+    this.#cache.set(handle, credential)
+  }
+
   reduceMinTtlMs(): number {
     this.#minTtlMs = Math.floor(this.#minTtlMs / 2)
     return this.#minTtlMs

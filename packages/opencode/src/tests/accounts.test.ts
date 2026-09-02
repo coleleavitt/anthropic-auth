@@ -1586,7 +1586,7 @@ describe('account storage', () => {
       type: 'oauth',
       access: 'access-before',
       refresh: 'refresh-before',
-      expires: 1_000,
+      expires: 10_000,
       lastRefreshedAt: 100,
     })
     await saveAccounts(storage, accountPath)
@@ -1760,7 +1760,7 @@ describe('account storage', () => {
       type: 'oauth',
       access: 'access-before',
       refresh: 'refresh-before',
-      expires: 1_000,
+      expires: 10_000,
     })
     await saveAccounts(seeded, accountPath)
 
@@ -2996,7 +2996,7 @@ describe('FallbackAccountManager', () => {
       type: 'oauth',
       access: 'plain-access',
       refresh: 'plain-refresh',
-      expires: 1_000,
+      expires: 10_000,
     })
     await saveAccounts(plainStorage, plainPath)
 
@@ -3104,6 +3104,11 @@ describe('FallbackAccountManager', () => {
       fetchImpl: vaultFetch,
       now: () => 1_000,
       isFallbackAccountVaultServed: (id) => id === 'vault-quota-401',
+      isFallbackAccountVaultEnabled: (id) => id === 'vault-quota-401',
+      resolveFallbackAccessToken: () => ({
+        token: 'vault-quota-401-fixture-token',
+        source: 'vault' as const,
+      }),
     })
     const vaultAccount = expectOAuthAccount(
       (await loadAccounts(vaultPath))?.accounts[0],
@@ -3111,15 +3116,165 @@ describe('FallbackAccountManager', () => {
 
     await expect(
       vaultManager.refreshAccountQuota(vaultAccount, vaultStorage),
-    ).resolves.toMatchObject({
-      account: { access: 'vault-sidecar-access' },
-    })
-    expect(vaultQuotaCalls).toBe(2)
+    ).rejects.toThrow('Claude quota check failed: 401')
+    expect(vaultQuotaCalls).toBe(1)
     expect(vaultTokenCalls).toBe(0)
     expect(
       expectOAuthAccount((await loadAccounts(vaultPath))?.accounts[0])
         .lastRefreshError,
     ).toBeUndefined()
+  })
+
+  test('quota polling uses a resident vault credential before an expired sidecar credential', async () => {
+    const storage = baseStorage()
+    const vaultToken = 'vault-quota-fixture-token'
+    storage.accounts.push({
+      id: 'vault-quota-token-source',
+      type: 'oauth',
+      access: 'expired-sidecar-token',
+      refresh: 'sidecar-refresh',
+      expires: 999,
+      claustrumHandle: 'vault-quota-token-source-handle',
+    })
+    await saveAccounts(storage)
+
+    const authorizations: string[] = []
+    const fetchImpl = mock(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 20 },
+            }),
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl,
+      now: () => 1_000,
+      isFallbackAccountVaultEnabled: (id: string) =>
+        id === 'vault-quota-token-source',
+      isFallbackAccountVaultServed: (id: string) =>
+        id === 'vault-quota-token-source',
+      resolveFallbackAccessToken: () => ({
+        token: vaultToken,
+        source: 'vault' as const,
+      }),
+    } as never)
+    const account = expectOAuthAccount((await loadAccounts())?.accounts[0])
+
+    await manager.refreshAccountQuota(account, storage)
+
+    expect(authorizations).toEqual([`Bearer ${vaultToken}`])
+  })
+
+  test('vault-cold quota polling skips an expired sidecar after one resolver lookup', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'vault-cold-quota',
+      type: 'oauth',
+      access: 'expired-sidecar-token',
+      refresh: 'sidecar-refresh',
+      expires: 999,
+      claustrumHandle: 'vault-cold-quota-handle',
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 500 },
+        seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt: 500 },
+      },
+    })
+    await saveAccounts(storage)
+
+    let resolverCalls = 0
+    let usageCalls = 0
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl: mock(() => {
+        usageCalls += 1
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }) as unknown as typeof fetch,
+      now: () => 1_000,
+      isFallbackAccountVaultEnabled: (id: string) => id === 'vault-cold-quota',
+      resolveFallbackAccessToken: () => {
+        resolverCalls += 1
+        return undefined
+      },
+    } as never)
+    const account = expectOAuthAccount((await loadAccounts())?.accounts[0])
+
+    const result = await manager.refreshAccountQuota(account, storage)
+
+    expect(result.fetched).toBe(false)
+    expect(usageCalls).toBe(0)
+    expect(resolverCalls).toBe(1)
+    expect(account.lastQuotaRefreshError).toBeUndefined()
+  })
+
+  test('expired non-vault fallback refreshes before polling quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'expired-non-vault-quota',
+      type: 'oauth',
+      access: 'expired-sidecar-token',
+      refresh: 'sidecar-refresh',
+      expires: 999,
+    })
+    await saveAccounts(storage)
+
+    const operations: string[] = []
+    const fetchImpl = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('/v1/oauth/token')) {
+          operations.push('refresh')
+          expect(JSON.parse(String(init?.body)).refresh_token).toBe(
+            'sidecar-refresh',
+          )
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                access_token: 'refreshed-sidecar-token',
+                refresh_token: 'refreshed-sidecar-refresh',
+                expires_in: 3_600,
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        if (url.includes('/api/oauth/usage')) {
+          operations.push('usage')
+          expect(new Headers(init?.headers).get('authorization')).toBe(
+            'Bearer refreshed-sidecar-token',
+          )
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 10 },
+                seven_day: { utilization: 20 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        throw new Error(`unexpected URL: ${url}`)
+      },
+    ) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl,
+      now: () => 1_000,
+    })
+    const account = expectOAuthAccount((await loadAccounts())?.accounts[0])
+
+    await manager.refreshAccountQuota(account, storage)
+
+    expect(operations).toEqual(['refresh', 'usage'])
   })
 
   test('refreshes expired fallback tokens and persists rotation', async () => {
@@ -4194,6 +4349,71 @@ describe('FallbackAccountManager', () => {
 
     expect(fetchImpl).toHaveBeenCalled()
     expect(fired).toBe(1)
+  })
+
+  test('vault-cold background quota ticks persist and notify only after an actual change', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'vault-cold-background-quota',
+      type: 'oauth',
+      access: 'expired-sidecar-access',
+      refresh: 'sidecar-refresh',
+      expires: 999,
+      claustrumHandle: 'vault-cold-background-handle',
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1 },
+        seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt: 1 },
+      },
+    })
+    await saveAccounts(storage)
+
+    let vaultAccess: string | undefined
+    let usageCalls = 0
+    let saves = 0
+    let notifications = 0
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      now: () => 50_000_000,
+      fetchImpl: mock(() => {
+        usageCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 30 },
+              seven_day: { utilization: 40 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }) as unknown as typeof fetch,
+      isFallbackAccountVaultEnabled: (id: string) =>
+        id === 'vault-cold-background-quota',
+      resolveFallbackAccessToken: () =>
+        vaultAccess
+          ? { token: vaultAccess, source: 'vault' as const }
+          : undefined,
+      onFallbackStorageChanged: () => {
+        notifications += 1
+      },
+    })
+    manager.save = mock(async () => {
+      saves += 1
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+    await manager.refreshQuotaForDueAccounts()
+    await manager.refreshQuotaForDueAccounts()
+
+    expect(usageCalls).toBe(0)
+    expect(saves).toBe(0)
+    expect(notifications).toBe(0)
+
+    vaultAccess = 'resident-vault-access'
+    await manager.refreshQuotaForDueAccounts()
+
+    expect(usageCalls).toBe(1)
+    expect(saves).toBe(1)
+    expect(notifications).toBe(1)
   })
 
   test('refreshes fallback token and retries quota check after stale access token 401', async () => {

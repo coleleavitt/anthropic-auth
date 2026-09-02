@@ -141,6 +141,7 @@ import {
   QuotaHeaderFeedRegistry,
   QuotaManager,
   type QuotaState,
+  quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -985,6 +986,35 @@ const anthropicAuthPlugin = async (
       process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
       getStickyRoutingStatePath(accountStoragePath),
   })
+  const persistFallbackQuotaError = async (
+    accountId: string,
+    error: NonNullable<OAuthAccount['lastQuotaRefreshError']>,
+  ) => {
+    try {
+      const storage = await loadAccounts(accountStoragePath)
+      const account = storage?.accounts.find(
+        (candidate): candidate is OAuthAccount =>
+          candidate.id === accountId && isOAuthAccount(candidate),
+      )
+      if (!storage || !account) return
+      if (
+        account.lastQuotaRefreshError?.checkedAt !== undefined &&
+        account.lastQuotaRefreshError.checkedAt > error.checkedAt
+      ) {
+        return
+      }
+      if (quotaSnapshotCheckedAt(account.quota) > error.checkedAt) return
+      account.lastQuotaRefreshError = error
+      await saveAccountState(storage, accountStoragePath, {
+        accounts: [accountId],
+      })
+    } catch (caught) {
+      logger.warn('quota', 'failed to persist fallback backoff state', {
+        accountId,
+        error: caught instanceof Error ? caught.message : String(caught),
+      })
+    }
+  }
   const quotaManager = new QuotaManager({
     storage: initialStorage,
     onMainQuotaFetched: async (
@@ -1039,6 +1069,49 @@ const anthropicAuthPlugin = async (
         })
       }
     },
+    onFallbackQuotaFetched: async (
+      accountId,
+      quota,
+      _checkedAt,
+      fetchStartedAt,
+    ) => {
+      try {
+        const storage = await loadAccounts(accountStoragePath)
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === accountId && isOAuthAccount(candidate),
+        )
+        if (!storage || !account) return
+        const persistedCheckedAt = quotaSnapshotCheckedAt(account.quota)
+        if (
+          persistedCheckedAt >= fetchStartedAt &&
+          getQuotaNextRefreshAt(account.quota, storage, persistedCheckedAt) >
+            Date.now()
+        ) {
+          quotaManager.seedFallbacksFromAccounts(
+            storage.accounts.filter(isOAuthAccount),
+          )
+          return
+        }
+        if (
+          account.lastQuotaRefreshError?.checkedAt !== undefined &&
+          account.lastQuotaRefreshError.checkedAt > fetchStartedAt
+        ) {
+          return
+        }
+        account.quota = quota
+        account.lastQuotaRefreshError = undefined
+        await saveAccountState(storage, accountStoragePath, {
+          accounts: [accountId],
+        })
+      } catch (error) {
+        logger.warn('quota', 'failed to persist fallback quota', {
+          accountId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    },
+    onFallbackApiError: persistFallbackQuotaError,
   })
 
   async function reconcileMainQuotaAccountIdentity(
@@ -1593,6 +1666,7 @@ const anthropicAuthPlugin = async (
 
   let claustrumCredentialCache: ClaustrumCredentialCache | null = null
   const claustrumAuthFailureReports = new Map<string, Promise<void>>()
+  const claustrumLastReportedVersion = new Map<string, number>()
   const claustrumBlockedAccounts = new Set<string>()
   const claustrumReauthAccounts = new Set<string>()
   const claustrumWarmScheduled = new Set<string>()
@@ -1626,9 +1700,126 @@ const anthropicAuthPlugin = async (
     return Boolean(cached && usableClaustrumAccessToken(cached, claustrumNow()))
   }
 
+  function claustrumWarmBackoffActive(handle: string): boolean {
+    const retryAt = claustrumWarmBackoffUntil.get(handle)
+    if (retryAt === undefined) return false
+    if (claustrumNow() >= retryAt) {
+      claustrumWarmBackoffUntil.delete(handle)
+      return false
+    }
+    return true
+  }
+
+  function resolveClaustrumAccess(
+    account: OAuthAccount,
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    options?: { warm?: boolean },
+  ): ClaustrumAccessResolution {
+    const handle = account.claustrumHandle
+    if (
+      !handle ||
+      !storage ||
+      !isClaustrumEnabledForAccount(storage, account.id) ||
+      claustrumBlockedAccounts.has(account.id)
+    ) {
+      return { accessToken: account.access }
+    }
+
+    const cache = claustrumCredentialCache
+    if (!cache) {
+      if (
+        account.access &&
+        account.expires !== undefined &&
+        account.expires > claustrumNow()
+      ) {
+        return { accessToken: account.access }
+      }
+      return {}
+    }
+
+    const cached = cache.peek(handle)
+    const cachedAccess = usableClaustrumAccessToken(cached, claustrumNow())
+    if (cached && cachedAccess) {
+      // Claustrum record_version is monotonic per handle: refresh_commit and
+      // --replace never reissue an older version, so <= is stale evidence.
+      if (
+        (claustrumLastReportedVersion.get(handle) ?? -1) >= cached.recordVersion
+      ) {
+        if (!claustrumWarmBackoffActive(handle)) {
+          scheduleClaustrumWarm(account.id, handle)
+        }
+        return {}
+      }
+      return {
+        accessToken: cachedAccess,
+        served: {
+          accountId: account.id,
+          handle,
+          recordVersion: cached.recordVersion,
+        },
+      }
+    }
+
+    // A cold vault cache must warm off-path; a usage poll cannot wait for IPC.
+    if (options?.warm !== false && !claustrumWarmBackoffActive(handle)) {
+      scheduleClaustrumWarm(account.id, handle)
+    }
+    if (
+      account.access &&
+      account.expires !== undefined &&
+      account.expires > claustrumNow()
+    ) {
+      return { accessToken: account.access }
+    }
+    return {}
+  }
+
+  function resolveFallbackAccessToken(
+    account: OAuthAccount,
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    options?: { warm?: boolean },
+  ): { token: string; source: 'vault' | 'sidecar' } | undefined {
+    const resolved = resolveClaustrumAccess(account, storage, options)
+    if (!resolved.accessToken) return undefined
+    return {
+      token: resolved.accessToken,
+      source: resolved.served ? 'vault' : 'sidecar',
+    }
+  }
+
+  async function warmClaustrumCredential(
+    accountId: string,
+    handle: string,
+  ): Promise<void> {
+    const cache = claustrumCredentialCache
+    if (!cache) return
+    try {
+      const credential = await cache.get(handle)
+      if (usableClaustrumAccessToken(credential, claustrumNow())) {
+        await markClaustrumCredentialReady(accountId, handle)
+      }
+    } catch (error) {
+      handleClaustrumCredentialError(accountId, error, handle)
+      logger.warn('claustrum', 'credential refresh failed', {
+        accountId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  function scheduleClaustrumWarm(accountId: string, handle: string) {
+    if (claustrumWarmScheduled.has(handle)) return
+    claustrumWarmScheduled.add(handle)
+    runtimeTimers.setTimeout(() => {
+      claustrumWarmScheduled.delete(handle)
+      void warmClaustrumCredential(accountId, handle)
+    }, 0)
+  }
+
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
     isFallbackAccountVaultServed,
+    resolveFallbackAccessToken,
     isFallbackAccountVaultEnabled: (accountId, storage) => {
       if (!isClaustrumEnabledForAccount(storage, accountId)) return false
       const account = storage.accounts.find(
@@ -5018,104 +5209,6 @@ const anthropicAuthPlugin = async (
             return response
           }
 
-          function claustrumWarmBackoffActive(handle: string): boolean {
-            const retryAt = claustrumWarmBackoffUntil.get(handle)
-            if (retryAt === undefined) return false
-            if (claustrumNow() >= retryAt) {
-              claustrumWarmBackoffUntil.delete(handle)
-              return false
-            }
-            return true
-          }
-
-          function resolveClaustrumAccess(
-            account: OAuthAccount,
-            storage: Awaited<ReturnType<typeof loadAccounts>>,
-          ): ClaustrumAccessResolution {
-            const handle = account.claustrumHandle
-            if (
-              !handle ||
-              !storage ||
-              !isClaustrumEnabledForAccount(storage, account.id) ||
-              claustrumBlockedAccounts.has(account.id)
-            ) {
-              return { accessToken: account.access }
-            }
-
-            const cache = claustrumCredentialCache
-            if (!cache) {
-              if (
-                account.access &&
-                account.expires !== undefined &&
-                account.expires > claustrumNow()
-              ) {
-                return { accessToken: account.access }
-              }
-              return {}
-            }
-
-            const cached = cache.peek(handle)
-            const cachedAccess = usableClaustrumAccessToken(
-              cached,
-              claustrumNow(),
-            )
-            if (cached && cachedAccess) {
-              return {
-                accessToken: cachedAccess,
-                served: {
-                  accountId: account.id,
-                  handle,
-                  recordVersion: cached.recordVersion,
-                },
-              }
-            }
-
-            // Never send an expired vault value; the sidecar is only a
-            // bounded degradation path while the detached refresh completes.
-            // Defer the refresh until selection has captured sidecar provenance;
-            // the detached refresh must never turn an expired peek into a report.
-            if (!claustrumWarmBackoffActive(handle)) {
-              scheduleClaustrumWarm(account.id, handle)
-            }
-            if (
-              account.access &&
-              account.expires !== undefined &&
-              account.expires > claustrumNow()
-            ) {
-              return { accessToken: account.access }
-            }
-            return {}
-          }
-
-          async function warmClaustrumCredential(
-            accountId: string,
-            handle: string,
-          ): Promise<void> {
-            const cache = claustrumCredentialCache
-            if (!cache) return
-            try {
-              const credential = await cache.get(handle)
-              if (usableClaustrumAccessToken(credential, claustrumNow())) {
-                await markClaustrumCredentialReady(accountId, handle)
-              }
-            } catch (error) {
-              handleClaustrumCredentialError(accountId, error, handle)
-              logger.warn('claustrum', 'credential refresh failed', {
-                accountId,
-                error: error instanceof Error ? error.message : String(error),
-              })
-            }
-          }
-
-          function scheduleClaustrumWarm(accountId: string, handle: string) {
-            if (claustrumWarmScheduled.has(handle)) return
-            claustrumWarmScheduled.add(handle)
-            runtimeTimers.setTimeout(() => {
-              claustrumWarmScheduled.delete(handle)
-              void warmClaustrumCredential(accountId, handle)
-            }, 0)
-          }
-
           async function reportClaustrumAuthFailure(
             served: {
               accountId: string
@@ -5126,6 +5219,12 @@ const anthropicAuthPlugin = async (
           ): Promise<void> {
             const cache = claustrumCredentialCache
             if (!cache) return
+            if (
+              served.recordVersion <=
+              (claustrumLastReportedVersion.get(served.handle) ?? -1)
+            ) {
+              return
+            }
             const current = cache.peek(served.handle)
             // Version match makes reports single-shot per served version. Accepted
             // tradeoff: an unrelated cache eviction also suppresses a genuine
@@ -5147,6 +5246,10 @@ const anthropicAuthPlugin = async (
                     recordVersion: served.recordVersion,
                   },
                   reporterSource,
+                )
+                claustrumLastReportedVersion.set(
+                  served.handle,
+                  served.recordVersion,
                 )
               } catch (error) {
                 handleClaustrumCredentialError(
@@ -5893,13 +5996,19 @@ const anthropicAuthPlugin = async (
             if (!accounts.length) return currentResponse ?? null
 
             const returnLastOnExhausted = options?.returnLastOnExhausted ?? true
-            await currentResponse?.body?.cancel().catch(() => {})
             let lastResponse: Response | null = currentResponse ?? null
+            let canceledCurrentResponse = false
+            const cancelCurrentResponse = async () => {
+              if (canceledCurrentResponse) return
+              canceledCurrentResponse = true
+              await currentResponse?.body?.cancel().catch(() => {})
+            }
 
             for (const [index, account] of accounts.entries()) {
               let response: Response
               if (isApiKeyAccount(account)) {
                 if (!account.apiKey) continue
+                await cancelCurrentResponse()
                 response = await sendWithApiAccount(
                   input,
                   init,
@@ -5915,6 +6024,7 @@ const anthropicAuthPlugin = async (
                   storage,
                 )
                 if (!claustrumResolution.accessToken) continue
+                await cancelCurrentResponse()
                 response = await sendWithAccessToken(
                   input,
                   init,
@@ -5960,13 +6070,20 @@ const anthropicAuthPlugin = async (
                 // Non-blocking; only the served account, never idle fallbacks.
                 if (
                   isOAuthAccount(account) &&
-                  account.access &&
+                  mainQuotaRoutingEnabled(storage) &&
                   quotaManager.shouldRefreshOnRequestCount(sessionRequestCount)
                 ) {
-                  void quotaManager
-                    .refreshFallback(account.id, account.access, account)
-                    .then(() => options?.onSuccess?.(account))
-                    .catch(() => {})
+                  const quotaAccess = resolveFallbackAccessToken(
+                    account,
+                    storage,
+                    { warm: false },
+                  )
+                  if (quotaAccess) {
+                    void quotaManager
+                      .refreshFallback(account.id, quotaAccess.token, account)
+                      .then(() => options?.onSuccess?.(account))
+                      .catch(() => {})
+                  }
                 }
                 return response
               }
@@ -6101,6 +6218,7 @@ const anthropicAuthPlugin = async (
 
           return {
             apiKey: '',
+            __reportClaustrumAuthFailureForTest: reportClaustrumAuthFailure,
             async fetch(input: string | URL | Request, init?: RequestInit) {
               const incomingHeaders = mergeHeaders(input, init)
               const laneStartRequest =
@@ -7164,7 +7282,11 @@ const anthropicAuthPlugin = async (
                         auth.access,
                         requestMainQuotaIdentity?.generation,
                       ),
-                      quotaManager.refreshAllFallbacks(fallbackAccts),
+                      quotaManager.refreshAllFallbacks(
+                        fallbackAccts,
+                        (account) =>
+                          resolveFallbackAccessToken(account, storage)?.token,
+                      ),
                     ])
                   } catch (error) {
                     log('[quota] killswitch refresh failed', {
@@ -7403,6 +7525,7 @@ const anthropicAuthPlugin = async (
     },
     __primeManager: primeManager,
     __quotaManager: quotaManager,
+    __persistFallbackQuotaErrorForTest: persistFallbackQuotaError,
     __fallbackRefreshReady: fallbackRefreshReady,
     __claustrumCredentialCache: claustrumCredentialCache,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks

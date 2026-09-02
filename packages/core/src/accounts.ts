@@ -434,6 +434,10 @@ export type AccountManagerOptions = {
     accountId: string,
     storage: AccountStorage,
   ) => boolean
+  resolveFallbackAccessToken?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => { token: string; source: 'vault' | 'sidecar' } | undefined
   onBackgroundRefresh?: (initial?: boolean) => Promise<void> | void
   // Invoked after a background quota pass persists at least one fallback storage
   // change (token refresh, quota update, or error recording), so consumers
@@ -3734,6 +3738,10 @@ export class FallbackAccountManager {
     accountId: string,
     storage: AccountStorage,
   ) => boolean
+  private readonly resolveFallbackAccessToken: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => { token: string; source: 'vault' | 'sidecar' } | undefined
   private readonly onBackgroundRefresh:
     | ((initial?: boolean) => Promise<void> | void)
     | undefined
@@ -3750,6 +3758,18 @@ export class FallbackAccountManager {
       options.isFallbackAccountVaultServed ?? (() => false)
     this.isFallbackAccountVaultEnabled =
       options.isFallbackAccountVaultEnabled ?? (() => false)
+    this.resolveFallbackAccessToken =
+      options.resolveFallbackAccessToken ??
+      ((account) => {
+        if (
+          !account.access ||
+          account.expires === undefined ||
+          account.expires <= this.now()
+        ) {
+          return undefined
+        }
+        return { token: account.access, source: 'sidecar' }
+      })
     this.onBackgroundRefresh = options.onBackgroundRefresh
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
     this.setIntervalImpl = options.setIntervalImpl ?? globalThis.setInterval
@@ -3871,8 +3891,9 @@ export class FallbackAccountManager {
           stale &&
           !quotaBackoffActive(next.lastQuotaRefreshError, this.now())
         ) {
-          next = (await this.refreshAccountQuota(next, storage)).account
-          changed = true
+          const result = await this.refreshAccountQuota(next, storage)
+          next = result.account
+          changed ||= result.changed
         }
         // Single source of truth: evaluate quota policy from the unified
         // QuotaManager cache (the same source as the staleness check above) so
@@ -4033,8 +4054,8 @@ export class FallbackAccountManager {
           ? this.quotaManager.isFallbackStale(next.id, next.access)
           : quotaIsStale(next, storage, this.now())
         if (!stale) continue
-        await this.refreshAccountQuota(next, storage)
-        changed = true
+        const result = await this.refreshAccountQuota(next, storage)
+        changed ||= result.changed
       } catch (error) {
         recordQuotaRefreshError(account, error, this.now())
         updateStoredAccount(storage, account)
@@ -4060,7 +4081,8 @@ export class FallbackAccountManager {
       try {
         if (
           tokenNeedsRefresh(next, storage, this.now()) &&
-          !this.isFallbackAccountVaultServed(next.id, storage)
+          !this.isFallbackAccountVaultServed(next.id, storage) &&
+          !this.isFallbackAccountVaultEnabled(next.id, storage)
         ) {
           const refreshError = next.lastRefreshError
           if (
@@ -4083,8 +4105,8 @@ export class FallbackAccountManager {
           }
           continue
         }
-        await this.refreshAccountQuota(next, storage)
-        changed = true
+        const result = await this.refreshAccountQuota(next, storage)
+        changed ||= result.changed
       } catch (error) {
         recordQuotaRefreshError(account, error, this.now())
         updateStoredAccount(storage, account)
@@ -4275,9 +4297,28 @@ export class FallbackAccountManager {
   }
 
   async refreshAccountQuota(account: OAuthAccount, storage: AccountStorage) {
+    const initialQuotaState = JSON.stringify([
+      account.quota,
+      account.lastQuotaRefreshError,
+    ])
+    let changed = false
     let target = account
-    if (!target.access) {
-      throw new Error(`Fallback account ${account.id} has no access token`)
+    const vaultEnabled = this.isFallbackAccountVaultEnabled(target.id, storage)
+    let access = this.resolveFallbackAccessToken(target, storage)
+    if (!access && !vaultEnabled) {
+      target = await this.refreshAccount(account, storage, { force: true })
+      changed = true
+      access = this.resolveFallbackAccessToken(target, storage)
+    }
+    if (!access) {
+      log('[quota] fallback quota poll skipped: no usable credential', {
+        accountId: target.id,
+      })
+      return {
+        account: target,
+        fetched: false,
+        changed,
+      }
     }
     // Unify on the shared QuotaManager when present: it adds inflight
     // deduplication and 429 backoff gating around the same quota API. Fall back
@@ -4297,18 +4338,38 @@ export class FallbackAccountManager {
     const fetchStartedAt = this.now()
     let fetched = false
     try {
-      const result = await fetchSnapshot(target.access)
+      const result = await fetchSnapshot(access.token)
       target.quota = result.quota
       fetched = result.fetched
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      if (!message.includes('Claude quota check failed: 401')) throw error
+      if (
+        !message.includes('Claude quota check failed: 401') ||
+        vaultEnabled ||
+        access.source !== 'sidecar'
+      ) {
+        throw error
+      }
       target = await this.refreshAccount(account, storage, {
         force: true,
       })
-      if (!target.access) throw error
+      changed = true
+      access = this.resolveFallbackAccessToken(target, storage)
+      if (!access) {
+        log(
+          '[quota] fallback quota poll skipped after refresh: no usable credential',
+          {
+            accountId: target.id,
+          },
+        )
+        return {
+          account: target,
+          fetched: false,
+          changed,
+        }
+      }
       // 401 does not arm QuotaManager backoff, so this retry proceeds.
-      const result = await fetchSnapshot(target.access)
+      const result = await fetchSnapshot(access.token)
       target.quota = result.quota
       fetched = result.fetched
     }
@@ -4325,18 +4386,19 @@ export class FallbackAccountManager {
     ) {
       this.seedFallbackQuota(latestAccount, latestStorage)
       updateStoredAccount(storage, latestAccount)
-      return { account: latestAccount, fetched: false }
+      return { account: latestAccount, fetched: false, changed: false }
     }
     if (
       latestStorage &&
-      latestAccount?.access === target.access &&
+      latestAccount &&
+      latestAccount.access === target.access &&
       latestAccount.quota &&
       quotaSnapshotCheckedAt(latestAccount.quota) >= fetchStartedAt &&
       quotaSnapshotIsFresh(latestAccount.quota, latestStorage, this.now())
     ) {
       this.seedFallbackQuota(latestAccount, latestStorage)
       updateStoredAccount(storage, latestAccount)
-      return { account: latestAccount, fetched }
+      return { account: latestAccount, fetched, changed: false }
     }
 
     target.lastQuotaRefreshError = undefined
@@ -4356,6 +4418,13 @@ export class FallbackAccountManager {
         target,
       )
     }
-    return { account: target, fetched }
+    return {
+      account: target,
+      fetched,
+      changed:
+        changed ||
+        JSON.stringify([target.quota, target.lastQuotaRefreshError]) !==
+          initialQuotaState,
+    }
   }
 }

@@ -645,6 +645,8 @@ type PluginRuntimeOverrides = Partial<{
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
 }>
 
+type TestTimerHandler = Parameters<typeof globalThis.setTimeout>[0]
+
 function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
   return {
     // Background intervals must not outlive the test-scoped fetch mock they captured.
@@ -891,6 +893,55 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
     )
     expect(state.fallbacks[0]?.needsReauth).toBe(false)
     expect(tokenCalls).toBe(0)
+  })
+})
+
+describe('fallback quota persistence ordering', () => {
+  test('does not restore a late quota error older than the persisted success', async () => {
+    const successAt = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'fallback-late-error',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: successAt + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 10,
+                remainingPercent: 90,
+                checkedAt: successAt,
+              },
+              seven_day: {
+                usedPercent: 20,
+                remainingPercent: 80,
+                checkedAt: successAt,
+              },
+            },
+          },
+        ],
+      }),
+    )
+
+    const plugin = await getPlugin()
+    await plugin.__persistFallbackQuotaErrorForTest('fallback-late-error', {
+      message: 'older quota failure',
+      checkedAt: successAt - 1,
+      nextRetryAt: successAt + 60_000,
+      retryCount: 1,
+      accountIdentity: 'fallback-late-error',
+    })
+    await plugin.dispose?.()
+
+    const saved = await loadAccounts()
+    const savedAccount = saved?.accounts[0]
+    expect(savedAccount).toBeDefined()
+    if (!savedAccount || !isOAuthAccount(savedAccount)) {
+      throw new Error('missing persisted fallback account')
+    }
+    expect(savedAccount.lastQuotaRefreshError).toBeUndefined()
   })
 })
 
@@ -18091,6 +18142,144 @@ describe('killswitch fetch gate', () => {
       refresh: 'main-refresh',
       expires: Date.now() + 100000,
     })
+
+  async function runVaultKillswitchQuotaRefresh(vaultResident: boolean) {
+    const originalNow = Date.now
+    let clock = originalNow()
+    Date.now = () => clock
+    try {
+      const now = clock
+      const accountId = 'killswitch-vault-fallback'
+      const handle = 'killswitch-vault-handle'
+      const vaultAccess = 'killswitch-vault-access'
+      const quota = {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+        seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            refreshEveryNRequests: 1,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: false,
+          },
+          killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+          claustrum: { accounts: { [accountId]: { enabled: true } } },
+          accounts: [
+            {
+              id: accountId,
+              type: 'oauth',
+              access: 'sidecar-access',
+              refresh: 'sidecar-refresh',
+              expires: now + 5 * 60 * 60 * 1000,
+              claustrumHandle: handle,
+              quota,
+            },
+          ],
+        }),
+      )
+
+      const connector = async () =>
+        ({
+          call: async (_moduleId: string, method: string) => {
+            if (method === 'credential.get') {
+              return {
+                result: {
+                  payload: Array.from(
+                    new TextEncoder().encode(
+                      JSON.stringify({ access_token: vaultAccess }),
+                    ),
+                  ),
+                  expires_at_ms: now + 12 * 60 * 60 * 1000,
+                  record_version: 1,
+                },
+              }
+            }
+            return { result: {} }
+          },
+          close: () => {},
+        }) as never
+      const detachedTimers: Array<() => void> = []
+      const setTimeout = mock((callback: TestTimerHandler, delay?: number) => {
+        if (delay === 0 && typeof callback === 'function') {
+          detachedTimers.push(callback as () => void)
+        }
+        return 0 as unknown as ReturnType<typeof globalThis.setTimeout>
+      }) as unknown as typeof globalThis.setTimeout
+      const usageAuthorizations: string[] = []
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        const url = extractUrl(input as string | URL | Request)
+        if (url.includes('/api/oauth/usage')) {
+          usageAuthorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 10 },
+                seven_day: { utilization: 10 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        return Promise.resolve(new Response('message-ok', { status: 200 }))
+      }) as unknown as typeof fetch
+
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connector,
+        setTimeout,
+      })
+      await plugin.__fallbackRefreshReady
+      clock = now + 6 * 60 * 60 * 1000
+      plugin.__quotaManager.clearFallback(accountId)
+      if (!vaultResident) {
+        plugin.__claustrumCredentialCache.invalidate(handle)
+      }
+      const residentBeforeRequest = Boolean(
+        plugin.__claustrumCredentialCache.peek(handle),
+      )
+      usageAuthorizations.length = 0
+      const timerBaseline = detachedTimers.length
+
+      const result = await plugin.auth.loader(oauthLoader, { models: {} })
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await response.text()
+      await plugin.dispose?.()
+
+      return {
+        fallbackUsageCalls: usageAuthorizations.filter(
+          (authorization) => authorization === `Bearer ${vaultAccess}`,
+        ).length,
+        residentBeforeRequest,
+        sidecarUsageCalls: usageAuthorizations.filter(
+          (authorization) => authorization === 'Bearer sidecar-access',
+        ).length,
+        scheduledWarmCount: detachedTimers.length - timerBaseline,
+      }
+    } finally {
+      Date.now = originalNow
+    }
+  }
+
+  test('killswitch quota refresh schedules one detached warm for a cold vault and expired sidecar', async () => {
+    const result = await runVaultKillswitchQuotaRefresh(false)
+
+    expect(result.fallbackUsageCalls).toBe(0)
+    expect(result.sidecarUsageCalls).toBe(0)
+    expect(result.scheduledWarmCount).toBe(1)
+  })
+
+  test('killswitch quota refresh polls with a resident vault credential instead of an expired sidecar', async () => {
+    const result = await runVaultKillswitchQuotaRefresh(true)
+
+    expect(result.residentBeforeRequest).toBe(true)
+    expect(result.sidecarUsageCalls).toBe(0)
+    expect(result.fallbackUsageCalls).toBe(1)
+    expect(result.scheduledWarmCount).toBe(0)
+  })
 
   // Main below the soft routing threshold but ABOVE the killswitch threshold,
   // with no fallbacks: the killswitch must not hard-block — the request falls
