@@ -283,9 +283,9 @@ Fallback retries are only attempted when the request body is safely replayable. 
 
 ### Token refresh
 
-Fallback OAuth tokens refresh in the background so idle accounts do not expire before they are needed. Refresh token rotation is persisted immediately. The plugin also re-reads the latest sidecar account before refreshing, which avoids using stale refresh-token snapshots when multiple background paths run close together.
+Fallback OAuth tokens refresh in the background so idle accounts do not expire before they are needed. Refresh token rotation is persisted immediately. The plugin also re-reads the latest sidecar account before refreshing, which avoids using stale refresh-token snapshots when multiple background paths run close together. Persisted refresh backoffs are bound to the refresh token that produced them, so replacing a rejected credential immediately clears its stale latch.
 
-If Anthropic reports `invalid_grant`, that fallback account must be logged in again.
+If Anthropic reports `invalid_grant`, that account must be logged in again. `/claude-account reset-backoff` manually clears the main account's refresh backoff and its matching quota backoff.
 
 ### Optional Claustrum custody (OpenCode)
 
@@ -391,6 +391,7 @@ In the OpenCode TUI, the `/claude-*` commands open interactive modal dialogs ins
 - `/claude-cachekeep` — select `always`, enter a cache keepalive window (`HH-HH`), or turn it `off`.
 - `/claude-prime` — turn quota-window priming on or off, or view its status and usage.
 - `/claude-killswitch` — enable or disable the killswitch, or edit per-account `5h,1w,scoped` thresholds.
+- `/claude-account` — manage fallback routes, inspect sanitized Claustrum custody state, or use `reset-backoff` to clear main OAuth refresh and matching quota backoffs.
 
 Applying a change in a modal persists it through the same configuration the slash arguments use, so the modal and the typed command (`/claude-routing fallback-first`, etc.) are equivalent. Outside the OpenCode TUI (OpenCode desktop or headless), the commands print their text summary as before; Pi is unaffected.
 
