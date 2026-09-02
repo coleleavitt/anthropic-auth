@@ -63,17 +63,27 @@ function isEndpoint(value: unknown): value is ClaustrumEndpoint {
 export async function detectClaustrumConnection(
   path = getDefaultClaustrumConnectionPath(),
 ): Promise<ClaustrumDetection> {
-  let value: unknown
+  let raw: string
   try {
-    value = JSON.parse(await readFile(path, 'utf8'))
+    raw = await readFile(path, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { status: 'absent', path }
-    }
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return { status: 'absent', path }
     return {
       status: 'malformed',
       path,
-      reason: error instanceof Error ? error.message : String(error),
+      reason: `unreadable (${code ?? 'unknown'})`,
+    }
+  }
+
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return {
+      status: 'malformed',
+      path,
+      reason: 'invalid JSON',
     }
   }
 

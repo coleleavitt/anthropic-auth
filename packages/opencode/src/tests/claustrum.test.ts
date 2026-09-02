@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -82,6 +82,18 @@ describe('Claustrum connection detection', () => {
     expect(result.status).toBe('absent')
   })
 
+  test('reports an unreadable connection file without parser text', async () => {
+    const path = join(tempDir, 'unreadable.json')
+    await writeFile(path, '{}')
+    await chmod(path, 0o000)
+
+    const result = await detectClaustrumConnection(path)
+
+    expect(result.status).toBe('malformed')
+    expect(result).toMatchObject({ reason: 'unreadable (EACCES)' })
+    expect(JSON.stringify(result)).not.toContain('invalid JSON')
+  })
+
   test('reports malformed JSON and invalid shape distinctly from absence', async () => {
     const path = join(tempDir, 'malformed.json')
     await writeFile(path, '{"schema":1,"wire_version":"2"}')
@@ -89,6 +101,17 @@ describe('Claustrum connection detection', () => {
     const result = await detectClaustrumConnection(path)
 
     expect(result.status).toBe('malformed')
+  })
+
+  test('does not expose parser text from malformed secret-bearing JSON', async () => {
+    const path = join(tempDir, 'secret-bearing-malformed.json')
+    const canary = 'CANARYSECRET'
+    await writeFile(path, `{"schema":1,"key":ckh_${canary}}`)
+
+    const result = await detectClaustrumConnection(path)
+
+    expect(result.status).toBe('malformed')
+    expect(JSON.stringify(result)).not.toContain(canary)
   })
 
   test('rejects an empty endpoint list as malformed', async () => {
