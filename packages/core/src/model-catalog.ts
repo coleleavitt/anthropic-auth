@@ -324,34 +324,57 @@ export async function fetchAnthropicModelCatalog(options: {
   const abortOuter = () => controller.abort()
   options.signal?.addEventListener('abort', abortOuter, { once: true })
   try {
-    const url = new URL(ANTHROPIC_MODELS_ENDPOINT)
-    url.searchParams.set('limit', '1000')
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        accept: 'application/json',
-        authorization: `Bearer ${options.accessToken}`,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': OAUTH_BETA,
-        'user-agent': USER_AGENT,
-      },
-      signal: controller.signal,
-    })
-    if (!response.ok) {
-      throw new Error(`Anthropic model list failed: HTTP ${response.status}`)
+    const models = new Map<string, CatalogModel>()
+    let afterId: string | undefined
+    for (let page = 0; page < 100; page++) {
+      const url = new URL(ANTHROPIC_MODELS_ENDPOINT)
+      url.searchParams.set('limit', '1000')
+      if (afterId) url.searchParams.set('after_id', afterId)
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          authorization: `Bearer ${options.accessToken}`,
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta': OAUTH_BETA,
+          'user-agent': USER_AGENT,
+        },
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        throw new Error(`Anthropic model list failed: HTTP ${response.status}`)
+      }
+      const payload = (await response.json()) as {
+        data?: unknown
+        has_more?: unknown
+        last_id?: unknown
+      }
+      if (!Array.isArray(payload.data)) {
+        throw new Error('Anthropic model list returned an unexpected body')
+      }
+      for (const entry of payload.data) {
+        const model = normalizeCatalogModel(entry)
+        if (model) models.set(model.id, model)
+      }
+      if (payload.has_more !== true) break
+      if (
+        typeof payload.last_id !== 'string' ||
+        payload.last_id.length === 0 ||
+        payload.last_id === afterId
+      ) {
+        throw new Error(
+          'Anthropic model list returned an invalid pagination cursor',
+        )
+      }
+      afterId = payload.last_id
+      if (page === 99) {
+        throw new Error('Anthropic model list exceeded the pagination limit')
+      }
     }
-    const payload = (await response.json()) as { data?: unknown }
-    if (!Array.isArray(payload.data)) {
-      throw new Error('Anthropic model list returned an unexpected body')
-    }
-    const models = payload.data.flatMap((entry) => {
-      const model = normalizeCatalogModel(entry)
-      return model ? [model] : []
-    })
-    if (models.length === 0) {
+    if (models.size === 0) {
       throw new Error('Anthropic model list returned no usable models')
     }
-    return models
+    return [...models.values()]
   } finally {
     clearTimeout(timeout)
     options.signal?.removeEventListener('abort', abortOuter)

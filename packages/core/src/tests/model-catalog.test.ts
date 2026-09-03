@@ -226,6 +226,35 @@ describe('fetchAnthropicModelCatalog', () => {
     expect(seenAuth).toBe('Bearer token-1')
   })
 
+  test('follows model list pagination', async () => {
+    const seenUrls: string[] = []
+    stubFetch((url) => {
+      seenUrls.push(url)
+      const afterId = new URL(url).searchParams.get('after_id')
+      return new Response(
+        JSON.stringify(
+          afterId
+            ? { data: [apiModel({ id: 'claude-sonnet-5' })], has_more: false }
+            : {
+                data: [apiModel({ id: 'claude-opus-5' })],
+                has_more: true,
+                last_id: 'claude-opus-5',
+              },
+        ),
+        { status: 200 },
+      )
+    })
+
+    const models = await fetchAnthropicModelCatalog({ accessToken: 'token-1' })
+    expect(models.map((model) => model.id)).toEqual([
+      'claude-opus-5',
+      'claude-sonnet-5',
+    ])
+    expect(new URL(seenUrls[1] ?? '').searchParams.get('after_id')).toBe(
+      'claude-opus-5',
+    )
+  })
+
   test('throws on a non-OK response', async () => {
     stubFetch(() => new Response('nope', { status: 401 }))
     await expect(
