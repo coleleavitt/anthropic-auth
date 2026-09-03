@@ -113,14 +113,20 @@ export const PARALLEL_TOOL_CALLS_SYSTEM_PROMPT = [
 
 export const CCH_SALT = '59cf53e54c78'
 export const CCH_POSITIONS = [4, 7, 20]
-export const CLAUDE_CODE_VERSION = '2.1.233'
+/**
+ * Minimum Claude Code version floor. Anthropic rejects requests whose
+ * fingerprint is too old for newer models (claude_code_version_too_old), so
+ * request paths use the npm-tracked live version and treat this constant only
+ * as the verified offline floor.
+ */
+export const CLAUDE_CODE_VERSION = '2.1.251'
 // Empty-user-text fallback. Real billing suffixes are message-derived.
 export const CLAUDE_CODE_BUILD_HASH = '015'
 export const CLAUDE_CODE_ENTRYPOINT = 'cli'
 export const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION = '0.112.1'
 export const CLAUDE_CODE_STAINLESS_RUNTIME_VERSION = 'v26.3.0'
 
-export const USER_AGENT = 'claude-cli/2.1.233 (external, cli)'
+export const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`
 
 export const CACHE_1H_MODES = ['explicit', 'automatic', 'hybrid'] as const
 export type Cache1hMode = (typeof CACHE_1H_MODES)[number]

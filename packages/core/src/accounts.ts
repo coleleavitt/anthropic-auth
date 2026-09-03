@@ -4,10 +4,10 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { parseRetryAfterSeconds, refreshClaudeOAuthToken } from './auth.ts'
+import { getCachedClaudeCodeVersion } from './claude-version.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
-  CLAUDE_CODE_VERSION,
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
 import { type LogLevel, log, logger } from './logger.ts'
@@ -3310,7 +3310,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
       'anthropic-beta': 'oauth-2025-04-20',
-      'User-Agent': `claude-code/${CLAUDE_CODE_VERSION}`,
+      'User-Agent': `claude-code/${getCachedClaudeCodeVersion()}`,
     },
   })
 

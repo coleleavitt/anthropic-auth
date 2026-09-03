@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
-import { OAUTH_BETA, USER_AGENT } from './constants.ts'
+import { getClaudeCodeUserAgent } from './claude-version.ts'
+import { OAUTH_BETA } from './constants.ts'
 import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_MYTHOS_5_MODEL_ID,
@@ -337,7 +338,7 @@ export async function fetchAnthropicModelCatalog(options: {
           authorization: `Bearer ${options.accessToken}`,
           'anthropic-version': '2023-06-01',
           'anthropic-beta': OAUTH_BETA,
-          'user-agent': USER_AGENT,
+          'user-agent': getClaudeCodeUserAgent(),
         },
         signal: controller.signal,
       })

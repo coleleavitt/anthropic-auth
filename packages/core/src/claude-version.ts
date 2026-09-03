@@ -56,9 +56,14 @@ export async function getClaudeCodeVersion(): Promise<string> {
       const data = (await response.json()) as { version?: string }
       if (!data.version || !isValidVersion(data.version))
         return getCachedClaudeCodeVersion()
-      cachedVersion = data.version
+      // Never downgrade below the verified floor: a stale registry mirror must
+      // not reintroduce a fingerprint Anthropic already rejects.
+      cachedVersion =
+        compareVersions(data.version, CLAUDE_CODE_VERSION) >= 0
+          ? data.version
+          : CLAUDE_CODE_VERSION
       cachedAt = Date.now()
-      return data.version
+      return cachedVersion
     } catch {
       return getCachedClaudeCodeVersion()
     } finally {

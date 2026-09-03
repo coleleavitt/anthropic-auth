@@ -4,6 +4,7 @@ import {
   applyClaudeCodeMetadata,
   CLAUDE_CODE_FULL_AGENT_BETAS,
   type ClaudeCodeIdentity,
+  getCachedClaudeCodeVersion,
   orderClaudeCodeBody,
   REQUIRED_BETAS,
   resolveClaudeCodeIdentity,
@@ -124,7 +125,9 @@ describe('Claude Code fingerprint helpers', () => {
       { body, identity },
     )
 
-    expect(headers.get('user-agent')).toBe('claude-cli/2.1.233 (external, cli)')
+    expect(headers.get('user-agent')).toBe(
+      `claude-cli/${getCachedClaudeCodeVersion()} (external, cli)`,
+    )
     expect(headers.get('x-claude-code-session-id')).toBe(identity.sessionId)
     expect(headers.get('x-stainless-package-version')).toBe('0.112.1')
     expect(headers.get('x-stainless-runtime-version')).toBe('v26.3.0')
@@ -255,7 +258,9 @@ describe('Claude Code bootstrap identity lookup', () => {
         expect(url.searchParams.get('model')).toBe('claude-sonnet-4-6')
 
         const headers = new Headers(init?.headers)
-        expect(headers.get('user-agent')).toBe('claude-code/2.1.233')
+        expect(headers.get('user-agent')).toBe(
+          `claude-code/${getCachedClaudeCodeVersion()}`,
+        )
         expect(headers.get('anthropic-beta')).toBe('oauth-2025-04-20')
         expect(headers.get('content-type')).toBe('application/json')
 

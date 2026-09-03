@@ -1,11 +1,13 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import { getClaudeCodeUserAgent } from './claude-version.ts'
+import {
+  getCachedClaudeCodeVersion,
+  getClaudeCodeUserAgent,
+} from './claude-version.ts'
 import {
   CLAUDE_CODE_BUILD_HASH,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_STAINLESS_PACKAGE_VERSION,
   CLAUDE_CODE_STAINLESS_RUNTIME_VERSION,
-  CLAUDE_CODE_VERSION,
   CONTEXT_1M_BETA,
   EFFORT_BETA,
   FAST_MODE_BETA,
@@ -103,7 +105,7 @@ async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
         authorization: `Bearer ${accessToken}`,
         'content-type': 'application/json',
         'anthropic-beta': 'oauth-2025-04-20',
-        'user-agent': `claude-code/${CLAUDE_CODE_VERSION}`,
+        'user-agent': `claude-code/${getCachedClaudeCodeVersion()}`,
       },
       signal: controller.signal,
     })

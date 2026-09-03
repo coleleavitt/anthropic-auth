@@ -5,6 +5,8 @@ import {
   compareVersions,
   getCachedClaudeCodeVersion,
   getClaudeCodeUserAgent,
+  getClaudeCodeVersion,
+  resetClaudeCodeVersionCache,
 } from '@cortexkit/anthropic-auth-core'
 
 describe('compareVersions', () => {
@@ -54,5 +56,56 @@ describe('version wiring', () => {
 
     expect(userAgent).toBe(`claude-cli/${version} (external, cli)`)
     expect(billing).toContain(`cc_version=${version}.`)
+  })
+})
+
+describe('live version tracking', () => {
+  test('floor is at least 2.1.251 so Fable-era models are accepted offline', () => {
+    resetClaudeCodeVersionCache()
+    expect(
+      compareVersions(getCachedClaudeCodeVersion(), '2.1.251'),
+    ).toBeGreaterThanOrEqual(0)
+  })
+
+  test('adopts a newer npm latest version for subsequent headers', async () => {
+    resetClaudeCodeVersionCache()
+    const previousFetch = globalThis.fetch
+    const previousDisable =
+      process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_VERSION_CHECK
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_VERSION_CHECK
+    globalThis.fetch = (async () =>
+      Response.json({ version: '9.9.9' })) as unknown as typeof fetch
+    try {
+      await expect(getClaudeCodeVersion()).resolves.toBe('9.9.9')
+      expect(getCachedClaudeCodeVersion()).toBe('9.9.9')
+      expect(getClaudeCodeUserAgent()).toBe('claude-cli/9.9.9 (external, cli)')
+    } finally {
+      globalThis.fetch = previousFetch
+      if (previousDisable !== undefined)
+        process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_VERSION_CHECK =
+          previousDisable
+      resetClaudeCodeVersionCache()
+    }
+  })
+
+  test('never downgrades below the verified floor from a stale registry', async () => {
+    resetClaudeCodeVersionCache()
+    const floor = getCachedClaudeCodeVersion()
+    const previousFetch = globalThis.fetch
+    const previousDisable =
+      process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_VERSION_CHECK
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_VERSION_CHECK
+    globalThis.fetch = (async () =>
+      Response.json({ version: '2.1.100' })) as unknown as typeof fetch
+    try {
+      await expect(getClaudeCodeVersion()).resolves.toBe(floor)
+      expect(getCachedClaudeCodeVersion()).toBe(floor)
+    } finally {
+      globalThis.fetch = previousFetch
+      if (previousDisable !== undefined)
+        process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_VERSION_CHECK =
+          previousDisable
+      resetClaudeCodeVersionCache()
+    }
   })
 })

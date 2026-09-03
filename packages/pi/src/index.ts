@@ -7,6 +7,7 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   exchange,
   findSharedAccountByCredential,
+  getClaudeCodeVersion,
   loadSharedAccountStore,
   resolveAnthropicModelCatalog,
   resolveModelCost,
@@ -197,6 +198,11 @@ export async function resolvePiModelCatalog(): Promise<CatalogModel[]> {
 
 export default async function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
   registerCommands(pi)
+
+  // Warm the live Claude Code version so request fingerprints track the
+  // published CLI instead of the compiled floor; Anthropic hard-rejects
+  // fingerprints that are too old for newer models.
+  void getClaudeCodeVersion().catch(() => {})
 
   const catalog = await resolvePiModelCatalog()
 
