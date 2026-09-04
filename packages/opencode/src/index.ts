@@ -2520,6 +2520,9 @@ const anthropicAuthPlugin = async (
             session: sessionId,
             error: error instanceof Error ? error.message : String(error),
           })
+          // Keep the notice queued for a later idle event. Retrying immediately
+          // can hot-loop and, after an ambiguous host timeout, insert duplicates.
+          return
         }
       }
     })()

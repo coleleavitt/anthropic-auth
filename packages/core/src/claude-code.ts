@@ -249,6 +249,7 @@ function hasFullAgentShape(body: Record<string, unknown>) {
 export function selectClaudeCodeBetas(
   body?: Record<string, unknown> | null,
   extraBetas: string[] = [],
+  options: { suppressContext1m?: boolean } = {},
 ) {
   const selected: string[] = body
     ? hasFullAgentShape(body)
@@ -259,9 +260,12 @@ export function selectClaudeCodeBetas(
     : [...CLAUDE_CODE_BASE_BETAS]
 
   if (body?.speed === 'fast') selected.push(FAST_MODE_BETA)
-  // A 1M-capable model without this beta is capped at ~200k: anything larger
-  // comes back as `stop_reason: "refusal"` with no content, billed in full.
-  if (modelSupportsContext1m(body?.model)) selected.push(CONTEXT_1M_BETA)
+  // A 1M-capable model without this beta uses the standard context window.
+  // `suppressContext1m` mirrors Claude Code's account-local fallback after the
+  // server specifically reports that usage credits are required for long
+  // context. It does not imply that 1M context is inherently paid usage.
+  if (!options.suppressContext1m && modelSupportsContext1m(body?.model))
+    selected.push(CONTEXT_1M_BETA)
   for (const beta of extraBetas) {
     const trimmed = beta.trim()
     if (trimmed) selected.push(trimmed)
@@ -323,6 +327,8 @@ export function applyClaudeCodeHeaders(
     extraBetas?: string[]
     agentId?: string
     parentAgentId?: string
+    /** Use the standard context path for an account with the native credits latch. */
+    suppressContext1m?: boolean
   } = {},
 ): Headers {
   const identity = options.identity ?? getClaudeCodeIdentity(accessToken)
@@ -336,7 +342,12 @@ export function applyClaudeCodeHeaders(
   headers.set('authorization', `Bearer ${accessToken}`)
   headers.set('content-type', 'application/json')
   headers.set('user-agent', getClaudeCodeUserAgent())
-  headers.set('anthropic-beta', selectClaudeCodeBetas(options.body, extraBetas))
+  headers.set(
+    'anthropic-beta',
+    selectClaudeCodeBetas(options.body, extraBetas, {
+      suppressContext1m: options.suppressContext1m,
+    }),
+  )
   headers.set('anthropic-dangerous-direct-browser-access', 'true')
   headers.set('anthropic-version', '2023-06-01')
   headers.set('x-app', 'cli')

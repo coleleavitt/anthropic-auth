@@ -34,6 +34,29 @@ describe('getClaudeCodeUserAgent', () => {
     )
   })
 
+  test('includes native Agent SDK and client-app identity details', () => {
+    const previousEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
+    const previousSdk = process.env.CLAUDE_AGENT_SDK_VERSION
+    const previousClient = process.env.CLAUDE_AGENT_SDK_CLIENT_APP
+    try {
+      process.env.CLAUDE_CODE_ENTRYPOINT = 'sdk-cli'
+      process.env.CLAUDE_AGENT_SDK_VERSION = '0.3.153'
+      process.env.CLAUDE_AGENT_SDK_CLIENT_APP = 'prime-agent'
+      expect(getClaudeCodeUserAgent('2.1.260')).toBe(
+        'claude-cli/2.1.260 (external, sdk-cli, agent-sdk/0.3.153, client-app/prime-agent)',
+      )
+    } finally {
+      if (previousEntrypoint === undefined)
+        delete process.env.CLAUDE_CODE_ENTRYPOINT
+      else process.env.CLAUDE_CODE_ENTRYPOINT = previousEntrypoint
+      if (previousSdk === undefined) delete process.env.CLAUDE_AGENT_SDK_VERSION
+      else process.env.CLAUDE_AGENT_SDK_VERSION = previousSdk
+      if (previousClient === undefined)
+        delete process.env.CLAUDE_AGENT_SDK_CLIENT_APP
+      else process.env.CLAUDE_AGENT_SDK_CLIENT_APP = previousClient
+    }
+  })
+
   test('defaults to the cached version used by the request headers', () => {
     expect(getClaudeCodeUserAgent()).toBe(
       `claude-cli/${getCachedClaudeCodeVersion()} (external, cli)`,

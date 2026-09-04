@@ -77,7 +77,13 @@ export async function getClaudeCodeVersion(): Promise<string> {
 export function getClaudeCodeUserAgent(
   version: string = getCachedClaudeCodeVersion(),
 ): string {
-  return `claude-cli/${version} (external, cli)`
+  const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT?.trim() || 'cli'
+  const details = [entrypoint]
+  const sdkVersion = process.env.CLAUDE_AGENT_SDK_VERSION?.trim()
+  if (sdkVersion) details.push(`agent-sdk/${sdkVersion}`)
+  const clientApp = process.env.CLAUDE_AGENT_SDK_CLIENT_APP?.trim()
+  if (clientApp) details.push(`client-app/${clientApp}`)
+  return `claude-cli/${version} (external, ${details.join(', ')})`
 }
 
 export function resetClaudeCodeVersionCache(): void {

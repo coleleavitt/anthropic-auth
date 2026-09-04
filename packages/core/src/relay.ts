@@ -819,8 +819,11 @@ class PersistentRelaySession {
     reason: string,
     closeEvent?: Event,
   ) {
-    if (pending.responseStartedAt != null && pending.streamByteCount > 0)
-      return false
+    // Once upstream response headers arrived, Anthropic has accepted and started
+    // the request. Replaying with a new request ID can duplicate billed work even
+    // when no SSE bytes reached this client. Fail closed and let the caller
+    // surface the ambiguous transport failure instead.
+    if (pending.responseStartedAt != null) return false
     if (pending.streamDone) return false
     if (pending.retryAttempts >= 1) return false
 

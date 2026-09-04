@@ -766,7 +766,7 @@ describe('relay client', () => {
     ).toBe('0.64')
   })
 
-  test('websocket optimistic response retries when socket closes after response_start before stream bytes', async () => {
+  test('websocket optimistic response fails closed when socket closes after response_start before stream bytes', async () => {
     const originalWebSocket = globalThis.WebSocket
     const sentPayloads: Array<{ id: string; mode: string }> = []
     const receivedHeaders: Headers[] = []
@@ -861,22 +861,21 @@ describe('relay client', () => {
         onResponseHeaders: (value) => receivedHeaders.push(value),
       })
       expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
-      expect(await response.text()).toBe('event: message_stop\n\n')
+      // The optimistic stream may resolve empty or reject depending on when the
+      // Web Streams implementation observes controller.error(). The invariant
+      // is that the accepted upstream request is never replayed.
+      await response.text().catch(() => '')
     } finally {
       globalThis.WebSocket = originalWebSocket
     }
 
-    expect(socketCount).toBe(2)
-    expect(sentPayloads.map((payload) => payload.mode)).toEqual([
-      'full_sync',
-      'full_sync',
-    ])
-    expect(sentPayloads[1]?.id).not.toBe(sentPayloads[0]?.id)
+    expect(socketCount).toBe(1)
+    expect(sentPayloads.map((payload) => payload.mode)).toEqual(['full_sync'])
     expect(
       receivedHeaders.map((value) =>
         value.get('anthropic-ratelimit-unified-5h-utilization'),
       ),
-    ).toEqual(['0.42'])
+    ).toEqual([])
   })
 
   test('websocket optimistic response reports stream close after bytes without retry', async () => {

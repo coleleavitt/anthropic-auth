@@ -153,6 +153,27 @@ export function classifyRetry(
 }
 
 /**
+ * Whether Anthropic says this 1M-context request requires usage credits.
+ *
+ * Claude Code 2.1.260 recognizes these two messages only on HTTP 429, sets an
+ * account-local `longContext1mCreditsBlocked` latch, and uses the 200k context
+ * path afterwards (`context_1m_entitlement=credits_clamp_200k`). This does not
+ * mean that 1M context is inherently paid extra usage; it is a server-directed
+ * fallback for the account/request state reported by this response.
+ */
+export function isLongContextCreditsRequiredError(
+  status: number,
+  body = '',
+): boolean {
+  if (status !== 429) return false
+  const text = body.toLowerCase()
+  return (
+    text.includes('extra usage is required for long context') ||
+    text.includes('usage credits are required for long context')
+  )
+}
+
+/**
  * Server-directed delay in milliseconds, or undefined when the response leaves
  * the pacing to the client. `retry-after` may be seconds or an HTTP date.
  */

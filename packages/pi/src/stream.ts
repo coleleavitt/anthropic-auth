@@ -24,6 +24,7 @@ import {
   isDumpPersistentlyEnabled,
   isFastModePersistentlyEnabled,
   isKillswitchEnabled,
+  isLongContextCreditsRequiredError,
   isOAuthAccount,
   isPermanentRefreshError,
   isValidApiBaseURL,
@@ -33,7 +34,9 @@ import {
   logger,
   materializeSharedFallbackAccounts,
   mergeAnthropicBetas,
+  modelSupportsContext1m,
   nextRetryDelayMs,
+  normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   pickSharedAccount,
@@ -358,6 +361,16 @@ export async function* parseSse(
   }
 }
 
+/**
+ * Access-token fingerprints for which Anthropic directed 1M-context requests
+ * to use the standard 200k window.
+ *
+ * Claude Code 2.1.260 sets an account-local latch after the specific 429 long-
+ * context credits response. This is not a claim that 1M context is inherently
+ * paid usage; it mirrors the server-directed fallback for this token lineage.
+ */
+const context1mClampedTokens = new Set<string>()
+
 async function sendAnthropicRequest(options: {
   model: Model<Api>
   context: Context
@@ -385,41 +398,57 @@ async function sendAnthropicRequest(options: {
     identity,
   )
   const fastMode = body.speed === 'fast'
-  const headers = options.apiAccount
-    ? configureApiRouteHeaders(options.apiAccount, fastMode)
-    : applyClaudeCodeHeaders(new Headers(), options.accessToken ?? '', {
-        body,
-        identity,
-      })
-  if (!options.apiAccount && fastMode) {
-    headers.set(
-      'anthropic-beta',
-      mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
-    )
-  }
   const relayAffinity = options.streamOptions?.sessionId ?? null
-
   const input = options.apiAccount
     ? buildExplicitBaseMessagesUrl(options.apiAccount.baseURL)
     : new URL('/v1/messages?beta=true', options.model.baseUrl)
-  const init: RequestInit = {
-    method: 'POST',
-    headers,
-    body: bodyText,
-    signal: options.streamOptions?.signal,
+
+  const harvestQuotaHeaders = (headers: Headers) => {
+    if (options.apiAccount || !options.accessToken) return
+    try {
+      const incoming = normalizeQuotaHeaders(headers)
+      if (!incoming.five_hour && !incoming.seven_day) return
+      const { quotaManager } = getPiRoutingServices(
+        options.storagePath,
+        storage,
+      )
+      if (
+        options.oauthAccountId &&
+        options.oauthAccountId !== STICKY_ROUTING_MAIN_ACCOUNT_ID
+      ) {
+        quotaManager.pushFallbackFromHeaders(
+          options.oauthAccountId,
+          options.accessToken,
+          incoming,
+        )
+      } else {
+        quotaManager.pushMainFromHeaders(options.accessToken, incoming)
+      }
+    } catch (error) {
+      logger.debug('pi.quota', 'failed to harvest response quota headers', {
+        error: errorText(error),
+      })
+    }
   }
 
-  await cacheKeepManager.track({
-    sessionId: relayAffinity,
-    url: input.toString(),
-    headers,
-    bodyText,
-    storage,
-    cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
-    oauthAccountId: options.oauthAccountId,
-  })
+  const buildHeaders = (suppressContext1m: boolean): Headers => {
+    const headers = options.apiAccount
+      ? configureApiRouteHeaders(options.apiAccount, fastMode)
+      : applyClaudeCodeHeaders(new Headers(), options.accessToken ?? '', {
+          body,
+          identity,
+          suppressContext1m,
+        })
+    if (!options.apiAccount && fastMode) {
+      headers.set(
+        'anthropic-beta',
+        mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
+      )
+    }
+    return headers
+  }
 
-  const directFetch = async () => {
+  const directFetch = async (headers: Headers, init: RequestInit) => {
     const startedAt = Date.now()
     // Fingerprint the bearer that actually goes out. `oauthAccountId` is only
     // set on some call sites, so without this a 429 in the log cannot be tied
@@ -438,6 +467,7 @@ async function sendAnthropicRequest(options: {
     })
     try {
       const response = await fetch(input, init)
+      harvestQuotaHeaders(response.headers)
       logger.debug('pi.send', 'direct fetch done', {
         status: response.status,
         durationMs: Date.now() - startedAt,
@@ -477,27 +507,87 @@ async function sendAnthropicRequest(options: {
     }
   }
 
-  if (options.apiAccount) return directFetch()
+  const sendOnce = async (suppressContext1m: boolean): Promise<Response> => {
+    const headers = buildHeaders(suppressContext1m)
+    const init: RequestInit = {
+      method: 'POST',
+      headers,
+      body: bodyText,
+      signal: options.streamOptions?.signal,
+    }
 
-  return sendViaRelay({
-    config: getRelayConfig(storage),
-    input,
-    init,
-    headers,
-    body: bodyText,
-    fallback: directFetch,
-    affinity: relayAffinity,
-  })
+    await cacheKeepManager.track({
+      sessionId: relayAffinity,
+      url: input.toString(),
+      headers,
+      bodyText,
+      storage,
+      cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
+      oauthAccountId: options.oauthAccountId,
+    })
+
+    if (options.apiAccount) return directFetch(headers, init)
+
+    return sendViaRelay({
+      config: getRelayConfig(storage),
+      input,
+      init,
+      headers,
+      body: bodyText,
+      fallback: () => directFetch(headers, init),
+      affinity: relayAffinity,
+      onResponseHeaders: harvestQuotaHeaders,
+    })
+  }
+
+  // Mirror Claude Code 2.1.260's account-local long-context credits latch. The
+  // first matching 429 is returned to the host; later requests on the same token
+  // use the standard 200k path. The SDK/host retry loop owns replay, so this
+  // layer must not create a second billed attempt inside one provider call.
+  const clampTokenFp =
+    !options.apiAccount && options.accessToken
+      ? tokenFingerprint(options.accessToken)
+      : undefined
+  const preClamped = clampTokenFp
+    ? context1mClampedTokens.has(clampTokenFp)
+    : false
+  const response = await sendOnce(preClamped)
+  if (
+    clampTokenFp &&
+    !preClamped &&
+    response.status === 429 &&
+    modelSupportsContext1m(options.model.id)
+  ) {
+    const peek = await response
+      .clone()
+      .text()
+      .catch(() => '')
+    if (isLongContextCreditsRequiredError(response.status, peek)) {
+      context1mClampedTokens.add(clampTokenFp)
+      logger.warn(
+        'pi.send',
+        'Anthropic requires usage credits for this 1M-context route; later requests will use 200k',
+        {
+          oauthAccountId: options.oauthAccountId,
+          tokenFp: clampTokenFp,
+          model: options.model.id,
+          requestId: response.headers.get('request-id'),
+          body: peek.slice(0, 200),
+        },
+      )
+      // Do not replay here. The native client records the latch while returning
+      // the rate-limit error; the host's normal retry/next turn uses it.
+    }
+  }
+  return response
 }
 
 /** Compact quota rendering for logs: `5h 48% / 7d 55%`, or `unknown`. */
 function describeQuota(quota: OAuthQuotaSnapshot | undefined): string {
   if (!quota) return 'unknown'
   const percent = (key: 'five_hour' | 'seven_day') => {
-    const remaining = quota[key]?.remainingPercent
-    return typeof remaining === 'number'
-      ? `${Math.round((1 - remaining) * 100)}%`
-      : '?'
+    const used = quota[key]?.usedPercent
+    return typeof used === 'number' ? `${Math.round(used)}%` : '?'
   }
   return `5h ${percent('five_hour')} / 7d ${percent('seven_day')}`
 }

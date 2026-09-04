@@ -48,7 +48,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - Let OpenCode and Pi use Claude Pro/Max OAuth credentials instead of an Anthropic API key.
 - In OpenCode, intercept the final Anthropic request and rewrite it into the Claude-compatible shape expected by Anthropic OAuth access.
 - In Pi, replace Pi's built-in Anthropic provider with a CortexKit provider override that uses the same Claude-compatible request path.
-- Add Claude billing headers with stable `cc_version` and body-derived `cch` signing.
+- Add Claude 2.1.260 billing headers with stable `cc_version` and the native literal `cch=00000` slot.
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.

@@ -52,7 +52,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - Let OpenCode and Pi use Claude Pro/Max OAuth credentials instead of an Anthropic API key.
 - In OpenCode, intercept the final Anthropic request and rewrite it into the Claude-compatible shape expected by Anthropic OAuth access.
 - In Pi, replace Pi's built-in Anthropic provider with a CortexKit provider override that uses the same Claude-compatible request path.
-- Add Claude billing headers with stable `cc_version` and body-derived `cch` signing.
+- Add Claude 2.1.260 billing headers with stable `cc_version` and the native literal `cch=00000` slot.
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.
@@ -723,7 +723,7 @@ For Claude Pro/Max OAuth requests, the plugin works at the final Anthropic wire-
 5. Rewrites cache controls according to `/claude-cache` mode.
 6. Renames MCP tool names into Claude-compatible PascalCase form.
 7. Opts eligible Fable 5 and Opus 5 OAuth requests into Anthropic's server-side safety fallback, restores stored fallback boundaries, and activates replay-safe client recovery if the response still refuses.
-8. Computes `cch` with Claude Code 2.1.233's independently captured xxHash64 seed (`0x4d659218e32a3268`) over the 2.1.172+ canonical preimage (all `model` values emptied and all integer `max_tokens` fields removed), then patches only the five-character billing-header slot in the unchanged wire body.
+8. Keeps Claude Code 2.1.260's literal `cch=00000` billing slot. Legacy xxHash64/canonical-preimage helpers remain diagnostic-only and do not mutate the wire body.
 
 The sanitizer is anchor-based: it removes paragraphs containing known OpenCode documentation or source anchors, performs a small set of inline replacements, and preserves the rest of the prompt including user/project instructions, tool policy, environment context, and file paths.
 

@@ -54,4 +54,22 @@ describe('selectClaudeCodeBetas — 1M context', () => {
   test('omits it when no model is named', () => {
     expect(selectClaudeCodeBetas()).not.toContain(CONTEXT_1M_BETA)
   })
+
+  test('suppressContext1m drops the beta for a 1M-capable model', () => {
+    // The native account-local credits latch switches later requests back to
+    // the standard context path after Anthropic's specific long-context 429.
+    expect(
+      selectClaudeCodeBetas({ model: 'claude-sonnet-5' }, [], {
+        suppressContext1m: true,
+      }),
+    ).not.toContain(CONTEXT_1M_BETA)
+  })
+
+  test('suppressContext1m leaves the other betas intact', () => {
+    const betas = selectClaudeCodeBetas({ model: 'claude-sonnet-5' }, [], {
+      suppressContext1m: true,
+    })
+    expect(betas).toContain('claude-code-20250219')
+    expect(betas).toContain('oauth-2025-04-20')
+  })
 })

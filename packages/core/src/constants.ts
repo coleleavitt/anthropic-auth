@@ -119,7 +119,7 @@ export const CCH_POSITIONS = [4, 7, 20]
  * request paths use the npm-tracked live version and treat this constant only
  * as the verified offline floor.
  */
-export const CLAUDE_CODE_VERSION = '2.1.251'
+export const CLAUDE_CODE_VERSION = '2.1.260'
 // Empty-user-text fallback. Real billing suffixes are message-derived.
 export const CLAUDE_CODE_BUILD_HASH = '015'
 export const CLAUDE_CODE_ENTRYPOINT = 'cli'

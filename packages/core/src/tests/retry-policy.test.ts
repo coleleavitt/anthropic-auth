@@ -5,6 +5,7 @@ import {
   classifyRateLimit,
   classifyRetry,
   DEFAULT_MAX_RETRIES,
+  isLongContextCreditsRequiredError,
   nextRetryDelayMs,
   retryAfterMs,
 } from '../retry-policy.ts'
@@ -190,4 +191,37 @@ describe('backoffDelayMs', () => {
 
 test('the default retry budget matches the CLI', () => {
   expect(DEFAULT_MAX_RETRIES).toBe(10)
+})
+
+describe('isLongContextCreditsRequiredError', () => {
+  test('matches only the native long-context 429 messages', () => {
+    for (const message of [
+      'Extra usage is required for long context',
+      'Usage credits are required for long context requests.',
+    ]) {
+      expect(isLongContextCreditsRequiredError(429, message)).toBe(true)
+    }
+  })
+
+  test('does not conflate general extra-usage errors with the 1M latch', () => {
+    expect(
+      isLongContextCreditsRequiredError(429, "You're out of extra usage"),
+    ).toBe(false)
+    expect(
+      isLongContextCreditsRequiredError(
+        429,
+        '{"error":{"details":{"error_code":"credits_required"}}}',
+      ),
+    ).toBe(false)
+  })
+
+  test('ignores the long-context message on non-native statuses', () => {
+    expect(
+      isLongContextCreditsRequiredError(
+        400,
+        'Usage credits are required for long context',
+      ),
+    ).toBe(false)
+    expect(isLongContextCreditsRequiredError(200, '')).toBe(false)
+  })
 })

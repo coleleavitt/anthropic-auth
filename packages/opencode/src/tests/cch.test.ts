@@ -42,7 +42,7 @@ describe('billing header helpers', () => {
     )
   })
 
-  test('matches the Claude Code 2.1.233 segment order and spacing', () => {
+  test('matches the Claude Code 2.1.260 segment order and spacing', () => {
     const messages = [{ role: 'user', content: 'audit header capture' }]
     expect(
       buildBillingHeaderValue(messages, '2.1.233', 'cli', undefined, {
@@ -81,7 +81,7 @@ describe('billing header helpers', () => {
     expect(header).not.toContain('cc_prompt_id')
   })
 
-  test('keeps the cch slot at a stable offset for signing', () => {
+  test('keeps the cch slot at a stable wire offset', () => {
     const messages = [{ role: 'user', content: 'audit header capture' }]
     const bare = buildBillingHeaderValue(messages, '2.1.233', 'cli')
     const decorated = buildBillingHeaderValue(
@@ -111,7 +111,7 @@ describe('billing header helpers', () => {
     expect(computeVersionSuffix('2.1.233')).toBe('015')
   })
 
-  test('signs serialized request body cch placeholder', async () => {
+  test('keeps the native literal cch placeholder on the wire', async () => {
     const body = JSON.stringify({
       system: [
         {
@@ -121,10 +121,10 @@ describe('billing header helpers', () => {
       ],
     })
 
-    expect(await signRequestBody(body)).toContain('cch=12a77;')
+    expect(await signRequestBody(body)).toContain('cch=00000;')
   })
 
-  test('matches the native 2.1.233 model/max_tokens preimage oracle', async () => {
+  test('retains the legacy diagnostic preimage without using it on the wire', async () => {
     const body = JSON.stringify({
       model: 'claude-sonnet-4-6',
       messages: [{ role: 'user', content: 'probe-0' }],
@@ -141,12 +141,12 @@ describe('billing header helpers', () => {
     expect(preimage).toContain('"model":""')
     expect(preimage).not.toContain('"max_tokens"')
     const signed = await signRequestBody(body)
-    expect(signed).toContain('cch=833f0;')
+    expect(signed).toContain('cch=00000;')
     expect(signed).toContain('"model":"claude-sonnet-4-6"')
     expect(signed).toContain('"max_tokens":1')
   })
 
-  test('globally strips nested model and max_tokens fields like native fetch', async () => {
+  test('keeps legacy nested-field canonicalization diagnostic-only', async () => {
     expect(buildCCHPreimage('{"input":{"max_tokens":7}}')).toBe('{"input":{}}')
     const header =
       'x-anthropic-billing-header: cc_version=2.1.233.000; cc_entrypoint=sdk-cli; cch=00000;'
@@ -157,7 +157,7 @@ describe('billing header helpers', () => {
       max_tokens: 1,
       stream: true,
     })
-    expect(await signRequestBody(nestedMax)).toContain('cch=3632a;')
+    expect(await signRequestBody(nestedMax)).toContain('cch=00000;')
 
     const nestedModel = JSON.stringify({
       model: 'claude-sonnet-4-6',
@@ -168,10 +168,10 @@ describe('billing header helpers', () => {
       max_tokens: 1,
       stream: true,
     })
-    expect(await signRequestBody(nestedModel)).toContain('cch=4db54;')
+    expect(await signRequestBody(nestedModel)).toContain('cch=00000;')
   })
 
-  test('signs only the billing header cch and leaves message history unchanged', async () => {
+  test('normalizes only the billing header cch and leaves message history unchanged', async () => {
     const historyText = 'historical debug content: cch=abcde; cch=00000;'
     const body = JSON.stringify({
       messages: [
@@ -193,7 +193,7 @@ describe('billing header helpers', () => {
 
     expect(parsed.messages[0].content[0].text).toBe(historyText)
     expect(parsed.system[0].text).toMatch(/cch=[0-9a-f]{5};$/)
-    expect(parsed.system[0].text).not.toContain('cch=00000;')
+    expect(parsed.system[0].text).toContain('cch=00000;')
   })
 
   test('builds the full billing header value', () => {

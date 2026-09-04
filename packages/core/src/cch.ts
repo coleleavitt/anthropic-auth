@@ -16,8 +16,6 @@ const CCH_PLACEHOLDER = 'cch=00000;'
 export const CCH_PATTERN = /\bcch=([0-9a-f]{5});/
 const BILLING_HEADER_CCH_PATTERN =
   /("system":\[\{"type":"text","text":"x-anthropic-billing-header: cc_version=[^;"]+; cc_entrypoint=[^;"]+; )cch=([0-9a-f]{5});/
-const BILLING_HEADER_CCH_PLACEHOLDER_PATTERN =
-  /("system":\[\{"type":"text","text":"x-anthropic-billing-header: cc_version=[^;"]+; cc_entrypoint=[^;"]+; )cch=00000;/
 
 let xxhashPromise: Promise<void> | null = null
 let xxhash64Raw: ((input: Uint8Array, seed: bigint) => bigint) | null = null
@@ -53,10 +51,10 @@ export function extractFirstUserMessageText(messages: Message[]): string {
 }
 
 /**
- * Compute the seeded xxHash64 token for already-canonicalized preimage bytes.
+ * Compute the legacy CortexKit xxHash64 diagnostic token.
  *
- * Callers signing a serialized Messages body must apply [`buildCCHPreimage`]
- * first, then mask to 20 bits and patch only the billing-header placeholder.
+ * Claude Code 2.1.260 does not place this value in its billing header; normal
+ * request dispatch keeps the native literal `cch=00000`.
  */
 export async function computeCCH(bodyBytes: Uint8Array): Promise<string> {
   await ensureXxhash()
@@ -75,11 +73,10 @@ export function resetBillingHeaderCCH(bodyString: string): string {
 }
 
 /**
- * Claude Code 2.1.172+ canonicalizes the hash preimage before xxHash64:
- * every JSON `model` value becomes empty and every integer `max_tokens`
- * field plus one adjacent comma is removed. Native-fetch oracle probes with
- * nested fields confirm that this transform is intentionally global. The wire body itself
- * remains unchanged apart from the five-character CCH slot.
+ * Build the legacy CortexKit diagnostic hash preimage.
+ *
+ * Retained for dump analysis and compatibility; it is not native 2.1.260 wire
+ * signing and must not mutate a normal Messages request.
  */
 export function buildCCHPreimage(bodyString: string): string {
   return bodyString
@@ -92,15 +89,10 @@ export function extractBillingHeaderCCH(bodyString: string): string | null {
 }
 
 export async function signRequestBody(bodyString: string): Promise<string> {
-  if (!BILLING_HEADER_CCH_PATTERN.test(bodyString)) return bodyString
-
-  const unsignedBodyString = resetBillingHeaderCCH(bodyString)
-  const preimage = buildCCHPreimage(unsignedBodyString)
-  const token = await computeCCH(new TextEncoder().encode(preimage))
-  return unsignedBodyString.replace(
-    BILLING_HEADER_CCH_PLACEHOLDER_PATTERN,
-    `$1cch=${token};`,
-  )
+  // Claude Code 2.1.260 emits this slot as the literal `cch=00000;`. Keep the
+  // async API for callers while normalizing stale/non-native signed bodies back
+  // to the native placeholder.
+  return resetBillingHeaderCCH(bodyString)
 }
 
 /** Compute Claude Code's message-derived 3-character cc_version suffix. */
@@ -129,12 +121,12 @@ export type BillingHeaderAttribution = {
 }
 
 /**
- * Build the billing header with a cch placeholder.
- * signRequestBody() must run after final request serialization to replace it.
+ * Build the billing header with Claude Code 2.1.260's literal cch placeholder.
+ * `signRequestBody()` normalizes this slot but does not replace it with a hash.
  *
- * Segment order and spacing mirror Claude Code 2.1.233 exactly: each optional
+ * Segment order and spacing mirror Claude Code 2.1.260 exactly: each optional
  * segment carries its own leading space, and the cch placeholder is emitted
- * first so the five-character slot keeps a stable offset for signing.
+ * first so the five-character slot keeps a stable wire offset.
  */
 export function buildBillingHeaderValue(
   _messages: Message[],
