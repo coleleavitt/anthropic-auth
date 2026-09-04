@@ -944,11 +944,12 @@ describe('Pi routes from the shared account store', () => {
     }
 
     expect(terminalTypes).toEqual(['done'])
-    // The exhausted account's token was never presented; the healthy one served.
+    // The exhausted account's token was never presented. The canonical main
+    // account serves immediately, so no later fallback is needed.
     expect(
       seenTokens.some((token) => token.includes(spent.credential.access)),
     ).toBe(false)
-    expect(seenTokens.some((token) => token.includes('c'.repeat(24)))).toBe(
+    expect(seenTokens.some((token) => token.includes('a'.repeat(24)))).toBe(
       true,
     )
   })
@@ -1349,6 +1350,45 @@ describe('Pi credential fallback', () => {
     }
     return { terminalTypes, result: await stream.result(), seenTokens }
   }
+
+  test('prefers the canonical shared account over an unrelated host token', async () => {
+    const shared = sharedOAuthAccount('shared-main', 'a')
+    await writeSharedStore([shared])
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-canonical-primary-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+
+    const seenTokens: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (!url.includes('/v1/messages')) {
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        }
+        seenTokens.push(new Headers(init?.headers).get('authorization') ?? '')
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'sk-ant-oat01-host-token-that-is-not-canonical',
+      sessionId: 'ses_pi_canonical_primary',
+    })
+    for await (const _event of stream) {
+      // Drain the stream so the request and account attribution complete.
+    }
+
+    expect(seenTokens).toEqual([`Bearer ${shared.credential.access}`])
+  })
 
   test('falls back to the shared store when the host supplies no key', async () => {
     // Pi keeps its credential separately from the machine-wide store, so a host

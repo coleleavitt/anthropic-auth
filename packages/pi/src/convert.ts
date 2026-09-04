@@ -47,6 +47,13 @@ const CLAUDE_CODE_TOOLS = new Map(
   ].map((name) => [name.toLowerCase(), name]),
 )
 
+// Anthropic reserves the exact deep_research tool name for Claude Code's own
+// paid research surface. A third-party tool with that wire name is rejected as
+// extra-usage traffic even when ordinary and Fable-scoped plan quota is healthy.
+// Keep Prime's public tool name intact and alias only the Anthropic wire shape.
+const PRIME_DEEP_RESEARCH_TOOL = 'deep_research'
+const PRIME_DEEP_RESEARCH_WIRE_TOOL = 'prime_deep_research'
+
 export type AnthropicRequestBody = {
   model: string
   max_tokens: number
@@ -87,11 +94,18 @@ function sanitizeToolId(id: string): string {
   return cleaned.length > 256 ? cleaned.slice(0, 256) : cleaned
 }
 
-function toClaudeCodeToolName(name: string): string {
+export function toClaudeCodeToolName(name: string): string {
+  if (name === PRIME_DEEP_RESEARCH_TOOL) return PRIME_DEEP_RESEARCH_WIRE_TOOL
   return CLAUDE_CODE_TOOLS.get(name.toLowerCase()) ?? name
 }
 
 export function fromClaudeCodeToolName(name: string, tools?: Tool[]): string {
+  if (
+    name === PRIME_DEEP_RESEARCH_WIRE_TOOL &&
+    tools?.some((tool) => tool.name === PRIME_DEEP_RESEARCH_TOOL)
+  ) {
+    return PRIME_DEEP_RESEARCH_TOOL
+  }
   const lower = name.toLowerCase()
   return tools?.find((tool) => tool.name.toLowerCase() === lower)?.name ?? name
 }

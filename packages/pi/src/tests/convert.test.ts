@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import type { Message } from '@earendil-works/pi-ai'
-import { buildAnthropicRequest } from '../convert'
+import {
+  buildAnthropicRequest,
+  fromClaudeCodeToolName,
+  toClaudeCodeToolName,
+} from '../convert'
 
 function userMsg(text: string): Message {
   return { role: 'user', content: text, timestamp: 0 }
@@ -157,6 +161,49 @@ describe('convertMessages — basic transforms', () => {
     expect(messages[1]?.role).toBe('assistant')
     const content = messages[1]?.content as Array<Record<string, unknown>>
     expect(content[0]).toEqual({ type: 'text', text: 'hello back' })
+  })
+
+  test('aliases Anthropic reserved deep_research on the wire', async () => {
+    expect(toClaudeCodeToolName('deep_research')).toBe('prime_deep_research')
+    expect(toClaudeCodeToolName('deep-research')).toBe('deep-research')
+  })
+
+  test('restores the Prime deep_research name on streamed tool calls', () => {
+    const tools = [{ name: 'deep_research' }] as any
+    expect(fromClaudeCodeToolName('prime_deep_research', tools)).toBe(
+      'deep_research',
+    )
+    expect(fromClaudeCodeToolName('prime_deep_research', [])).toBe(
+      'prime_deep_research',
+    )
+  })
+
+  test('uses the reserved-tool alias in definitions and replayed tool calls', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5',
+      {
+        messages: [
+          userMsg('research this'),
+          toolCallMsg('call_1', 'deep_research'),
+          toolResultMsg('call_1', 'done'),
+          userMsg('thanks'),
+        ],
+        tools: [
+          {
+            name: 'deep_research',
+            description: 'Research.',
+            parameters: { type: 'object', properties: {} },
+          },
+        ],
+      } as any,
+      undefined,
+      defaultCache,
+    )
+    expect(body.tools?.[0]?.name).toBe('prime_deep_research')
+    const assistant = body.messages[1]?.content as Array<
+      Record<string, unknown>
+    >
+    expect(assistant[0]?.name).toBe('prime_deep_research')
   })
 
   test('converts tool_use and tool_result round-trip', async () => {

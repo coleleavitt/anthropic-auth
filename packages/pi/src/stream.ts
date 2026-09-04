@@ -1776,18 +1776,18 @@ export function streamCortexKitAnthropic(
     stream.push({ type: 'start', partial: output })
 
     try {
-      // Pi hands us its own stored credential. That store is separate from the
-      // machine-wide one, so a host that has never run Pi's own login has
-      // nothing to give even when several accounts are logged in and routable.
-      // Falling back to the shared store is the whole point of having one —
-      // every other path here already reads it.
+      // The canonical shared store owns account selection and token rotation.
+      // Prime's host-native credential is a compatibility fallback: preferring
+      // it here can silently send with a superseded or unrelated account while
+      // the router reports a different canonical main account.
       const hostKey = options?.apiKey?.trim()
-      const accessToken = hostKey || (await sharedAccessToken()) || ''
+      const sharedKey = await sharedAccessToken()
+      const accessToken = sharedKey || hostKey || ''
       logger.debug('pi.stream', 'primary credential resolved', {
-        source: hostKey
-          ? 'host-supplied (Pi own store)'
-          : accessToken
-            ? 'shared account store'
+        source: sharedKey
+          ? 'shared account store'
+          : hostKey
+            ? 'host-supplied (Pi own store)'
             : 'none',
         tokenFp: accessToken ? tokenFingerprint(accessToken) : undefined,
       })
