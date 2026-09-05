@@ -98,9 +98,44 @@ export function forgetDeadRefreshTokens() {
   deadRefreshFingerprints.clear()
 }
 
+function abortableWait(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted()
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 export async function refreshAnthropicToken(
   credentials: OAuthCredentials,
+  optionsOrSignal:
+    | AbortSignal
+    | {
+        claimMaxAttempts?: number
+        refreshTimeoutMs?: number
+        signal?: AbortSignal
+      } = {},
 ): Promise<OAuthCredentials> {
+  const options =
+    optionsOrSignal instanceof AbortSignal
+      ? { signal: optionsOrSignal }
+      : optionsOrSignal
+  const signal = options.signal
+  signal?.throwIfAborted()
+  const refreshTimeoutMs = options.refreshTimeoutMs ?? 20_000
+  if (refreshTimeoutMs >= 30_000) {
+    throw new Error(
+      'Anthropic refresh timeout must remain below the refresh lease',
+    )
+  }
   const loaded = await loadSharedAccountStore().catch(() => null)
   const sharedAccount = loaded?.store.accounts.find(
     (account) =>
@@ -128,6 +163,8 @@ export async function refreshAnthropicToken(
   // already reached Anthropic.
   let leaseId: string | undefined
   if (sharedAccount) {
+    const claimMaxAttempts =
+      options.claimMaxAttempts ?? REFRESH_CLAIM_MAX_ATTEMPTS
     for (let attempt = 0; ; attempt += 1) {
       const claim = await claimSharedAccountRefresh(
         sharedAccount.id,
@@ -159,17 +196,23 @@ export async function refreshAnthropicToken(
           `Anthropic account ${sharedAccount.id} has a revoked refresh token; re-login is required`,
         )
       }
-      if (claim.status === 'unknown-account') break
-      if (attempt >= REFRESH_CLAIM_MAX_ATTEMPTS) {
-        // Proceeding without the claim is the one path that can still
-        // double-spend, so it is logged loudly with both processes named.
-        logger.error('refresh.spend', 'claim timed out; refreshing unclaimed', {
-          accountId: sharedAccount.id,
-          selfPid: process.pid,
-          holderPid: claim.status === 'held' ? claim.holderPid : undefined,
-          attempts: attempt + 1,
-        })
-        break
+      if (claim.status === 'unknown-account') {
+        throw new Error('Anthropic refresh claim account disappeared')
+      }
+      if (attempt >= claimMaxAttempts) {
+        logger.error(
+          'refresh.spend',
+          'refresh claim timed out; refusing spend',
+          {
+            accountId: sharedAccount.id,
+            selfPid: process.pid,
+            holderPid: claim.status === 'held' ? claim.holderPid : undefined,
+            attempts: attempt + 1,
+          },
+        )
+        throw new Error(
+          'Anthropic refresh claim timed out; refresh was not attempted',
+        )
       }
       // Matches the CLI's lock retry: bounded attempts, jittered waits.
       logger.info('refresh.spend', 'claim held by another process', {
@@ -179,136 +222,183 @@ export async function refreshAnthropicToken(
         heldForMs: claim.until - Date.now(),
         attempt,
       })
-      await new Promise((resolve) =>
-        setTimeout(resolve, 1_000 + Math.random() * 1_000),
-      )
+      await abortableWait(1_000 + Math.random() * 1_000, signal)
     }
   }
 
-  // Claude Code may hold this very credential. Anthropic revokes the family
-  // when a superseded refresh token is presented, so a rotation that is not
-  // published back forks the two copies and the next refresh from either side
-  // kills the account for both. Check before spending, and adopt whatever the
-  // native app already has rather than racing it.
-  const nativeBefore = await readNativeClaudeOAuth().catch(() => null)
-  const sharesNativeCredential =
-    nativeBefore?.refreshToken === credentials.refresh
-  if (nativeBefore && !sharesNativeCredential) {
-    // The native app already moved on. Its token is the live one.
-    if (
-      nativeBefore.accessToken &&
-      typeof nativeBefore.expiresAt === 'number' &&
-      nativeBefore.expiresAt > Date.now()
-    ) {
-      logger.info('refresh.spend', 'adopting the native app rotation', {
+  try {
+    const nativeOptions = process.env.CLAUDE_CONFIG_DIR
+      ? { configDirectory: process.env.CLAUDE_CONFIG_DIR }
+      : {}
+    // Claude Code may hold this very credential. Anthropic revokes the family
+    // when a superseded refresh token is presented, so a rotation that is not
+    // published back forks the two copies and the next refresh from either side
+    // kills the account for both. Check before spending, and adopt whatever the
+    // native app already has rather than racing it.
+    const nativeBefore = await readNativeClaudeOAuth(nativeOptions).catch(
+      () => null,
+    )
+    const sharesNativeCredential =
+      nativeBefore?.refreshToken === credentials.refresh
+    if (nativeBefore && !sharesNativeCredential) {
+      // The native app already moved on. Its token is the live one.
+      if (
+        nativeBefore.accessToken &&
+        typeof nativeBefore.expiresAt === 'number' &&
+        nativeBefore.expiresAt > Date.now()
+      ) {
+        logger.info('refresh.spend', 'adopting the native app rotation', {
+          selfPid: process.pid,
+        })
+        const adopted = {
+          refresh: nativeBefore.refreshToken,
+          access: nativeBefore.accessToken,
+          expires: nativeBefore.expiresAt,
+        }
+        if (sharedAccount && leaseId) {
+          const persisted = await updateSharedAccountStore((store) => {
+            const current = store.accounts.find(
+              (account) => account.id === sharedAccount.id,
+            )
+            if (
+              current?.credential.type !== 'oauth' ||
+              current.credential.refresh !== credentials.refresh ||
+              current.refresh_lease?.id !== leaseId
+            ) {
+              return false
+            }
+            current.credential.access = adopted.access
+            current.credential.refresh = adopted.refresh
+            current.credential.expires_at = adopted.expires
+            current.dead_refresh_fingerprint = undefined
+            current.last_error = undefined
+            current.refresh_lease = undefined
+            store.current = current.id
+            return true
+          })
+          if (!persisted.result) {
+            throw new Error(
+              'Anthropic native credential adoption was superseded',
+            )
+          }
+        }
+        return adopted
+      }
+    }
+
+    const refreshFp = tokenFingerprint(credentials.refresh)
+    if (deadRefreshFingerprints.has(refreshFp)) {
+      logger.error('refresh.spend', 'skipping a known-dead refresh token', {
+        refreshFp: refreshFp.slice(0, 8),
+        accountId: sharedAccount?.id,
         selfPid: process.pid,
       })
-      return {
-        refresh: nativeBefore.refreshToken,
-        access: nativeBefore.accessToken,
-        expires: nativeBefore.expiresAt,
+      if (sharedAccount && leaseId) {
+        await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
+          () => {},
+        )
+      }
+      throw new Error(
+        'Anthropic refresh token was revoked; re-login is required (run `/login anthropic` in Pi, or `opencode-anthropic-auth login`)',
+      )
+    }
+
+    let refreshed: Awaited<ReturnType<typeof refreshClaudeOAuthToken>>
+    try {
+      refreshed = await refreshClaudeOAuthToken({
+        refreshToken: credentials.refresh,
+        refreshTokenExpiresAt: refreshExpiry,
+        timeoutMs: refreshTimeoutMs,
+        signal,
+      })
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('invalid_grant')) {
+        // Terminal for this token whether or not the store knows the account.
+        deadRefreshFingerprints.add(refreshFp)
+        if (sharedAccount) {
+          await markSharedRefreshTokenDead(
+            sharedAccount.id,
+            credentials.refresh,
+          ).catch(() => {})
+        }
+      }
+      if (sharedAccount && leaseId) {
+        await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
+          () => {},
+        )
+      }
+      throw error
+    }
+
+    if (sharedAccount) {
+      const persisted = await updateSharedAccountStore((store) => {
+        const current = store.accounts.find(
+          (account) => account.id === sharedAccount.id,
+        )
+        if (
+          current?.credential.type !== 'oauth' ||
+          current.credential.refresh !== credentials.refresh
+        ) {
+          return false
+        }
+        current.credential.access = refreshed.access
+        current.credential.refresh = refreshed.refresh
+        current.credential.expires_at = refreshed.expires
+        current.credential.refresh_expires_at =
+          refreshed.refreshTokenExpiresAt ??
+          current.credential.refresh_expires_at
+        current.dead_refresh_fingerprint = undefined
+        current.last_error = undefined
+        current.refresh_lease = undefined
+        store.current = current.id
+        return true
+      })
+      if (!persisted.result) {
+        const winner = (await loadSharedAccountStore()).store.accounts.find(
+          (account) => account.id === sharedAccount.id,
+        )
+        if (winner?.credential.type !== 'oauth') {
+          throw new Error('Anthropic OAuth refresh was superseded')
+        }
+        return {
+          refresh: winner.credential.refresh,
+          access: winner.credential.access,
+          expires: winner.credential.expires_at,
+        }
       }
     }
-  }
 
-  const refreshFp = tokenFingerprint(credentials.refresh)
-  if (deadRefreshFingerprints.has(refreshFp)) {
-    logger.error('refresh.spend', 'skipping a known-dead refresh token', {
-      refreshFp: refreshFp.slice(0, 8),
-      accountId: sharedAccount?.id,
-      selfPid: process.pid,
-    })
+    if (sharesNativeCredential) {
+      // Publish the rotation so Claude Code's mtime watch picks it up; without
+      // this its copy is superseded the moment we succeed.
+      const outcome = await publishNativeClaudeOAuth(
+        {
+          accessToken: refreshed.access,
+          refreshToken: refreshed.refresh,
+          expiresAt: refreshed.expires,
+          ...(refreshed.refreshTokenExpiresAt !== undefined
+            ? { refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt }
+            : {}),
+          ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
+        },
+        nativeOptions,
+      ).catch(() => 'absent' as const)
+      logger.info('refresh.spend', 'published rotation to Claude Code', {
+        outcome,
+        selfPid: process.pid,
+      })
+    }
+
+    return {
+      refresh: refreshed.refresh,
+      access: refreshed.access,
+      expires: refreshed.expires,
+    }
+  } finally {
     if (sharedAccount && leaseId) {
       await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
         () => {},
       )
     }
-    throw new Error(
-      'Anthropic refresh token was revoked; re-login is required (run `/login anthropic` in Pi, or `opencode-anthropic-auth login`)',
-    )
-  }
-
-  let refreshed: Awaited<ReturnType<typeof refreshClaudeOAuthToken>>
-  try {
-    refreshed = await refreshClaudeOAuthToken({
-      refreshToken: credentials.refresh,
-      refreshTokenExpiresAt: refreshExpiry,
-    })
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('invalid_grant')) {
-      // Terminal for this token whether or not the store knows the account.
-      deadRefreshFingerprints.add(refreshFp)
-      if (sharedAccount) {
-        await markSharedRefreshTokenDead(
-          sharedAccount.id,
-          credentials.refresh,
-        ).catch(() => {})
-      }
-    }
-    if (sharedAccount && leaseId) {
-      await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
-        () => {},
-      )
-    }
-    throw error
-  }
-
-  if (sharedAccount) {
-    const persisted = await updateSharedAccountStore((store) => {
-      const current = store.accounts.find(
-        (account) => account.id === sharedAccount.id,
-      )
-      if (
-        current?.credential.type !== 'oauth' ||
-        current.credential.refresh !== credentials.refresh
-      ) {
-        return false
-      }
-      current.credential.access = refreshed.access
-      current.credential.refresh = refreshed.refresh
-      current.credential.expires_at = refreshed.expires
-      current.credential.refresh_expires_at =
-        refreshed.refreshTokenExpiresAt ?? current.credential.refresh_expires_at
-      current.last_error = undefined
-      current.refresh_lease = undefined
-      return true
-    })
-    if (!persisted.result) {
-      const winner = (await loadSharedAccountStore()).store.accounts.find(
-        (account) => account.id === sharedAccount.id,
-      )
-      if (winner?.credential.type !== 'oauth') {
-        throw new Error('Anthropic OAuth refresh was superseded')
-      }
-      return {
-        refresh: winner.credential.refresh,
-        access: winner.credential.access,
-        expires: winner.credential.expires_at,
-      }
-    }
-  }
-
-  if (sharesNativeCredential) {
-    // Publish the rotation so Claude Code's mtime watch picks it up; without
-    // this its copy is superseded the moment we succeed.
-    const outcome = await publishNativeClaudeOAuth({
-      accessToken: refreshed.access,
-      refreshToken: refreshed.refresh,
-      expiresAt: refreshed.expires,
-      ...(refreshed.refreshTokenExpiresAt !== undefined
-        ? { refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt }
-        : {}),
-      ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
-    }).catch(() => 'absent' as const)
-    logger.info('refresh.spend', 'published rotation to Claude Code', {
-      outcome,
-      selfPid: process.pid,
-    })
-  }
-
-  return {
-    refresh: refreshed.refresh,
-    access: refreshed.access,
-    expires: refreshed.expires,
   }
 }

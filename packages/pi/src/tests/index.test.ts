@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -16,6 +16,7 @@ import cortexKitPiAnthropicAuth, {
 const originalFetch = globalThis.fetch
 const originalStorePath = process.env.ANTHROPIC_ACCOUNTS_FILE
 const originalCatalogPath = process.env.ANTHROPIC_MODEL_CATALOG_FILE
+const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
 const tempDirectories: string[] = []
 
 afterEach(async () => {
@@ -26,6 +27,9 @@ afterEach(async () => {
   if (originalCatalogPath === undefined)
     delete process.env.ANTHROPIC_MODEL_CATALOG_FILE
   else process.env.ANTHROPIC_MODEL_CATALOG_FILE = originalCatalogPath
+  if (originalClaudeConfigDir === undefined)
+    delete process.env.CLAUDE_CONFIG_DIR
+  else process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir
   await Promise.all(
     tempDirectories
       .splice(0)
@@ -340,5 +344,171 @@ describe('shared credential adoption skips dead accounts', () => {
     // The live account's credential was adopted; the dead token was never spent.
     expect(adopted.access).toContain('b'.repeat(24))
     expect(tokenPosts).toBe(0)
+  })
+})
+
+describe('shared refresh lease safety', () => {
+  test('honors the host abort signal before spending a refresh token', async () => {
+    const controller = new AbortController()
+    controller.abort(new Error('host cancelled'))
+    let posts = 0
+    globalThis.fetch = (async () => {
+      posts += 1
+      throw new Error('must not fetch')
+    }) as unknown as typeof fetch
+
+    await expect(
+      refreshAnthropicToken(
+        { access: 'old-access', refresh: 'old-refresh', expires: 1 },
+        controller.signal,
+      ),
+    ).rejects.toThrow('host cancelled')
+    expect(posts).toBe(0)
+  })
+
+  test('never spends a refresh token after claim contention times out', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pi-refresh-held-'))
+    tempDirectories.push(directory)
+    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
+    await saveSharedAccountStore({
+      version: 1,
+      current: 'pi-main',
+      accounts: [
+        {
+          id: 'pi-main',
+          enabled: true,
+          created_at: new Date().toISOString(),
+          credential: {
+            type: 'oauth',
+            access: 'old-access',
+            refresh: 'old-refresh',
+            expires_at: 1,
+          },
+          refresh_lease: {
+            id: 'peer',
+            until: Date.now() + 60_000,
+            token_fingerprint: 'peer',
+            holder_pid: 42,
+          },
+        },
+      ],
+    })
+    let posts = 0
+    globalThis.fetch = (async () => {
+      posts += 1
+      return Response.json({
+        access_token: 'bad',
+        refresh_token: 'bad',
+        expires_in: 3600,
+      })
+    }) as unknown as typeof fetch
+
+    await expect(
+      refreshAnthropicToken(
+        { access: 'old-access', refresh: 'old-refresh', expires: 1 },
+        { claimMaxAttempts: 0 },
+      ),
+    ).rejects.toThrow('refresh claim')
+    expect(posts).toBe(0)
+  })
+
+  test('rejects a refresh timeout that can outlive the shared lease', async () => {
+    let posts = 0
+    globalThis.fetch = (async () => {
+      posts += 1
+      throw new Error('must not fetch')
+    }) as unknown as typeof fetch
+
+    await expect(
+      refreshAnthropicToken(
+        { access: 'old-access', refresh: 'old-refresh', expires: 1 },
+        { refreshTimeoutMs: 30_000 },
+      ),
+    ).rejects.toThrow('below the refresh lease')
+    expect(posts).toBe(0)
+  })
+
+  test('adopts native rotation into the shared store and releases its lease', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pi-native-adopt-'))
+    tempDirectories.push(directory)
+    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
+    process.env.CLAUDE_CONFIG_DIR = directory
+    await saveSharedAccountStore({
+      version: 1,
+      current: 'missing',
+      accounts: [
+        {
+          id: 'pi-main',
+          enabled: true,
+          created_at: new Date().toISOString(),
+          credential: {
+            type: 'oauth',
+            access: 'old-access',
+            refresh: 'old-refresh',
+            expires_at: 1,
+          },
+        },
+      ],
+    })
+    const expiresAt = Date.now() + 3_600_000
+    await writeFile(
+      join(directory, '.credentials.json'),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'native-access',
+          refreshToken: 'native-refresh',
+          expiresAt,
+        },
+      }),
+    )
+    let posts = 0
+    globalThis.fetch = (async () => {
+      posts += 1
+      throw new Error('must not fetch')
+    }) as unknown as typeof fetch
+
+    await expect(
+      refreshAnthropicToken({
+        access: 'old-access',
+        refresh: 'old-refresh',
+        expires: 1,
+      }),
+    ).resolves.toEqual({
+      access: 'native-access',
+      refresh: 'native-refresh',
+      expires: expiresAt,
+    })
+    const stored = JSON.parse(
+      await readFile(process.env.ANTHROPIC_ACCOUNTS_FILE, 'utf8'),
+    )
+    expect(stored.current).toBe('pi-main')
+    expect(stored.accounts[0].credential).toMatchObject({
+      access: 'native-access',
+      refresh: 'native-refresh',
+      expires_at: expiresAt,
+    })
+    expect(stored.accounts[0].refresh_lease).toBeUndefined()
+    expect(posts).toBe(0)
+  })
+})
+
+describe('cold fallback catalog', () => {
+  test('includes Claude Haiku 4.5 while offline with no cache', async () => {
+    await isolateCatalogState()
+    globalThis.fetch = (() => {
+      throw new Error('offline')
+    }) as unknown as typeof fetch
+    const { pi, providers } = mockPi()
+    await cortexKitPiAnthropicAuth(pi)
+    expect(
+      providers
+        .get('anthropic')
+        ?.models?.find((model) => model.id === 'claude-haiku-4-5'),
+    ).toMatchObject({
+      id: 'claude-haiku-4-5',
+      name: 'Claude Haiku 4.5',
+      contextWindow: 200_000,
+      maxTokens: 64_000,
+    })
   })
 })

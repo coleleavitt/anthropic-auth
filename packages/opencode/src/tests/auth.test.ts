@@ -420,6 +420,47 @@ describe('refreshClaudeOAuthToken', () => {
   })
 })
 
+describe('refresh timeout', () => {
+  test('aborts the entire refresh operation within its configured deadline', async () => {
+    let signal: AbortSignal | undefined
+    const refresh = refreshClaudeOAuthToken({
+      refreshToken: 'old-refresh',
+      timeoutMs: 5,
+      fetchImpl: mock((_input: string | URL | Request, init?: RequestInit) => {
+        signal = init?.signal ?? undefined
+        return new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(signal?.reason), {
+            once: true,
+          })
+        })
+      }) as unknown as typeof fetch,
+    })
+    await expect(refresh).rejects.toThrow()
+    expect(signal?.aborted).toBe(true)
+  })
+
+  test('honors caller cancellation before the token endpoint settles', async () => {
+    const caller = new AbortController()
+    let signal: AbortSignal | undefined
+    const refresh = refreshClaudeOAuthToken({
+      refreshToken: 'old-refresh',
+      signal: caller.signal,
+      timeoutMs: 1_000,
+      fetchImpl: mock((_input: string | URL | Request, init?: RequestInit) => {
+        signal = init?.signal ?? undefined
+        return new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(signal?.reason), {
+            once: true,
+          })
+        })
+      }) as unknown as typeof fetch,
+    })
+    caller.abort(new Error('caller stopped'))
+    await expect(refresh).rejects.toThrow('caller stopped')
+    expect(signal?.aborted).toBe(true)
+  })
+})
+
 describe('retry-after-ms handling', () => {
   test('prefers retry-after-ms for refresh and revoke failures', async () => {
     const refresh = refreshClaudeOAuthToken({

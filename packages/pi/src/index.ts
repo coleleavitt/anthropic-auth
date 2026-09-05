@@ -177,6 +177,7 @@ export const FALLBACK_MODEL_CATALOG: CatalogModel[] = [
   fallbackModel('claude-opus-4-5', 'Claude Opus 4.5', 200_000, 64_000),
   fallbackModel('claude-sonnet-4-5', 'Claude Sonnet 4.5', 200_000, 64_000),
   fallbackModel('claude-sonnet-5', 'Claude Sonnet 5', 1_000_000, 128_000),
+  fallbackModel('claude-haiku-4-5', 'Claude Haiku 4.5', 200_000, 64_000),
 ]
 
 async function currentSharedAccessToken(): Promise<string | undefined> {

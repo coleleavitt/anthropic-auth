@@ -175,6 +175,26 @@ function isTransientNetworkError(error: unknown) {
   )
 }
 
+function abortableWait(
+  ms: number,
+  signal: AbortSignal,
+  setTimeoutImpl: typeof globalThis.setTimeout,
+): Promise<void> {
+  signal.throwIfAborted()
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+    const onAbort = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    timer = setTimeoutImpl(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+  })
+}
+
 export async function refreshClaudeOAuthToken(input: {
   refreshToken: string
   refreshTokenExpiresAt?: number
@@ -184,10 +204,17 @@ export async function refreshClaudeOAuthToken(input: {
   maxRetries?: number
   baseDelayMs?: number
   setTimeoutImpl?: typeof globalThis.setTimeout
+  signal?: AbortSignal
+  /** Whole-operation deadline. Must remain shorter than a refresh lease. */
+  timeoutMs?: number
 }): Promise<ClaudeOAuthRefreshResult> {
   const fetchImpl = input.fetchImpl ?? fetch
   const maxRetries = input.maxRetries ?? 2
   const baseDelayMs = input.baseDelayMs ?? 500
+  const timeoutMs = input.timeoutMs ?? 20_000
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('Claude OAuth refresh timeout must be positive')
+  }
   const initialNow = input.now?.() ?? Date.now()
 
   // Every reach for the token endpoint is recorded, with the caller's stack.
@@ -223,157 +250,172 @@ export async function refreshClaudeOAuthToken(input: {
     throw new ClaudeOAuthRefreshTokenExpiredError()
   }
   const setTimeoutImpl = input.setTimeoutImpl ?? globalThis.setTimeout
+  const timeoutController = new AbortController()
+  const abortTimer = globalThis.setTimeout(
+    () => timeoutController.abort(new Error('Claude OAuth refresh timed out')),
+    timeoutMs,
+  )
+  const signal = input.signal
+    ? AbortSignal.any([input.signal, timeoutController.signal])
+    : timeoutController.signal
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delay = baseDelayMs * 2 ** (attempt - 1)
-        await new Promise((resolve) => setTimeoutImpl(resolve, delay))
-      }
-
-      const response = await fetchImpl(TOKEN_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json, text/plain, */*',
-          'User-Agent': AXIOS_USER_AGENT,
-        },
-        body: JSON.stringify({
-          grant_type: 'refresh_token',
-          refresh_token: input.refreshToken,
-          client_id: getOAuthClientId(),
-          scope: REFRESH_SCOPE,
-        }),
-      })
-
-      if (!response.ok) {
-        if (response.status >= 500 && attempt < maxRetries) {
-          await response.body?.cancel().catch(() => {})
-          continue
+  try {
+    signal.throwIfAborted()
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          const delay = baseDelayMs * 2 ** (attempt - 1)
+          await abortableWait(delay, signal, setTimeoutImpl)
         }
-        const body = await readOAuthErrorBody(response, [input.refreshToken])
-        // `invalid_grant` is the family being gone, not a transient failure —
-        // the loudest signal that a token was spent twice somewhere. Logged at
-        // error so it stands out from ordinary refresh churn.
-        const isDeadFamily = body.includes('invalid_grant')
-        logger[isDeadFamily ? 'error' : 'warn'](
-          'refresh.spend',
-          isDeadFamily
-            ? 'refresh token rejected — token family is revoked'
-            : 'refresh failed',
-          {
-            spendId,
-            refreshFp,
-            status: response.status,
-            attempt,
-            body: body.slice(0, 300),
+
+        signal.throwIfAborted()
+        const response = await fetchImpl(TOKEN_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json, text/plain, */*',
+            'User-Agent': AXIOS_USER_AGENT,
           },
-        )
-        throw new ClaudeOAuthRefreshError(
-          response.status,
-          body,
-          response.headers.get('retry-after'),
-          response.headers.get('retry-after-ms'),
-        )
-      }
+          body: JSON.stringify({
+            grant_type: 'refresh_token',
+            refresh_token: input.refreshToken,
+            client_id: getOAuthClientId(),
+            scope: REFRESH_SCOPE,
+          }),
+          signal,
+        })
 
-      const json = (await response.json()) as {
-        access_token: string
-        refresh_token?: string
-        expires_in: number
-        refresh_token_expires_in?: number
-        scope?: string
-        account?: { uuid?: string; email_address?: string }
-        organization?: { uuid?: string }
-      }
-      if (
-        typeof json.access_token !== 'string' ||
-        !json.access_token ||
-        !Number.isFinite(json.expires_in) ||
-        json.expires_in <= 0
-      ) {
-        throw new Error(
-          'Claude OAuth refresh returned an invalid token response',
-        )
-      }
-      if (
-        json.refresh_token !== undefined &&
-        (typeof json.refresh_token !== 'string' || !json.refresh_token)
-      ) {
-        throw new Error(
-          'Claude OAuth refresh returned an invalid refresh token',
-        )
-      }
-      if (
-        json.refresh_token_expires_in !== undefined &&
-        (typeof json.refresh_token_expires_in !== 'number' ||
-          !Number.isFinite(json.refresh_token_expires_in) ||
-          json.refresh_token_expires_in <= 0)
-      ) {
-        throw new Error(
-          'Claude OAuth refresh returned an invalid refresh-token expiry',
-        )
-      }
-      const refreshedAt = input.now?.() ?? Date.now()
-      const expires = refreshedAt + json.expires_in * 1000
-      const refreshTokenExpiresAt =
-        typeof json.refresh_token_expires_in === 'number'
-          ? refreshedAt + json.refresh_token_expires_in * 1000
-          : input.refreshTokenExpiresAt
-      if (!Number.isSafeInteger(expires)) {
-        throw new Error('Claude OAuth refresh returned an overflowing expiry')
-      }
-      if (
-        refreshTokenExpiresAt !== undefined &&
-        !Number.isSafeInteger(refreshTokenExpiresAt)
-      ) {
-        throw new Error(
-          'Claude OAuth refresh returned an overflowing refresh-token expiry',
-        )
-      }
+        if (!response.ok) {
+          if (response.status >= 500 && attempt < maxRetries) {
+            await response.body?.cancel().catch(() => {})
+            continue
+          }
+          const body = await readOAuthErrorBody(response, [input.refreshToken])
+          // `invalid_grant` is the family being gone, not a transient failure —
+          // the loudest signal that a token was spent twice somewhere. Logged at
+          // error so it stands out from ordinary refresh churn.
+          const isDeadFamily = body.includes('invalid_grant')
+          logger[isDeadFamily ? 'error' : 'warn'](
+            'refresh.spend',
+            isDeadFamily
+              ? 'refresh token rejected — token family is revoked'
+              : 'refresh failed',
+            {
+              spendId,
+              refreshFp,
+              status: response.status,
+              attempt,
+              body: body.slice(0, 300),
+            },
+          )
+          throw new ClaudeOAuthRefreshError(
+            response.status,
+            body,
+            response.headers.get('retry-after'),
+            response.headers.get('retry-after-ms'),
+          )
+        }
 
-      // Records the rotation edge: which token was spent and which replaced
-      // it. Chained across a log this reconstructs the family's whole lineage,
-      // and a fork in it — two spends of the same fingerprint — is exactly the
-      // double-spend that gets a family revoked.
-      const rotatedTo = json.refresh_token ?? input.refreshToken
-      logger.info('refresh.spend', 'refresh succeeded', {
-        spendId,
-        refreshFp,
-        rotatedToFp: tokenFingerprint(rotatedTo).slice(0, 8),
-        rotated: rotatedTo !== input.refreshToken,
-        expiresInSec: json.expires_in,
-        scopes: json.scope,
-      })
+        const json = (await response.json()) as {
+          access_token: string
+          refresh_token?: string
+          expires_in: number
+          refresh_token_expires_in?: number
+          scope?: string
+          account?: { uuid?: string; email_address?: string }
+          organization?: { uuid?: string }
+        }
+        if (
+          typeof json.access_token !== 'string' ||
+          !json.access_token ||
+          !Number.isFinite(json.expires_in) ||
+          json.expires_in <= 0
+        ) {
+          throw new Error(
+            'Claude OAuth refresh returned an invalid token response',
+          )
+        }
+        if (
+          json.refresh_token !== undefined &&
+          (typeof json.refresh_token !== 'string' || !json.refresh_token)
+        ) {
+          throw new Error(
+            'Claude OAuth refresh returned an invalid refresh token',
+          )
+        }
+        if (
+          json.refresh_token_expires_in !== undefined &&
+          (typeof json.refresh_token_expires_in !== 'number' ||
+            !Number.isFinite(json.refresh_token_expires_in) ||
+            json.refresh_token_expires_in <= 0)
+        ) {
+          throw new Error(
+            'Claude OAuth refresh returned an invalid refresh-token expiry',
+          )
+        }
+        const refreshedAt = input.now?.() ?? Date.now()
+        const expires = refreshedAt + json.expires_in * 1000
+        const refreshTokenExpiresAt =
+          typeof json.refresh_token_expires_in === 'number'
+            ? refreshedAt + json.refresh_token_expires_in * 1000
+            : input.refreshTokenExpiresAt
+        if (!Number.isSafeInteger(expires)) {
+          throw new Error('Claude OAuth refresh returned an overflowing expiry')
+        }
+        if (
+          refreshTokenExpiresAt !== undefined &&
+          !Number.isSafeInteger(refreshTokenExpiresAt)
+        ) {
+          throw new Error(
+            'Claude OAuth refresh returned an overflowing refresh-token expiry',
+          )
+        }
 
-      return {
-        access: json.access_token,
-        refresh: json.refresh_token ?? input.refreshToken,
-        expires,
-        expiresIn: json.expires_in,
-        ...(typeof refreshTokenExpiresAt === 'number'
-          ? { refreshTokenExpiresAt }
-          : {}),
-        ...(json.scope
-          ? { scopes: json.scope.split(/\s+/).filter(Boolean) }
-          : {}),
-        ...(json.account?.uuid ? { accountId: json.account.uuid } : {}),
-        ...(json.account?.email_address
-          ? { email: json.account.email_address }
-          : {}),
-        ...(json.organization?.uuid
-          ? { organizationId: json.organization.uuid }
-          : {}),
-        authLineageId: input.authLineageId,
+        // Records the rotation edge: which token was spent and which replaced
+        // it. Chained across a log this reconstructs the family's whole lineage,
+        // and a fork in it — two spends of the same fingerprint — is exactly the
+        // double-spend that gets a family revoked.
+        const rotatedTo = json.refresh_token ?? input.refreshToken
+        logger.info('refresh.spend', 'refresh succeeded', {
+          spendId,
+          refreshFp,
+          rotatedToFp: tokenFingerprint(rotatedTo).slice(0, 8),
+          rotated: rotatedTo !== input.refreshToken,
+          expiresInSec: json.expires_in,
+          scopes: json.scope,
+        })
+
+        return {
+          access: json.access_token,
+          refresh: json.refresh_token ?? input.refreshToken,
+          expires,
+          expiresIn: json.expires_in,
+          ...(typeof refreshTokenExpiresAt === 'number'
+            ? { refreshTokenExpiresAt }
+            : {}),
+          ...(json.scope
+            ? { scopes: json.scope.split(/\s+/).filter(Boolean) }
+            : {}),
+          ...(json.account?.uuid ? { accountId: json.account.uuid } : {}),
+          ...(json.account?.email_address
+            ? { email: json.account.email_address }
+            : {}),
+          ...(json.organization?.uuid
+            ? { organizationId: json.organization.uuid }
+            : {}),
+          authLineageId: input.authLineageId,
+        }
+      } catch (error) {
+        if (error instanceof ClaudeOAuthRefreshError) throw error
+        if (attempt < maxRetries && isTransientNetworkError(error)) continue
+        throw error
       }
-    } catch (error) {
-      if (error instanceof ClaudeOAuthRefreshError) throw error
-      if (attempt < maxRetries && isTransientNetworkError(error)) continue
-      throw error
     }
-  }
 
-  throw new Error('Token refresh exhausted all retries')
+    throw new Error('Token refresh exhausted all retries')
+  } finally {
+    globalThis.clearTimeout(abortTimer)
+  }
 }
 
 export type ClaudeOAuthRevokeOutcome = 'revoked' | 'already-inactive'
