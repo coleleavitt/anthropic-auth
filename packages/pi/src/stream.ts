@@ -1,4 +1,5 @@
 import {
+  type AccountStorage,
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
@@ -75,7 +76,12 @@ import {
 } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
 import { getPiAccountStoragePath } from './paths.ts'
-import { refreshAnthropicToken } from './shared-refresh.ts'
+import { accountSpanId, refreshAnthropicToken } from './shared-refresh.ts'
+import {
+  errorHttpStatus,
+  type TraceSpan,
+  withAuthSpan,
+} from './trace-bridge.ts'
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -687,14 +693,25 @@ async function firstStreamingError(
  * Prefers whatever selection would route to, so the credential handed back is
  * the same one the router would have chosen anyway.
  */
-async function sharedAccessToken(): Promise<string | undefined> {
+function sharedAccessToken(): Promise<string | undefined> {
+  return withAuthSpan('auth.route', undefined, selectSharedAccessToken)
+}
+
+async function selectSharedAccessToken(
+  span: TraceSpan,
+): Promise<string | undefined> {
   const loaded = await loadSharedAccountStore().catch((error) => {
     logger.warn('pi.stream', 'shared account store unreadable', {
       error: errorText(error),
     })
+    span.setAttributes({ 'auth.reason': 'store-unreadable' })
     return null
   })
-  if (!loaded) return undefined
+  if (!loaded) {
+    span.setAttributes({ 'auth.pool_size': 0, 'auth.outcome': 'none' })
+    return undefined
+  }
+  span.setAttributes({ 'auth.pool_size': loaded.store.accounts.length })
 
   // This token is used as a bearer directly — nothing on this path refreshes
   // it. `pickSharedAccount` only judges quota and cooldown, so it will happily
@@ -712,6 +729,7 @@ async function sharedAccessToken(): Promise<string | undefined> {
           ? now - candidate.credential.expires_at
           : undefined,
     })
+    span.setAttributes({ 'auth.reason': 'main-expired' })
     candidate = loaded.store.accounts.find(
       (account) =>
         account.id !== candidate?.id && oauthCredentialIsLive(account, now),
@@ -723,15 +741,27 @@ async function sharedAccessToken(): Promise<string | undefined> {
     // tokens by design, so the store is usually one rotation away from
     // healthy. Giving up here told the user to re-login while six accounts
     // held refresh tokens valid for another three weeks.
+    span.setAttributes({ 'auth.reason': 'all-expired' })
     const refreshed = await refreshExpiredSharedAccount(loaded.store, now)
-    if (refreshed) return refreshed
+    if (refreshed) {
+      span.setAttributes({
+        'auth.selected': accountSpanId(refreshed.accountId),
+        'auth.outcome': 'refreshed',
+      })
+      return refreshed.access
+    }
     logger.error('pi.stream', 'no shared account has a live access token', {
       accounts: loaded.store.accounts.length,
     })
+    span.setAttributes({ 'auth.outcome': 'none' })
     return undefined
   }
   logger.info('pi.stream', 'using a shared-store credential', {
     accountId: candidate.id,
+  })
+  span.setAttributes({
+    'auth.selected': accountSpanId(candidate.id),
+    'auth.outcome': 'selected',
   })
   return candidate.credential.access || undefined
 }
@@ -747,7 +777,7 @@ async function sharedAccessToken(): Promise<string | undefined> {
 async function refreshExpiredSharedAccount(
   store: Awaited<ReturnType<typeof loadSharedAccountStore>>['store'],
   now: number,
-): Promise<string | undefined> {
+): Promise<{ access: string; accountId: string } | undefined> {
   const candidates = store.accounts.filter(
     (account) =>
       account.enabled !== false &&
@@ -760,16 +790,19 @@ async function refreshExpiredSharedAccount(
   for (const account of candidates) {
     if (account.credential.type !== 'oauth') continue
     try {
-      const rotated = await refreshAnthropicToken({
-        refresh: account.credential.refresh,
-        access: account.credential.access,
-        expires: account.credential.expires_at,
-      })
+      const rotated = await refreshAnthropicToken(
+        {
+          refresh: account.credential.refresh,
+          access: account.credential.access,
+          expires: account.credential.expires_at,
+        },
+        { reason: 'expired' },
+      )
       if (rotated.access) {
         logger.info('pi.stream', 'revived the shared store by refreshing', {
           accountId: account.id,
         })
-        return rotated.access
+        return { access: rotated.access, accountId: account.id }
       }
     } catch (error) {
       logger.warn('pi.stream', 'shared account refresh failed; trying next', {
@@ -779,6 +812,52 @@ async function refreshExpiredSharedAccount(
     }
   }
   return undefined
+}
+
+/** Mirrors `isPermanentRefreshError` for a thrown error rather than a stored one. */
+function refreshErrorIsPermanent(error: unknown) {
+  if (typeof error !== 'object' || error === null) return false
+  const { permanent, message } = error as {
+    permanent?: unknown
+    message?: unknown
+  }
+  if (permanent === true) return true
+  if (errorHttpStatus(error) === 400) return true
+  return typeof message === 'string' && message.includes('invalid_grant')
+}
+
+/**
+ * The 401-retry refresh of a routed fallback account, traced as
+ * `auth.refresh` so a rotation forced by the API shows up next to the ones
+ * the plugin schedules itself. The manager owns the lease and the store
+ * write; this only names the outcome.
+ */
+function refreshRouteAccountAfter401(
+  manager: FallbackAccountManager,
+  account: OAuthAccount,
+  storage: AccountStorage,
+) {
+  return withAuthSpan(
+    'auth.refresh',
+    { 'auth.reason': '401-retry', 'auth.account': accountSpanId(account.id) },
+    async (span) => {
+      try {
+        const refreshed = await manager.refreshAccount(account, storage, {
+          force: true,
+        })
+        span.setAttributes({
+          'auth.outcome': refreshed.access ? 'ok' : 'refused',
+        })
+        return refreshed
+      } catch (error) {
+        span.setAttributes({
+          'auth.outcome': refreshErrorIsPermanent(error) ? 'revoked' : 'error',
+          'http.status': errorHttpStatus(error),
+        })
+        throw error
+      }
+    },
+  )
 }
 
 /** An OAuth account whose access token is present and not past its expiry. */
@@ -1428,12 +1507,10 @@ async function executeWithFallback(options: {
       ) {
         const authRouteId = route.id
         try {
-          const refreshed = await manager.refreshAccount(
+          const refreshed = await refreshRouteAccountAfter401(
+            manager,
             route.account,
             storage,
-            {
-              force: true,
-            },
           )
           if (refreshed.access) {
             route = { ...route, access: refreshed.access, account: refreshed }

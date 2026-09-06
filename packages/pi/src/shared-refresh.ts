@@ -22,8 +22,42 @@ import {
   updateSharedAccountStore,
 } from '@cortexkit/anthropic-auth-core'
 import type { OAuthCredentials } from '@earendil-works/pi-ai'
+import {
+  errorHttpStatus,
+  type TraceSpan,
+  withAuthSpan,
+} from './trace-bridge.ts'
 
 const SHARED_CREDENTIAL_ADOPTION_SKEW_MS = 60_000
+
+/** Why a refresh was attempted; recorded on the `auth.refresh` span. */
+export type RefreshReason = 'expired' | 'preemptive' | 'forced' | '401-retry'
+
+export type RefreshOutcome = 'ok' | 'refused' | 'revoked' | 'error'
+
+/**
+ * A stable, non-secret handle for an account in span attributes. Store ids
+ * are opaque (`pi-main`, an account uuid), but an id that looks like an
+ * address is hashed so the trace log never carries an email.
+ */
+export function accountSpanId(id: string): string {
+  return id.includes('@') ? tokenFingerprint(id).slice(0, 8) : id
+}
+
+/**
+ * Classify a refresh failure for the span. `revoked` is the token family
+ * being gone (nothing to retry); `error` is everything the network or the
+ * host did to us. Refusals — the plugin declining to spend — are stamped at
+ * the point of refusal, since only that code knows it never called out.
+ */
+function classifyRefreshFailure(error: unknown): RefreshOutcome {
+  if (!(error instanceof Error)) return 'error'
+  if (error.message.includes('invalid_grant')) return 'revoked'
+  if ((error as { code?: unknown }).code === 'refresh_token_expired')
+    return 'revoked'
+  if ((error as { permanent?: unknown }).permanent === true) return 'revoked'
+  return 'error'
+}
 
 export function currentSharedAccount(
   store: LoadedSharedAccountStore['store'],
@@ -114,24 +148,66 @@ function abortableWait(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
+export interface RefreshAnthropicTokenOptions {
+  claimMaxAttempts?: number
+  refreshTimeoutMs?: number
+  signal?: AbortSignal
+  /** Defaults to `expired` or `preemptive` from the credential's expiry. */
+  reason?: RefreshReason
+}
+
 export async function refreshAnthropicToken(
   credentials: OAuthCredentials,
-  optionsOrSignal:
-    | AbortSignal
-    | {
-        claimMaxAttempts?: number
-        refreshTimeoutMs?: number
-        signal?: AbortSignal
-      } = {},
+  optionsOrSignal: AbortSignal | RefreshAnthropicTokenOptions = {},
 ): Promise<OAuthCredentials> {
   const options =
     optionsOrSignal instanceof AbortSignal
       ? { signal: optionsOrSignal }
       : optionsOrSignal
+  const reason =
+    options.reason ??
+    (typeof credentials.expires === 'number' &&
+    credentials.expires <= Date.now()
+      ? 'expired'
+      : 'preemptive')
+  return withAuthSpan(
+    'auth.refresh',
+    {
+      'auth.reason': reason,
+      // Replaced by the store id once the account is known; a fingerprint
+      // prefix is all that identifies a credential the store has never seen.
+      'auth.account': tokenFingerprint(credentials.refresh).slice(0, 8),
+    },
+    async (span) => {
+      try {
+        const rotated = await performAnthropicRefresh(
+          credentials,
+          options,
+          span,
+        )
+        span.setAttributes({ 'auth.outcome': 'ok' })
+        return rotated
+      } catch (error) {
+        if (span.attrs['auth.outcome'] === undefined) {
+          span.setAttributes({ 'auth.outcome': classifyRefreshFailure(error) })
+        }
+        span.setAttributes({ 'http.status': errorHttpStatus(error) })
+        throw error
+      }
+    },
+  )
+}
+
+async function performAnthropicRefresh(
+  credentials: OAuthCredentials,
+  options: RefreshAnthropicTokenOptions,
+  span: TraceSpan,
+): Promise<OAuthCredentials> {
   const signal = options.signal
   signal?.throwIfAborted()
   const refreshTimeoutMs = options.refreshTimeoutMs ?? 20_000
   if (refreshTimeoutMs >= 30_000) {
+    span.setAttributes({ 'auth.outcome': 'refused' })
     throw new Error(
       'Anthropic refresh timeout must remain below the refresh lease',
     )
@@ -148,7 +224,13 @@ export async function refreshAnthropicToken(
       credentials,
       Date.now(),
     )
-    if (adopted) return adopted
+    if (adopted) {
+      span.setAttributes({ 'auth.source': 'adopted-shared' })
+      return adopted
+    }
+  }
+  if (sharedAccount) {
+    span.setAttributes({ 'auth.account': accountSpanId(sharedAccount.id) })
   }
   const refreshExpiry =
     sharedAccount?.credential.type === 'oauth'
@@ -180,6 +262,7 @@ export async function refreshAnthropicToken(
           accountId: sharedAccount.id,
           selfPid: process.pid,
         })
+        span.setAttributes({ 'auth.source': 'adopted-peer' })
         return {
           refresh: claim.credential.refresh,
           access: claim.credential.access,
@@ -192,11 +275,13 @@ export async function refreshAnthropicToken(
           accountId: sharedAccount.id,
           selfPid: process.pid,
         })
+        span.setAttributes({ 'auth.outcome': 'revoked' })
         throw new Error(
           `Anthropic account ${sharedAccount.id} has a revoked refresh token; re-login is required`,
         )
       }
       if (claim.status === 'unknown-account') {
+        span.setAttributes({ 'auth.outcome': 'refused' })
         throw new Error('Anthropic refresh claim account disappeared')
       }
       if (attempt >= claimMaxAttempts) {
@@ -210,6 +295,10 @@ export async function refreshAnthropicToken(
             attempts: attempt + 1,
           },
         )
+        span.setAttributes({
+          'auth.outcome': 'refused',
+          'auth.claim_attempts': attempt + 1,
+        })
         throw new Error(
           'Anthropic refresh claim timed out; refresh was not attempted',
         )
@@ -277,11 +366,13 @@ export async function refreshAnthropicToken(
             return true
           })
           if (!persisted.result) {
+            span.setAttributes({ 'auth.outcome': 'refused' })
             throw new Error(
               'Anthropic native credential adoption was superseded',
             )
           }
         }
+        span.setAttributes({ 'auth.source': 'adopted-native' })
         return adopted
       }
     }
@@ -298,6 +389,7 @@ export async function refreshAnthropicToken(
           () => {},
         )
       }
+      span.setAttributes({ 'auth.outcome': 'revoked' })
       throw new Error(
         'Anthropic refresh token was revoked; re-login is required (run `/login anthropic` in Pi, or `opencode-anthropic-auth login`)',
       )
@@ -358,8 +450,10 @@ export async function refreshAnthropicToken(
           (account) => account.id === sharedAccount.id,
         )
         if (winner?.credential.type !== 'oauth') {
+          span.setAttributes({ 'auth.outcome': 'refused' })
           throw new Error('Anthropic OAuth refresh was superseded')
         }
+        span.setAttributes({ 'auth.source': 'adopted-winner' })
         return {
           refresh: winner.credential.refresh,
           access: winner.credential.access,
@@ -389,6 +483,7 @@ export async function refreshAnthropicToken(
       })
     }
 
+    span.setAttributes({ 'auth.source': 'refreshed' })
     return {
       refresh: refreshed.refresh,
       access: refreshed.access,

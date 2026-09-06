@@ -28,6 +28,7 @@ import {
   sharedCredentialIsLive,
 } from './shared-refresh.ts'
 import { streamCortexKitAnthropic } from './stream.ts'
+import { errorHttpStatus, withAuthSpan } from './trace-bridge.ts'
 
 export async function loginAnthropic(
   callbacks: OAuthLoginCallbacks,
@@ -190,11 +191,30 @@ async function currentSharedAccessToken(): Promise<string | undefined> {
 }
 
 export async function resolvePiModelCatalog(): Promise<CatalogModel[]> {
-  const resolved = await resolveAnthropicModelCatalog({
-    accessToken: await currentSharedAccessToken(),
-    fallback: FALLBACK_MODEL_CATALOG,
+  return withAuthSpan('auth.catalog', undefined, async (span) => {
+    const accessToken = await currentSharedAccessToken()
+    span.setAttributes({ 'catalog.authenticated': Boolean(accessToken) })
+    const resolved = await resolveAnthropicModelCatalog({
+      accessToken,
+      fallback: FALLBACK_MODEL_CATALOG,
+      onError: (error) => {
+        // A stale cache is served while the refresh runs in the background,
+        // so this can land after the span has ended and go unreported; the
+        // bridge never throws either way.
+        span.setAttributes({
+          'catalog.error':
+            error instanceof Error ? error.message : String(error),
+          'http.status': errorHttpStatus(error),
+        })
+      },
+    })
+    span.setAttributes({
+      'catalog.models': resolved.models.length,
+      'catalog.cached': resolved.source === 'cache',
+      'catalog.source': resolved.source,
+    })
+    return resolved.models
   })
-  return resolved.models
 }
 
 export default async function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
