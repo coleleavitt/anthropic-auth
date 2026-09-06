@@ -10,6 +10,14 @@ function userMsg(text: string): Message {
   return { role: 'user', content: text, timestamp: 0 }
 }
 
+/** Shape of the final plain-text user turn: it closes the cached prefix, so it is a text block with the breakpoint. */
+function cachedUserText(text: string) {
+  return {
+    role: 'user',
+    content: [{ type: 'text', text, cache_control: { type: 'ephemeral' } }],
+  }
+}
+
 function assistantMsg(text: string): Message {
   return {
     role: 'assistant',
@@ -143,13 +151,13 @@ describe('convertMessages — basic transforms', () => {
   test('converts user text message', async () => {
     const messages = await buildMessages([userMsg('hello world')])
     expect(messages.length).toBe(1)
-    expect(messages[0]).toEqual({ role: 'user', content: 'hello world' })
+    expect(messages[0]).toEqual(cachedUserText('hello world'))
   })
 
   test('skips empty user messages', async () => {
     const messages = await buildMessages([userMsg(''), userMsg('real message')])
     expect(messages.length).toBe(1)
-    expect(messages[0]).toEqual({ role: 'user', content: 'real message' })
+    expect(messages[0]).toEqual(cachedUserText('real message'))
   })
 
   test('converts assistant text blocks', async () => {
@@ -289,10 +297,7 @@ describe('convertMessages — basic transforms', () => {
 
   test('sanitizes surrogate pairs in text', async () => {
     const messages = await buildMessages([userMsg('hello \uD800 world')])
-    expect(messages[0]).toEqual({
-      role: 'user',
-      content: 'hello \uFFFD world',
-    })
+    expect(messages[0]).toEqual(cachedUserText('hello \uFFFD world'))
   })
 
   test('preserves valid surrogate pairs (astral characters) in text', async () => {
@@ -300,10 +305,7 @@ describe('convertMessages — basic transforms', () => {
     // surrogate pair (😀 = \uD83D\uDE00) is a single astral code point and
     // must survive unmangled.
     const messages = await buildMessages([userMsg('hi \uD83D\uDE00 there')])
-    expect(messages[0]).toEqual({
-      role: 'user',
-      content: 'hi \uD83D\uDE00 there',
-    })
+    expect(messages[0]).toEqual(cachedUserText('hi \uD83D\uDE00 there'))
   })
 
   test('sanitizes tool IDs with invalid characters', async () => {
@@ -427,6 +429,51 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
     expect(content[0]?.cache_control).toEqual({ type: 'ephemeral' })
   })
 
+  test('closes the cached prefix on a plain-text final user turn', async () => {
+    // A typed prompt or task notification arrives as string content. Without
+    // a breakpoint on it the whole conversation after the system prompt was
+    // sent uncached on every such turn.
+    const body = await buildBody(
+      [
+        userMsg('first'),
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'reply' }],
+          api: 'cortexkit-anthropic-messages',
+          provider: 'anthropic',
+          model: 'claude-fable-5-1',
+          stopReason: 'stop',
+          timestamp: 1,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
+          },
+        } as Message,
+        userMsg('<task-notification>done</task-notification>'),
+      ],
+      PI_PROMPT,
+    )
+    const last = body.messages.at(-1)
+    expect(last?.role).toBe('user')
+    const content = last?.content as Array<Record<string, unknown>>
+    expect(Array.isArray(content)).toBe(true)
+    expect(content.at(-1)).toMatchObject({
+      type: 'text',
+      text: '<task-notification>done</task-notification>',
+      cache_control: { type: 'ephemeral' },
+    })
+  })
+
   test('unshifts the documentation block onto a structured first user message', async () => {
     const body = await buildBody(
       [
@@ -481,7 +528,7 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
   test('leaves system[] and messages untouched when no prompt is set', async () => {
     const body = await buildBody([userMsg('hello')])
     expect(body.system).toHaveLength(2)
-    expect(body.messages[0]).toEqual({ role: 'user', content: 'hello' })
+    expect(body.messages[0]).toEqual(cachedUserText('hello'))
   })
 })
 

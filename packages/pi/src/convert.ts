@@ -348,6 +348,15 @@ function addEphemeralCacheControl(body: AnthropicRequestBody): void {
       if (lastBlock && typeof lastBlock === 'object') {
         lastBlock.cache_control = { type: 'ephemeral' }
       }
+    } else if (typeof content === 'string') {
+      // A plain-text user turn (a typed prompt, a task notification) must
+      // still close the cached prefix. Leaving it as a string skipped the
+      // breakpoint entirely, so every such turn re-sent the whole
+      // conversation uncached: ~300k tokens and $2-4 per one-line reply in a
+      // long session, while tool-result turns (array content) were cached.
+      message.content = [
+        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+      ]
     }
     break
   }
