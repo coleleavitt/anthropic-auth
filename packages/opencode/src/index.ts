@@ -20,7 +20,6 @@ import {
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
-  CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_HAIKU_4_5_MODEL_ID,
@@ -139,6 +138,7 @@ import {
   reorderAccountsPersistent,
   reorderSharedAccounts,
   resolveClaudeCodeIdentity,
+  resolveClaudeFableMythos5Pricing,
   revokeClaudeOAuthToken,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
@@ -794,12 +794,14 @@ function addFableMythos5Models<
           id: spec.id,
           name: spec.name,
           api: base.api ? { ...base.api, id: spec.id } : undefined,
+          // Resolved per spec id so a future 5.1 entry picks up its cheaper
+          // cache-read tier instead of inheriting the 5.0 rate.
           cost: {
-            input: CLAUDE_FABLE_MYTHOS_5_PRICING.input,
-            output: CLAUDE_FABLE_MYTHOS_5_PRICING.output,
+            input: resolveClaudeFableMythos5Pricing(spec.id).input,
+            output: resolveClaudeFableMythos5Pricing(spec.id).output,
             cache: {
-              read: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheRead,
-              write: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheWrite5m,
+              read: resolveClaudeFableMythos5Pricing(spec.id).cacheRead,
+              write: resolveClaudeFableMythos5Pricing(spec.id).cacheWrite5m,
             },
           },
           limit: {

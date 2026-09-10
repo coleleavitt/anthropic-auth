@@ -10,6 +10,7 @@ import {
   modelSupportsAdaptiveThinking,
   modelSupportsMaxEffort,
   modelSupportsXhighEffort,
+  resolveClaudeFableMythos5Pricing,
   resolveThinkingShape,
 } from '../models'
 
@@ -252,5 +253,70 @@ describe('modelAllowsForcedManualThinking', () => {
     expect(modelAllowsForcedManualThinking('claude-sonnet-4-6')).toBe(true)
     expect(modelAllowsForcedManualThinking('claude-opus-4-7')).toBe(false)
     expect(modelAllowsForcedManualThinking('claude-opus-5')).toBe(false)
+  })
+})
+
+describe('claude-mythos-5 capability regression', () => {
+  // Mythos 5's baked-catalog entry ships `capabilities: []`, which reads like a
+  // denial. Claude Code hardcodes it as adaptive/effort-capable anyway, and its
+  // catalog lookup returns "unknown" (not false) for an absent capability. These
+  // assertions exist so nobody "corrects" mythos-5 to non-adaptive later.
+  test('is adaptive despite an empty catalog capability list', () => {
+    expect(modelSupportsAdaptiveThinking('claude-mythos-5')).toBe(true)
+    expect(modelSupportsMaxEffort('claude-mythos-5')).toBe(true)
+    expect(modelSupportsXhighEffort('claude-mythos-5')).toBe(true)
+    expect(resolveThinkingShape('claude-mythos-5', {})).toBe('adaptive')
+  })
+
+  test('is never forced back to a manual budget', () => {
+    // Only Opus 4.6 / Sonnet 4.6 accept the deprecated budget shape.
+    expect(modelAllowsForcedManualThinking('claude-mythos-5')).toBe(false)
+    expect(
+      resolveThinkingShape('claude-mythos-5', {
+        CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
+      }),
+    ).toBe('adaptive')
+  })
+
+  test('mythos 5.1 matches mythos 5', () => {
+    expect(modelSupportsAdaptiveThinking('claude-mythos-5-1')).toBe(true)
+    expect(modelSupportsXhighEffort('claude-mythos-5-1')).toBe(true)
+  })
+})
+
+describe('Fable/Mythos 5.1 cache-read pricing', () => {
+  // Ground truth: Claude Code 2.1.260 catalog maps 5.0 to tier_10_50
+  // (cache read $1.00) and 5.1 to tier_10_50_cache_read_0_25 ($0.25).
+  test('5.0 keeps the $1.00 cache-read rate', () => {
+    for (const id of ['claude-fable-5', 'claude-mythos-5']) {
+      expect(resolveClaudeFableMythos5Pricing(id).cacheRead).toBe(1)
+    }
+  })
+
+  test('5.1 uses the cheaper $0.25 cache-read rate', () => {
+    for (const id of ['claude-fable-5-1', 'claude-mythos-5-1']) {
+      expect(resolveClaudeFableMythos5Pricing(id).cacheRead).toBe(0.25)
+    }
+  })
+
+  test('only cache-read differs between the tiers', () => {
+    const five = resolveClaudeFableMythos5Pricing('claude-fable-5')
+    const fiveOne = resolveClaudeFableMythos5Pricing('claude-fable-5-1')
+    expect(fiveOne.input).toBe(five.input)
+    expect(fiveOne.output).toBe(five.output)
+    expect(fiveOne.cacheWrite5m).toBe(five.cacheWrite5m)
+    expect(fiveOne.cacheWrite1h).toBe(five.cacheWrite1h)
+  })
+
+  test('a dated 5.1 snapshot still resolves to the 5.1 tier', () => {
+    expect(
+      resolveClaudeFableMythos5Pricing('claude-fable-5-1-20260601').cacheRead,
+    ).toBe(0.25)
+  })
+
+  test('does not mistake a dated 5.0 snapshot for 5.1', () => {
+    expect(
+      resolveClaudeFableMythos5Pricing('claude-fable-5-20260609').cacheRead,
+    ).toBe(1)
   })
 })

@@ -6,9 +6,9 @@ import { dirname, join } from 'node:path'
 import { getClaudeCodeUserAgent } from './claude-version.ts'
 import { OAUTH_BETA } from './constants.ts'
 import {
-  CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_MYTHOS_5_MODEL_ID,
   isClaudeFableOrMythos5Model,
+  resolveClaudeFableMythos5Pricing,
 } from './models.ts'
 import { getSharedAccountStoreDirectory } from './shared-account-store.ts'
 
@@ -117,11 +117,13 @@ const FALLBACK_COST: ModelCost = {
 
 export function resolveModelCost(modelId: string): ModelCost {
   if (isClaudeFableOrMythos5Model(modelId)) {
+    // 5.1 point releases sit on a cheaper cache-read tier than 5.0.
+    const pricing = resolveClaudeFableMythos5Pricing(modelId)
     return {
-      input: CLAUDE_FABLE_MYTHOS_5_PRICING.input,
-      output: CLAUDE_FABLE_MYTHOS_5_PRICING.output,
-      cacheRead: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheRead,
-      cacheWrite: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheWrite5m,
+      input: pricing.input,
+      output: pricing.output,
+      cacheRead: pricing.cacheRead,
+      cacheWrite: pricing.cacheWrite5m,
     }
   }
   const exact = [...MODEL_PRICING]

@@ -40,6 +40,41 @@ export const CLAUDE_FABLE_MYTHOS_5_PRICING = {
   cacheWrite1h: 20,
 } as const
 
+/**
+ * Fable 5.1 and Mythos 5.1 share Fable/Mythos 5's input, output, and cache-write
+ * rates but sit on a cheaper cache-read tier: Claude Code's baked catalog maps
+ * `claude-fable-5`/`claude-mythos-5` to `tier_10_50` (cache read $1.00) and
+ * `claude-fable-5-1`/`claude-mythos-5-1` to `tier_10_50_cache_read_0_25`
+ * (cache read $0.25). Without this split the 5.1 models are billed at 4x their
+ * true cache-read rate in cost projections.
+ */
+export const CLAUDE_FABLE_MYTHOS_5_1_PRICING = {
+  ...CLAUDE_FABLE_MYTHOS_5_PRICING,
+  cacheRead: 0.25,
+} as const
+
+/**
+ * True for the 5.1 point releases of the Fable/Mythos families, which differ from
+ * their 5.0 counterparts only in cache-read pricing.
+ */
+export function isClaudeFableOrMythos5PointOneModel(model: unknown): boolean {
+  if (typeof model !== 'string') return false
+  const canonical = model.trim().toLowerCase()
+  return CLAUDE_FABLE_MYTHOS_5_MODEL_IDS.some(
+    (id) => canonical === `${id}-1` || canonical.startsWith(`${id}-1-`),
+  )
+}
+
+/**
+ * Cache-read-accurate pricing for any Fable/Mythos model, selecting the 5.1 tier
+ * when the id is a 5.1 point release.
+ */
+export function resolveClaudeFableMythos5Pricing(model: unknown) {
+  return isClaudeFableOrMythos5PointOneModel(model)
+    ? CLAUDE_FABLE_MYTHOS_5_1_PRICING
+    : CLAUDE_FABLE_MYTHOS_5_PRICING
+}
+
 export const CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW = 1_000_000
 export const CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS = 128_000
 export const CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE = '2026-06-09'
@@ -59,6 +94,16 @@ export const CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS: Record<
   },
 }
 
+/**
+ * NOTE ON `claude-mythos-5`: its entry in Claude Code's baked model catalog ships
+ * `capabilities: []`, which looks like it denies adaptive thinking. It does not.
+ * The catalog lookup returns `undefined` ("unknown"), never `false`, for a
+ * capability that is merely absent, and Claude Code additionally hardcodes
+ * `|| canonical === "claude-mythos-5"` into its `adaptive_thinking`, `effort`,
+ * `max_effort`, and `xhigh_effort` predicates precisely because the catalog entry
+ * is empty. Mythos 5 is adaptive and effort-capable, and (like Fable) it rejects
+ * `{type:"disabled"}`, so treating it as adaptive here is correct.
+ */
 export function isClaudeFableOrMythos5Model(model: unknown) {
   return (
     typeof model === 'string' &&
