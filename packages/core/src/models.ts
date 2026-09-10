@@ -133,16 +133,130 @@ const NON_ADAPTIVE_THINKING_MODEL_IDS = new Set([
   'claude-haiku-4-5',
 ])
 
-export function modelSupportsAdaptiveThinking(model: unknown): boolean {
-  if (typeof model !== 'string') return false
-  // Strip a trailing 8-digit or @date version suffix to get the canonical id.
-  const canonical = model
+/**
+ * Canonical model id: strips a trailing `-YYYYMMDD` / `@YYYYMMDD` snapshot suffix
+ * and the `[1m]` context marker, matching Claude Code's `getCanonicalName`.
+ */
+const CANONICAL_CLAUDE_FAMILY_MATCHERS: ReadonlyArray<
+  readonly [needle: RegExp, canonical: string]
+> = [
+  [/claude-opus-4-8/, 'claude-opus-4-8'],
+  [/claude-opus-4-7/, 'claude-opus-4-7'],
+  [/claude-opus-4-6/, 'claude-opus-4-6'],
+  [/claude-opus-4-5/, 'claude-opus-4-5'],
+  [/claude-opus-4-1/, 'claude-opus-4-1'],
+  [/claude-opus-4(?!-\d(?!\d))/, 'claude-opus-4-0'],
+  [/claude-sonnet-4-6/, 'claude-sonnet-4-6'],
+  [/claude-sonnet-4-5/, 'claude-sonnet-4-5'],
+  [/claude-sonnet-4(?!-\d(?!\d))/, 'claude-sonnet-4-0'],
+  [/claude-haiku-4-5/, 'claude-haiku-4-5'],
+  [/claude-3-7-sonnet/, 'claude-3-7-sonnet'],
+  [/claude-3-5-sonnet/, 'claude-3-5-sonnet'],
+  [/claude-3-5-haiku/, 'claude-3-5-haiku'],
+  [/claude-3-opus/, 'claude-3-opus'],
+  [/claude-3-sonnet/, 'claude-3-sonnet'],
+  [/claude-3-haiku/, 'claude-3-haiku'],
+]
+
+export function canonicalClaudeModelId(model: string): string {
+  const normalized = model
     .trim()
     .toLowerCase()
-    .replace(/[-@]\d{8}$/, '')
+    .replace(/\[1m\]/gi, '')
+  for (const [needle, canonical] of CANONICAL_CLAUDE_FAMILY_MATCHERS) {
+    if (needle.test(normalized)) return canonical
+  }
+  return normalized.replace(/[-@]\d{8}$/, '')
+}
+
+function isFirstPartyClaudeId(canonical: string): boolean {
+  return canonical.startsWith('claude-') || canonical.startsWith('anthropic')
+}
+
+export function modelSupportsAdaptiveThinking(model: unknown): boolean {
+  if (typeof model !== 'string') return false
+  const canonical = canonicalClaudeModelId(model)
   if (canonical.startsWith('claude-3-')) return false
   if (NON_ADAPTIVE_THINKING_MODEL_IDS.has(canonical)) return false
-  return canonical.startsWith('claude-') || canonical.startsWith('anthropic')
+  return isFirstPartyClaudeId(canonical)
+}
+
+/**
+ * `output_config.effort: "max"` support. Mirrors Claude Code's `N5$`, which shares
+ * the adaptive-thinking split exactly: every model that supports adaptive thinking
+ * also accepts `max` effort.
+ */
+export function modelSupportsMaxEffort(model: unknown): boolean {
+  return modelSupportsAdaptiveThinking(model)
+}
+
+/**
+ * `output_config.effort: "xhigh"` support. Mirrors Claude Code's `E5$`, which is
+ * STRICTLY NARROWER than adaptive/max support: Opus 4.6 and Sonnet 4.6 are adaptive
+ * and take `max`, but do NOT accept `xhigh`. Claude Code downgrades an unsupported
+ * `xhigh` to `high` rather than sending it.
+ */
+const NON_XHIGH_EFFORT_MODEL_IDS = new Set([
+  ...NON_ADAPTIVE_THINKING_MODEL_IDS,
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+])
+
+export function modelSupportsXhighEffort(model: unknown): boolean {
+  if (typeof model !== 'string') return false
+  const canonical = canonicalClaudeModelId(model)
+  if (canonical.startsWith('claude-3-')) return false
+  if (NON_XHIGH_EFFORT_MODEL_IDS.has(canonical)) return false
+  return isFirstPartyClaudeId(canonical)
+}
+
+/**
+ * Downgrade an effort level the target model cannot serve, exactly as Claude Code
+ * does before sending (`max`/`xhigh` → `high`). Sending an unsupported level is a
+ * request-shaping error, so it is corrected rather than passed through.
+ */
+export function clampEffortForModel(effort: string, model: unknown): string {
+  if (effort === 'max' && !modelSupportsMaxEffort(model)) return 'high'
+  if (effort === 'xhigh' && !modelSupportsXhighEffort(model)) return 'high'
+  return effort
+}
+
+/**
+ * Models where adaptive thinking can be forced back to a manual token budget.
+ * Mirrors Claude Code's `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING` gate, which is
+ * deliberately limited to Opus 4.6 and Sonnet 4.6: those two still ACCEPT the
+ * deprecated `{type:"enabled",budget_tokens}` shape (the SDK only logs a
+ * deprecation warning), whereas Opus 4.7 and newer hard-reject `budget_tokens`
+ * with a 400. Forcing a manual budget on anything else would break the request,
+ * so the escape hatch must not apply to other models.
+ */
+const FORCIBLE_MANUAL_THINKING_MODEL_IDS = new Set([
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+])
+
+export function modelAllowsForcedManualThinking(model: unknown): boolean {
+  if (typeof model !== 'string') return false
+  return FORCIBLE_MANUAL_THINKING_MODEL_IDS.has(canonicalClaudeModelId(model))
+}
+
+/**
+ * Resolves the thinking shape for a model, honoring the opt-in
+ * `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING` escape hatch. Returns `'adaptive'` for
+ * models on the adaptive contract and `'budget'` for the legacy manual-budget
+ * families. The escape hatch downgrades ONLY the two models that still accept a
+ * manual budget; it is ignored everywhere else so it cannot produce a 400.
+ */
+export function resolveThinkingShape(
+  model: unknown,
+  env: Record<string, string | undefined> = process.env,
+): 'adaptive' | 'budget' {
+  if (!modelSupportsAdaptiveThinking(model)) return 'budget'
+  const flag = env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING?.trim().toLowerCase()
+  const disabled =
+    flag === '1' || flag === 'true' || flag === 'yes' || flag === 'on'
+  if (disabled && modelAllowsForcedManualThinking(model)) return 'budget'
+  return 'adaptive'
 }
 
 export function isOpenAIReasoningSignature(value: unknown): boolean {

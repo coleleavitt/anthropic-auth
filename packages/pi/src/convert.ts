@@ -8,13 +8,14 @@ import {
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
+  clampEffortForModel,
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
-  modelSupportsAdaptiveThinking,
   orderClaudeCodeBody,
+  resolveThinkingShape,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -526,19 +527,35 @@ export async function buildAnthropicRequest(
   // thinking-disabled, so there is no disable case here (see transform.ts for
   // the raw-body path). The 5-series families ref their own per-family constant
   // so a future divergence only changes that constant, not this call site.
-  const isAdaptiveThinking = modelSupportsAdaptiveThinking(modelId)
+  //
+  // Opus 4.6 and Sonnet 4.6 can be forced back to a manual budget with
+  // CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING because they still accept the
+  // deprecated shape; newer models reject budget_tokens, so the escape hatch is
+  // ignored for them.
+  const isAdaptiveThinking = resolveThinkingShape(modelId) === 'adaptive'
   if (isFableOrMythos5) {
     body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
   } else if (isSonnet5) {
     body.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
   } else if (isOpus5) {
     body.thinking = { ...CLAUDE_OPUS_5_ADAPTIVE_THINKING }
-  } else if (isAdaptiveThinking) {
-    body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
   }
+  // NOTE: adaptive non-5 models (Opus 4.6/4.7/4.8, Sonnet 4.6) are deliberately
+  // NOT force-injected here. On those models omitting `thinking` means thinking
+  // is OFF, so injecting it would silently enable (and bill for) reasoning the
+  // caller never requested. They only get a thinking field when the caller sets
+  // `reasoning`, which is handled below. The 5-series is different: thinking is
+  // on by default there, so the injection above only opts `display` back in.
 
   if (options?.reasoning) {
     if (isAdaptiveThinking) {
+      // Adaptive non-5 models have thinking OFF unless a thinking field is sent,
+      // so an explicit `reasoning` request must turn it on. `display:"summarized"`
+      // keeps reasoning text visible on the models that default it to "omitted".
+      // The 5-series already got its per-family constant above; don't overwrite it.
+      if (!isFableOrMythos5 && !isSonnet5 && !isOpus5) {
+        body.thinking = { type: 'adaptive', display: 'summarized' }
+      }
       // Pi's `minimal` is not in Anthropic's effort enum (low/medium/high/xhigh/max) — 400s if passed through.
       const effortByReasoning: Record<string, string> = {
         minimal: 'low',
@@ -548,8 +565,14 @@ export async function buildAnthropicRequest(
         xhigh: 'xhigh',
         max: 'max',
       }
+      // Opus 4.6 and Sonnet 4.6 are adaptive and accept `max`, but NOT `xhigh`.
+      // Claude Code downgrades an unsupported level to `high` instead of sending
+      // it, so mirror that rather than letting the API reject the request.
       body.output_config = {
-        effort: effortByReasoning[options.reasoning] ?? 'medium',
+        effort: clampEffortForModel(
+          effortByReasoning[options.reasoning] ?? 'medium',
+          modelId,
+        ),
       }
     } else {
       // Legacy models (Opus 4.5-, Sonnet 4.5-, Haiku 4.5, Claude 3.x) still use

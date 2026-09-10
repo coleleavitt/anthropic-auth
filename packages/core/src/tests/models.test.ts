@@ -2,9 +2,15 @@ import { describe, expect, test } from 'bun:test'
 import {
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_MODEL_ID,
+  canonicalClaudeModelId,
+  clampEffortForModel,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
+  modelAllowsForcedManualThinking,
   modelSupportsAdaptiveThinking,
+  modelSupportsMaxEffort,
+  modelSupportsXhighEffort,
+  resolveThinkingShape,
 } from '../models'
 
 describe('isClaudeSonnet5Model', () => {
@@ -124,5 +130,127 @@ describe('modelSupportsAdaptiveThinking', () => {
     expect(modelSupportsAdaptiveThinking(undefined)).toBe(false)
     expect(modelSupportsAdaptiveThinking(42)).toBe(false)
     expect(modelSupportsAdaptiveThinking('gpt-5')).toBe(false)
+  })
+})
+
+describe('canonicalClaudeModelId', () => {
+  test('strips a dated snapshot suffix', () => {
+    expect(canonicalClaudeModelId('claude-opus-4-8-20260101')).toBe(
+      'claude-opus-4-8',
+    )
+    expect(canonicalClaudeModelId('claude-opus-4-8@20260101')).toBe(
+      'claude-opus-4-8',
+    )
+  })
+
+  test('strips the 1m context marker', () => {
+    expect(canonicalClaudeModelId('claude-opus-4-8[1m]')).toBe(
+      'claude-opus-4-8',
+    )
+  })
+})
+
+describe('modelSupportsXhighEffort', () => {
+  test('excludes Opus 4.6 and Sonnet 4.6 even though they are adaptive', () => {
+    // Ground truth: Claude Code's E5$ is strictly narrower than FH8/N5$.
+    for (const id of ['claude-opus-4-6', 'claude-sonnet-4-6']) {
+      expect(modelSupportsAdaptiveThinking(id)).toBe(true)
+      expect(modelSupportsMaxEffort(id)).toBe(true)
+      expect(modelSupportsXhighEffort(id)).toBe(false)
+    }
+  })
+
+  test.each([
+    'claude-opus-4-7',
+    'claude-opus-4-8',
+    'claude-opus-5',
+    'claude-sonnet-5',
+    'claude-fable-5',
+  ])('allows xhigh on %s', (id) => {
+    expect(modelSupportsXhighEffort(id)).toBe(true)
+  })
+
+  test('excludes the legacy manual-budget families', () => {
+    expect(modelSupportsXhighEffort('claude-opus-4-5')).toBe(false)
+    expect(modelSupportsXhighEffort('claude-haiku-4-5')).toBe(false)
+    expect(modelSupportsXhighEffort('claude-3-opus')).toBe(false)
+  })
+})
+
+describe('clampEffortForModel', () => {
+  test('downgrades xhigh to high on Opus 4.6 / Sonnet 4.6', () => {
+    expect(clampEffortForModel('xhigh', 'claude-opus-4-6')).toBe('high')
+    expect(clampEffortForModel('xhigh', 'claude-sonnet-4-6')).toBe('high')
+  })
+
+  test('keeps max on Opus 4.6 (max_effort is supported)', () => {
+    expect(clampEffortForModel('max', 'claude-opus-4-6')).toBe('max')
+  })
+
+  test('keeps xhigh and max on Opus 4.7+', () => {
+    expect(clampEffortForModel('xhigh', 'claude-opus-4-7')).toBe('xhigh')
+    expect(clampEffortForModel('max', 'claude-opus-5')).toBe('max')
+  })
+
+  test('downgrades both on legacy models', () => {
+    expect(clampEffortForModel('xhigh', 'claude-opus-4-5')).toBe('high')
+    expect(clampEffortForModel('max', 'claude-opus-4-5')).toBe('high')
+  })
+
+  test('leaves ordinary levels untouched', () => {
+    expect(clampEffortForModel('low', 'claude-opus-4-6')).toBe('low')
+    expect(clampEffortForModel('high', 'claude-opus-4-5')).toBe('high')
+  })
+})
+
+describe('resolveThinkingShape', () => {
+  test('is adaptive by default for adaptive models', () => {
+    expect(resolveThinkingShape('claude-opus-4-6', {})).toBe('adaptive')
+    expect(resolveThinkingShape('claude-opus-4-8', {})).toBe('adaptive')
+  })
+
+  test('is budget for legacy models regardless of the flag', () => {
+    expect(resolveThinkingShape('claude-opus-4-5', {})).toBe('budget')
+    expect(
+      resolveThinkingShape('claude-opus-4-5', {
+        CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
+      }),
+    ).toBe('budget')
+  })
+
+  test('the escape hatch forces a manual budget only on 4.6 models', () => {
+    const env = { CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1' }
+    expect(resolveThinkingShape('claude-opus-4-6', env)).toBe('budget')
+    expect(resolveThinkingShape('claude-sonnet-4-6', env)).toBe('budget')
+    // Opus 4.7+ hard-rejects budget_tokens, so the hatch must be ignored.
+    expect(resolveThinkingShape('claude-opus-4-7', env)).toBe('adaptive')
+    expect(resolveThinkingShape('claude-opus-4-8', env)).toBe('adaptive')
+    expect(resolveThinkingShape('claude-opus-5', env)).toBe('adaptive')
+  })
+
+  test('accepts the documented truthy spellings', () => {
+    for (const value of ['1', 'true', 'yes', 'on', 'TRUE']) {
+      expect(
+        resolveThinkingShape('claude-opus-4-6', {
+          CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: value,
+        }),
+      ).toBe('budget')
+    }
+    for (const value of ['0', 'false', '', 'off']) {
+      expect(
+        resolveThinkingShape('claude-opus-4-6', {
+          CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: value,
+        }),
+      ).toBe('adaptive')
+    }
+  })
+})
+
+describe('modelAllowsForcedManualThinking', () => {
+  test('is limited to the two deprecated-but-accepted models', () => {
+    expect(modelAllowsForcedManualThinking('claude-opus-4-6')).toBe(true)
+    expect(modelAllowsForcedManualThinking('claude-sonnet-4-6')).toBe(true)
+    expect(modelAllowsForcedManualThinking('claude-opus-4-7')).toBe(false)
+    expect(modelAllowsForcedManualThinking('claude-opus-5')).toBe(false)
   })
 })

@@ -571,6 +571,80 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
     expect(body.output_config).toEqual({ effort: 'high' })
   })
 
+  test('does not enable thinking on adaptive non-5 models without reasoning', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-4-8',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    // On Opus 4.6/4.7/4.8 and Sonnet 4.6, omitting `thinking` means thinking is
+    // OFF. Injecting it would silently enable and bill reasoning the caller never
+    // requested, so the field must stay absent.
+    expect(body.thinking).toBeUndefined()
+    expect(body.output_config).toBeUndefined()
+  })
+
+  test('downgrades xhigh effort to high on Opus 4.6 (no xhigh support)', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-4-6',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'xhigh' } as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('keeps max effort on Opus 4.6 (max_effort is supported)', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-4-6',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'max' } as any,
+      defaultCache,
+    )
+
+    expect(body.output_config).toEqual({ effort: 'max' })
+  })
+
+  test('keeps xhigh effort on Opus 4.7', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-4-7',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'xhigh' } as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'xhigh' })
+  })
+
+  test('never sends budget_tokens to an adaptive model', async () => {
+    for (const model of [
+      'claude-opus-4-6',
+      'claude-opus-4-7',
+      'claude-opus-4-8',
+      'claude-sonnet-4-6',
+    ]) {
+      const { body } = await buildAnthropicRequest(
+        model,
+        {
+          messages: [userMsg('hello')],
+          systemPrompt: 'test',
+          tools: [],
+        } as any,
+        { reasoning: 'high' } as any,
+        defaultCache,
+      )
+      expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+      expect(
+        (body.thinking as Record<string, unknown>).budget_tokens,
+      ).toBeUndefined()
+    }
+  })
+
   test('clamps manual thinking budget below max_tokens for legacy models', async () => {
     const { body } = await buildAnthropicRequest(
       'claude-opus-4-5',
