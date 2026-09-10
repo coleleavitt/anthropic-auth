@@ -108,6 +108,43 @@ export function isClaudeOpus5Model(model: unknown) {
   )
 }
 
+/**
+ * Models that use adaptive thinking (`{type:"adaptive"}` + `output_config.effort`)
+ * rather than the legacy `{type:"enabled", budget_tokens:N}` shape. Mirrors Claude
+ * Code 2.1.260's model capability catalog and the 2.1.137 `FH8` predicate: adaptive
+ * thinking is the default for first-party models, with an explicit deny list for the
+ * older families that only accept manual token budgets.
+ *
+ * Sending `budget_tokens` to an adaptive-only model 400s (hard rejection on Opus 4.7+),
+ * and adaptive models pair thinking depth with `effort`, not a token budget. Fable/
+ * Mythos 5, Sonnet 5, and Opus 5 are covered by their own predicates but are adaptive
+ * too, so this returns true for them as well.
+ *
+ * The deny list is matched on the canonical (date-suffix-stripped) model id:
+ * `claude-3-*`, `claude-opus-4-0/4-1/4-5`, `claude-sonnet-4-0/4-5`, `claude-haiku-4-5`.
+ * Everything else (Opus 4.6/4.7/4.8, Sonnet 4.6, all 5-series) is adaptive.
+ */
+const NON_ADAPTIVE_THINKING_MODEL_IDS = new Set([
+  'claude-opus-4-0',
+  'claude-opus-4-1',
+  'claude-opus-4-5',
+  'claude-sonnet-4-0',
+  'claude-sonnet-4-5',
+  'claude-haiku-4-5',
+])
+
+export function modelSupportsAdaptiveThinking(model: unknown): boolean {
+  if (typeof model !== 'string') return false
+  // Strip a trailing 8-digit or @date version suffix to get the canonical id.
+  const canonical = model
+    .trim()
+    .toLowerCase()
+    .replace(/[-@]\d{8}$/, '')
+  if (canonical.startsWith('claude-3-')) return false
+  if (NON_ADAPTIVE_THINKING_MODEL_IDS.has(canonical)) return false
+  return canonical.startsWith('claude-') || canonical.startsWith('anthropic')
+}
+
 export function isOpenAIReasoningSignature(value: unknown): boolean {
   if (typeof value !== 'string') return false
   if (value.startsWith('gAAAA')) return true

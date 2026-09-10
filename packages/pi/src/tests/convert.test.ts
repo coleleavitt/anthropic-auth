@@ -557,7 +557,7 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
     expect(body.output_config).toBeUndefined()
   })
 
-  test('keeps manual thinking budgets for non-Fable models', async () => {
+  test('uses adaptive thinking + effort for adaptive non-5 models (Opus 4.8)', async () => {
     const { body } = await buildAnthropicRequest(
       'claude-opus-4-8',
       { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
@@ -565,8 +565,28 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
       defaultCache,
     )
 
+    // Opus 4.8 supports adaptive thinking, so it must NOT get budget_tokens
+    // (Opus 4.7+ 400s if budget_tokens is sent) — it uses effort instead.
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('clamps manual thinking budget below max_tokens for legacy models', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-4-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'high' } as any,
+      defaultCache,
+    )
+
+    // Legacy models use manual budgets, but the requested 20480 exceeds the
+    // default 16384 max_tokens; Anthropic requires budget < max_tokens, so it
+    // is clamped to max_tokens - 1 exactly as Claude Code does.
     expect(body.output_config).toBeUndefined()
-    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 20_480 })
+    expect(body.thinking).toEqual({
+      type: 'enabled',
+      budget_tokens: body.max_tokens - 1,
+    })
   })
 })
 
@@ -653,16 +673,18 @@ describe('buildAnthropicRequest — Opus 5 thinking', () => {
     expect(body.output_config).toEqual({ effort: 'low' })
   })
 
-  test('keeps manual thinking budgets for non-Opus5 models', async () => {
+  test('keeps manual thinking budgets for legacy non-adaptive models', async () => {
     const { body } = await buildAnthropicRequest(
-      'claude-opus-4-8',
+      'claude-sonnet-4-5',
       { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
-      { reasoning: 'high' } as any,
+      { reasoning: 'low' } as any,
       defaultCache,
     )
 
+    // Sonnet 4.5 is not adaptive: it uses a manual budget. 4096 (low) fits under
+    // the default max_tokens, so it passes through unclamped.
     expect(body.output_config).toBeUndefined()
-    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 20_480 })
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 4096 })
   })
 })
 

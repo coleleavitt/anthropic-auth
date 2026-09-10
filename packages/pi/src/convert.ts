@@ -13,6 +13,7 @@ import {
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
+  modelSupportsAdaptiveThinking,
   orderClaudeCodeBody,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
@@ -513,23 +514,31 @@ export async function buildAnthropicRequest(
   const isFableOrMythos5 = isClaudeFableOrMythos5Model(modelId)
   const isSonnet5 = isClaudeSonnet5Model(modelId)
   const isOpus5 = isClaudeOpus5Model(modelId)
-  // Sonnet 5 and Opus 5 share Fable/Mythos's adaptive-summarized contract: make
-  // adaptive thinking visible (display defaults to "omitted") and map reasoning
-  // to output_config effort. Pi's typed options cannot express
+  // Adaptive thinking is the default shape for every current first-party model
+  // except the older families (Opus 4.5 and earlier, Sonnet 4.5 and earlier,
+  // Haiku 4.5, Claude 3.x). Opus 4.6/4.7/4.8 and Sonnet 4.6 are adaptive too, so
+  // they must NOT receive a `budget_tokens` field: Opus 4.7+ hard-rejects it with
+  // a 400, and adaptive models tune thinking depth with `effort`, not a token
+  // budget. This mirrors Claude Code 2.1.260's model capability catalog.
+  //
+  // Make adaptive thinking visible (display defaults to "omitted") and map Pi's
+  // reasoning to output_config effort. Pi's typed options cannot express
   // thinking-disabled, so there is no disable case here (see transform.ts for
-  // the raw-body path). Each model refs its own per-family constant —
-  // families can diverge, so the constant rather than a shared alias keeps
-  // the call sites explicit.
+  // the raw-body path). The 5-series families ref their own per-family constant
+  // so a future divergence only changes that constant, not this call site.
+  const isAdaptiveThinking = modelSupportsAdaptiveThinking(modelId)
   if (isFableOrMythos5) {
     body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
   } else if (isSonnet5) {
     body.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
   } else if (isOpus5) {
     body.thinking = { ...CLAUDE_OPUS_5_ADAPTIVE_THINKING }
+  } else if (isAdaptiveThinking) {
+    body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
   }
 
   if (options?.reasoning) {
-    if (isFableOrMythos5 || isSonnet5 || isOpus5) {
+    if (isAdaptiveThinking) {
       // Pi's `minimal` is not in Anthropic's effort enum (low/medium/high/xhigh/max) — 400s if passed through.
       const effortByReasoning: Record<string, string> = {
         minimal: 'low',
@@ -543,6 +552,10 @@ export async function buildAnthropicRequest(
         effort: effortByReasoning[options.reasoning] ?? 'medium',
       }
     } else {
+      // Legacy models (Opus 4.5-, Sonnet 4.5-, Haiku 4.5, Claude 3.x) still use
+      // manual token budgets. Anthropic requires `budget_tokens < max_tokens`, so
+      // clamp to `max_tokens - 1` exactly as Claude Code does — otherwise a high/
+      // xhigh budget (20480/32000) exceeds the default 16384 max_tokens and 400s.
       const budgets: Record<string, number> = {
         minimal: 1024,
         low: 4096,
@@ -550,16 +563,17 @@ export async function buildAnthropicRequest(
         high: 20_480,
         xhigh: 32_000,
       }
+      const requestedBudget =
+        (
+          options.thinkingBudgets as
+            | Record<string, number | undefined>
+            | undefined
+        )?.[options.reasoning] ??
+        budgets[options.reasoning] ??
+        10_240
       body.thinking = {
         type: 'enabled',
-        budget_tokens:
-          (
-            options.thinkingBudgets as
-              | Record<string, number | undefined>
-              | undefined
-          )?.[options.reasoning] ??
-          budgets[options.reasoning] ??
-          10_240,
+        budget_tokens: Math.min(requestedBudget, body.max_tokens - 1),
       }
     }
   }

@@ -4,6 +4,7 @@ import {
   CLAUDE_OPUS_5_MODEL_ID,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
+  modelSupportsAdaptiveThinking,
 } from '../models'
 
 describe('isClaudeSonnet5Model', () => {
@@ -86,5 +87,42 @@ describe('CLAUDE_OPUS_5_ADAPTIVE_THINKING', () => {
       type: 'adaptive',
       display: 'summarized',
     })
+  })
+})
+
+describe('modelSupportsAdaptiveThinking', () => {
+  test.each([
+    'claude-opus-4-6',
+    'claude-opus-4-7',
+    'claude-opus-4-8',
+    'claude-opus-4-8-20260101',
+    'claude-opus-5',
+    'claude-sonnet-4-6',
+    'claude-sonnet-5',
+    'claude-fable-5',
+    'claude-mythos-5',
+    'claude-haiku-5',
+  ])('treats %s as adaptive', (id) => {
+    expect(modelSupportsAdaptiveThinking(id)).toBe(true)
+  })
+
+  test.each([
+    'claude-opus-4-0',
+    'claude-opus-4-1',
+    'claude-opus-4-5',
+    'claude-opus-4-5-20251101',
+    'claude-sonnet-4-0',
+    'claude-sonnet-4-5',
+    'claude-haiku-4-5',
+    'claude-3-5-sonnet',
+    'claude-3-opus',
+  ])('treats %s as non-adaptive (manual budget)', (id) => {
+    expect(modelSupportsAdaptiveThinking(id)).toBe(false)
+  })
+
+  test('rejects non-string and non-Claude input', () => {
+    expect(modelSupportsAdaptiveThinking(undefined)).toBe(false)
+    expect(modelSupportsAdaptiveThinking(42)).toBe(false)
+    expect(modelSupportsAdaptiveThinking('gpt-5')).toBe(false)
   })
 })
