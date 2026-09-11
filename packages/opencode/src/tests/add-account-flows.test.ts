@@ -5,6 +5,8 @@ import { join } from 'node:path'
 
 let tempDir: string
 let accountPath: string
+const suiteAccountFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+const suiteSharedAccountFile = process.env.ANTHROPIC_ACCOUNTS_FILE
 
 async function useTempAccountFile() {
   if (tempDir) {
@@ -13,6 +15,7 @@ async function useTempAccountFile() {
   tempDir = await mkdtemp(join(tmpdir(), 'anthropic-add-acct-'))
   accountPath = join(tempDir, 'anthropic-auth.json')
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
+  process.env.ANTHROPIC_ACCOUNTS_FILE = join(tempDir, 'accounts.json')
   const { saveAccounts } = await import('@cortexkit/anthropic-auth-core')
   await saveAccounts(
     {
@@ -109,7 +112,12 @@ beforeEach(async () => {
 afterEach(async () => {
   const { __setLogTestSink } = await import('@cortexkit/anthropic-auth-core')
   __setLogTestSink(null)
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+  if (suiteAccountFile === undefined)
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+  else process.env.OPENCODE_ANTHROPIC_AUTH_FILE = suiteAccountFile
+  if (suiteSharedAccountFile === undefined)
+    delete process.env.ANTHROPIC_ACCOUNTS_FILE
+  else process.env.ANTHROPIC_ACCOUNTS_FILE = suiteSharedAccountFile
   if (tempDir) {
     await rm(tempDir, { recursive: true, force: true }).catch(() => {})
   }
