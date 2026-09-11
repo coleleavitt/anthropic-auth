@@ -132,7 +132,8 @@ anthropic-auth/
 - `packages/opencode/src/shared-auth.ts`: Resolves canonical shared credentials, adopts legacy OpenCode auth/fallbacks, preserves API-key versus OAuth header semantics, and synchronizes token rotations
 - `packages/opencode/src/tui-preferences.ts`: Comment-preserving JSONC preference reads/writes plus live reload through content-checked directory events and an independent polling fallback for missed events or `fs.watch` construction failures
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
-- `packages/pi/src/stream.ts`: Pi provider streaming implementation
+- `packages/pi/src/stream.ts`: Pi provider streaming implementation, including server-side fallback opt-in/boundary preservation and structured terminal-refusal diagnostics
+- `packages/core/src/relay.ts`: Shared HTTP/WebSocket relay implementation; persistent WebSocket sends propagate caller cancellation and close fail-closed after a dispatched request is aborted because binary response frames are not request-tagged
 
 **Tests:**
 - `packages/core/src/tests/`: Core-only unit tests (dump, killswitch, models, prime, quota surfaces)

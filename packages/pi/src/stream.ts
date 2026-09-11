@@ -5,6 +5,7 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  CLAUDE_FABLE_5_MODEL_ID,
   classifyRetry,
   createEmptyStorage,
   createStickyNoRouteResponse,
@@ -22,6 +23,7 @@ import {
   isApiKeyAccount,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
+  isClaudeOpus5Model,
   isDumpPersistentlyEnabled,
   isFastModePersistentlyEnabled,
   isKillswitchEnabled,
@@ -93,6 +95,111 @@ const stickyRouters = new Map<string, StickySessionRouter>()
 const quotaManagers = new Map<string, QuotaManager>()
 const fallbackManagers = new Map<string, FallbackAccountManager>()
 const PI_SERVICE_CACHE_LIMIT = 16
+const SERVER_SIDE_FALLBACK_BETA = 'server-side-fallback-2026-07-01'
+const SERVER_FALLBACK_MARKER_TEXT = String.fromCodePoint(0x2060)
+const SERVER_FALLBACK_SIGNATURE_PREFIX = 'cortexkit-server-fallback-v1:'
+
+type ServerFallbackMarker = { fromModel: string; toModel: string }
+
+function safeFallbackModel(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 128 &&
+    /^claude-[a-z0-9-]+$/i.test(value)
+  )
+}
+
+function encodeFallbackMarker(marker: ServerFallbackMarker) {
+  return `${SERVER_FALLBACK_SIGNATURE_PREFIX}${marker.fromModel}|${marker.toModel}`
+}
+
+function decodeFallbackMarker(value: unknown): ServerFallbackMarker | null {
+  if (
+    typeof value !== 'string' ||
+    !value.startsWith(SERVER_FALLBACK_SIGNATURE_PREFIX)
+  )
+    return null
+  const encoded = value.slice(SERVER_FALLBACK_SIGNATURE_PREFIX.length)
+  const separator = encoded.indexOf('|')
+  if (separator <= 0 || separator !== encoded.lastIndexOf('|')) return null
+  const fromModel = encoded.slice(0, separator)
+  const toModel = encoded.slice(separator + 1)
+  return safeFallbackModel(fromModel) && safeFallbackModel(toModel)
+    ? { fromModel, toModel }
+    : null
+}
+
+function markerFromFallbackBlock(
+  block: Record<string, unknown>,
+): ServerFallbackMarker | null {
+  const from = block.from
+  const to = block.to
+  if (
+    block.type !== 'fallback' ||
+    !from ||
+    typeof from !== 'object' ||
+    !to ||
+    typeof to !== 'object'
+  )
+    return null
+  const fromModel = (from as Record<string, unknown>).model
+  const toModel = (to as Record<string, unknown>).model
+  return safeFallbackModel(fromModel) && safeFallbackModel(toModel)
+    ? { fromModel, toModel }
+    : null
+}
+
+function rewriteStoredFallbackMarkers(
+  body: Record<string, unknown>,
+  enabled: boolean,
+) {
+  let changed = false
+  if (!Array.isArray(body.messages)) return changed
+  for (const rawMessage of body.messages) {
+    if (!rawMessage || typeof rawMessage !== 'object') continue
+    const message = rawMessage as Record<string, unknown>
+    if (message.role !== 'assistant' || !Array.isArray(message.content))
+      continue
+    const rewritten: unknown[] = []
+    for (const rawBlock of message.content) {
+      if (!rawBlock || typeof rawBlock !== 'object') {
+        rewritten.push(rawBlock)
+        continue
+      }
+      const block = rawBlock as Record<string, unknown>
+      const isInternalMarker =
+        block.type === 'thinking' &&
+        block.thinking === SERVER_FALLBACK_MARKER_TEXT &&
+        typeof block.signature === 'string' &&
+        block.signature.startsWith(SERVER_FALLBACK_SIGNATURE_PREFIX)
+      if (!isInternalMarker) {
+        rewritten.push(rawBlock)
+        continue
+      }
+      changed = true
+      const marker = decodeFallbackMarker(block.signature)
+      if (enabled && marker) {
+        rewritten.push({
+          type: 'fallback',
+          from: { model: marker.fromModel },
+          to: { model: marker.toModel },
+        })
+      }
+    }
+    message.content = rewritten
+  }
+  return changed
+}
+
+function isServerFallbackModel(model: unknown): model is string {
+  return (
+    isClaudeOpus5Model(model) ||
+    (typeof model === 'string' &&
+      (model === CLAUDE_FABLE_5_MODEL_ID ||
+        model.startsWith(`${CLAUDE_FABLE_5_MODEL_ID}-`)))
+  )
+}
 
 function setBoundedService<T>(map: Map<string, T>, key: string, value: T) {
   map.delete(key)
@@ -230,10 +337,7 @@ function mapStopReason(reason: string | null | undefined): StopReason {
 function describeStopReasonFailure(reason: string): string {
   switch (reason) {
     case 'refusal':
-      // A >200k request on a 1M-capable model returns exactly this when
-      // `context-1m-2025-08-07` is missing — HTTP 200, no content, input
-      // billed in full. With the beta present, 510k answers normally.
-      return 'Anthropic refused this request (stop_reason: refusal). Common causes: a context over 200k without the 1M beta, or content the model declined. Note the input is billed even though no output was produced.'
+      return 'Anthropic refused this request (stop_reason: refusal). The input and any thinking or output tokens produced before the refusal are billed.'
     case 'model_context_window_exceeded':
       return 'Anthropic stopped early: the request exceeded the model context window (stop_reason: model_context_window_exceeded). Compact or split the conversation.'
     default:
@@ -392,7 +496,7 @@ async function sendAnthropicRequest(options: {
   const identity = options.accessToken
     ? await resolveClaudeCodeIdentity(options.accessToken, options.model.id)
     : undefined
-  const { body, bodyText } = await buildAnthropicRequest(
+  const builtRequest = await buildAnthropicRequest(
     options.model.id,
     options.context,
     options.streamOptions,
@@ -403,6 +507,18 @@ async function sendAnthropicRequest(options: {
     isFastModePersistentlyEnabled(storage),
     identity,
   )
+  const body = builtRequest.body
+  const serverFallbackEnabled =
+    !options.apiAccount && isServerFallbackModel(options.model.id)
+  if (serverFallbackEnabled) body.fallbacks = 'default'
+  const markersChanged = rewriteStoredFallbackMarkers(
+    body,
+    serverFallbackEnabled,
+  )
+  const bodyText =
+    serverFallbackEnabled || markersChanged
+      ? JSON.stringify(body)
+      : builtRequest.bodyText
   const fastMode = body.speed === 'fast'
   const relayAffinity = options.streamOptions?.sessionId ?? null
   const input = options.apiAccount
@@ -445,6 +561,14 @@ async function sendAnthropicRequest(options: {
           identity,
           suppressContext1m,
         })
+    if (!options.apiAccount && serverFallbackEnabled) {
+      headers.set(
+        'anthropic-beta',
+        mergeAnthropicBetas(headers.get('anthropic-beta'), [
+          SERVER_SIDE_FALLBACK_BETA,
+        ]),
+      )
+    }
     if (!options.apiAccount && fastMode) {
       headers.set(
         'anthropic-beta',
@@ -1910,12 +2034,26 @@ export function streamCortexKitAnthropic(
       })
 
       const blocks = output.content as Block[]
+      let hasCompletedToolCall = false
       for await (const event of parseSse(response)) {
         if (event.type === 'message_start') {
           updateUsage(model, output, event.message?.usage)
         } else if (event.type === 'content_block_start') {
           const block = event.content_block
-          if (block?.type === 'text') {
+          const fallbackMarker = block ? markerFromFallbackBlock(block) : null
+          if (fallbackMarker) {
+            output.content.push({
+              type: 'thinking',
+              thinking: SERVER_FALLBACK_MARKER_TEXT,
+              thinkingSignature: encodeFallbackMarker(fallbackMarker),
+              index: event.index,
+            } as Block)
+            stream.push({
+              type: 'thinking_start',
+              contentIndex: output.content.length - 1,
+              partial: output,
+            })
+          } else if (block?.type === 'text') {
             output.content.push({
               type: 'text',
               text: '',
@@ -2027,6 +2165,7 @@ export function streamCortexKitAnthropic(
               block.arguments = JSON.parse(block.partialJson ?? '{}')
             } catch {}
             delete block.partialJson
+            hasCompletedToolCall = true
             stream.push({
               type: 'toolcall_end',
               contentIndex,
@@ -2039,10 +2178,36 @@ export function streamCortexKitAnthropic(
           // absent value would report a healthy stream as a failed one.
           const rawStopReason = event.delta?.stop_reason
           if (rawStopReason) {
-            output.stopReason = mapStopReason(String(rawStopReason))
+            output.rawStopReason = String(rawStopReason)
+            ;(
+              output as AssistantMessage & { stopReasonRaw?: string }
+            ).stopReasonRaw = output.rawStopReason
+            output.stopReason =
+              output.rawStopReason === 'refusal' && hasCompletedToolCall
+                ? 'toolUse'
+                : mapStopReason(output.rawStopReason)
+            if (
+              output.rawStopReason === 'refusal' &&
+              output.stopReason === 'error'
+            ) {
+              output.diagnostics = [
+                ...(output.diagnostics ?? []),
+                {
+                  type: 'provider_stream_failure',
+                  timestamp: Date.now(),
+                  details: {
+                    kind: 'refusal',
+                    providerErrorType: 'refusal',
+                    ...(response.headers.get('request-id')
+                      ? { requestId: response.headers.get('request-id') }
+                      : {}),
+                  },
+                },
+              ]
+            }
             if (output.stopReason === 'error') {
               output.errorMessage = describeStopReasonFailure(
-                String(rawStopReason),
+                output.rawStopReason,
               )
               // `streaming response` is logged before this loop runs, so
               // without this a refused turn is indistinguishable from a served

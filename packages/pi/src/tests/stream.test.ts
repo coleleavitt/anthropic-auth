@@ -476,6 +476,8 @@ describe('Pi API fallback routing helpers', () => {
     )
 
     const authorizations: string[] = []
+    let apiBody: Record<string, unknown> | undefined
+    let apiBetas = ''
     globalThis.fetch = mock(
       (input: string | URL | Request, init?: RequestInit) => {
         const url =
@@ -509,6 +511,10 @@ describe('Pi API fallback routing helpers', () => {
         const authorization =
           new Headers(init?.headers).get('authorization') ?? ''
         authorizations.push(authorization)
+        if (authorization === 'Bearer api-key') {
+          apiBody = JSON.parse(String(init?.body))
+          apiBetas = new Headers(init?.headers).get('anthropic-beta') ?? ''
+        }
         if (authorization === 'Bearer fallback-access') {
           return Promise.resolve(new Response('exhausted', { status: 429 }))
         }
@@ -525,15 +531,61 @@ describe('Pi API fallback routing helpers', () => {
       },
     ) as unknown as typeof fetch
 
-    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
-      apiKey: 'main-access',
-      sessionId: 'ses_pi_sticky_api',
-    })
+    const markerContext = {
+      ...anthropicContext,
+      messages: [
+        ...anthropicContext.messages,
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: '\u2060',
+              thinkingSignature:
+                'cortexkit-server-fallback-v1:claude-fable-5|claude-opus-4-8',
+            },
+          ],
+          api: anthropicModel.api,
+          provider: anthropicModel.provider,
+          model: anthropicModel.id,
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
+          },
+          stopReason: 'stop',
+          timestamp: 1,
+        },
+        { role: 'user', content: 'continue', timestamp: 2 },
+      ],
+    }
+    const stream = streamCortexKitAnthropic(
+      anthropicModel,
+      markerContext as never,
+      {
+        apiKey: 'main-access',
+        sessionId: 'ses_pi_sticky_api',
+      },
+    )
     for await (const _event of stream) {
       // Drain the provider stream.
     }
 
     expect(authorizations).toEqual(['Bearer fallback-access', 'Bearer api-key'])
+    expect(apiBody?.fallbacks).toBeUndefined()
+    expect(JSON.stringify(apiBody)).not.toContain(
+      'cortexkit-server-fallback-v1:',
+    )
+    expect(apiBetas).not.toContain('server-side-fallback-2026-07-01')
   })
 
   async function streamWithMessageDelta(delta: string) {
@@ -1173,31 +1225,45 @@ describe('Pi routes from the shared account store', () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-refusal-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
 
-    globalThis.fetch = mock((input: string | URL | Request) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
-      if (!url.includes('/v1/messages')) {
-        return Promise.resolve(new Response(HEALTHY_USAGE, { status: 200 }))
-      }
-      // HTTP 200, content-free, refused — input billed, no output produced.
-      return Promise.resolve(
-        new Response(
-          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":120000,"output_tokens":0}}}\n\n' +
-            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"input_tokens":120000,"output_tokens":0}}\n\n' +
-            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-          { status: 200 },
-        ),
-      )
-    }) as unknown as typeof fetch
+    let messageCalls = 0
+    let sentBody: Record<string, unknown> | undefined
+    let sentBetas = ''
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (!url.includes('/v1/messages')) {
+          return Promise.resolve(new Response(HEALTHY_USAGE, { status: 200 }))
+        }
+        messageCalls += 1
+        sentBody = JSON.parse(String(init?.body))
+        sentBetas = new Headers(init?.headers).get('anthropic-beta') ?? ''
+        // Incident shape: the model emitted signed thinking and output before
+        // the terminal refusal, so both categories contain billable tokens.
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":120000,"output_tokens":0}}}\n\n' +
+              'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n' +
+              'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private reasoning"}}\n\n' +
+              'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed-thinking"}}\n\n' +
+              'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+              'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"input_tokens":120000,"output_tokens":37}}\n\n' +
+              'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200, headers: { 'request-id': 'req_refusal_1' } },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
 
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
       apiKey: 'main-access',
       sessionId: 'ses_pi_refusal',
-    })
+      thinking: { type: 'adaptive' },
+    } as never)
     const terminal: { type: string; message?: string }[] = []
     for await (const event of stream) {
       if (event.type === 'done' || event.type === 'error')
@@ -1210,6 +1276,161 @@ describe('Pi routes from the shared account store', () => {
 
     expect(terminal.map((entry) => entry.type)).toEqual(['error'])
     expect(terminal[0]?.message ?? '').toContain('refusal')
+    const result = await stream.result()
+    expect(result.rawStopReason).toBe('refusal')
+    expect(
+      (result as typeof result & { stopReasonRaw?: string }).stopReasonRaw,
+    ).toBe('refusal')
+    expect(result.usage.output).toBe(37)
+    expect(result.content).toContainEqual({
+      type: 'thinking',
+      thinking: 'private reasoning',
+      thinkingSignature: 'signed-thinking',
+    })
+    expect(result.diagnostics).toEqual([
+      {
+        type: 'provider_stream_failure',
+        timestamp: expect.any(Number),
+        details: {
+          kind: 'refusal',
+          providerErrorType: 'refusal',
+          requestId: 'req_refusal_1',
+        },
+      },
+    ])
+    expect(result.errorMessage).toContain('thinking or output tokens')
+    expect(result.errorMessage).not.toContain('1M beta')
+    expect(messageCalls).toBe(1)
+    expect(sentBody?.fallbacks).toBe('default')
+    expect(sentBetas.split(',')).toContain('server-side-fallback-2026-07-01')
+  })
+
+  test('persists a server fallback boundary and restores it on the next request', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-fallback-boundary-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+
+    const requestBodies: Array<Record<string, unknown>> = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (!url.includes('/v1/messages'))
+          return Promise.resolve(new Response(HEALTHY_USAGE, { status: 200 }))
+        requestBodies.push(JSON.parse(String(init?.body)))
+        const boundary =
+          requestBodies.length === 1
+            ? 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"}}}\n\n' +
+              'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+            : ''
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n' +
+              boundary +
+              'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n' +
+              'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const first = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_fallback_boundary',
+    })
+    for await (const _event of first) {
+    }
+    const firstResult = await first.result()
+    expect(firstResult.content).toContainEqual({
+      type: 'thinking',
+      thinking: '\u2060',
+      thinkingSignature:
+        'cortexkit-server-fallback-v1:claude-fable-5|claude-opus-4-8',
+    })
+
+    const nextContext = {
+      ...anthropicContext,
+      messages: [
+        ...anthropicContext.messages,
+        firstResult,
+        { role: 'user', content: 'continue', timestamp: 1 },
+      ],
+    }
+    const second = streamCortexKitAnthropic(anthropicModel, nextContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_fallback_boundary',
+    })
+    for await (const _event of second) {
+    }
+
+    const secondMessages = requestBodies[1]?.messages
+    expect(Array.isArray(secondMessages)).toBe(true)
+    const assistant = (secondMessages as Array<Record<string, unknown>>).find(
+      (message) => message.role === 'assistant',
+    )
+    expect(assistant?.content).toContainEqual({
+      type: 'fallback',
+      from: { model: 'claude-fable-5' },
+      to: { model: 'claude-opus-4-8' },
+    })
+    expect(assistant?.content).not.toContainEqual(
+      expect.objectContaining({
+        signature: expect.stringContaining('cortexkit-server-fallback-v1:'),
+      }),
+    )
+    expect(requestBodies).toHaveLength(2)
+  })
+
+  test('preserves a completed tool call when a fallback turn later refuses', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-fallback-tool-refusal-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      if (!url.includes('/v1/messages'))
+        return Promise.resolve(new Response(HEALTHY_USAGE, { status: 200 }))
+      return Promise.resolve(
+        new Response(
+          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n' +
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}\n\n' +
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\"}"}}\n\n' +
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":1}}\n\n' +
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_tool_refusal',
+    })
+    const terminal: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminal.push(event.type)
+    }
+    const result = await stream.result()
+    expect(terminal).toEqual(['done'])
+    expect(result.stopReason).toBe('toolUse')
+    expect(result.rawStopReason).toBe('refusal')
+    expect(result.diagnostics).toBeUndefined()
+    expect(result.content).toContainEqual({
+      type: 'toolCall',
+      id: 'toolu_1',
+      name: 'Read',
+      arguments: { path: 'README.md' },
+    })
   })
 
   test('leaves routing untouched when the shared store is empty', async () => {

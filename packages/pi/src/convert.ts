@@ -68,6 +68,7 @@ export type AnthropicRequestBody = {
     | { type: 'adaptive'; display: 'summarized' }
   output_config?: { effort: string }
   cache_control?: { type: 'ephemeral' }
+  fallbacks?: 'default'
   speed?: 'fast'
 }
 

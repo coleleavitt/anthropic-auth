@@ -116,6 +116,39 @@ class RelayWebSocketConnectionResetError extends Error {
   }
 }
 
+function abortReason(signal: AbortSignal): unknown {
+  return (
+    signal.reason ??
+    new DOMException('This operation was aborted', 'AbortError')
+  )
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal)
+}
+
+function raceWithAbort<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(abortReason(signal))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal))
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      },
+    )
+  })
+}
+
 const sessionState = new Map<string, RelaySessionState>()
 const websocketSessions = new Map<string, PersistentRelaySession>()
 const loggedRelayConfigMessages = new Set<string>()
@@ -502,6 +535,9 @@ type RelayTimerImplementations = {
 
 type PendingWebSocketRequest = {
   payload: RelayPayload
+  signal?: AbortSignal
+  abortListener?: () => void
+  aborted?: boolean
   bodyText: string
   resolve: (response: Response) => void
   reject: (error: unknown) => void
@@ -563,6 +599,7 @@ class PersistentRelaySession {
     bodyText: string,
     optimisticResponse = false,
     onResponseHeaders?: (headers: Headers) => void,
+    signal?: AbortSignal,
   ): Promise<RelaySendResult> {
     this.touch()
     const enqueuedAt = perfNowMs()
@@ -575,15 +612,18 @@ class PersistentRelaySession {
           enqueuedAt,
           optimisticResponse,
           onResponseHeaders,
+          signal,
         ),
       )
-    const result = start.then(async ({ response, getPayload }) => ({
-      response: await response,
-      payload: getPayload(),
-      transport: 'websocket' as const,
-      protocol: 2 as const,
-      usedRelay: true,
-    }))
+    const result = raceWithAbort(start, signal).then(
+      async ({ response, getPayload }) => ({
+        response: await response,
+        payload: getPayload(),
+        transport: 'websocket' as const,
+        protocol: 2 as const,
+        usedRelay: true,
+      }),
+    )
     this.queue = start.then(
       ({ done }) => done.catch(() => {}),
       () => {},
@@ -597,9 +637,12 @@ class PersistentRelaySession {
     enqueuedAt: number,
     optimisticResponse: boolean,
     onResponseHeaders?: (headers: Headers) => void,
+    signal?: AbortSignal,
   ) {
+    throwIfAborted(signal)
     const connectStart = perfNowMs()
-    await this.ensureConnected()
+    await this.ensureConnected(signal)
+    throwIfAborted(signal)
     const connectedAt = perfNowMs()
     const localState = sessionState.get(this.affinity)
     const serverHash = this.serverState?.hash
@@ -633,6 +676,7 @@ class PersistentRelaySession {
       bodyText,
       optimisticResponse,
       onResponseHeaders,
+      signal,
     )
     void first.done.catch(() => {})
     let activeDone = first.done
@@ -653,6 +697,7 @@ class PersistentRelaySession {
         bodyText,
         optimisticResponse,
         onResponseHeaders,
+        signal,
       )
       void retry.done.catch(() => {})
       activeDone = retry.done
@@ -665,13 +710,13 @@ class PersistentRelaySession {
     return { response, done, getPayload: () => activePayload }
   }
 
-  private async ensureConnected() {
+  private async ensureConnected(signal?: AbortSignal) {
     if (
       this.socket?.readyState === WebSocket.OPEN &&
       this.serverState !== undefined
     )
       return
-    if (this.connecting) return await this.connecting
+    if (this.connecting) return await raceWithAbort(this.connecting, signal)
 
     this.connecting = new Promise<void>((resolve, reject) => {
       const url = toWebSocketUrl(this.config.url, this.config.token)
@@ -681,12 +726,28 @@ class PersistentRelaySession {
       this.socket = socket
       this.serverState = undefined
 
+      const cleanupAbort = () => {
+        if (signal) signal.removeEventListener('abort', onAbort)
+      }
+      const onAbort = () => {
+        this.timers.clearTimeout(timeout)
+        cleanupAbort()
+        reject(abortReason(signal ?? AbortSignal.abort()))
+        socket.close()
+      }
       const timeout = this.timers.setTimeout(() => {
+        cleanupAbort()
         socket.close()
         reject(new Error('relay websocket ready timed out'))
       }, 15_000)
+      if (signal) signal.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) {
+        onAbort()
+        return
+      }
 
       socket.addEventListener('message', (event) => {
+        if (this.socket !== socket) return
         try {
           if (typeof event.data !== 'string') {
             this.handleBinaryChunk(event.data)
@@ -695,6 +756,7 @@ class PersistentRelaySession {
           const message = parseRelayControlMessage(event.data)
           if (message.type === 'ready') {
             this.timers.clearTimeout(timeout)
+            cleanupAbort()
             this.serverState = message.state
             resolve()
             return
@@ -702,6 +764,7 @@ class PersistentRelaySession {
           this.handleMessage(message)
         } catch (error) {
           this.timers.clearTimeout(timeout)
+          cleanupAbort()
           reject(error)
           this.failPending(error)
           socket.close()
@@ -710,6 +773,8 @@ class PersistentRelaySession {
 
       socket.addEventListener('error', () => {
         this.timers.clearTimeout(timeout)
+        cleanupAbort()
+        if (this.socket !== socket) return
         const error = new RelayWebSocketConnectionResetError(
           'relay websocket error',
         )
@@ -719,11 +784,11 @@ class PersistentRelaySession {
 
       socket.addEventListener('close', (event) => {
         this.timers.clearTimeout(timeout)
-        if (this.socket === socket) {
-          this.socket = undefined
-          this.serverState = undefined
-          this.connecting = undefined
-        }
+        cleanupAbort()
+        if (this.socket !== socket) return
+        this.socket = undefined
+        this.serverState = undefined
+        this.connecting = undefined
         if (this.pending) {
           if (this.pending.retryingBeforeResponse) return
           const closedAfterResponseStart =
@@ -757,7 +822,9 @@ class PersistentRelaySession {
     bodyText: string,
     optimisticResponse: boolean,
     onResponseHeaders?: (headers: Headers) => void,
+    signal?: AbortSignal,
   ) {
+    throwIfAborted(signal)
     const socket = this.socket
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error('relay websocket is not connected')
@@ -774,6 +841,7 @@ class PersistentRelaySession {
       const pending: PendingWebSocketRequest = {
         payload,
         bodyText,
+        signal,
         resolve,
         reject,
         streamDone: false,
@@ -792,6 +860,17 @@ class PersistentRelaySession {
         responseHeadersDelivered: false,
       }
       this.pending = pending
+      if (signal) {
+        pending.abortListener = () => {
+          if (this.pending === pending)
+            this.abortPending(pending, abortReason(signal))
+        }
+        signal.addEventListener('abort', pending.abortListener, { once: true })
+        if (signal.aborted) {
+          this.abortPending(pending, abortReason(signal))
+          return
+        }
+      }
       this.resetPendingTimeout(pending)
       socket.send(JSON.stringify(payload))
       if (optimisticResponse) {
@@ -823,6 +902,7 @@ class PersistentRelaySession {
     // the request. Replaying with a new request ID can duplicate billed work even
     // when no SSE bytes reached this client. Fail closed and let the caller
     // surface the ambiguous transport failure instead.
+    if (pending.signal?.aborted) return false
     if (pending.responseStartedAt != null) return false
     if (pending.streamDone) return false
     if (pending.retryAttempts >= 1) return false
@@ -843,8 +923,9 @@ class PersistentRelaySession {
 
     void (async () => {
       try {
-        await this.ensureConnected()
+        await this.ensureConnected(pending.signal)
         if (this.pending !== pending) return
+        throwIfAborted(pending.signal)
         const retryPayload = createFullSyncPayload(
           pending.payload,
           pending.bodyText,
@@ -904,7 +985,7 @@ class PersistentRelaySession {
 
   private handleBinaryChunk(data: unknown) {
     const pending = this.pending
-    if (!pending?.responseStarted) return
+    if (!pending?.responseStarted || pending.aborted) return
     this.enqueueStreamChunk(pending, toBinaryChunk(data))
   }
 
@@ -942,6 +1023,12 @@ class PersistentRelaySession {
     if (!pending) return
     if ('id' in message && message.id && message.id !== pending.payload.id)
       return
+    if (pending.aborted) {
+      if (message.type === 'done') this.finishPending(message)
+      else if (message.type === 'error')
+        this.failPending(abortReason(pending.signal ?? AbortSignal.abort()))
+      return
+    }
 
     if (message.type === 'accepted') {
       const acceptedAt = perfNowMs()
@@ -1043,6 +1130,8 @@ class PersistentRelaySession {
       `perf websocket done session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(finishedAt - pending.sentAt)} streamMs=${pending.responseStartedAt == null ? 'unknown' : formatMs(finishedAt - pending.responseStartedAt)} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}${workerStats}`,
     )
     this.timers.clearTimeout(pending.timeout)
+    if (pending.signal && pending.abortListener)
+      pending.signal.removeEventListener('abort', pending.abortListener)
     if (!pending.streamDone) {
       this.deliverResponseHeaders(pending)
       pending.streamDone = true
@@ -1052,10 +1141,29 @@ class PersistentRelaySession {
     this.pending = undefined
   }
 
+  private abortPending(pending: PendingWebSocketRequest, error: unknown) {
+    if (this.pending !== pending || pending.aborted) return
+    pending.aborted = true
+    pending.retryingBeforeResponse = false
+    this.timers.clearTimeout(pending.timeout)
+    if (pending.signal && pending.abortListener)
+      pending.signal.removeEventListener('abort', pending.abortListener)
+    this.pending = undefined
+    if (pending.responseStarted) pending.streamController?.error(error)
+    else pending.reject(error)
+    pending.rejectDone(error)
+    // Binary relay chunks carry no request ID. Close after clearing pending so
+    // late bytes cannot be misattributed to the next serialized request, and
+    // the close handler cannot reconnect/replay the aborted request.
+    this.socket?.close()
+  }
+
   private failPending(error: unknown) {
     const pending = this.pending
     if (!pending) return
     this.timers.clearTimeout(pending.timeout)
+    if (pending.signal && pending.abortListener)
+      pending.signal.removeEventListener('abort', pending.abortListener)
     this.pending = undefined
     if (pending.responseStarted) {
       pending.streamController?.error(error)
@@ -1152,6 +1260,7 @@ export async function sendViaRelay(options: {
     setTimeoutImpl = globalThis.setTimeout,
     clearTimeoutImpl = globalThis.clearTimeout,
   } = options
+  const signal = init?.signal ?? undefined
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
 
   const affinity =
@@ -1203,8 +1312,10 @@ export async function sendViaRelay(options: {
           bodyText,
           optimisticResponse === true,
           onResponseHeaders,
+          signal,
         )
       } catch (error) {
+        throwIfAborted(signal)
         relayLog(
           `websocket relay failed session=${shortAffinity(affinity)}; trying http relay: ${error instanceof Error ? error.message : String(error)}`,
         )
@@ -1213,7 +1324,7 @@ export async function sendViaRelay(options: {
           payload,
           bodyText,
           fallback,
-          signal: init?.signal,
+          signal: signal,
         })
       }
     } else {
@@ -1222,7 +1333,7 @@ export async function sendViaRelay(options: {
         payload,
         bodyText,
         fallback,
-        signal: init?.signal,
+        signal: signal,
       })
     }
 
@@ -1286,6 +1397,7 @@ export async function sendViaRelay(options: {
     })
     return result.response
   } catch (error) {
+    throwIfAborted(signal)
     if (!config.fallbackToDirect) {
       relayLog(
         `relay failed session=${shortAffinity(affinity)} and fallbackToDirect=false: ${error instanceof Error ? error.message : String(error)}`,
