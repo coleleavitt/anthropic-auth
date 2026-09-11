@@ -29,3 +29,11 @@ cd ~/SiteResearch/anthropic/binaries/v268 && sha256sum -c SHA256SUMS
 Minimal contamination regression:
   bun test packages/opencode/src/tests/cli.test.ts packages/opencode/src/tests/add-account-flows.test.ts
   35 pass, 0 fail, exit 0
+
+Explicit refusal acceptance:
+  bun test packages/pi/src/tests/stream.test.ts --test-name-pattern 'refusal|refuses|server fallback boundary'
+  reports refusal stop reason: pass
+  incident-shaped nonzero-output refusal + diagnostic: pass
+  fallback boundary persistence/restoration: pass
+  completed-tool refusal continuation: pass
+  4 pass, 0 fail, 25 assertions, exit 0
