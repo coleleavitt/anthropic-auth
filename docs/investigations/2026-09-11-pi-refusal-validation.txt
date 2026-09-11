@@ -1,0 +1,31 @@
+Validation run: 2026-09-11
+
+bun run test
+  core:     414 pass, 0 fail, 25 files
+  opencode: 1254 pass, 0 fail, 42 files
+  pi:       130 pass, 0 fail, 5 files
+  exit: 0
+
+bun run typecheck
+  exit: 0
+
+bun run build
+  exit: 0
+
+bunx biome check packages/core/src/relay.ts packages/core/src/tests/relay.test.ts packages/pi/src/convert.ts packages/pi/src/stream.ts packages/pi/src/tests/stream.test.ts packages/opencode/src/tests/add-account-flows.test.ts
+  Checked 6 files. No fixes applied.
+  exit: 0
+
+git diff --check
+  exit: 0
+
+cd ~/SiteResearch/anthropic/binaries/v268 && sha256sum -c SHA256SUMS
+  anthropic-ai-claude-code-linux-x64-2.1.268.tgz: OK
+  claude: OK
+  extracted/src/entrypoints/cli.js: OK
+  cli.deobfuscated.js: OK
+  exit: 0
+
+Minimal contamination regression:
+  bun test packages/opencode/src/tests/cli.test.ts packages/opencode/src/tests/add-account-flows.test.ts
+  35 pass, 0 fail, exit 0
