@@ -799,6 +799,12 @@ Wait for GitHub Actions:
 
 The release workflow runs checks, publishes the core, OpenCode, and Pi packages to npm with provenance, and creates the GitHub release.
 
+## Investigation reports
+
+- [Final Pi refusal and cancellation report](FINAL_REPORT.md) — implemented fixes, explicit regression gates, Prime trace reconstruction, and Claude Code 2.1.268 artifact provenance.
+- [Detailed refusal/retry/cancellation evidence](docs/investigations/2026-09-11-pi-refusal-retry-cancellation.md)
+- [Retained validation summary](docs/investigations/2026-09-11-pi-refusal-validation.txt)
+
 ## Troubleshooting
 
 - Clear OpenCode's plugin cache after plugin config changes: `rm -rf ~/.cache/opencode`.
