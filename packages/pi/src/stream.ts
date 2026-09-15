@@ -49,6 +49,8 @@ import {
   quotaSnapshotPassesPolicy,
   recordSharedAccountQuota,
   resolveClaudeCodeIdentity,
+  resolveModelCost,
+  resolveRefusalFallbackModel,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
   StickySessionRouter,
@@ -334,10 +336,23 @@ function mapStopReason(reason: string | null | undefined): StopReason {
 // `length` truncation Claude Code reuses for it, because a caller that compacts
 // a conversation would accept the truncated response as a complete summary and
 // persist it over the original messages.
-function describeStopReasonFailure(reason: string): string {
+function describeStopReasonFailure(
+  reason: string,
+  stopDetails?: {
+    category?: string | null
+    explanation?: string | null
+  } | null,
+): string {
   switch (reason) {
-    case 'refusal':
-      return 'Anthropic refused this request (stop_reason: refusal). The input and any thinking or output tokens produced before the refusal are billed.'
+    case 'refusal': {
+      const category = stopDetails?.category?.trim()
+      const explanation = stopDetails?.explanation?.trim()
+      const suffix = [
+        category ? ` Category: ${category}.` : '',
+        explanation ? ` ${explanation}` : '',
+      ].join('')
+      return `Anthropic refused this request (stop_reason: refusal). The input and any thinking or output tokens produced before the refusal are billed.${suffix}`
+    }
     case 'model_context_window_exceeded':
       return 'Anthropic stopped early: the request exceeded the model context window (stop_reason: model_context_window_exceeded). Compact or split the conversation.'
     default:
@@ -363,6 +378,18 @@ function createOutput(model: Model<Api>): AssistantMessage {
     stopReason: 'stop',
     timestamp: Date.now(),
   }
+}
+
+/**
+ * Builds a `Model<Api>` for a refusal re-route target by cloning the refusing
+ * model and overriding only the id and cost. The shipped refusal targets
+ * (opus-4-8, opus-5) share the 1M context window and 128k max-output of the
+ * Fable 5 / Opus 5 models that route to them, so the base window is kept; the
+ * cost table is looked up per target so usage accounting stays accurate.
+ */
+function deriveFallbackModel(base: Model<Api>, targetId: string): Model<Api> {
+  if (base.id === targetId) return base
+  return { ...base, id: targetId, cost: resolveModelCost(targetId) }
 }
 
 type AnthropicEvent = {
@@ -2011,246 +2038,358 @@ export function streamCortexKitAnthropic(
         messages: context.messages?.length ?? 0,
       })
       const requestStartedAt = Date.now()
-      const { response, bodyText } = await executeWithRetry({
-        model,
-        context,
-        streamOptions: options,
-        primaryAccessToken: accessToken,
-        storagePath,
-      })
 
-      if (!response.ok) {
-        logger.warn('pi.stream', 'request failed', {
-          status: response.status,
-          durationMs: Date.now() - requestStartedAt,
-          body: (bodyText ?? '').slice(0, 300),
+      // Client-side refusal -> fallback routing. On a terminal `stop_reason:
+      // refusal` Anthropic bills the turn but returns no usable content, and the
+      // server-side `fallbacks:"default"` opt-in does not rescue large-context
+      // Fable 5 / Opus 5 refusals. Claude Code recovers by re-issuing on a
+      // category-mapped model (bio -> opus-5, cyber -> opus-4-8) and retracting
+      // the refusal; Pi previously surfaced a hard error and left the user to
+      // switch models by hand. Mirror Claude Code here: while nothing
+      // user-visible has streamed, re-route a refusal to the mapped fallback
+      // model (or the opus-4-8 catch-all) up to a bounded number of hops.
+      let activeModel = model
+      const triedModels: string[] = []
+      let refusalHop = 0
+      const MAX_REFUSAL_HOPS = 2
+
+      for (;;) {
+        // Reset the shared output in place so the single `start` already pushed
+        // to the host stays valid. A refusal streams no visible content, so
+        // discarding the prior attempt is invisible to the caller.
+        output.content = []
+        output.model = activeModel.id
+        output.usage = {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        }
+        output.stopReason = 'stop'
+        output.rawStopReason = undefined
+        output.errorMessage = undefined
+        output.diagnostics = undefined
+
+        const { response, bodyText } = await executeWithRetry({
+          model: activeModel,
+          context,
+          streamOptions: options,
+          primaryAccessToken: accessToken,
+          storagePath,
         })
-        throw new Error(
-          `Anthropic request failed: HTTP ${response.status} ${bodyText ?? ''}`,
-        )
-      }
-      logger.info('pi.stream', 'streaming response', {
-        durationMs: Date.now() - requestStartedAt,
-      })
 
-      const blocks = output.content as Block[]
-      let hasCompletedToolCall = false
-      for await (const event of parseSse(response)) {
-        if (event.type === 'message_start') {
-          updateUsage(model, output, event.message?.usage)
-        } else if (event.type === 'content_block_start') {
-          const block = event.content_block
-          const fallbackMarker = block ? markerFromFallbackBlock(block) : null
-          if (fallbackMarker) {
-            output.content.push({
-              type: 'thinking',
-              thinking: SERVER_FALLBACK_MARKER_TEXT,
-              thinkingSignature: encodeFallbackMarker(fallbackMarker),
-              index: event.index,
-            } as Block)
-            stream.push({
-              type: 'thinking_start',
-              contentIndex: output.content.length - 1,
-              partial: output,
-            })
-          } else if (block?.type === 'text') {
-            output.content.push({
-              type: 'text',
-              text: '',
-              index: event.index,
-            } as Block)
-            stream.push({
-              type: 'text_start',
-              contentIndex: output.content.length - 1,
-              partial: output,
-            })
-          } else if (block?.type === 'thinking') {
-            output.content.push({
-              type: 'thinking',
-              thinking: '',
-              thinkingSignature: '',
-              index: event.index,
-            } as Block)
-            stream.push({
-              type: 'thinking_start',
-              contentIndex: output.content.length - 1,
-              partial: output,
-            })
-          } else if (block?.type === 'tool_use') {
-            output.content.push({
-              type: 'toolCall',
-              id: String(block.id),
-              name: fromClaudeCodeToolName(String(block.name), context.tools),
-              arguments: {},
-              partialJson: '',
-              index: event.index,
-            } as Block)
-            stream.push({
-              type: 'toolcall_start',
-              contentIndex: output.content.length - 1,
-              partial: output,
-            })
-          }
-        } else if (event.type === 'content_block_delta') {
-          const contentIndex = blocks.findIndex(
-            (block) => block.index === event.index,
+        if (!response.ok) {
+          logger.warn('pi.stream', 'request failed', {
+            status: response.status,
+            durationMs: Date.now() - requestStartedAt,
+            body: (bodyText ?? '').slice(0, 300),
+          })
+          throw new Error(
+            `Anthropic request failed: HTTP ${response.status} ${bodyText ?? ''}`,
           )
-          const block = blocks[contentIndex]
-          if (!block || !event.delta) continue
-          if (event.delta.type === 'text_delta' && block.type === 'text') {
-            const delta = String(event.delta.text ?? '')
-            block.text += delta
-            stream.push({
-              type: 'text_delta',
-              contentIndex,
-              delta,
-              partial: output,
-            })
-          } else if (
-            event.delta.type === 'thinking_delta' &&
-            block.type === 'thinking'
-          ) {
-            const delta = String(event.delta.thinking ?? '')
-            block.thinking += delta
-            stream.push({
-              type: 'thinking_delta',
-              contentIndex,
-              delta,
-              partial: output,
-            })
-          } else if (
-            event.delta.type === 'signature_delta' &&
-            block.type === 'thinking'
-          ) {
-            block.thinkingSignature = `${block.thinkingSignature ?? ''}${String(event.delta.signature ?? '')}`
-          } else if (
-            event.delta.type === 'input_json_delta' &&
-            block.type === 'toolCall'
-          ) {
-            const delta = String(event.delta.partial_json ?? '')
-            block.partialJson = `${block.partialJson ?? ''}${delta}`
-            try {
-              block.arguments = JSON.parse(block.partialJson)
-            } catch {}
-            stream.push({
-              type: 'toolcall_delta',
-              contentIndex,
-              delta,
-              partial: output,
-            })
-          }
-        } else if (event.type === 'content_block_stop') {
-          const contentIndex = blocks.findIndex(
-            (block) => block.index === event.index,
-          )
-          const block = blocks[contentIndex]
-          if (!block) continue
-          delete block.index
-          if (block.type === 'text') {
-            stream.push({
-              type: 'text_end',
-              contentIndex,
-              content: block.text,
-              partial: output,
-            })
-          } else if (block.type === 'thinking') {
-            stream.push({
-              type: 'thinking_end',
-              contentIndex,
-              content: block.thinking,
-              partial: output,
-            })
-          } else if (block.type === 'toolCall') {
-            try {
-              block.arguments = JSON.parse(block.partialJson ?? '{}')
-            } catch {}
-            delete block.partialJson
-            hasCompletedToolCall = true
-            stream.push({
-              type: 'toolcall_end',
-              contentIndex,
-              toolCall: block,
-              partial: output,
-            })
-          }
-        } else if (event.type === 'message_delta') {
-          // A usage-only message_delta carries no stop_reason, so mapping the
-          // absent value would report a healthy stream as a failed one.
-          const rawStopReason = event.delta?.stop_reason
-          if (rawStopReason) {
-            output.rawStopReason = String(rawStopReason)
-            ;(
-              output as AssistantMessage & { stopReasonRaw?: string }
-            ).stopReasonRaw = output.rawStopReason
-            output.stopReason =
-              output.rawStopReason === 'refusal' && hasCompletedToolCall
-                ? 'toolUse'
-                : mapStopReason(output.rawStopReason)
-            if (
-              output.rawStopReason === 'refusal' &&
-              output.stopReason === 'error'
-            ) {
-              output.diagnostics = [
-                ...(output.diagnostics ?? []),
-                {
-                  type: 'provider_stream_failure',
-                  timestamp: Date.now(),
-                  details: {
-                    kind: 'refusal',
-                    providerErrorType: 'refusal',
-                    ...(response.headers.get('request-id')
-                      ? { requestId: response.headers.get('request-id') }
-                      : {}),
-                  },
-                },
-              ]
+        }
+        logger.info('pi.stream', 'streaming response', {
+          durationMs: Date.now() - requestStartedAt,
+          model: activeModel.id,
+        })
+
+        const blocks = output.content as Block[]
+        let hasCompletedToolCall = false
+        let reroute:
+          | {
+              target: string
+              category: string | null
+              explanation: string | null
+              requestId: string | null
             }
-            if (output.stopReason === 'error') {
-              output.errorMessage = describeStopReasonFailure(
-                output.rawStopReason,
-              )
-              // `streaming response` is logged before this loop runs, so
-              // without this a refused turn is indistinguishable from a served
-              // one in the log — the request appears to succeed and the error
-              // only ever reaches the caller. Report the token counts too: they
-              // are what decide whether a refusal is a context-size problem or
-              // a genuine content decline.
-              logger.error('pi.stream', 'stream ended with a failing stop', {
-                stopReason: String(rawStopReason),
-                model: model.id,
-                sessionId: options?.sessionId,
-                messages: context.messages?.length ?? 0,
-                inputTokens: event.usage?.input_tokens,
-                outputTokens: event.usage?.output_tokens,
-                contextWindow: model.contextWindow,
+          | undefined
+        for await (const event of parseSse(response)) {
+          if (event.type === 'message_start') {
+            updateUsage(activeModel, output, event.message?.usage)
+          } else if (event.type === 'content_block_start') {
+            const block = event.content_block
+            const fallbackMarker = block ? markerFromFallbackBlock(block) : null
+            if (fallbackMarker) {
+              output.content.push({
+                type: 'thinking',
+                thinking: SERVER_FALLBACK_MARKER_TEXT,
+                thinkingSignature: encodeFallbackMarker(fallbackMarker),
+                index: event.index,
+              } as Block)
+              stream.push({
+                type: 'thinking_start',
+                contentIndex: output.content.length - 1,
+                partial: output,
+              })
+            } else if (block?.type === 'text') {
+              output.content.push({
+                type: 'text',
+                text: '',
+                index: event.index,
+              } as Block)
+              stream.push({
+                type: 'text_start',
+                contentIndex: output.content.length - 1,
+                partial: output,
+              })
+            } else if (block?.type === 'thinking') {
+              output.content.push({
+                type: 'thinking',
+                thinking: '',
+                thinkingSignature: '',
+                index: event.index,
+              } as Block)
+              stream.push({
+                type: 'thinking_start',
+                contentIndex: output.content.length - 1,
+                partial: output,
+              })
+            } else if (block?.type === 'tool_use') {
+              output.content.push({
+                type: 'toolCall',
+                id: String(block.id),
+                name: fromClaudeCodeToolName(String(block.name), context.tools),
+                arguments: {},
+                partialJson: '',
+                index: event.index,
+              } as Block)
+              stream.push({
+                type: 'toolcall_start',
+                contentIndex: output.content.length - 1,
+                partial: output,
               })
             }
+          } else if (event.type === 'content_block_delta') {
+            const contentIndex = blocks.findIndex(
+              (block) => block.index === event.index,
+            )
+            const block = blocks[contentIndex]
+            if (!block || !event.delta) continue
+            if (event.delta.type === 'text_delta' && block.type === 'text') {
+              const delta = String(event.delta.text ?? '')
+              block.text += delta
+              stream.push({
+                type: 'text_delta',
+                contentIndex,
+                delta,
+                partial: output,
+              })
+            } else if (
+              event.delta.type === 'thinking_delta' &&
+              block.type === 'thinking'
+            ) {
+              const delta = String(event.delta.thinking ?? '')
+              block.thinking += delta
+              stream.push({
+                type: 'thinking_delta',
+                contentIndex,
+                delta,
+                partial: output,
+              })
+            } else if (
+              event.delta.type === 'signature_delta' &&
+              block.type === 'thinking'
+            ) {
+              block.thinkingSignature = `${block.thinkingSignature ?? ''}${String(event.delta.signature ?? '')}`
+            } else if (
+              event.delta.type === 'input_json_delta' &&
+              block.type === 'toolCall'
+            ) {
+              const delta = String(event.delta.partial_json ?? '')
+              block.partialJson = `${block.partialJson ?? ''}${delta}`
+              try {
+                block.arguments = JSON.parse(block.partialJson)
+              } catch {}
+              stream.push({
+                type: 'toolcall_delta',
+                contentIndex,
+                delta,
+                partial: output,
+              })
+            }
+          } else if (event.type === 'content_block_stop') {
+            const contentIndex = blocks.findIndex(
+              (block) => block.index === event.index,
+            )
+            const block = blocks[contentIndex]
+            if (!block) continue
+            delete block.index
+            if (block.type === 'text') {
+              stream.push({
+                type: 'text_end',
+                contentIndex,
+                content: block.text,
+                partial: output,
+              })
+            } else if (block.type === 'thinking') {
+              stream.push({
+                type: 'thinking_end',
+                contentIndex,
+                content: block.thinking,
+                partial: output,
+              })
+            } else if (block.type === 'toolCall') {
+              try {
+                block.arguments = JSON.parse(block.partialJson ?? '{}')
+              } catch {}
+              delete block.partialJson
+              hasCompletedToolCall = true
+              stream.push({
+                type: 'toolcall_end',
+                contentIndex,
+                toolCall: block,
+                partial: output,
+              })
+            }
+          } else if (event.type === 'message_delta') {
+            // A usage-only message_delta carries no stop_reason, so mapping the
+            // absent value would report a healthy stream as a failed one.
+            const rawStopReason = event.delta?.stop_reason
+            if (rawStopReason) {
+              output.rawStopReason = String(rawStopReason)
+              ;(
+                output as AssistantMessage & { stopReasonRaw?: string }
+              ).stopReasonRaw = output.rawStopReason
+              output.stopReason =
+                output.rawStopReason === 'refusal' && hasCompletedToolCall
+                  ? 'toolUse'
+                  : mapStopReason(output.rawStopReason)
+              if (
+                output.rawStopReason === 'refusal' &&
+                output.stopReason === 'error'
+              ) {
+                // Anthropic carries the refusal reason on `stop_details`
+                // ({category, explanation}). Capturing it is what lets the client
+                // route by category (bio/cyber) and tell the user why, instead of
+                // discarding it and surfacing a bare "refusal".
+                const stopDetails = (event.delta?.stop_details ?? null) as {
+                  category?: string | null
+                  explanation?: string | null
+                } | null
+                const refusalCategory = stopDetails?.category ?? null
+                const refusalExplanation = stopDetails?.explanation ?? null
+                const requestId = response.headers.get('request-id')
+                output.diagnostics = [
+                  ...(output.diagnostics ?? []),
+                  {
+                    type: 'provider_stream_failure',
+                    timestamp: Date.now(),
+                    details: {
+                      kind: 'refusal',
+                      providerErrorType: 'refusal',
+                      ...(refusalCategory ? { refusalCategory } : {}),
+                      ...(refusalExplanation ? { refusalExplanation } : {}),
+                      ...(requestId ? { requestId } : {}),
+                    },
+                  },
+                ]
+                // A refusal streams no visible content, so re-routing to a
+                // fallback model is invisible to the caller. Only re-route while
+                // that holds; if any text/tool/thinking content already streamed,
+                // fall through to the error path and keep it.
+                const sawVisibleOutput = (output.content as Block[]).some(
+                  (candidate) =>
+                    (candidate.type === 'text' &&
+                      candidate.text.trim().length > 0) ||
+                    candidate.type === 'toolCall' ||
+                    (candidate.type === 'thinking' &&
+                      candidate.thinking.length > 0 &&
+                      candidate.thinking !== SERVER_FALLBACK_MARKER_TEXT),
+                )
+                if (!sawVisibleOutput && refusalHop < MAX_REFUSAL_HOPS) {
+                  const target = resolveRefusalFallbackModel(
+                    activeModel.id,
+                    refusalCategory,
+                    triedModels,
+                  )
+                  if (target)
+                    reroute = {
+                      target,
+                      category: refusalCategory,
+                      explanation: refusalExplanation,
+                      requestId,
+                    }
+                }
+              }
+              if (output.stopReason === 'error') {
+                output.errorMessage = describeStopReasonFailure(
+                  output.rawStopReason,
+                  event.delta?.stop_details as
+                    | { category?: string | null; explanation?: string | null }
+                    | null
+                    | undefined,
+                )
+                // `streaming response` is logged before this loop runs, so
+                // without this a refused turn is indistinguishable from a served
+                // one in the log. Report the token counts and refusal category:
+                // they decide whether a refusal is a context-size problem or a
+                // genuine content decline, and whether a re-route will follow.
+                logger.error('pi.stream', 'stream ended with a failing stop', {
+                  stopReason: String(rawStopReason),
+                  refusalCategory:
+                    (
+                      event.delta?.stop_details as {
+                        category?: string | null
+                      } | null
+                    )?.category ?? null,
+                  willReroute: Boolean(reroute),
+                  model: activeModel.id,
+                  sessionId: options?.sessionId,
+                  messages: context.messages?.length ?? 0,
+                  inputTokens: event.usage?.input_tokens,
+                  outputTokens: event.usage?.output_tokens,
+                  contextWindow: activeModel.contextWindow,
+                })
+              }
+            }
+            updateUsage(activeModel, output, event.usage)
+          } else if (event.type === 'error') {
+            logger.error('pi.stream', 'stream carried an error frame', {
+              model: activeModel.id,
+              sessionId: options?.sessionId,
+              event: JSON.stringify(event).slice(0, 300),
+            })
+            throw new Error(JSON.stringify(event))
           }
-          updateUsage(model, output, event.usage)
-        } else if (event.type === 'error') {
-          logger.error('pi.stream', 'stream carried an error frame', {
-            model: model.id,
-            sessionId: options?.sessionId,
-            event: JSON.stringify(event).slice(0, 300),
-          })
-          throw new Error(JSON.stringify(event))
         }
-      }
 
-      if (options?.signal?.aborted) throw new Error('Request was aborted')
-      // A `done` event only admits stop/length/toolUse, so an error stop reason
-      // has to leave through the error path or it reaches the caller unlabelled.
-      if (output.stopReason === 'error')
-        throw new Error(
-          output.errorMessage ?? describeStopReasonFailure('(none reported)'),
-        )
-      for (const block of output.content as Block[]) delete block.index
-      stream.push({
-        type: 'done',
-        reason: output.stopReason as 'stop' | 'length' | 'toolUse',
-        message: output,
-      })
-      stream.end()
+        if (options?.signal?.aborted) throw new Error('Request was aborted')
+
+        // A routable refusal re-issues the prompt on the mapped fallback model.
+        // The refused attempt streamed nothing user-visible, so this is a silent
+        // recovery from the caller's perspective.
+        if (reroute) {
+          logger.warn('pi.stream', 're-routing after refusal', {
+            fromModel: activeModel.id,
+            toModel: reroute.target,
+            refusalCategory: reroute.category,
+            hop: refusalHop + 1,
+            sessionId: options?.sessionId,
+            requestId: reroute.requestId,
+          })
+          triedModels.push(activeModel.id)
+          refusalHop += 1
+          activeModel = deriveFallbackModel(model, reroute.target)
+          continue
+        }
+
+        // A `done` event only admits stop/length/toolUse, so an error stop reason
+        // has to leave through the error path or it reaches the caller unlabelled.
+        if (output.stopReason === 'error')
+          throw new Error(
+            output.errorMessage ?? describeStopReasonFailure('(none reported)'),
+          )
+        for (const block of output.content as Block[]) delete block.index
+        stream.push({
+          type: 'done',
+          reason: output.stopReason as 'stop' | 'length' | 'toolUse',
+          message: output,
+        })
+        stream.end()
+        break
+      }
     } catch (error) {
       for (const block of output.content as Block[]) delete block.index
       output.stopReason = options?.signal?.aborted ? 'aborted' : 'error'

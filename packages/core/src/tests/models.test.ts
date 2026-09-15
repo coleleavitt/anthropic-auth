@@ -11,6 +11,7 @@ import {
   modelSupportsMaxEffort,
   modelSupportsXhighEffort,
   resolveClaudeFableMythos5Pricing,
+  resolveRefusalFallbackModel,
   resolveThinkingShape,
 } from '../models'
 
@@ -318,5 +319,68 @@ describe('Fable/Mythos 5.1 cache-read pricing', () => {
     expect(
       resolveClaudeFableMythos5Pricing('claude-fable-5-20260609').cacheRead,
     ).toBe(1)
+  })
+})
+
+describe('resolveRefusalFallbackModel', () => {
+  test('routes a cyber refusal to opus-4-8 by category', () => {
+    expect(resolveRefusalFallbackModel('claude-fable-5', 'cyber')).toBe(
+      'claude-opus-4-8',
+    )
+  })
+
+  test('routes a bio refusal to opus-5 on the default map', () => {
+    expect(resolveRefusalFallbackModel('claude-fable-5-1', 'bio')).toBe(
+      'claude-opus-5',
+    )
+  })
+
+  test('opus-5 has no bio route, so a bio refusal uses the catch-all floor', () => {
+    expect(resolveRefusalFallbackModel('claude-opus-5', 'bio')).toBe(
+      'claude-opus-4-8',
+    )
+  })
+
+  test('opus-5 routes a cyber refusal to opus-4-8', () => {
+    expect(resolveRefusalFallbackModel('claude-opus-5', 'cyber')).toBe(
+      'claude-opus-4-8',
+    )
+  })
+
+  test('a missing category falls back to the opus-4-8 catch-all', () => {
+    expect(resolveRefusalFallbackModel('claude-fable-5', null)).toBe(
+      'claude-opus-4-8',
+    )
+  })
+
+  test('the catch-all can be disabled for an unmapped category', () => {
+    expect(
+      resolveRefusalFallbackModel('claude-fable-5', undefined, [], {
+        catchAll: false,
+      }),
+    ).toBeUndefined()
+  })
+
+  test('never routes a model to itself (opus-4-8 floor)', () => {
+    expect(
+      resolveRefusalFallbackModel('claude-opus-4-8', 'cyber'),
+    ).toBeUndefined()
+  })
+
+  test('never re-routes to an already-tried model', () => {
+    expect(
+      resolveRefusalFallbackModel('claude-fable-5', 'cyber', [
+        'claude-opus-4-8-20260101',
+      ]),
+    ).toBeUndefined()
+  })
+
+  test('matches tried models on their canonical id', () => {
+    // A dated snapshot of the current model must still count as tried.
+    expect(
+      resolveRefusalFallbackModel('claude-opus-5-20260901', 'cyber', [
+        'claude-opus-4-8',
+      ]),
+    ).toBeUndefined()
   })
 })

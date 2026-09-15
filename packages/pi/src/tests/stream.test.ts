@@ -635,6 +635,138 @@ describe('Pi API fallback routing helpers', () => {
     expect(terminalTypes).toEqual(['error'])
   })
 
+  // Helper: drive a stream while returning a scripted response per /v1/messages
+  // call, capturing the body sent on each call.
+  function scriptResponses(responses: Response[]) {
+    const bodies: Array<Record<string, unknown>> = []
+    let call = 0
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (!url.includes('/v1/messages'))
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        if (init?.body) bodies.push(JSON.parse(String(init.body)))
+        const response = responses[Math.min(call, responses.length - 1)]!
+        call += 1
+        return Promise.resolve(response.clone())
+      },
+    ) as unknown as typeof fetch
+    return { bodies, calls: () => call }
+  }
+
+  const REFUSAL_EMPTY = (category?: string, requestId = 'req_refuse') =>
+    new Response(
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":200000,"output_tokens":0}}}\n\n' +
+        `event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"${category ? `,"stop_details":{"category":"${category}","explanation":"declined"}` : ''}},"usage":{"input_tokens":200000,"output_tokens":0}}\n\n` +
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      { status: 200, headers: { 'request-id': requestId } },
+    )
+
+  const SERVED_TEXT = new Response(
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}\n\n' +
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n' +
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n' +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    { status: 200, headers: { 'request-id': 'req_served' } },
+  )
+
+  test('re-routes a cyber refusal to opus-4-8 and serves the retry', async () => {
+    const { bodies, calls } = scriptResponses([
+      REFUSAL_EMPTY('cyber'),
+      SERVED_TEXT,
+    ])
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_reroute_cyber',
+    })
+    const terminal: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminal.push(event.type)
+    }
+    const result = await stream.result()
+    expect(terminal).toEqual(['done'])
+    expect(result.stopReason).toBe('stop')
+    expect(result.model).toBe('claude-opus-4-8')
+    expect(calls()).toBe(2)
+    // The retry went out on the mapped fallback model.
+    expect(bodies[1]?.model).toBe('claude-opus-4-8')
+  })
+
+  test('re-routes a category-less refusal to the opus-4-8 catch-all', async () => {
+    const { calls } = scriptResponses([REFUSAL_EMPTY(), SERVED_TEXT])
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_reroute_catchall',
+    })
+    for await (const _event of stream) {
+    }
+    const result = await stream.result()
+    expect(result.stopReason).toBe('stop')
+    expect(result.model).toBe('claude-opus-4-8')
+    expect(calls()).toBe(2)
+  })
+
+  test('surfaces the refusal category and stops re-routing at the opus-4-8 floor', async () => {
+    // opus-4-8 is the safe floor: a refusal there must not route to itself, so a
+    // persistent refusal surfaces after a single hop with the category exposed.
+    const { calls } = scriptResponses([REFUSAL_EMPTY('cyber')])
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_reroute_floor',
+    })
+    const terminal: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminal.push(event.type)
+    }
+    const result = await stream.result()
+    expect(terminal).toEqual(['error'])
+    expect(result.stopReason).toBe('error')
+    expect(result.model).toBe('claude-opus-4-8')
+    // fable-5 -> opus-4-8 (hop 1), opus-4-8 refuses -> no self-route -> surface.
+    expect(calls()).toBe(2)
+    expect(result.errorMessage).toContain('cyber')
+    const diag = (result.diagnostics ?? [])[0] as
+      | { details?: { refusalCategory?: string } }
+      | undefined
+    expect(diag?.details?.refusalCategory).toBe('cyber')
+  })
+
+  test('does not re-route when visible content already streamed before the refusal', async () => {
+    const refusalAfterText = new Response(
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}\n\n' +
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}\n\n' +
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"category":"cyber"}},"usage":{"output_tokens":5}}\n\n' +
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      { status: 200, headers: { 'request-id': 'req_visible' } },
+    )
+    const { calls } = scriptResponses([refusalAfterText, SERVED_TEXT])
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_reroute_visible',
+    })
+    const terminal: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminal.push(event.type)
+    }
+    const result = await stream.result()
+    expect(terminal).toEqual(['error'])
+    expect(result.model).toBe('claude-fable-5')
+    // No re-route: the visible text must be preserved, so only one call is made.
+    expect(calls()).toBe(1)
+  })
+
   test('names the context window when Anthropic reports it exceeded', async () => {
     const { message, terminalTypes } = await streamWithMessageDelta(
       '{"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{"output_tokens":1}}',

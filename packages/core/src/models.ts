@@ -304,6 +304,76 @@ export function resolveThinkingShape(
   return 'adaptive'
 }
 
+export const CLAUDE_OPUS_4_8_MODEL_ID = 'claude-opus-4-8'
+
+/**
+ * Anthropic refusal categories carried on `message_delta.delta.stop_details`.
+ * Only `bio` and `cyber` have configured fallback routes in Claude Code; any
+ * other value (or an absent category) is treated as unmapped.
+ */
+export type RefusalCategory = 'bio' | 'cyber' | (string & {})
+
+/**
+ * Per-model refusal-category → fallback-model route maps, mirrored verbatim from
+ * Claude Code 2.1.268 (`chunk-pryvkh3w.js`, functions `Swo`/`ywo`/`_wo`/`bwo`):
+ *
+ *   ywo (default) = { bio: "claude-opus-5",  cyber: "claude-opus-4-8" }
+ *   _wo (opus-5)  = { cyber: "claude-opus-4-8" }   // bio has NO route on opus-5
+ *
+ * The `bwo` variant (both categories → opus-4-8) is only reached for models that
+ * are strictly newer than opus-5; none are in the shipped catalog, so it is not
+ * represented here. The maps are keyed on the canonical (snapshot-stripped) id.
+ */
+const REFUSAL_ROUTE_DEFAULT: Readonly<Record<string, string>> = {
+  bio: CLAUDE_OPUS_5_MODEL_ID,
+  cyber: CLAUDE_OPUS_4_8_MODEL_ID,
+}
+const REFUSAL_ROUTE_OPUS_5: Readonly<Record<string, string>> = {
+  cyber: CLAUDE_OPUS_4_8_MODEL_ID,
+}
+
+/** The safe floor a terminal refusal downgrades to when no category route applies. */
+export const CLAUDE_REFUSAL_CATCH_ALL_MODEL = CLAUDE_OPUS_4_8_MODEL_ID
+
+export function refusalFallbackRouteMap(
+  model: string,
+): Readonly<Record<string, string>> {
+  if (canonicalClaudeModelId(model) === CLAUDE_OPUS_5_MODEL_ID) {
+    return REFUSAL_ROUTE_OPUS_5
+  }
+  return REFUSAL_ROUTE_DEFAULT
+}
+
+/**
+ * Resolves the model a terminal `stop_reason: refusal` should re-route to, given
+ * the refusing model, the Anthropic refusal category (may be null/unknown), and
+ * the canonical ids already tried this turn.
+ *
+ * Faithful to Claude Code's category map (bio/cyber), with one deliberate
+ * addition: when the category is missing or unmapped and `catchAll` is set
+ * (default), it downgrades to opus-4-8 — the safe floor a user reaches by hand
+ * today. Never routes to the refusing model itself or to an already-tried model,
+ * so a bounded hop count cannot loop.
+ */
+export function resolveRefusalFallbackModel(
+  model: string,
+  category: string | null | undefined,
+  triedModels: readonly string[] = [],
+  options: { catchAll?: boolean } = {},
+): string | undefined {
+  const catchAll = options.catchAll ?? true
+  const map = refusalFallbackRouteMap(model)
+  const mapped = category ? map[category] : undefined
+  const candidate =
+    mapped ?? (catchAll ? CLAUDE_REFUSAL_CATCH_ALL_MODEL : undefined)
+  if (!candidate) return undefined
+  const candidateCanonical = canonicalClaudeModelId(candidate)
+  if (candidateCanonical === canonicalClaudeModelId(model)) return undefined
+  const tried = new Set(triedModels.map((id) => canonicalClaudeModelId(id)))
+  if (tried.has(candidateCanonical)) return undefined
+  return candidate
+}
+
 export function isOpenAIReasoningSignature(value: unknown): boolean {
   if (typeof value !== 'string') return false
   if (value.startsWith('gAAAA')) return true
