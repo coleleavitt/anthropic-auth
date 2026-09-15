@@ -5,7 +5,9 @@ import {
   resolveContentFilterFallbackMode,
   SERVER_FALLBACK_MARKER_TEXT,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
+  SERVER_SIDE_FALLBACK_BASE_BETA,
   SERVER_SIDE_FALLBACK_BETA,
+  SERVER_SIDE_FALLBACK_BETAS,
   type ServerSideFallbackOutcome,
 } from '../server-fallback'
 
@@ -111,6 +113,15 @@ describe('applyServerSideFallbackToBody', () => {
       expect((body as { fallbacks?: unknown }).fallbacks).toBe('default')
     }
     expect(SERVER_SIDE_FALLBACK_BETA).toBe('server-side-fallback-2026-07-01')
+    // Claude Code sends both the base capability and the category router, base
+    // first. Sending only the category beta leaves server-side fallback off.
+    expect(SERVER_SIDE_FALLBACK_BASE_BETA).toBe(
+      'server-side-fallback-2026-06-01',
+    )
+    expect(SERVER_SIDE_FALLBACK_BETAS).toEqual([
+      'server-side-fallback-2026-06-01',
+      'server-side-fallback-2026-07-01',
+    ])
   })
 
   test('does not opt unrelated models into server-side fallback', () => {

@@ -35,7 +35,7 @@ import { makeByteBoundedMemo } from './sanitize-memo'
 import {
   applyServerSideFallbackToBody,
   createServerSideFallbackStreamRewriter,
-  SERVER_SIDE_FALLBACK_BETA,
+  SERVER_SIDE_FALLBACK_BETAS,
   type ServerSideFallbackOutcome,
 } from './server-fallback'
 
@@ -163,7 +163,7 @@ export function setOAuthHeaders(
     ...options,
     extraBetas:
       options.body?.fallbacks === 'default'
-        ? [SERVER_SIDE_FALLBACK_BETA]
+        ? SERVER_SIDE_FALLBACK_BETAS
         : undefined,
   })
 }

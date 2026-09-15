@@ -1434,7 +1434,14 @@ describe('Pi routes from the shared account store', () => {
     expect(result.errorMessage).not.toContain('1M beta')
     expect(messageCalls).toBe(1)
     expect(sentBody?.fallbacks).toBe('default')
-    expect(sentBetas.split(',')).toContain('server-side-fallback-2026-07-01')
+    // Both server-fallback betas ride along: the base capability plus the
+    // category router, matching Claude Code. Base is ordered before category.
+    const betaList = sentBetas.split(',')
+    expect(betaList).toContain('server-side-fallback-2026-06-01')
+    expect(betaList).toContain('server-side-fallback-2026-07-01')
+    expect(betaList.indexOf('server-side-fallback-2026-06-01')).toBeLessThan(
+      betaList.indexOf('server-side-fallback-2026-07-01'),
+    )
   })
 
   test('persists a server fallback boundary and restores it on the next request', async () => {

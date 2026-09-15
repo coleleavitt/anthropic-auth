@@ -1656,9 +1656,9 @@ describe('prepareFableCacheWarmSource', () => {
     const body = JSON.parse(source.bodyText)
     expect(body.fallbacks).toBeUndefined()
     expect(body.speed).toBeUndefined()
-    expect(selectClaudeCodeBetas(body).split(',')).not.toContain(
-      'server-side-fallback-2026-07-01',
-    )
+    const apiRouteBetas = selectClaudeCodeBetas(body).split(',')
+    expect(apiRouteBetas).not.toContain('server-side-fallback-2026-07-01')
+    expect(apiRouteBetas).not.toContain('server-side-fallback-2026-06-01')
   })
 })
 

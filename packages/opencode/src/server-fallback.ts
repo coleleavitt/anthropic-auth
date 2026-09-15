@@ -3,7 +3,18 @@ import {
   recoverableRefusalFamily,
 } from './fable-fallback'
 
+// Anthropic gates server-side fallback behind TWO betas and Claude Code sends
+// both: the base `server_side_fallback` (2026-06-01) enables inline fallback at
+// all, and `server_side_fallback_category` (2026-07-01) adds bio/cyber category
+// routing. Sending only the category beta left the base off, so the server
+// returned a terminal refusal instead of serving a fallback. Order matches
+// Claude Code's `[MP, Ch]`: base first, then category.
+export const SERVER_SIDE_FALLBACK_BASE_BETA = 'server-side-fallback-2026-06-01'
 export const SERVER_SIDE_FALLBACK_BETA = 'server-side-fallback-2026-07-01'
+export const SERVER_SIDE_FALLBACK_BETAS = [
+  SERVER_SIDE_FALLBACK_BASE_BETA,
+  SERVER_SIDE_FALLBACK_BETA,
+]
 export const SERVER_FALLBACK_MARKER_TEXT = '\u2060'
 export const SERVER_FALLBACK_SIGNATURE_PREFIX = 'cortexkit-server-fallback-v1:'
 

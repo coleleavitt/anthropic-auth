@@ -91,3 +91,30 @@ done by hand.
    the cyber target and a catch-all downgrade for unmapped/`bio`-on-opus-5 (GAP A). Retract the
    refused stream and re-issue on the fallback model, like `fallback_request`.
 3. Warn on switching to opus-5/fable-5 with a large cold context; offer compaction (GAP C).
+
+
+## v2.1.272 diff (checked 2026-09-15, newest on npm; we had v268)
+
+Extracted 2.1.272 and diffed the refusal machinery against the implementation.
+
+- **Route map is byte-identical to v268.** v272 `chunk-b2hkftr9.js`:
+  `FYo={bio:"claude-opus-5",cyber:"claude-opus-4-8"}`, `$Yo={cyber:"claude-opus-4-8"}`,
+  `BYo={bio:"claude-opus-4-8",cyber:"claude-opus-4-8"}`, selector
+  `UYo(e){ if(k$e(e)) return BYo; if(e==="claude-opus-5"||e==="claude-opus-5[1m]") return $Yo; return FYo }`.
+  `k$e` (the SOe/BYo predicate) returns `false` — BYo is unreachable in the shipped catalog.
+  Our `resolveRefusalFallbackModel` matches this exactly.
+- **NEW: two server-fallback betas, and Claude Code sends BOTH.** v272 `chunk-04p5afpb.js`:
+  `MP=Re("server_side_fallback","server-side-fallback-2026-06-01")` (base capability) and
+  `Ch=Re("server_side_fallback_category","server-side-fallback-2026-07-01")` (category routing).
+  The opt-in `nnr(...)` pushes `[MP, Ch]` — both betas — whenever server fallback is active.
+  v268 does the same (`dI`=06-01, `zg`=07-01). Pi and OpenCode were sending ONLY 07-01, so the
+  base capability was never enabled — a likely reason the server returned a terminal refusal
+  instead of serving an inline `fallback_message`. FIXED: both packages now send
+  `[server-side-fallback-2026-06-01, server-side-fallback-2026-07-01]` (base first).
+- **NEW refusal categories exist but have no fallback route.** v272 adds
+  `["bio","cyber","aup","agentic","control"]` and the `frontier_llm`/`reasoning_extraction`
+  classifications, but only `bio`/`cyber` are in the route map (`wX(e)=e==="cyber"||e==="bio"`).
+  Claude Code declines the rest unless `CLAUDE_CODE_REFUSAL_FALLBACK_CATCH_ALL` is set. Our
+  implementation intentionally downgrades any unmapped/absent category to the opus-4-8 catch-all
+  (bounded, non-looping) — a deliberate superset of Claude Code's default, matching the manual
+  recovery the user was doing.

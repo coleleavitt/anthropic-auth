@@ -97,7 +97,18 @@ const stickyRouters = new Map<string, StickySessionRouter>()
 const quotaManagers = new Map<string, QuotaManager>()
 const fallbackManagers = new Map<string, FallbackAccountManager>()
 const PI_SERVICE_CACHE_LIMIT = 16
-const SERVER_SIDE_FALLBACK_BETA = 'server-side-fallback-2026-07-01'
+// Anthropic gates server-side fallback behind TWO betas and Claude Code sends
+// both: the base `server_side_fallback` (2026-06-01) enables inline fallback at
+// all, and `server_side_fallback_category` (2026-07-01) adds the bio/cyber
+// category routing. Sending only the category beta left the base capability off,
+// so the server returned a terminal refusal instead of serving a fallback. Order
+// matches Claude Code's `[MP, Ch]`: base first, then category.
+const SERVER_SIDE_FALLBACK_BASE_BETA = 'server-side-fallback-2026-06-01'
+const SERVER_SIDE_FALLBACK_CATEGORY_BETA = 'server-side-fallback-2026-07-01'
+const SERVER_SIDE_FALLBACK_BETAS = [
+  SERVER_SIDE_FALLBACK_BASE_BETA,
+  SERVER_SIDE_FALLBACK_CATEGORY_BETA,
+]
 const SERVER_FALLBACK_MARKER_TEXT = String.fromCodePoint(0x2060)
 const SERVER_FALLBACK_SIGNATURE_PREFIX = 'cortexkit-server-fallback-v1:'
 
@@ -591,9 +602,10 @@ async function sendAnthropicRequest(options: {
     if (!options.apiAccount && serverFallbackEnabled) {
       headers.set(
         'anthropic-beta',
-        mergeAnthropicBetas(headers.get('anthropic-beta'), [
-          SERVER_SIDE_FALLBACK_BETA,
-        ]),
+        mergeAnthropicBetas(
+          headers.get('anthropic-beta'),
+          SERVER_SIDE_FALLBACK_BETAS,
+        ),
       )
     }
     if (!options.apiAccount && fastMode) {
