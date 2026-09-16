@@ -55,8 +55,8 @@ anthropic-auth/
 
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
-- Contains: Extension entry point, command registration, request building, streaming provider
-- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, Pi documentation-prompt relocation, and cache breakpoint placement), `paths.ts` (Pi-specific path resolution)
+- Contains: Extension entry point, command registration, host credential seeding, request building, streaming provider
+- Key files: `index.ts` (provider and model-catalog registration), `adopt-host-credential.ts` (cold-start seeding of Pi's own `auth.json` from the canonical shared store), `stream.ts` (streaming request handling), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, Pi documentation-prompt relocation, and cache breakpoint placement), `paths.ts` (Pi-specific path resolution)
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic and relay servers
@@ -132,6 +132,7 @@ anthropic-auth/
 - `packages/opencode/src/shared-auth.ts`: Resolves canonical shared credentials, adopts legacy OpenCode auth/fallbacks, preserves API-key versus OAuth header semantics, and synchronizes token rotations
 - `packages/opencode/src/tui-preferences.ts`: Comment-preserving JSONC preference reads/writes plus live reload through content-checked directory events and an independent polling fallback for missed events or `fs.watch` construction failures
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
+- `packages/pi/src/adopt-host-credential.ts`: Seeds Pi's own `auth.json` from the canonical shared account store when Pi holds no Anthropic entry, so Pi's pre-flight `hasConfiguredAuth` gate cannot refuse a machine whose shared store is already authenticated; never overwrites an existing host entry and never throws
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation, including server-side fallback opt-in/boundary preservation and structured terminal-refusal diagnostics
 - `packages/core/src/relay.ts`: Shared HTTP/WebSocket relay implementation; persistent WebSocket sends propagate caller cancellation and close fail-closed after a dispatched request is aborted because binary response frames are not request-tagged
 

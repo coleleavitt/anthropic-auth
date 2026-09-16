@@ -20,6 +20,7 @@ import type {
 } from '@earendil-works/pi-ai'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
+import { adoptSharedCredentialIntoHostAuth } from './adopt-host-credential.ts'
 import { registerCommands } from './commands.ts'
 import {
   currentSharedAccount,
@@ -219,6 +220,12 @@ export async function resolvePiModelCatalog(): Promise<CatalogModel[]> {
 
 export default async function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
   registerCommands(pi)
+
+  // Pi's pre-flight gate (`hasConfiguredAuth`) reads only Pi's own auth file,
+  // while our request path reads the shared store, so a cold `auth.json` would
+  // refuse a machine that is fully authenticated. Seed it before the provider
+  // is registered, and never let a failure here block registration.
+  await adoptSharedCredentialIntoHostAuth().catch(() => undefined)
 
   // Warm the live Claude Code version so request fingerprints track the
   // published CLI instead of the compiled floor; Anthropic hard-rejects
