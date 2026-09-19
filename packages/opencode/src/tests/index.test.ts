@@ -18478,6 +18478,114 @@ describe('auth.loader', () => {
     ])
   })
 
+  test('sticky-balanced reselects after the user changes the session model', async () => {
+    const checkedAt = Date.now()
+    const quota = (fableRemaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+        checkedAt,
+      },
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100 - fableRemaining,
+          remainingPercent: fableRemaining,
+          resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
+          checkedAt,
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(0),
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+        accounts: [
+          {
+            id: 'fable-rich',
+            type: 'oauth',
+            access: 'fable-rich-access',
+            refresh: 'fable-rich-refresh',
+            expires: checkedAt + 5 * 60 * 60_000,
+            quota: quota(100),
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+    const successSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      return Promise.resolve(new Response(successSse, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 100_000,
+        }),
+      { models: {} },
+    )
+    const request = (model: string) => ({
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_user_model_change' },
+      body: JSON.stringify({
+        model,
+        max_tokens: 128_000,
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    await (await result.fetch(MESSAGES_URL, request('claude-fable-5-1'))).text()
+    await (await result.fetch(MESSAGES_URL, request('claude-opus-5'))).text()
+
+    expect(authorizations).toEqual([
+      'Bearer fable-rich-access',
+      'Bearer main-access',
+    ])
+  })
+
   test('sticky-balanced reports main re-login instead of falling through when no fallback can serve the requested model', async () => {
     const checkedAt = Date.now()
     const quota = (fableRemaining: number) => ({

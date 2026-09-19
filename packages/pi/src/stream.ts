@@ -856,6 +856,7 @@ async function executeWithFallback(options: {
       sessionId,
       family: stickyRouteFamilyForModel(options.model.id),
       modelId: options.model.id,
+      affinityModelId: options.model.id,
       candidates: routes.candidates,
       retainAccountIds: routes.retainAccountIds,
       storage,

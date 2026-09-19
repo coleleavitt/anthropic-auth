@@ -131,7 +131,7 @@
 **StickySessionRouter:**
 - Purpose: Quota-balance cold sessions without moving an established prompt cache between OAuth accounts
 - Location: `packages/core/src/sticky-routing.ts`
-- Pattern: Cross-process locked atomic registry keyed by SHA-256 session hashes. Candidate weights combine spendable 5h/7d/model-scoped quota, reset horizon, and bytes assigned since the candidate quota snapshot. Assignments survive transient errors, can be cleared for the current session with `/claude-routing reset`, and expire after seven inactive days. Direct Opus allocation first consumes usable accounts with exhausted Fable scope; OpenCode Fable/Opus 5 recovery continues on the original sticky account.
+- Pattern: Cross-process locked atomic registry keyed by SHA-256 session hashes. Candidate weights combine spendable 5h/7d/model-scoped quota, reset horizon, and bytes assigned since the candidate quota snapshot. Assignments survive transient errors, can be cleared for the current session with `/claude-routing reset`, and expire after seven inactive days. Affinity is bound to the user-selected model: changing models discards the old assignment and its stale CacheKeep preference before quota-based reselection, while an internal Fable/Opus recovery model continues on the original account. Legacy assignments without a model identity are reallocated once rather than guessed. Direct Opus allocation first consumes usable accounts with exhausted Fable scope.
 
 **CacheKeepManager:**
 - Purpose: Tracks hybrid-cache sessions and sends pre-warm requests before 1-hour TTL expiry; also exposes immediate zero-output prewarming for Fable/Opus 5 content-filter recovery

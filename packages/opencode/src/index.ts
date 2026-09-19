@@ -8016,6 +8016,7 @@ const anthropicAuthPlugin = async (
                       sessionId,
                       family,
                       modelId: routingModelId,
+                      affinityModelId: requestModel,
                       candidates: stickyRoutes.candidates,
                       retainAccountIds: stickyRoutes.retainAccountIds,
                       storage: stickyRoutes.storage,

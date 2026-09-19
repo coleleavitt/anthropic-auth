@@ -12,6 +12,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Bind sticky-balanced affinity to the user-selected model for OpenCode and Pi, discarding the old assignment and CacheKeep route preference on a real model change while preserving account affinity for transparent Fable/Opus recovery.
 - Enroll newly bound Claustrum OAuth accounts into the OpenCode routing pool at startup or live without a restart, after exact credential-ID and provider-account verification; immediately prime quota for sticky-balanced routing, persist only secret-free tombstone rows, preserve disabled accounts, and recover missed manifest watch events with one process-shared metadata poll.
 - Remove obsolete root-level build output before workspace builds so stale pre-custody CLI artifacts cannot bypass current account and Claustrum safeguards.
 - Give consecutive Desktop fallback notices distinct, pre-registered message IDs before the assistant; defer delivery when safe ordering is unavailable and bound notice tracking across sessions (#230).
