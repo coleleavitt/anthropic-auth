@@ -6,6 +6,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Minor Changes
 
+- Add unified interactive `opencode-anthropic-auth setup` wizard (`bunx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
+- Add Claustrum vault custody support to Pi with native ambient authentication, per-dispatch scoped credential authorization, atomic roster reconciliation, and version-fenced 401 reporting.
+- Implement zero-bind scoped Claustrum custody across OpenCode and Pi, discovering vaulted Anthropic accounts automatically via `listScoped` under `category:anthropic-native` without manual capability handle minting, manifest files, or process restarts.
+
 - Add the global `/claude-account claustrum|local` custody mode for every OpenCode OAuth account, including main-account tombstone takeover, fail-closed serving, and explicit Pi refusal.
 - Add global Claustrum manifest onboarding, startup legacy-handle migration, and verified local re-login recovery.
 - Add a crash-resumable OpenCode Claustrum enrollment ceremony for the future scoped-discovery cutover, using producer-owned typed wire decoders, one host-global owner-only token, secret-before-propose persistence, process/file-lock sharing, and explicit pending/terminal status without enabling scoped credential spending yet.

@@ -6,6 +6,9 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Minor Changes
 
+- Add unified interactive `opencode-anthropic-auth setup` wizard (`bunx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
+- Implement zero-bind scoped Claustrum custody in OpenCode, discovering vaulted Anthropic accounts automatically via `listScoped` under `category:anthropic-native` without manual capability handle minting, manifest files, or process restarts.
+
 - Add API-key/proxy-only custom headers and model aliases while preserving versioned proxy base paths and protecting route authentication, protocol headers, body framing, and internal correlation state.
 - Add a crash-resumable Claustrum enrollment ceremony for the future scoped-discovery cutover, sharing one owner-only `anthropic-auth-opencode` identity across project processes and projecting approval status without changing the existing handle-based serving path.
 

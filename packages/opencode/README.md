@@ -53,6 +53,18 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - Add `/claude-cache`, `/claude-cachekeep`, `/claude-prime`, `/claude-start`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands.
 - Optionally relay large requests through a Cloudflare Worker owned by the user.
 
+## Setup wizard (recommended)
+
+Run the interactive setup wizard:
+
+```bash
+bunx @cortexkit/opencode-anthropic-auth setup
+```
+
+The wizard detects OpenCode, Pi, and Claustrum, configures plugin entries, and optionally activates Claustrum custody.
+
+---
+
 ## Install
 
 ### OpenCode
