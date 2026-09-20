@@ -7,6 +7,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 ### Minor Changes
 
 - Add API-key/proxy-only custom headers and model aliases while preserving versioned proxy base paths and protecting route authentication, protocol headers, body framing, and internal correlation state.
+- Add a crash-resumable Claustrum enrollment ceremony for the future scoped-discovery cutover, sharing one owner-only `anthropic-auth-opencode` identity across project processes and projecting approval status without changing the existing handle-based serving path.
 
 ### Patch Changes
 

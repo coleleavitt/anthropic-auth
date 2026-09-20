@@ -405,6 +405,10 @@ export async function spawnOpencode(
       'sidebar-state.json',
     )
     childEnv.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(env.tempDir, 'rpc')
+    childEnv.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+      env.configDir,
+      'claustrum-enrollment.json',
+    )
     childEnv.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = join(env.tempDir, 'dumps')
     childEnv.OPENCODE_ANTHROPIC_AUTH_LOG_FILE = join(
       env.tempDir,

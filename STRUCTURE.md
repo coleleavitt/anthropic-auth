@@ -88,6 +88,7 @@ anthropic-auth/
 **Core Logic:**
 - `packages/core/src/auth.ts`: OAuth authorize → PKCE challenge → token exchange → refresh, with provider-bound custody tombstones rejected before network access
 - `packages/core/src/claustrum.ts`: Optional OpenCode global-custody transport — connection-file and owner-only manifest validation, cross-platform stale manifest lock quarantine reaping, inherited-identity scrubbing, shared reconnects, handle and tombstone parsing, resident credential cache, minimum-TTL warming, record-version 401 fencing, and close-during-reconnect shutdown safety
+- `packages/core/src/claustrum-enrollment.ts`: Host-parameterized, crash-resumable Claustrum enrollment ceremony — owner-only bounded state, secret-before-propose persistence, idempotent crash replay, one-shot token persistence ordering, cross-process locking, terminal reset guards, and secret-free status projection
 - `packages/core/src/oauth-profile.ts`: OAuth profile metadata fetch, tier formatting (`Max 5x`, `Team · Max 5x`), and 7-day TTL validation
 - `packages/core/src/quota-headers.ts`: Normalization of `anthropic-ratelimit-unified-*` headers from direct fetch and relay transports into shared quota snapshots
 - `packages/core/src/quota-header-feed.ts`: Schema-versioned, owner-only per-process lease files containing an explicit allowlist of fresh quota observations for host-local consumers
@@ -138,6 +139,7 @@ anthropic-auth/
 - `packages/opencode/src/custody-dimensions.ts`: Classification of route custody status, fallback custody dimensions, and tombstone/vault-served evidence
 - `packages/opencode/src/custody-enrollment.ts`: Plans and materializes newly bound Claustrum fallback accounts as deterministic secret-free tombstone routing rows after live identity verification
 - `packages/opencode/src/custody-manifest-watcher.ts`: Shares one manifest directory watcher per process/path, debounces atomic replacements, and uses a low-frequency metadata poll to recover missed filesystem events
+- `packages/opencode/src/claustrum-enrollment-registry.ts`: Adopts one process-shared `anthropic-auth-opencode` enrollment manager at a host-global owner-only token path, serializes plugin leases, polls pending approval without keeping Bun alive, and deliberately exposes no scoped spending operations
 - `packages/opencode/src/local-login.ts`: Verified local re-login completion, custody divergence markers, and binding clearance after returning to local mode
 - `packages/opencode/src/tui-preferences.ts`: Comment-preserving JSONC preference reads/writes plus live reload through content-checked directory events and an independent polling fallback for missed events or `fs.watch` construction failures
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting

@@ -22,6 +22,7 @@
       "name": "@cortexkit/anthropic-auth-core",
       "version": "1.22.0",
       "dependencies": {
+        "@cortexkit/claustrum-client": "0.3.0",
         "@cortexkit/subc-client": "^0.11.1",
         "xxhash-wasm": "^1.1.0",
       },
@@ -215,6 +216,8 @@
     "@cortexkit/anthropic-auth-core": ["@cortexkit/anthropic-auth-core@workspace:packages/core"],
 
     "@cortexkit/anthropic-auth-e2e": ["@cortexkit/anthropic-auth-e2e@workspace:packages/e2e-tests"],
+
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.3.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.8.1" } }, "sha512-vX28AlhG6vsk2PDNIQMkMmcP2gg+tcODuuz/xppVyLnveNL8aVZlZll1TkT1T9UMKeLDk/vvfOkeMSAC9ZaKGA=="],
 
     "@cortexkit/opencode-anthropic-auth": ["@cortexkit/opencode-anthropic-auth@workspace:packages/opencode"],
 
@@ -921,6 +924,8 @@
     "@babel/helper-compilation-targets/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
     "@babel/helper-create-class-features-plugin/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
+
+    "@cortexkit/claustrum-client/@cortexkit/subc-client": ["@cortexkit/subc-client@0.8.1", "", {}, "sha512-8U9w3AnSff0QYlLVzcKOuTULakRtVpcGJrquGHxOQQlWZGzXZdCs8nroLMeoM2xhFGwxIh8xFk832w1KG6akAA=="],
 
     "@google/genai/ws": ["ws@8.20.0", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA=="],
 

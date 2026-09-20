@@ -291,6 +291,8 @@ The request path reads only a resident in-memory credential. Startup warming and
 
 After a new Anthropic credential is explicitly bound to `anthropic-auth`, a running plugin watches the manifest and automatically creates its secret-free routing row; the same reconciliation runs during startup. Enrollment requires an exact live `credential.get` match for both the manifest credential ID and provider account UUID, persists only a custody tombstone plus identity metadata, and immediately refreshes the new route's quota so sticky-balanced routing does not wait for the next background interval. Existing disabled rows remain disabled. To stop routing without changing the manifest, disable the account; removing a manifest-bound row is refused until its binding is removed.
 
+Claustrum mode also starts the future scoped-discovery enrollment ceremony under the host identity `anthropic-auth-opencode`. The plugin writes the request secret before proposing, shares one locked ceremony across every OpenCode project process, and displays the pending request ID and exact approval command in `/claude-account`. Approval is persisted atomically as an owner-only token at `$XDG_STATE_HOME/cortexkit/anthropic-auth/opencode-enrollment.json` (default `~/.local/state/cortexkit/anthropic-auth/opencode-enrollment.json`). Grant that identity only `category:anthropic-native`; never grant the broader `llm-provider` category. This release does not spend the enrollment token yet: model requests continue through the existing capability-handle manifest until the scoped-discovery cutover lands. `/claude-account enrollment-reset` retries only a denied or locally blocked ceremony and refuses to discard pending or approved authority.
+
 If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state. API-key routes are unaffected.
 
 ## Quota-aware routing
@@ -676,6 +678,7 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `ANTHROPIC_DEFAULT_FABLE_MODEL` | Proxy alias for `claude-fable-*` and `claude-mythos-*` models. |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
+| `OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE` | Override the owner-only OpenCode Claustrum enrollment-token path. |
 | `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to bypass Anthropic's server policy and use deterministic 10-response client recovery exclusively. The default tries server-side safety fallback first and uses client recovery as a backstop. |
 | `PI_ANTHROPIC_AUTH_FILE` | Override the Pi sidecar config path. |
 | `PI_AGENT_DIR` | Override Pi's agent directory when deriving the default sidecar path. |

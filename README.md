@@ -297,6 +297,8 @@ Entering custody preflights every enabled OAuth account. A refusal changes nothi
 In custody, every enabled OAuth route is served from the vault, including the main account. A cold main vault record returns a typed startup refusal and holds every OAuth route until the next viable boot; after a warm boot, it returns a typed provider-unavailable error. The plugin does not fall back to sidecar credentials or send a tombstone as a bearer token. A cold fallback is excluded only for that request, so other warm routes can still serve.
 
 Leaving custody puts the main account back into interactive OpenCode sign-in. A fallback binding clears only after a login completed through the plugin's own login flow observes new credential material. To enter custody again for that fallback, the operator must import the new material into the vault with `--replace`; until then, `/claude-account claustrum` refuses with `binding_missing`. API-key routes are unaffected.
+
+Claustrum mode also starts the future scoped-discovery enrollment ceremony under the host identity `anthropic-auth-opencode`. The plugin durably stores the request secret before proposing, shares one locked ceremony across OpenCode project processes, and shows the request ID and approval command in `/claude-account`. The approved owner-only token defaults to `~/.local/state/cortexkit/anthropic-auth/opencode-enrollment.json`. Grant only `category:anthropic-native`; do not grant the broader `llm-provider` category. This release persists the enrollment but continues serving through the existing capability-handle manifest until scoped discovery lands. `/claude-account enrollment-reset` retries only denied or locally blocked ceremonies.
 ## Quota-aware routing
 
 When `quota.enabled` is true, the plugin checks Anthropic's OAuth usage endpoint and applies the configured remaining-quota thresholds to both main and fallback accounts.
@@ -703,6 +705,7 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
+| `OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE` | Override the owner-only OpenCode Claustrum enrollment-token path. |
 | `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to bypass Anthropic's server policy and use deterministic 10-response client recovery exclusively. The default tries server-side safety fallback first and uses client recovery as a backstop. |
 | `OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE` | Override the persistent sticky-balanced session assignment file. |
 | `OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | Override the temporary OpenCode CacheKeep session lease directory. |

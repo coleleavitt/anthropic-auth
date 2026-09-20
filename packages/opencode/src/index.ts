@@ -36,6 +36,8 @@ import {
   type ClaustrumCredential,
   type ClaustrumCredentialCache,
   ClaustrumCredentialError,
+  type ClaustrumEnrollmentConnection,
+  type ClaustrumEnrollmentStatus,
   type ClaustrumReporterSource,
   type CustodyHandleManifest,
   CustodyHandleManifestReader,
@@ -47,6 +49,7 @@ import {
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
   connectClaustrumCredentialCache,
+  connectClaustrumEnrollmentClient,
   createEmptyStorage,
   createStickyNoRouteResponse,
   custodyCredentialId,
@@ -71,6 +74,7 @@ import {
   FallbackAccountManager,
   fallbackAccountUuidForLineage,
   fetchOAuthAccountProfile,
+  formatEnrollmentStatus,
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
@@ -221,6 +225,11 @@ import {
   summarizeCacheTtl,
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
+import {
+  adoptClaustrumEnrollment,
+  type ClaustrumEnrollmentAdoption,
+  getOpenCodeClaustrumEnrollmentPaths,
+} from './claustrum-enrollment-registry.ts'
 import {
   custodyStateFor,
   fallbackCustodyDimensions,
@@ -972,6 +981,8 @@ type PluginRuntimeOverrides = Partial<{
   clearInterval: typeof globalThis.clearInterval
   custodyManifestPollIntervalMs: number
   claustrumConnector: ClaustrumConnector
+  claustrumEnrollmentConnect: () => Promise<ClaustrumEnrollmentConnection>
+  claustrumEnrollmentPollIntervalMs: number
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
   removeCustodyHandleManifestEntry: AcknowledgeLocalOAuthLoginOptions['remove']
@@ -1103,6 +1114,67 @@ const anthropicAuthPlugin = async (
       cause: error instanceof Error ? error : undefined,
     })
   }
+  let claustrumEnrollmentStatus: ClaustrumEnrollmentStatus = { state: 'idle' }
+  let claustrumEnrollmentAdoption: ClaustrumEnrollmentAdoption | null = null
+  function ensureClaustrumEnrollmentAdoption(): ClaustrumEnrollmentAdoption {
+    if (claustrumEnrollmentAdoption) return claustrumEnrollmentAdoption
+    const identity = {
+      project_root: ctx.directory ?? process.cwd(),
+      harness: 'opencode',
+      session: `store-${primeStorageFingerprint(accountStoragePath)}`,
+    }
+    claustrumEnrollmentAdoption = adoptClaustrumEnrollment({
+      paths: getOpenCodeClaustrumEnrollmentPaths(),
+      connect: () =>
+        runtimeOverrides.claustrumEnrollmentConnect?.() ??
+        connectClaustrumEnrollmentClient({
+          projectRoot: ctx.directory ?? process.cwd(),
+          storagePath: accountStoragePath,
+          identity,
+          logger: (errorClass) =>
+            logger.warn('claustrum', 'unknown enrollment error class', {
+              errorClass,
+            }),
+          ...(getConfiguredClaustrumConnectionFile() && {
+            connectionFile: getConfiguredClaustrumConnectionFile(),
+          }),
+        }),
+      setTimeoutImpl: runtimeTimers.setTimeout,
+      clearTimeoutImpl: runtimeTimers.clearTimeout,
+      onStatus: (status) => {
+        const previous = claustrumEnrollmentStatus
+        claustrumEnrollmentStatus = status
+        if (
+          status.state === 'unavailable' &&
+          (previous.state !== 'unavailable' || previous.code !== status.code)
+        ) {
+          logger.warn('claustrum', 'enrollment ceremony unavailable', {
+            error: status.code,
+          })
+        } else if (
+          status.state === 'approved' &&
+          previous.state !== 'approved'
+        ) {
+          logger.info('claustrum', 'enrollment ceremony approved', {
+            generation: status.tokenGeneration,
+          })
+        }
+      },
+      ...(runtimeOverrides.claustrumEnrollmentPollIntervalMs !== undefined && {
+        pollIntervalMs: runtimeOverrides.claustrumEnrollmentPollIntervalMs,
+      }),
+    })
+    return claustrumEnrollmentAdoption
+  }
+  function stopClaustrumEnrollmentAdoption(): void {
+    claustrumEnrollmentAdoption?.release()
+    claustrumEnrollmentAdoption = null
+    claustrumEnrollmentStatus = { state: 'idle' }
+  }
+  if (getClaustrumMode(initialStorage) === 'claustrum') {
+    ensureClaustrumEnrollmentAdoption()
+  }
+
   const fallbackMode = resolveContentFilterFallbackMode(
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
   )
@@ -3599,6 +3671,13 @@ const anthropicAuthPlugin = async (
   }
   const dispose: NonNullable<Hooks['dispose']> = async () => {
     try {
+      stopClaustrumEnrollmentAdoption()
+    } catch (error) {
+      logger.warn('claustrum', 'failed to stop enrollment ceremony', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
       custodyManifestWatcherAdoption?.release()
       await custodyManifestRefreshChain.catch(() => {})
     } catch (error) {
@@ -4914,7 +4993,7 @@ const anthropicAuthPlugin = async (
                 : { status: 'unresolved', reason: 'missing-entry' }
           : undefined,
       transition: async (mode) => {
-        return runClaustrumTakeoverCommand(
+        const transitionResult = await runClaustrumTakeoverCommand(
           {
             storagePath: accountStoragePath,
             loadStorage: () => loadAccounts(accountStoragePath),
@@ -4928,6 +5007,38 @@ const anthropicAuthPlugin = async (
           },
           mode,
         )
+        const transitionedStorage = await loadAccounts(accountStoragePath)
+        if (getClaustrumMode(transitionedStorage) === 'claustrum') {
+          ensureClaustrumEnrollmentAdoption()
+        } else {
+          stopClaustrumEnrollmentAdoption()
+        }
+        return transitionResult
+      },
+      resetEnrollment: async () => {
+        const adoption = ensureClaustrumEnrollmentAdoption()
+        const reset = await adoption.resetTerminal()
+        switch (reset) {
+          case 'reset':
+            return {
+              text: 'Claustrum enrollment reset; a new request is being prepared.',
+            }
+          case 'idle':
+            await adoption.reconcileNow()
+            return { text: 'Claustrum enrollment request is being prepared.' }
+          case 'refused-pending':
+            return {
+              text: 'Claustrum enrollment is still pending. Deny or approve that request before resetting it.',
+            }
+          case 'refused-approved':
+            return {
+              text: 'Claustrum enrollment is already approved. Revoke it in Claustrum before removing local enrollment state.',
+            }
+          case 'busy':
+            return {
+              text: 'Another plugin process is reconciling Claustrum enrollment; retry shortly.',
+            }
+        }
       },
     })
 
@@ -5075,10 +5186,15 @@ const anthropicAuthPlugin = async (
     const detection = await detectClaustrumConnection(
       getConfiguredClaustrumConnectionFile(),
     )
+    const custodyMode = getClaustrumMode(accountStorage)
+    if (custodyMode === 'claustrum') ensureClaustrumEnrollmentAdoption()
     return {
       accounts,
       claustrumDetection: detection.status,
-      custodyMode: getClaustrumMode(accountStorage),
+      custodyMode,
+      ...(custodyMode === 'claustrum' && {
+        claustrumEnrollment: claustrumEnrollmentStatus,
+      }),
     }
   }
 
@@ -5115,6 +5231,11 @@ const anthropicAuthPlugin = async (
         claustrumDetection: accountProjection.claustrumDetection,
         custodyMode: accountProjection.custodyMode,
         custodyModeKnown: true,
+        ...(accountProjection.claustrumEnrollment && {
+          enrollmentStatus: formatEnrollmentStatus(
+            accountProjection.claustrumEnrollment,
+          ).join('\n'),
+        }),
       }
       if ('knobs' in result && result.knobs) {
         Object.assign(knobs, result.knobs)

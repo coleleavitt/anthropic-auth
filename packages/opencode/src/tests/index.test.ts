@@ -52,6 +52,7 @@ import {
   PROFILE_TTL_MS,
   type ProviderAccountUuid,
   primeStorageFingerprint,
+  readClaustrumEnrollmentStatus,
   removeCustodyHandleManifestEntry,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
@@ -63,6 +64,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { SubcCallError } from '@cortexkit/subc-client'
+import { getOpenCodeClaustrumEnrollmentPaths } from '../claustrum-enrollment-registry'
 import { EFFORT_MARKER_PREFIX } from '../effort-history'
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
@@ -544,6 +546,10 @@ async function useTempAccountFile(storage: AccountStorage) {
     tempConfigDir,
     'sidebar-state.json',
   )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    tempConfigDir,
+    'opencode-enrollment.json',
+  )
   process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
     tempConfigDir,
     'cachekeep-registry',
@@ -570,6 +576,10 @@ function restoreProcessTestFiles() {
   process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
     testDir,
     'sidebar-state.json',
+  )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    testDir,
+    'opencode-enrollment.json',
   )
   process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
     testDir,
@@ -685,6 +695,8 @@ type PluginRuntimeOverrides = Partial<{
   clearInterval: typeof globalThis.clearInterval
   custodyManifestPollIntervalMs: number
   claustrumConnector: (options: unknown) => Promise<unknown>
+  claustrumEnrollmentConnect: () => Promise<unknown>
+  claustrumEnrollmentPollIntervalMs: number
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
   removeCustodyHandleManifestEntry: typeof removeCustodyHandleManifestEntry
@@ -700,6 +712,12 @@ function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
     ) as unknown as typeof setInterval,
     clearInterval: mock(() => {}) as unknown as typeof clearInterval,
     custodyManifestPollIntervalMs: 0,
+    claustrumEnrollmentPollIntervalMs: 0,
+    claustrumEnrollmentConnect: async () => ({
+      enrollPropose: async () => ({ requestId: 'test-enrollment-request' }),
+      enrollPoll: async () => ({ status: 'pending' as const }),
+      close() {},
+    }),
   }
 }
 
@@ -1528,6 +1546,82 @@ describe('fallback Claustrum credential resolution', () => {
       },
     )
   })
+
+  test.serial(
+    'starts a durable enrollment ceremony in Claustrum mode without enabling scoped serving',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      let approved = false
+      let proposalHash = ''
+      let connectionClosed = false
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumEnrollmentPollIntervalMs: 5,
+        claustrumEnrollmentConnect: async () => ({
+          enrollPropose: async ({
+            requestSecretHash,
+          }: {
+            requestSecretHash: string
+          }) => {
+            proposalHash = requestSecretHash
+            return { requestId: 'request-autostart' }
+          },
+          enrollPoll: async () =>
+            approved
+              ? {
+                  status: 'approved' as const,
+                  name: 'anthropic-auth-opencode',
+                  token: 'ae'.repeat(32),
+                  tokenGeneration: 1,
+                }
+              : { status: 'pending' as const },
+          close: () => {
+            connectionClosed = true
+          },
+        }),
+      })
+      const enrollmentPaths = getOpenCodeClaustrumEnrollmentPaths()
+      const deadline = Date.now() + 2_000
+      let pending: Record<string, unknown> | undefined
+      while (Date.now() < deadline) {
+        pending = await readFile(enrollmentPaths.statePath, 'utf8')
+          .then((source) => JSON.parse(source))
+          .catch(() => undefined)
+        if (pending?.requestId === 'request-autostart') break
+        await Bun.sleep(5)
+      }
+      expect(pending?.phase).toBe('pending')
+      expect(typeof pending?.requestSecret).toBe('string')
+      expect(proposalHash).toHaveLength(64)
+
+      approved = true
+      const approvalDeadline = Date.now() + 2_000
+      let approvedStatus: Awaited<
+        ReturnType<typeof readClaustrumEnrollmentStatus>
+      > = { state: 'idle' }
+      while (Date.now() < approvalDeadline) {
+        approvedStatus = await readClaustrumEnrollmentStatus(enrollmentPaths)
+        if (approvedStatus.state === 'approved') break
+        await Bun.sleep(5)
+      }
+      expect(approvedStatus).toEqual({
+        state: 'approved',
+        proposedName: 'anthropic-auth-opencode',
+        approvedName: 'anthropic-auth-opencode',
+        tokenGeneration: 1,
+      })
+      expect(await readFile(enrollmentPaths.statePath, 'utf8')).not.toContain(
+        String(pending?.requestSecret),
+      )
+      await plugin.dispose?.()
+      expect(connectionClosed).toBe(true)
+    },
+  )
 
   test.serial('warms a manifest-only handle at startup', async () => {
     await useTempAccountFile(manifestStorage({ label: 'manifest-start' }))
