@@ -22,6 +22,7 @@ import { acquireRefreshFileLock } from './accounts.js'
 import { parseJsonRedacted } from './json.js'
 
 export const CLAUSTRUM_OPENCODE_ENROLLMENT_NAME = 'anthropic-auth-opencode'
+export const CLAUSTRUM_PI_ENROLLMENT_NAME = 'anthropic-auth-pi'
 const ENROLLMENT_SCHEMA = 1
 const ENROLLMENT_FILE_MAX_BYTES = 16 * 1024
 const ENROLLMENT_LOCK_TTL_MS = 30_000
@@ -311,6 +312,7 @@ async function writeStateAtomic(
 
 export async function readClaustrumEnrollmentStatus(
   paths: ClaustrumEnrollmentPaths,
+  proposedName = CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
 ): Promise<ClaustrumEnrollmentStatus> {
   const tokenValue = await readBoundedJson(paths.tokenPath)
   const token =
@@ -321,7 +323,7 @@ export async function readClaustrumEnrollmentStatus(
   if (token) {
     return {
       state: 'approved',
-      proposedName: state?.proposedName ?? CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+      proposedName: state?.proposedName ?? proposedName,
       ...(state?.phase === 'approved' &&
         state.approvedName !== undefined && {
           approvedName: state.approvedName,
@@ -351,6 +353,17 @@ export async function readClaustrumEnrollmentStatus(
     proposedName: state.proposedName,
     code: state.errorCode ?? 'unknown',
   }
+}
+
+/** Read fresh bearer material for a scoped operation; never publish this value. */
+export async function readClaustrumEnrollmentToken(
+  tokenPath: string,
+): Promise<EnrollmentTokenFile> {
+  await refuseWritableAncestor(tokenPath)
+  const value = await readBoundedJson(tokenPath)
+  if (value === undefined)
+    throw new Error('Claustrum enrollment is not configured')
+  return decodeTokenFile(value)
 }
 
 function statusFromState(state: EnrollmentState): ClaustrumEnrollmentStatus {
@@ -406,35 +419,11 @@ export class ClaustrumEnrollmentManager {
   }
 
   async status(): Promise<ClaustrumEnrollmentStatus> {
-    return readClaustrumEnrollmentStatus(this.#paths)
+    return readClaustrumEnrollmentStatus(this.#paths, this.#proposedName)
   }
 
-  async resetTerminal(): Promise<
-    'reset' | 'idle' | 'refused-pending' | 'refused-approved' | 'busy'
-  > {
-    await mkdir(dirname(this.#paths.statePath), {
-      recursive: true,
-      mode: 0o700,
-    })
-    const lock = await acquireRefreshFileLock({
-      name: 'ceremony',
-      path: this.#paths.statePath,
-      ttlMs: ENROLLMENT_LOCK_TTL_MS,
-      renew: true,
-    })
-    if (!lock) return 'busy'
-    try {
-      if ((await readBoundedJson(this.#paths.tokenPath)) !== undefined)
-        return 'refused-approved'
-      const stateValue = await readBoundedJson(this.#paths.statePath)
-      if (stateValue === undefined) return 'idle'
-      const state = decodeEnrollmentState(stateValue)
-      if (state.phase === 'pending') return 'refused-pending'
-      await unlink(this.#paths.statePath)
-      return 'reset'
-    } finally {
-      await lock.release()
-    }
+  async resetTerminal(): Promise<ClaustrumEnrollmentResetResult> {
+    return resetClaustrumEnrollmentState(this.#paths, this.#proposedName)
   }
 
   async reconcile(): Promise<ClaustrumEnrollmentStatus> {
@@ -456,6 +445,11 @@ export class ClaustrumEnrollmentManager {
       const stateValue = await readBoundedJson(this.#paths.statePath)
       let state =
         stateValue === undefined ? undefined : decodeEnrollmentState(stateValue)
+      if (state && state.proposedName !== this.#proposedName) {
+        throw new Error(
+          'Claustrum enrollment state belongs to a different consumer',
+        )
+      }
       if (token) {
         if (!state || state.phase === 'pending') {
           const approved: ApprovedEnrollmentState = {
@@ -601,5 +595,44 @@ export class ClaustrumEnrollmentManager {
     } finally {
       await lock.release()
     }
+  }
+}
+
+export type ClaustrumEnrollmentResetResult =
+  | 'reset'
+  | 'idle'
+  | 'refused-pending'
+  | 'refused-approved'
+  | 'busy'
+
+/** Reset local terminal metadata without connecting to the credential daemon. */
+export async function resetClaustrumEnrollmentState(
+  paths: ClaustrumEnrollmentPaths,
+  proposedName: string,
+): Promise<ClaustrumEnrollmentResetResult> {
+  await mkdir(dirname(paths.statePath), { recursive: true, mode: 0o700 })
+  const lock = await acquireRefreshFileLock({
+    name: 'ceremony',
+    path: paths.statePath,
+    ttlMs: ENROLLMENT_LOCK_TTL_MS,
+    renew: true,
+  })
+  if (!lock) return 'busy'
+  try {
+    if ((await readBoundedJson(paths.tokenPath)) !== undefined)
+      return 'refused-approved'
+    const value = await readBoundedJson(paths.statePath)
+    if (value === undefined) return 'idle'
+    const state = decodeEnrollmentState(value)
+    if (state.proposedName !== proposedName)
+      throw new Error(
+        'Claustrum enrollment state belongs to a different consumer',
+      )
+    if (state.phase === 'pending') return 'refused-pending'
+    await lock.assertOwned()
+    await unlink(paths.statePath)
+    return 'reset'
+  } finally {
+    await lock.release()
   }
 }

@@ -6,6 +6,16 @@ The Pi provider catalog includes Claude Fable 5 (`claude-fable-5`) and 5.1 (`cla
 
 This package is part of the CortexKit Anthropic Auth monorepo, which supports both OpenCode (`@cortexkit/opencode-anthropic-auth`) and Pi (`@cortexkit/pi-anthropic-auth`) through the same shared core logic.
 
+## Setup wizard (recommended)
+
+Use the unified setup wizard to install the extension and optionally configure Claustrum custody:
+
+```bash
+bunx @cortexkit/opencode-anthropic-auth setup
+```
+
+---
+
 ## Install
 
 Install with Pi's package manager:

@@ -57,6 +57,12 @@ export type QuotaRefreshResult = {
 export type QuotaManagerOptions = {
   storage: AccountStorage | null
   fetchImpl?: typeof fetch
+  /** Resolve custody credentials at the actual HTTP boundary, after quota gates. */
+  fetchQuotaSnapshot?: (request: {
+    kind: 'main' | 'fallback'
+    accountId: string | undefined
+    accessToken: string
+  }) => Promise<OAuthQuotaSnapshot>
   now?: () => number
   onMainQuotaFetched?: (
     quota: OAuthQuotaSnapshot,
@@ -146,6 +152,7 @@ export class QuotaManager {
   // --- Config ---
   private storage: AccountStorage | null
   private readonly fetchImpl: typeof fetch
+  private readonly fetchQuotaSnapshot: QuotaManagerOptions['fetchQuotaSnapshot']
   private readonly now: () => number
   private readonly onMainQuotaFetched: QuotaManagerOptions['onMainQuotaFetched']
   private readonly onApiError: QuotaManagerOptions['onApiError']
@@ -155,6 +162,7 @@ export class QuotaManager {
   constructor(opts: QuotaManagerOptions) {
     this.storage = opts.storage
     this.fetchImpl = opts.fetchImpl ?? fetch
+    this.fetchQuotaSnapshot = opts.fetchQuotaSnapshot
     this.now = opts.now ?? Date.now
     this.onMainQuotaFetched = opts.onMainQuotaFetched
     this.onApiError = opts.onApiError
@@ -195,6 +203,11 @@ export class QuotaManager {
   ): QuotaEntry | null {
     this.bindFallbackLineage(accountId, account)
     return this.fallbacks.get(accountId) ?? null
+  }
+
+  /** A host transport resolves scoped credentials at dispatch time. */
+  canFetchWithoutAccessToken(): boolean {
+    return this.fetchQuotaSnapshot !== undefined
   }
 
   getAllFallbacks(): Map<string, QuotaEntry> {
@@ -347,7 +360,8 @@ export class QuotaManager {
   ): Promise<OAuthQuotaSnapshot> {
     const mainAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
-    if (!credential) throw new Error('Main OAuth access token is unavailable')
+    if (!credential && !this.fetchQuotaSnapshot)
+      throw new Error('Main OAuth access token is unavailable')
     return (
       await this.refreshMainWithMetadata(
         mainAccountId,
@@ -364,7 +378,8 @@ export class QuotaManager {
   ): Promise<QuotaRefreshResult> {
     const effectiveAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
-    if (!credential) throw new Error('Main OAuth access token is unavailable')
+    if (!credential && !this.fetchQuotaSnapshot)
+      throw new Error('Main OAuth access token is unavailable')
     if (
       expectedIdentityGeneration !== undefined &&
       (this.mainGeneration !== expectedIdentityGeneration ||
@@ -399,7 +414,7 @@ export class QuotaManager {
     const inflightToken = ++this.inflightMainToken
     this.inflightMain = this._fetchMain(
       effectiveAccountId,
-      credential,
+      credential ?? '',
       generation,
       inflightToken,
     )
@@ -421,6 +436,9 @@ export class QuotaManager {
     accessToken: string,
     account: Pick<OAuthAccount, 'authLineageId'> | undefined,
   ): Promise<QuotaRefreshResult> {
+    if (!accessToken && !this.fetchQuotaSnapshot) {
+      throw new Error('Fallback OAuth access token is unavailable')
+    }
     this.bindFallbackLineage(accountId, account)
     const inflightKey = QuotaManager.fallbackInflightKey(accountId)
     const inflight = this.inflightFallbacks.get(inflightKey)
@@ -925,11 +943,17 @@ export class QuotaManager {
         }
         try {
           const fetchStartedAt = this.now()
-          const quota = await fetchOAuthQuotaSnapshot({
-            accessToken,
-            fetchImpl: this.fetchImpl,
-            now: this.now,
-          })
+          const quota = this.fetchQuotaSnapshot
+            ? await this.fetchQuotaSnapshot({
+                kind: 'main',
+                accountId: mainAccountId,
+                accessToken,
+              })
+            : await fetchOAuthQuotaSnapshot({
+                accessToken,
+                fetchImpl: this.fetchImpl,
+                now: this.now,
+              })
           const now = this.now()
           if (
             this.mainQuotaIdentityKnown &&
@@ -1032,11 +1056,17 @@ export class QuotaManager {
         }
         try {
           const fetchStartedAt = this.now()
-          const quota = await fetchOAuthQuotaSnapshot({
-            accessToken,
-            fetchImpl: this.fetchImpl,
-            now: this.now,
-          })
+          const quota = this.fetchQuotaSnapshot
+            ? await this.fetchQuotaSnapshot({
+                kind: 'fallback',
+                accountId,
+                accessToken,
+              })
+            : await fetchOAuthQuotaSnapshot({
+                accessToken,
+                fetchImpl: this.fetchImpl,
+                now: this.now,
+              })
           const now = this.now()
           if ((this.fallbackGenerations.get(accountId) ?? 0) !== generation) {
             return {

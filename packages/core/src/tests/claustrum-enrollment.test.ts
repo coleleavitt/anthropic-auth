@@ -22,6 +22,7 @@ import {
   ClaustrumEnrollmentManager,
   getClaustrumEnrollmentPaths,
   readClaustrumEnrollmentStatus,
+  readClaustrumEnrollmentToken,
 } from '../claustrum-enrollment.ts'
 
 const tempDirs: string[] = []
@@ -462,7 +463,7 @@ describe('ClaustrumEnrollmentManager', () => {
         paths,
         client({
           enrollPoll: async () => {
-            throw new ClaustrumCredentialError(code, 'permanent', 'refused')
+            throw new ClaustrumCredentialError(code, 'permanent', 'gone')
           },
         }),
       )
@@ -516,4 +517,92 @@ describe('ClaustrumEnrollmentManager', () => {
     })
     expect(JSON.stringify(status)).not.toContain(token)
   })
+})
+
+describe('scoped enrollment token reads', () => {
+  test('reads each atomic replacement rather than retaining the previous token', async () => {
+    const paths = await fixture()
+    await writeEnrollmentTokenFile(paths.tokenPath, {
+      token: secret,
+      token_generation: 1,
+    })
+    expect(await readClaustrumEnrollmentToken(paths.tokenPath)).toEqual({
+      token: secret,
+      token_generation: 1,
+    })
+    await writeEnrollmentTokenFile(paths.tokenPath, {
+      token: '02'.repeat(32),
+      token_generation: 2,
+    })
+    expect(await readClaustrumEnrollmentToken(paths.tokenPath)).toEqual({
+      token: '02'.repeat(32),
+      token_generation: 2,
+    })
+    await rm(paths.tokenPath)
+    await expect(readClaustrumEnrollmentToken(paths.tokenPath)).rejects.toThrow(
+      'not configured',
+    )
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    'refuses symlinks and world-readable token files',
+    async () => {
+      const paths = await fixture()
+      await writeEnrollmentTokenFile(paths.tokenPath, {
+        token: secret,
+        token_generation: 1,
+      })
+      const link = join(dirname(paths.tokenPath), 'link.json')
+      await symlink(paths.tokenPath, link)
+      await expect(readClaustrumEnrollmentToken(link)).rejects.toThrow()
+      await chmod(paths.tokenPath, 0o644)
+      await expect(
+        readClaustrumEnrollmentToken(paths.tokenPath),
+      ).rejects.toThrow('owner-only')
+    },
+  )
+})
+
+test('a second host cannot adopt or reset another host ceremony on disk', async () => {
+  const paths = await fixture()
+  const original = manager(
+    paths,
+    client({ enrollPoll: async () => ({ status: 'denied' }) }),
+  )
+  await original.reconcile()
+  const before = await readFile(paths.statePath, 'utf8')
+  let calls = 0
+  const other = manager(
+    paths,
+    client({
+      enrollPropose: async () => {
+        calls++
+        return { requestId: 'wrong-host' }
+      },
+    }),
+    { proposedName: 'anthropic-auth-pi' },
+  )
+  await expect(other.reconcile()).rejects.toThrow('different consumer')
+  await expect(other.resetTerminal()).rejects.toThrow('different consumer')
+  expect(await readFile(paths.statePath, 'utf8')).toBe(before)
+  expect(calls).toBe(0)
+})
+
+test('Pi token-only status uses its own consumer name', async () => {
+  const paths = await fixture()
+  await writeEnrollmentTokenFile(paths.tokenPath, {
+    token: secret,
+    token_generation: 1,
+  })
+  const instance = manager(paths, client(), {
+    proposedName: 'anthropic-auth-pi',
+  })
+  expect(await instance.status()).toEqual({
+    state: 'approved',
+    proposedName: 'anthropic-auth-pi',
+    tokenGeneration: 1,
+  })
+  expect(
+    await readClaustrumEnrollmentStatus(paths, 'anthropic-auth-pi'),
+  ).toEqual(await instance.status())
 })

@@ -192,10 +192,11 @@ export function custodyStatusLabel(state: CustodyStatusState): string {
 
 export function formatEnrollmentStatus(
   status: ClaustrumEnrollmentStatus,
+  scopedServing = false,
 ): string[] {
   switch (status.state) {
     case 'idle':
-      return ['- Enrollment: starting']
+      return ['- Enrollment: not enrolled']
     case 'busy':
       return ['- Enrollment: another plugin process is reconciling']
     case 'unavailable':
@@ -215,12 +216,20 @@ export function formatEnrollmentStatus(
       const name = status.approvedName ?? status.proposedName
       return /^[A-Za-z0-9_-]{1,128}$/.test(name)
         ? [
-            `- Enrollment: approved as enrolled:${name} (generation ${status.tokenGeneration}; scoped serving not active yet)`,
-            `- Grant: \`ck auth grant --principal enrolled:${name} --selector-kind category --selector anthropic-native --operation read\``,
+            `- Enrollment: approved as enrolled:${name} (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
+            ...(scopedServing
+              ? []
+              : [
+                  `- Grant: \`ck auth grant --principal enrolled:${name} --selector-kind category --selector anthropic-native --operation read\``,
+                ]),
           ]
         : [
-            `- Enrollment: approved (generation ${status.tokenGeneration}; scoped serving not active yet)`,
-            '- Inspect the approved name with `ck auth enroll list` before granting access.',
+            `- Enrollment: approved (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
+            ...(scopedServing
+              ? []
+              : [
+                  '- Inspect the approved name with `ck auth enroll list` before granting access.',
+                ]),
           ]
     }
     case 'denied':
@@ -420,6 +429,15 @@ export async function executeAccountCommand(input: {
     const target = accounts.find((a) => a.id === id)
     if (!target) {
       return { text: `Account "${id}" not found.` }
+    }
+    if (
+      getClaustrumMode(input.storage) === 'claustrum' &&
+      isOAuthAccount(target) &&
+      target.claustrumScopedCredentialId
+    ) {
+      return {
+        text: `Account "${target.label ?? id}" is managed by Claustrum. Disable it to stop routing, or remove it from the vault.`,
+      }
     }
     const binding = input.resolveCustodyBinding?.(target)
     if (
