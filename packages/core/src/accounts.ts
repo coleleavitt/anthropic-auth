@@ -5149,7 +5149,8 @@ export class FallbackAccountManager {
       access = this.resolveFallbackAccessToken(target, storage)
     }
     const delegatedQuotaAuthorization =
-      vaultEnabled && this.quotaManager?.canFetchWithoutAccessToken() === true
+      storage?.claustrum?.scopedRoster === true &&
+      this.quotaManager?.canFetchWithoutAccessToken() === true
     if (!access && !delegatedQuotaAuthorization) {
       log('[quota] fallback quota poll skipped: no usable credential', {
         accountId: target.id,

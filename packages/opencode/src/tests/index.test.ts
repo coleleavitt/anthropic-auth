@@ -18014,7 +18014,7 @@ describe('auth.loader', () => {
 
   test('fetch wrapper refreshes stale usable main quota in background', async () => {
     const originalDateNow = Date.now
-    let now = 0
+    let now = originalDateNow()
     Date.now = mock(() => now) as unknown as typeof Date.now
     await useTempAccountFile(
       createFallbackStorage({
@@ -18059,7 +18059,7 @@ describe('auth.loader', () => {
             type: 'oauth',
             access: 'main-access',
             refresh: 'main-refresh',
-            expires: 1_000_000,
+            expires: now + 1_000_000,
           }),
         { models: {} },
       )
@@ -18067,7 +18067,7 @@ describe('auth.loader', () => {
       expect(await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()).toBe(
         'message-1',
       )
-      now = 120000
+      now += 120000
       // The second quota fetch never resolves. A correct background refresh
       // still lets the model response settle; a blocking implementation hits
       // this deadlock backstop regardless of machine speed.

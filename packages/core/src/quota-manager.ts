@@ -207,7 +207,11 @@ export class QuotaManager {
 
   /** A host transport resolves scoped credentials at dispatch time. */
   canFetchWithoutAccessToken(): boolean {
-    return this.fetchQuotaSnapshot !== undefined
+    return Boolean(
+      this.fetchQuotaSnapshot &&
+        (this.storage === null ||
+          this.storage?.claustrum?.scopedRoster === true),
+    )
   }
 
   getAllFallbacks(): Map<string, QuotaEntry> {
@@ -360,7 +364,7 @@ export class QuotaManager {
   ): Promise<OAuthQuotaSnapshot> {
     const mainAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
-    if (!credential && !this.fetchQuotaSnapshot)
+    if (!credential && !this.canFetchWithoutAccessToken())
       throw new Error('Main OAuth access token is unavailable')
     return (
       await this.refreshMainWithMetadata(
@@ -378,7 +382,7 @@ export class QuotaManager {
   ): Promise<QuotaRefreshResult> {
     const effectiveAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
-    if (!credential && !this.fetchQuotaSnapshot)
+    if (!credential && !this.canFetchWithoutAccessToken())
       throw new Error('Main OAuth access token is unavailable')
     if (
       expectedIdentityGeneration !== undefined &&
@@ -436,7 +440,7 @@ export class QuotaManager {
     accessToken: string,
     account: Pick<OAuthAccount, 'authLineageId'> | undefined,
   ): Promise<QuotaRefreshResult> {
-    if (!accessToken && !this.fetchQuotaSnapshot) {
+    if (!accessToken && !this.canFetchWithoutAccessToken()) {
       throw new Error('Fallback OAuth access token is unavailable')
     }
     this.bindFallbackLineage(accountId, account)
@@ -483,12 +487,13 @@ export class QuotaManager {
     for (const account of accounts) {
       if (account.enabled === false) continue
       const accessToken =
-        resolveAccessToken?.(account) ??
-        (account.access &&
-        account.expires !== undefined &&
-        account.expires > now
-          ? account.access
-          : undefined)
+        resolveAccessToken !== undefined
+          ? resolveAccessToken(account)
+          : account.access &&
+              account.expires !== undefined &&
+              account.expires > now
+            ? account.access
+            : undefined
       if (!accessToken) continue
 
       this.bindFallbackLineage(account.id, account)
@@ -876,6 +881,14 @@ export class QuotaManager {
     return true
   }
 
+  private isClosed = false
+
+  close(): void {
+    this.isClosed = true
+    this.inflightFallbacks.clear()
+    this.inflightMain = null
+  }
+
   /**
    * Serialize API calls through a shared gate so only one
    * quota API request runs at a time, with a minimum gap
@@ -884,6 +897,7 @@ export class QuotaManager {
    */
   private _enqueueApiFetch<T>(fn: () => Promise<T>): Promise<T> {
     const gatedFn = async (): Promise<T> => {
+      if (this.isClosed) throw new Error('QuotaManager is closed')
       // Wait until minimum gap since last API call
       const elapsed = this.now() - this.lastApiCallAt
       if (elapsed < QuotaManager.API_CALL_GAP_MS) {
@@ -892,6 +906,7 @@ export class QuotaManager {
           if (typeof id === 'object' && 'unref' in id) id.unref()
         })
       }
+      if (this.isClosed) throw new Error('QuotaManager is closed')
       this.lastApiCallAt = this.now()
       return fn()
     }
