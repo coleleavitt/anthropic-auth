@@ -1709,14 +1709,17 @@ export function getClaustrumMode(
 export function isOAuthAccountVaultOwned(
   storage: AccountStorage | null,
   account: FallbackAccount,
-  binding: CustodyHandleResolution | undefined,
+  binding?: CustodyHandleResolution | undefined,
 ): boolean {
   return (
     getClaustrumMode(storage) === 'claustrum' &&
     isOAuthAccount(account) &&
     account.enabled !== false &&
     // Source is provenance, not authorization; the resolver owns the binding decision.
-    binding?.status === 'resolved'
+    (binding?.status === 'resolved' ||
+      Boolean(
+        storage?.claustrum?.scopedRoster && account.claustrumScopedCredentialId,
+      ))
   )
 }
 

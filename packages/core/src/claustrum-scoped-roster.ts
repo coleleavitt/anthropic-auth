@@ -23,7 +23,16 @@ export interface ClaustrumScopedRoster {
   view: string
 }
 
+function preferredLabel(credentialId: string): string | undefined {
+  const parts = credentialId.split(':')
+  return parts.length >= 3 && parts[2]?.trim()
+    ? parts.slice(2).join(':').trim()
+    : undefined
+}
+
 function routeId(account: ClaustrumScopedAccount): string {
+  const label = preferredLabel(account.credentialId)
+  if (label) return label
   return `scoped-${createHash('sha256').update(account.accountId).digest('hex')}`
 }
 
@@ -120,7 +129,11 @@ export function projectClaustrumScopedRoster(
       if (existing) unused.delete(existing.id)
       return {
         id,
-        label: existing?.label ?? row.email ?? row.credentialId,
+        label:
+          existing?.label ??
+          preferredLabel(row.credentialId) ??
+          row.email ??
+          row.credentialId,
         type: 'oauth',
         enabled: existing
           ? existing.enabled !== false
