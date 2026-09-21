@@ -1217,6 +1217,10 @@ const anthropicAuthPlugin = async (
                 }),
               }),
         pollIntervalMs: runtimeOverrides.custodyManifestPollIntervalMs ?? 2000,
+        onRoster: async () => {
+          await fallbackManager.refreshQuotaForDueAccounts().catch(() => {})
+          await refreshSidebarQuota().catch(() => {})
+        },
         ...overrides,
       })
       openCodeScopedRuntimes.set(storagePath, runtime)
