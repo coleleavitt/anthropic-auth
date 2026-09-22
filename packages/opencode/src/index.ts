@@ -24,11 +24,17 @@ import {
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_LOGGING_COMMAND_NAME,
+  CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
+  CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_OPUS_5_5_MODEL_ID,
+  CLAUDE_OPUS_5_5_PRICING,
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
+  CLAUDE_USAGE_COMMAND_NAME,
   claimSharedAccountRefresh,
+  classifyProviderBlock,
   computeXxhash64Hex,
   continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
@@ -49,6 +55,7 @@ import {
   executeLoggingCommand,
   executePrimeCommand,
   executeRoutingCommand,
+  executeUsageCommand,
   FallbackAccountManager,
   fetchOAuthAccountProfile,
   formatOAuthAccountTier,
@@ -82,9 +89,12 @@ import {
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   isCacheKeepSubagentsEnabled,
+  isClaudeCodeVersionTooOldError,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   isCostZeroingEnabled,
   isDumpPersistentlyEnabled,
+  isEncryptedServerToolContentError,
   isFastModeEnabled,
   isFastModePersistentlyEnabled,
   isFastModeSupportedModel,
@@ -130,13 +140,16 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  recordResponseUsage,
   refreshBackoffActive,
+  refreshClaudeCodeVersion,
   refreshClaudeOAuthToken,
   releaseSharedAccountRefresh,
   removeAccountPersistent,
   removeSharedAccount,
   reorderAccountsPersistent,
   reorderSharedAccounts,
+  requiredClaudeCodeVersion,
   resolveClaudeCodeIdentity,
   resolveClaudeFableMythos5Pricing,
   revokeClaudeOAuthToken,
@@ -170,6 +183,7 @@ import {
   startOAuthLoopbackSession,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
+  stripEncryptedServerToolContent,
   syncRefreshedFallbackAccountInSharedStore,
   TrustedDeviceToken,
   tokenFingerprint,
@@ -731,19 +745,22 @@ const FABLE_RESTORED_NOTICE =
  */
 function buildSwitchedToOpusNotice(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) {
-    return 'Opus 5 content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Opus 5 cache warm.'
+    const label = fallbackModelLabel(modelId)
+    return `${label} content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the ${label} cache warm.`
   }
   return FABLE_SWITCHED_TO_OPUS_NOTICE
 }
 
 function buildRestoredNotice(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) {
-    return 'Opus 5 recovery window complete. Returning to Opus 5.'
+    const label = fallbackModelLabel(modelId)
+    return `${label} recovery window complete. Returning to ${label}.`
   }
   return FABLE_RESTORED_NOTICE
 }
 
 function fallbackModelLabel(modelId: string): string {
+  if (isClaudeOpus55Model(modelId)) return 'Opus 5.5'
   if (isClaudeOpus5Model(modelId)) return 'Opus 5'
   if (modelId === 'claude-fable-5' || modelId.startsWith('claude-fable-5-'))
     return 'Fable 5'
@@ -819,6 +836,56 @@ function addFableMythos5Models<
         },
       ]),
     ),
+  } as T
+}
+
+/**
+ * Publish `claude-opus-5-5` when the host's own catalog has not caught up.
+ *
+ * OpenCode ships a static Anthropic model list; Opus 5.5 launched with Claude
+ * Code 2.1.280 and is live on `/v1/models` today, so without this the model is
+ * simply unreachable from the picker. Modeled on the Fable/Mythos injection:
+ * clone the closest shipped Opus entry, then correct the fields that differ
+ * (id, name, 1M context, 128k output, and Opus 5.5's cheaper
+ * `tier_4_20_cache_read_0_20` pricing). Existing host entries win, so this
+ * disappears on its own once OpenCode ships the model.
+ */
+function addOpus55Model<T extends Record<string, AnthropicProviderModel>>(
+  models: T,
+): T {
+  if (models[CLAUDE_OPUS_5_5_MODEL_ID]) return models
+  const base =
+    models['claude-opus-5'] ??
+    models['claude-opus-4-8'] ??
+    Object.values(models)[0]
+  if (!base) return models
+  return {
+    ...models,
+    [CLAUDE_OPUS_5_5_MODEL_ID]: {
+      ...base,
+      id: CLAUDE_OPUS_5_5_MODEL_ID,
+      name: 'Claude Opus 5.5',
+      api: base.api ? { ...base.api, id: CLAUDE_OPUS_5_5_MODEL_ID } : undefined,
+      cost: {
+        input: CLAUDE_OPUS_5_5_PRICING.input,
+        output: CLAUDE_OPUS_5_5_PRICING.output,
+        cache: {
+          read: CLAUDE_OPUS_5_5_PRICING.cacheRead,
+          write: CLAUDE_OPUS_5_5_PRICING.cacheWrite5m,
+        },
+      },
+      limit: {
+        ...(base.limit ?? {}),
+        context: CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
+        output: CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
+      },
+      capabilities: {
+        ...(base.capabilities ?? {}),
+        reasoning: true,
+        attachment: true,
+        toolcall: true,
+      },
+    },
   } as T
 }
 
@@ -3215,6 +3282,9 @@ const anthropicAuthPlugin = async (
   ): Promise<OpenDialogPayload> {
     if (command === 'claude-quota')
       return { command, text: await buildQuotaCommandSummary(), knobs: {} }
+    if (command === 'claude-usage')
+      return { command, text: executeUsageCommand(), knobs: {} }
+
     if (command === 'claude-start') {
       const text = await executePersistentStartCommand(args, sessionId)
       return {
@@ -3568,6 +3638,12 @@ const anthropicAuthPlugin = async (
           description:
             'Show current Claude OAuth quota usage for all accounts.',
         },
+        [CLAUDE_USAGE_COMMAND_NAME]: {
+          template: CLAUDE_USAGE_COMMAND_NAME,
+          description:
+            'Show total SQLite request history, token counts, and cost breakdown across accounts.',
+        },
+
         [CLAUDE_DUMP_COMMAND_NAME]: {
           template: CLAUDE_DUMP_COMMAND_NAME,
           description:
@@ -3612,7 +3688,7 @@ const anthropicAuthPlugin = async (
         context: { auth?: { type?: string } },
       ) {
         const models = applyClaudeOpus5Variants(
-          addFableMythos5Models(provider.models),
+          addOpus55Model(addFableMythos5Models(provider.models)),
         )
         // Zero OAuth model costs by default (quota-based, not per-token billed).
         // The canonical shared credential can intentionally differ from an old
@@ -4573,6 +4649,50 @@ const anthropicAuthPlugin = async (
             return response
           }
 
+          /**
+           * Detect Anthropic's declared-version gate on a 400 and make it actionable.
+           *
+           * A model launched after this process started can sit above the version cached
+           * from npm, and every request then fails with
+           * `claude_code_version_too_old` until the hourly TTL expires. Force the version
+           * refresh so the next request carries a current `claude-cli/<version>` user
+           * agent, and log what the server asked for instead of an opaque 400.
+           */
+          function noteClaudeCodeVersionGate(response: Response) {
+            if (
+              response.status < 400 ||
+              response.status >= 500 ||
+              !response.body
+            )
+              return
+            void response
+              .clone()
+              .text()
+              .then((text) => {
+                // Policy / DLP / safety-monitor refusals are verdicts, not faults. Name
+                // the one that fired so the log is actionable instead of a raw body.
+                const block = classifyProviderBlock(response.status, text)
+                if (block) {
+                  logger.error('provider-block', block.message, {
+                    status: response.status,
+                    kind: block.kind,
+                  })
+                  return
+                }
+                if (!isClaudeCodeVersionTooOldError(response.status, text))
+                  return
+                const required = requiredClaudeCodeVersion(text)
+                logger.error(
+                  'version-gate',
+                  `Anthropic rejected this model for the declared Claude Code version${
+                    required ? ` (requires ${required} or newer)` : ''
+                  }; refreshing the tracked version, then retry the request.`,
+                )
+                void refreshClaudeCodeVersion().catch(() => {})
+              })
+              .catch(() => {})
+          }
+
           async function sendWithAccessToken(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -4583,6 +4703,7 @@ const anthropicAuthPlugin = async (
             oauthAccountId = 'main',
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
+            encryptedContentStripped = false,
           ) {
             const start = nowMs()
             let requestStorage = currentStorage
@@ -4904,6 +5025,79 @@ const anthropicAuthPlugin = async (
               status: response.status,
               streaming,
             })
+            try {
+              const reqModel = parseRequestModel(body) || 'claude-sonnet-4-6'
+              const currentStore = await getRequestStorage()
+              const foundAccount = currentStore?.accounts?.find(
+                (a) => a.id === oauthAccountId,
+              ) as any
+              // In fallback accounts, id is the email. For main, use first account's id or label.
+              const accEmail =
+                foundAccount?.email ||
+                foundAccount?.id ||
+                foundAccount?.label ||
+                (oauthAccountId === 'main'
+                  ? (currentStore?.accounts?.[0] as any)?.email ||
+                    (currentStore?.accounts?.[0] as any)?.id ||
+                    (currentStore?.accounts?.[0] as any)?.label ||
+                    'main'
+                  : oauthAccountId)
+
+              recordResponseUsage(
+                accEmail,
+                reqModel,
+                response.headers,
+                roundMs(nowMs() - sendStart),
+                response.status,
+                undefined,
+                {
+                  agent: 'opencode',
+                  sessionId: relayAffinity ?? undefined,
+                },
+              )
+            } catch (_err) {}
+
+            // Encrypted web-search / code-execution payloads are bound to the
+            // credential that issued them, so a session migrated to a fallback
+            // account is rejected with a 400 naming the block. Claude Code
+            // 2.1.280 only labels this and fails the turn; the request has
+            // already failed here, so strip the undecryptable blocks and
+            // re-send once on the same account.
+            if (
+              response.status === 400 &&
+              !encryptedContentStripped &&
+              typeof init?.body === 'string'
+            ) {
+              const errorText = await response
+                .clone()
+                .text()
+                .catch(() => '')
+              if (
+                isEncryptedServerToolContentError(response.status, errorText)
+              ) {
+                const strip = stripEncryptedServerToolContent(init.body)
+                if (strip.stripped) {
+                  logger.warn(
+                    'encrypted-content',
+                    'server-tool payload was issued to another account; stripping it and retrying once',
+                    { route, oauthAccountId },
+                  )
+                  return sendWithAccessToken(
+                    input,
+                    { ...init, body: strip.bodyText },
+                    accessToken,
+                    trace,
+                    route,
+                    currentStorage,
+                    oauthAccountId,
+                    fableRequest,
+                    laneStartRequest,
+                    true,
+                  )
+                }
+              }
+            }
+
             return response
           }
 
@@ -5430,6 +5624,7 @@ const anthropicAuthPlugin = async (
                     : undefined,
               })
               const wrapResponse = (response: Response) => {
+                noteClaudeCodeVersionGate(response)
                 const diagnosticsContext =
                   cacheDiagnosticsResponses.get(response)
                 return createStrippedStream(response, {

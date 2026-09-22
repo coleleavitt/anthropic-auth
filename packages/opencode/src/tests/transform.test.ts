@@ -2132,6 +2132,35 @@ describe('rewriteRequestBody', () => {
     expect(result.thinking.budget_tokens).toBeUndefined()
   })
 
+  test('rewrites disabled thinking to adaptive for Opus 5.5', async () => {
+    // Opus 5.5 carries `rejects_disabled_thinking`; verified live on
+    // 2026-09-22 that `{type:"disabled"}` answers 400
+    // "thinking.type.disabled is not supported for this model".
+    const body = JSON.stringify({
+      model: 'claude-opus-5-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'max' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    // Effort is only clamped for the disabled pair, which no longer exists.
+    expect(result.output_config).toEqual({ effort: 'max' })
+  })
+
+  test('requests summarized adaptive thinking for Opus 5.5 without thinking', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
   test('preserves explicitly disabled thinking for Opus 5', async () => {
     const body = JSON.stringify({
       model: 'claude-opus-5',

@@ -675,6 +675,77 @@ describe('provider.models', () => {
     })
   })
 
+  test('publishes Opus 5.5 with its own pricing when the host lacks it', async () => {
+    const plugin = await getPlugin()
+    const models = {
+      'claude-opus-5': {
+        id: 'claude-opus-5',
+        name: 'Claude Opus 5',
+        api: {
+          id: 'claude-opus-5',
+          type: 'aisdk',
+          package: '@ai-sdk/anthropic',
+        },
+        cost: { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+        limit: { context: 1_000_000, output: 128_000 },
+        capabilities: { reasoning: true, attachment: true, toolcall: true },
+        release_date: '2026-01-01',
+      },
+    }
+
+    const result = await plugin.provider?.models?.(
+      { models } as never,
+      { auth: { type: 'api' } } as never,
+    )
+
+    expect(result?.['claude-opus-5-5']?.name).toBe('Claude Opus 5.5')
+    expect(result?.['claude-opus-5-5']?.api?.id).toBe('claude-opus-5-5')
+    // tier_4_20_cache_read_0_20, not Opus 5's tier_5_25.
+    expect(result?.['claude-opus-5-5']?.cost).toEqual({
+      input: 4,
+      output: 20,
+      cache: { read: 0.2, write: 5 },
+    })
+    expect(result?.['claude-opus-5-5']?.limit).toMatchObject({
+      context: 1_000_000,
+      output: 128_000,
+    })
+    // Shares the Opus 5 effort variants.
+    expect(Object.keys(result?.['claude-opus-5-5']?.variants ?? {})).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+  })
+
+  test('never overwrites an Opus 5.5 entry the host already ships', async () => {
+    const plugin = await getPlugin()
+    const models = {
+      'claude-opus-5-5': {
+        id: 'claude-opus-5-5',
+        name: 'Host Opus 5.5',
+        api: {
+          id: 'claude-opus-5-5',
+          type: 'aisdk',
+          package: '@ai-sdk/anthropic',
+        },
+        cost: { input: 4, output: 20, cache: { read: 0.2, write: 5 } },
+        limit: { context: 1_000_000, output: 128_000 },
+        capabilities: { reasoning: true, attachment: true, toolcall: true },
+        release_date: '2026-09-22',
+      },
+    }
+
+    const result = await plugin.provider?.models?.(
+      { models } as never,
+      { auth: { type: 'api' } } as never,
+    )
+
+    expect(result?.['claude-opus-5-5']?.name).toBe('Host Opus 5.5')
+  })
+
   test('replaces stale Opus 5 manual-thinking variants with adaptive efforts', async () => {
     const plugin = await getPlugin()
     const models = {

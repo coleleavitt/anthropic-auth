@@ -10,6 +10,7 @@ export const COMMAND_MODAL_NAMES = [
   'claude-routing',
   'claude-killswitch',
   'claude-logging',
+  'claude-usage',
 ] as const
 
 export type CommandModalName = (typeof COMMAND_MODAL_NAMES)[number]

@@ -6,6 +6,7 @@ import {
   CacheKeepManager,
   CacheKeepSessionRegistry,
   CLAUDE_FABLE_5_MODEL_ID,
+  classifyProviderBlock,
   classifyRetry,
   createEmptyStorage,
   createStickyNoRouteResponse,
@@ -23,6 +24,7 @@ import {
   isApiKeyAccount,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
+  isClaudeCodeVersionTooOldError,
   isClaudeOpus5Model,
   isDumpPersistentlyEnabled,
   isFastModePersistentlyEnabled,
@@ -48,6 +50,8 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   recordSharedAccountQuota,
+  refreshClaudeCodeVersion,
+  requiredClaudeCodeVersion,
   resolveClaudeCodeIdentity,
   resolveModelCost,
   resolveRefusalFallbackModel,
@@ -2098,6 +2102,25 @@ export function streamCortexKitAnthropic(
             durationMs: Date.now() - requestStartedAt,
             body: (bodyText ?? '').slice(0, 300),
           })
+          // Anthropic gates a newly launched model on the Claude Code version
+          // declared in the user agent. Force the npm-tracked version refresh
+          // so the next request self-heals, and say what happened instead of
+          // handing the caller a raw 400 body.
+          if (isClaudeCodeVersionTooOldError(response.status, bodyText ?? '')) {
+            const required = requiredClaudeCodeVersion(bodyText ?? '')
+            void refreshClaudeCodeVersion().catch(() => {})
+            throw new Error(
+              `Anthropic rejected ${activeModel.id} for the declared Claude Code version${
+                required ? ` (requires ${required} or newer)` : ''
+              }. The tracked version is being refreshed; retry the request.`,
+            )
+          }
+          const block = classifyProviderBlock(response.status, bodyText ?? '')
+          if (block) {
+            throw new Error(
+              `${block.message} (HTTP ${response.status}, ${block.kind})`,
+            )
+          }
           throw new Error(
             `Anthropic request failed: HTTP ${response.status} ${bodyText ?? ''}`,
           )

@@ -14,10 +14,12 @@ import {
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   mergeAnthropicBetas,
+  modelRejectsDisabledThinking,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
@@ -1009,6 +1011,15 @@ function normalizeOpus5Request(
   if (!isClaudeOpus5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   const thinking = parsed.thinking
+  // Opus 5.5 carries `rejects_disabled_thinking`: `{type:"disabled"}` is a hard
+  // 400 ("\"thinking.type.disabled\" is not supported for this model. Use
+  // \"thinking.type.adaptive\" and \"output_config.effort\""), verified live.
+  // A disable request there must become the adaptive shape — the same treatment
+  // Fable/Mythos already get — rather than a failed request.
+  if (modelRejectsDisabledThinking(parsed.model)) {
+    parsed.thinking = { ...CLAUDE_OPUS_5_ADAPTIVE_THINKING }
+    return { replacedExisting: hadThinking, display: 'summarized' }
+  }
   if (isRecord(thinking) && thinking.type === 'disabled') {
     parsed.thinking = { type: 'disabled' }
     const outputConfig = parsed.output_config
@@ -1741,7 +1752,11 @@ function retryableAnthropicStreamError(
 function retryableFableContentFilterError(
   model: unknown,
 ): RetryableAnthropicStreamError {
-  const label = isClaudeOpus5Model(model) ? 'Opus 5' : 'Fable'
+  const label = isClaudeOpus55Model(model)
+    ? 'Opus 5.5'
+    : isClaudeOpus5Model(model)
+      ? 'Opus 5'
+      : 'Fable'
   const error = new Error(
     `${label} response was blocked by the provider content filter; retrying with Opus 4.8`,
   ) as RetryableAnthropicStreamError
