@@ -348,3 +348,60 @@ test('shutdown rejects connection waiters immediately and closes a late client',
     connection.resolve(client)
   }
 })
+
+test('onRoster fires only when the discovery view changes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'scoped-runtime-view-'))
+  dirs.push(dir)
+  const storagePath = join(dir, 'accounts.json'),
+    tokenPath = join(dir, 'token.json')
+  await saveAccounts({ version: 1, accounts: [] }, storagePath)
+  await setClaustrumModePersistent('claustrum', storagePath)
+  await writeFile(
+    tokenPath,
+    JSON.stringify({ token: '02'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  let view = 'v1'
+  const seen: string[] = []
+  const runtime = new ClaustrumScopedRuntime({
+    storagePath,
+    tokenPath,
+    connect: async () => ({
+      listScoped: async () => ({
+        rows: [
+          {
+            id: 'oauth:anthropic',
+            accountId: 'provider-0',
+            categories: ['anthropic-native'],
+            serves: ['anthropic'],
+            credentialType: 'oauth',
+            refreshAdapter: 'anthropic',
+            operations: ['read'],
+            recordVersion: 1,
+            createdAtMs: null,
+            state: 'active',
+          },
+        ],
+        view,
+      }),
+      getScoped: async () => {
+        throw new Error('no dispatch in this test')
+      },
+      reportAuthFailureScoped: async () => {},
+      close: () => {},
+    }),
+    pollIntervalMs: 0,
+    onRoster: (roster) => {
+      seen.push(roster.view)
+    },
+  })
+  runtimes.push(runtime)
+  await runtime.refresh()
+  await runtime.refresh()
+  // Second poll with an identical view must not re-notify: subscribers
+  // refresh quotas and rewrite shared state files on every notification.
+  expect(seen).toEqual(['v1'])
+  view = 'v2'
+  await runtime.refresh()
+  expect(seen).toEqual(['v1', 'v2'])
+})

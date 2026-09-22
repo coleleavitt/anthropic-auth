@@ -4,6 +4,10 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+### Patch Changes
+
+- Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick (opt-out via `cacheKeepAggregateRefreshIntervalMs: 0`) so per-request writes no longer clobber a sibling's count with a stale zero.
+
 ## 1.23.0
 
 ### Minor Changes

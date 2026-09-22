@@ -4,6 +4,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+### Patch Changes
+
+- Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick so per-request writes no longer clobber a sibling's count with a stale zero.
+
 ## 1.23.0
 
 ### Minor Changes

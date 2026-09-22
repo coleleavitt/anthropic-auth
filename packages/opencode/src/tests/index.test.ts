@@ -697,6 +697,7 @@ type PluginRuntimeOverrides = Partial<{
   claustrumConnector: (options: unknown) => Promise<unknown>
   claustrumEnrollmentConnect: () => Promise<unknown>
   claustrumEnrollmentPollIntervalMs: number
+  cacheKeepAggregateRefreshIntervalMs: number
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
   removeCustodyHandleManifestEntry: typeof removeCustodyHandleManifestEntry
@@ -713,6 +714,7 @@ function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
     clearInterval: mock(() => {}) as unknown as typeof clearInterval,
     custodyManifestPollIntervalMs: 0,
     claustrumEnrollmentPollIntervalMs: 0,
+    cacheKeepAggregateRefreshIntervalMs: 0,
     claustrumEnrollmentConnect: async () => ({
       enrollPropose: async () => ({ requestId: 'test-enrollment-request' }),
       enrollPoll: async () => ({ status: 'pending' as const }),

@@ -1032,6 +1032,7 @@ type PluginRuntimeOverrides = Partial<{
   claustrumEnrollmentConnect: () => Promise<ClaustrumEnrollmentConnection>
   claustrumScopedConnect: () => Promise<ClaustrumScopedClient>
   claustrumEnrollmentPollIntervalMs: number
+  cacheKeepAggregateRefreshIntervalMs: number
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
   removeCustodyHandleManifestEntry: AcknowledgeLocalOAuthLoginOptions['remove']
@@ -3784,6 +3785,21 @@ const anthropicAuthPlugin = async (
     return aggregateCacheKeepSessions
   }
 
+  // Keep the cross-process aggregate fresh on every instance: per-request
+  // sidebar writes use the in-memory view, and without this an idle instance
+  // would clobber a sibling's tracked-session count with a stale zero.
+  const cacheKeepAggregateRefreshIntervalMs =
+    runtimeOverrides.cacheKeepAggregateRefreshIntervalMs ?? 10_000
+  const cacheKeepAggregateRefreshTimer =
+    cacheKeepAggregateRefreshIntervalMs > 0
+      ? runtimeTimers.setInterval(() => {
+          void getAllTrackedCacheKeepSessions().catch(() => {})
+        }, cacheKeepAggregateRefreshIntervalMs)
+      : undefined
+  ;(
+    cacheKeepAggregateRefreshTimer as { unref?: () => void } | undefined
+  )?.unref?.()
+
   setCache1hState({
     enabled: isCache1hPersistentlyEnabled(initialStorage),
     mode: getCache1hPersistentMode(initialStorage),
@@ -3871,6 +3887,15 @@ const anthropicAuthPlugin = async (
       fallbackManager.stopBackgroundRefresh()
     } catch (error) {
       logger.warn('fallback-background', 'failed to stop', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
+      if (cacheKeepAggregateRefreshTimer !== undefined) {
+        runtimeTimers.clearInterval(cacheKeepAggregateRefreshTimer)
+      }
+    } catch (error) {
+      logger.warn('cachekeep', 'failed to stop aggregate refresh', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -4161,6 +4186,10 @@ const anthropicAuthPlugin = async (
   }
 
   async function refreshSidebarQuota() {
+    // Rebuild the cross-process CacheKeep aggregate first: sibling plugin
+    // instances (other project directories) may track sessions this instance
+    // never sees, and their writes must not be clobbered with a stale zero.
+    await getAllTrackedCacheKeepSessions().catch(() => {})
     const { storage, access } = await resolveSidebarQuotaAccess()
     writeSidebarState(storage, {
       activeId: lastSidebarRouting.activeId,
@@ -4367,6 +4396,7 @@ const anthropicAuthPlugin = async (
   ) {
     if (latestGetAuth) {
       try {
+        await getAllTrackedCacheKeepSessions().catch(() => {})
         const auth = await latestGetAuth()
         await writeSidebarState(updatedStorage, {
           activeId: lastSidebarRouting.activeId,

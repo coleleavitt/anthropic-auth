@@ -37,6 +37,9 @@ export interface ClaustrumScopedRuntimeOptions {
   storagePath: string
   tokenPath: string
   connect: () => Promise<ClaustrumScopedClient>
+  /** Fired once per discovery change (including the initial snapshot),
+   * keyed by the inventory view digest. Repeat polls with an identical
+   * view do not notify. */
   onRoster?: (roster: ClaustrumScopedRoster) => void
   onError?: () => void
   setTimeoutImpl?: typeof setTimeout
@@ -140,8 +143,13 @@ export class ClaustrumScopedRuntime {
         signal: this.#shutdown.signal,
       })
       this.#assertOpen()
+      const changed = roster?.view !== this.#roster?.view
       this.#roster = roster
-      if (roster) this.#options.onRoster?.(roster)
+      // Notify only on discovery changes (including the initial snapshot).
+      // The poll loop runs every few seconds; unconditional notification
+      // would make every plugin instance rewrite shared state files on each
+      // tick, clobbering fresher cross-process data (e.g. CacheKeep counts).
+      if (roster && changed) this.#options.onRoster?.(roster)
       return roster
     })().finally(() => {
       this.#refreshing = undefined
