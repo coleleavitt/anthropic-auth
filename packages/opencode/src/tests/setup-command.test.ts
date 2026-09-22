@@ -269,6 +269,86 @@ test('executes end-to-end Claustrum setup for OpenCode with mock ck and daemon',
   })
 })
 
+test('approved enrollment never opens a live daemon connection', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'setup-claustrum-nodaemon-'))
+  testDirs.push(root)
+
+  const env: NodeJS.ProcessEnv = {
+    HOME: root,
+    XDG_CONFIG_HOME: join(root, '.config'),
+    XDG_DATA_HOME: join(root, '.local', 'share'),
+    XDG_STATE_HOME: join(root, '.local', 'state'),
+    // Hostile daemon pointers: an approved token must not require any
+    // enrollment connection, so these must never be touched.
+    XDG_RUNTIME_DIR: join(root, 'nonexistent-runtime'),
+    CLAUSTRUM_SUBC_CONNECTION: join(root, 'nonexistent-subc.json'),
+    PI_CODING_AGENT_DIR: join(root, 'nonexistent-pi'),
+  }
+
+  const paths = {
+    tokenPath: join(
+      root,
+      '.local',
+      'state',
+      'cortexkit',
+      'anthropic-auth',
+      'opencode-enrollment.json',
+    ),
+    statePath: join(
+      root,
+      '.local',
+      'state',
+      'cortexkit',
+      'anthropic-auth',
+      'opencode-enrollment-state.json',
+    ),
+  }
+  await mkdir(join(root, '.local', 'state', 'cortexkit', 'anthropic-auth'), {
+    recursive: true,
+  })
+  await writeFile(
+    paths.tokenPath,
+    JSON.stringify({ token: '03'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+
+  const row = {
+    id: 'oauth:anthropic',
+    accountId: 'provider-main',
+    categories: ['anthropic-native'],
+    credentialType: 'oauth',
+    refreshAdapter: 'anthropic',
+    state: 'active',
+    operations: ['read'],
+    recordVersion: 1,
+  }
+  const scopedClient = {
+    listScoped: async () => ({ view: 'v', rows: [row as any] }),
+    getScoped: async () => ({
+      material: 'mock-access',
+      credentialId: row.id,
+      accountId: row.accountId,
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 3_600_000,
+    }),
+    reportAuthFailureScoped: async () => {},
+    close: () => {},
+  } as any
+  const runner = createMockRunner({
+    ck: () => ({ exitCode: 0, stdout: '', stderr: '' }),
+  })
+
+  const { setupClaustrumForHost } = await import('../setup/claustrum.ts')
+  const res = await setupClaustrumForHost('opencode', {
+    paths,
+    runner,
+    env,
+    scopedClient,
+  })
+  expect(res.ok).toBe(true)
+  expect(res.discoveredAccounts).toHaveLength(1)
+})
+
 test('executes Pi Claustrum setup: removes local OAuth and commits scoped roster', async () => {
   const root = await mkdtemp(join(tmpdir(), 'setup-pi-claustrum-'))
   testDirs.push(root)

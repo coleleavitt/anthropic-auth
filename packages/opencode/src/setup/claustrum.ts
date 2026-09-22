@@ -42,16 +42,26 @@ export async function setupClaustrumForHost(
   const proposedName = `anthropic-auth-${host}`
   const paths = options.paths ?? getHostClaustrumEnrollmentPaths(host, env)
 
-  const enrollClient =
-    options.enrollmentClient ?? (await connectClaustrumEnrollmentClient())
+  // 1. Check enrollment status before opening any daemon connection, so an
+  // already-approved token never requires a live enrollment client (CI and
+  // isolated tests provide only a scoped mock and no daemon).
+  let status = await readClaustrumEnrollmentStatus(paths, proposedName)
+  let enrollClient:
+    | (ClaustrumEnrollmentClient & { close?: () => void })
+    | undefined = options.enrollmentClient
+  let ownedEnrollClient = false
+  const ensureEnrollClient = async () => {
+    if (!enrollClient) {
+      enrollClient = await connectClaustrumEnrollmentClient()
+      ownedEnrollClient = true
+    }
+    return enrollClient
+  }
 
   try {
-    // 1. Check or start enrollment
-    let status = await readClaustrumEnrollmentStatus(paths, proposedName)
-
     if (status.state === 'idle') {
       const manager = new ClaustrumEnrollmentManager({
-        client: enrollClient,
+        client: await ensureEnrollClient(),
         paths,
         proposedName,
       })
@@ -82,7 +92,7 @@ export async function setupClaustrumForHost(
       }
 
       const manager = new ClaustrumEnrollmentManager({
-        client: enrollClient,
+        client: await ensureEnrollClient(),
         paths,
         proposedName,
       })
@@ -239,8 +249,8 @@ export async function setupClaustrumForHost(
       }
     }
   } finally {
-    if (!options.enrollmentClient) {
-      enrollClient.close?.()
+    if (ownedEnrollClient) {
+      enrollClient?.close?.()
     }
   }
 }
