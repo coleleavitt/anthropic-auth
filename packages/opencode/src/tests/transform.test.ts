@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
   CLAUDE_CODE_IDENTITY,
+  CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   FAST_MODE_BETA,
   MID_CONVERSATION_OUTPUT_CONFIG_BETA,
@@ -179,7 +180,7 @@ describe('conversation-start billing suffix pinning', () => {
       { sessionId } as Parameters<typeof rewriteRequestBody>[1],
     )
   const versionSuffix = (body: string) =>
-    JSON.parse(body).system[0].text.match(/cc_version=2\.1\.258\.([^;]+);/)?.[1]
+    JSON.parse(body).system[0].text.match(/cc_version=[0-9.]+\.([^;]+);/)?.[1]
 
   test('pins the first suffix for a session while allowing a different session to freeze independently', async () => {
     const first = JSON.parse(
@@ -196,10 +197,10 @@ describe('conversation-start billing suffix pinning', () => {
       versionSuffix(JSON.stringify(changed)),
     )
     expect(versionSuffix(JSON.stringify(first))).toBe(
-      computeCcVersionSuffix('messAage', '2.1.258'),
+      computeCcVersionSuffix('messAage', CLAUDE_CODE_VERSION),
     )
     expect(versionSuffix(JSON.stringify(other))).toBe(
-      computeCcVersionSuffix('messBage', '2.1.258'),
+      computeCcVersionSuffix('messBage', CLAUDE_CODE_VERSION),
     )
     expect(versionSuffix(JSON.stringify(other))).not.toBe(
       versionSuffix(JSON.stringify(first)),
@@ -237,10 +238,10 @@ describe('conversation-start billing suffix pinning', () => {
     const changed = JSON.parse(await rewriteForSession('messDage'))
 
     expect(first.system[0].text).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messCage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messCage', CLAUDE_CODE_VERSION)};`,
     )
     expect(changed.system[0].text).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messDage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messDage', CLAUDE_CODE_VERSION)};`,
     )
     expect(changed.system[0].text).not.toBe(first.system[0].text)
   })
@@ -252,7 +253,7 @@ describe('conversation-start billing suffix pinning', () => {
     )
 
     expect(changed.system[0].text).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('', CLAUDE_CODE_VERSION)};`,
     )
   })
 
@@ -264,7 +265,7 @@ describe('conversation-start billing suffix pinning', () => {
     )
 
     expect(reset.system[0].text).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messBage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messBage', CLAUDE_CODE_VERSION)};`,
     )
   })
 
@@ -282,11 +283,13 @@ describe('conversation-start billing suffix pinning', () => {
         { laneStart: true, sessionId },
       ),
     )
-    expect(laneStart.system[0].text).toContain('cc_version=2.1.258.')
+    expect(laneStart.system[0].text).toContain(
+      `cc_version=${CLAUDE_CODE_VERSION}.`,
+    )
 
     const realTurn = JSON.parse(await rewriteForSession('messAage', sessionId))
     expect(realTurn.system[0].text).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messAage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messAage', CLAUDE_CODE_VERSION)};`,
     )
   })
 
@@ -303,7 +306,7 @@ describe('conversation-start billing suffix pinning', () => {
       await rewriteForSession('messCage', 'cc-suffix-lru-active'),
     )
     expect(later.system[0].text).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messAage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messAage', CLAUDE_CODE_VERSION)};`,
     )
   })
 })

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   type ProviderAccountUuid,
 } from '@cortexkit/anthropic-auth-core'
@@ -478,7 +479,7 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
 
     const firstHeader = String(first.system?.[0]?.text)
     expect(String(compacted.system?.[0]?.text)).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messCage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messCage', CLAUDE_CODE_VERSION)};`,
     )
     expect(String(compacted.system?.[0]?.text)).toBe(firstHeader)
     expect(String(other.system?.[0]?.text)).not.toBe(firstHeader)
@@ -491,10 +492,10 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
     const changedHeader = String(changed.system?.[0]?.text)
 
     expect(firstHeader).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messCage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messCage', CLAUDE_CODE_VERSION)};`,
     )
     expect(changedHeader).toContain(
-      `cc_version=2.1.258.${computeCcVersionSuffix('messDage', '2.1.258')};`,
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messDage', CLAUDE_CODE_VERSION)};`,
     )
     expect(changedHeader).not.toBe(firstHeader)
   })
