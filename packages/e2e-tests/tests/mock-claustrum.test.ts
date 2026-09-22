@@ -33,8 +33,8 @@ describe('fake Claustrum daemon', () => {
     roots.push(root)
     const daemon = await startFakeClaustrumDaemon({
       directory: root,
-      credentials: {
-        'ckh_main': {
+      scopedCredentials: {
+        'oauth:anthropic': {
           payload: JSON.stringify({ access_token: 'vault-main' }),
           account_id: 'account-main',
           record_version: 7,
@@ -49,15 +49,16 @@ describe('fake Claustrum daemon', () => {
     })
     clients.push(client)
 
-    const response = await client.call('claustrum', 'credential.get', {
-      handle: 'ckh_main',
-      force_refresh: false,
+    const response = await client.call('claustrum', 'credential.get_scoped', {
+      credential_id: 'oauth:anthropic',
+      enrollment_token: 'aa'.repeat(32),
       min_ttl_ms: 0,
     })
 
     expect(response).toEqual({
       result: {
         payload: Array.from(new TextEncoder().encode('{"access_token":"vault-main"}')),
+        credential_id: 'oauth:anthropic',
         account_id: 'account-main',
         record_version: 7,
         expires_at_ms: expect.any(Number),
@@ -70,8 +71,8 @@ describe('fake Claustrum daemon', () => {
     roots.push(root)
     const daemon = await startFakeClaustrumDaemon({
       directory: root,
-      credentials: {
-        ckh_main: {
+      scopedCredentials: {
+        'oauth:anthropic': {
           payload: JSON.stringify({ access_token: 'vault-main' }),
           account_id: 'account-main',
           record_version: 7,
@@ -91,8 +92,8 @@ describe('fake Claustrum daemon', () => {
         1n,
         Buffer.from(
           JSON.stringify({
-            method: 'credential.get',
-            params: { handle: 'ckh_main' },
+            method: 'credential.get_scoped',
+            params: { credential_id: 'oauth:anthropic', enrollment_token: 'aa'.repeat(32) },
           }),
         ),
       )

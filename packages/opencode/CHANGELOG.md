@@ -4,8 +4,13 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+### Breaking Changes
+
+- Remove legacy capability-handle and manifest-based Claustrum custody. The plugin serves OAuth only via enrolled scoped credentials; old Claustrum configurations without `scopedRoster: true` fail closed until the offline `setup` wizard completes.
+
 ### Patch Changes
 
+- Stop background local OAuth refresh or quota probing for incomplete legacy Claustrum configurations, even if old sidecar secrets remain.
 - Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick (opt-out via `cacheKeepAggregateRefreshIntervalMs: 0`) so per-request writes no longer clobber a sibling's count with a stale zero.
 
 ## 1.23.0

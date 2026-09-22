@@ -3,15 +3,8 @@ import type {
   ClaustrumMode,
   FallbackAccount,
 } from '../accounts.ts'
-import {
-  getClaustrumMode,
-  isOAuthAccount,
-  isOAuthAccountVaultOwned,
-} from '../accounts.ts'
-import type {
-  ClaustrumDetection,
-  CustodyHandleResolution,
-} from '../claustrum.ts'
+import { getClaustrumMode, isOAuthAccount } from '../accounts.ts'
+import type { ClaustrumDetection } from '../claustrum.ts'
 import type { ClaustrumEnrollmentStatus } from '../claustrum-enrollment.ts'
 import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
@@ -310,7 +303,6 @@ export async function executeAccountCommand(input: {
   storage: AccountStorage
   claustrum?: ClaustrumDetection
   statusProjection?: AccountCommandStatusProjection
-  resolveCustodyBinding?: (account: FallbackAccount) => CustodyHandleResolution
   path?: string
   transition?: ClaustrumModeTransition
   resetEnrollment?: () => Promise<AccountCommandResult>
@@ -347,14 +339,13 @@ export async function executeAccountCommand(input: {
       const storedAccount = input.storage.accounts.find(
         (account) => account.id === a.id,
       )
-      const binding = storedAccount
-        ? input.resolveCustodyBinding?.(storedAccount)
-        : undefined
       const custody = projected
         ? custodyStatusLabel(projected.custodyState)
         : a.id !== mainId &&
             storedAccount &&
-            isOAuthAccountVaultOwned(input.storage, storedAccount, binding)
+            getClaustrumMode(input.storage) === 'claustrum' &&
+            isOAuthAccount(storedAccount) &&
+            storedAccount.claustrumScopedCredentialId
           ? custodyStatusLabel('on-cold')
           : 'local'
       lines.push(
@@ -437,17 +428,6 @@ export async function executeAccountCommand(input: {
     ) {
       return {
         text: `Account "${target.label ?? id}" is managed by Claustrum. Disable it to stop routing, or remove it from the vault.`,
-      }
-    }
-    const binding = input.resolveCustodyBinding?.(target)
-    if (
-      getClaustrumMode(input.storage) === 'claustrum' &&
-      isOAuthAccount(target) &&
-      binding?.status === 'resolved' &&
-      binding.source === 'manifest'
-    ) {
-      return {
-        text: `Account "${target.label ?? id}" is bound by the Claustrum manifest. Disable it to stop routing, or remove its Claustrum binding before removing the routing row.`,
       }
     }
     return {

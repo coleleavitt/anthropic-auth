@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { once, EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
+import { E2EHarness } from '../src/harness.ts'
 import {
   terminateChildProcess,
   waitForOpencodeReady,
@@ -90,4 +91,17 @@ test('listener discovery fails immediately when the child exits without announci
     expect(child.listenerCount('error')).toBe(0)
     expect(child.stdout?.listenerCount('data')).toBe(0)
   } finally { await terminateChildProcess(child) }
+})
+
+
+test('harness polling awaits an asynchronous predicate rather than accepting its Promise as true', async () => {
+  const harness = Object.create(E2EHarness.prototype) as E2EHarness
+  let attempts = 0
+  const found = await harness.waitFor(async () => {
+    attempts++
+    await Promise.resolve()
+    return attempts === 3 ? 'committed-roster' : undefined
+  }, { intervalMs: 1, timeoutMs: 200 })
+  expect(found).toBe('committed-roster')
+  expect(attempts).toBe(3)
 })

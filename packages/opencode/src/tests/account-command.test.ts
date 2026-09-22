@@ -7,7 +7,8 @@ import {
   mock,
   test,
 } from 'bun:test'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import * as fs from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -26,7 +27,6 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
 import { drainNotifications } from '../rpc/notifications'
-import { connectorFor } from './custody-ruled-row.fixture'
 import { DEFAULT_FETCH_MOCK, installDefaultFetchMock } from './test-fetch'
 import {
   createTimerTracking,
@@ -484,21 +484,18 @@ describe('executeAccountCommand status', () => {
     expect(resetEnrollment).toHaveBeenCalledTimes(1)
   })
 
-  test('renders a resolved custody binding without a status projection', async () => {
+  test('projects a scoped fallback conservatively without a status projection', async () => {
     const storage = baseStorage()
-    storage.claustrum = { mode: 'claustrum' }
+    storage.claustrum = { mode: 'claustrum', scopedRoster: true }
+    const account = storage.accounts[0]
+    if (account?.type !== 'oauth') throw new Error('missing OAuth fixture')
+    account.claustrumScopedCredentialId = 'oauth:anthropic:work'
+    account.anthropicAccountUuid = 'account-work' as never
+    account.claustrumScopedState = 'active'
 
-    const result = await executeAccountCommand({
-      argumentsText: '',
-      storage,
-      resolveCustodyBinding: () => ({
-        status: 'resolved',
-        source: 'legacy',
-        handle: 'legacy-handle',
-      }),
-    } as never)
-
+    const result = await executeAccountCommand({ argumentsText: '', storage })
     expect(result.text).toContain('**Work account** [fallback] · vault cold')
+    expect(result.text).not.toContain('handle')
   })
 
   test('usage returns usage text', async () => {
@@ -652,24 +649,21 @@ describe('executeAccountCommand remove', () => {
     })
   })
 
-  test('refuses to remove a manifest-bound OAuth row in Claustrum mode', async () => {
+  test('refuses to remove a scoped OAuth row while it remains in the vault', async () => {
     const storage = {
       ...baseStorage(),
       claustrum: { mode: 'claustrum' as const },
     }
+    const fallback = storage.accounts.find(
+      (account) => account.id === 'fallback-1',
+    )
+    if (fallback?.type !== 'oauth') throw new Error('missing OAuth fixture')
+    fallback.claustrumScopedCredentialId = 'oauth:anthropic:fallback-1'
     const result = await executeAccountCommand({
       argumentsText: 'remove fallback-1',
       storage,
-      resolveCustodyBinding: () => ({
-        status: 'resolved',
-        source: 'manifest',
-        handle: `ckh_${'A'.repeat(43)}`,
-        credentialId: 'oauth:anthropic:fallback-1',
-      }),
     })
-
-    expect(result.text).toContain('bound by the Claustrum manifest')
-    expect(result.text).toContain('Disable it')
+    expect(result.text).toContain('managed by Claustrum')
     expect(result.updated).toBeUndefined()
   })
 
@@ -962,7 +956,7 @@ describe('account command INFO logs (via plugin)', () => {
     const storage = baseStorage()
     await saveAccounts(storage, accountPath)
     const before = await readFile(accountPath, 'utf8')
-    const beforeMtime = (await stat(accountPath)).mtimeMs
+    const beforeMtime = (await fs.stat(accountPath)).mtimeMs
     const plugin = await getPlugin()
     drainNotifications(0, 'ses_test')
 
@@ -972,62 +966,28 @@ describe('account command INFO logs (via plugin)', () => {
     expect(payload?.text).toContain('/claude-account claustrum')
     expect(payload?.text).toContain('/claude-account local')
     expect(await readFile(accountPath, 'utf8')).toBe(before)
-    expect((await stat(accountPath)).mtimeMs).toBe(beforeMtime)
+    expect((await fs.stat(accountPath)).mtimeMs).toBe(beforeMtime)
   })
 
-  test('claustrum command refuses a real main with migration guidance and zero writes', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
-    const connectionFile = join(tempDir, 'claustrum-connection.json')
-    await writeFile(
-      connectionFile,
-      JSON.stringify({
-        schema: 1,
-        wire_version: 1,
-        endpoints: [{ host: '127.0.0.1', port: 1 }],
+  test('claustrum command gives scoped setup guidance without changing local storage', async () => {
+    await saveAccounts(baseStorage(), accountPath)
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      async () => ({
+        type: 'oauth',
+        access: 'real-main-access',
+        refresh: 'real-main-refresh',
+        expires: Date.now() + 60_000,
       }),
+      { models: {} },
     )
-    const previousConnectionFile =
-      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
-      connectionFile
-
-    try {
-      const plugin = await getPlugin(undefined, {
-        claustrumConnector: connectorFor([], () => ({ result: {} })),
-      })
-      await plugin.auth.loader(
-        async () => ({
-          type: 'oauth',
-          access: 'real-main-access',
-          refresh: 'real-main-refresh',
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-      const before = await readFile(accountPath, 'utf8')
-      drainNotifications(0, 'ses_test')
-
-      await executeCommand(plugin, 'claude-account', 'claustrum')
-
-      const text = drainNotifications(0, 'ses_test').at(-1)?.payload.text
-      expect(text).toBe(
-        [
-          'Custody takeover refused:',
-          'main: TAKEOVER_INCOMPLETE_MAIN_REAL — Mint a handle with `ck auth mint-handle`; this plugin then writes the manifest entry.',
-          'Work account: binding_missing',
-          'Personal account: binding_missing',
-        ].join('\n'),
-      )
-      expect(await readFile(accountPath, 'utf8')).toBe(before)
-      expect(findCommandsLog('account enabled')).toBeUndefined()
-    } finally {
-      if (previousConnectionFile === undefined)
-        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
-      else
-        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
-          previousConnectionFile
-    }
+    const before = await readFile(accountPath, 'utf8')
+    drainNotifications(0, 'ses_test')
+    await executeCommand(plugin, 'claude-account', 'claustrum')
+    expect(drainNotifications(0, 'ses_test').at(-1)?.payload.text).toContain(
+      'setup',
+    )
+    expect(await readFile(accountPath, 'utf8')).toBe(before)
   })
 
   test('does not retain a background interval unless the helper opts in', async () => {

@@ -405,3 +405,44 @@ test('onRoster fires only when the discovery view changes', async () => {
   await runtime.refresh()
   expect(seen).toEqual(['v1', 'v2'])
 })
+
+test('two project runtimes sharing storage serve the persisted roster while a peer holds discovery lease', async () => {
+  const f = await fixture()
+  const original = await f.runtime.refresh()
+  expect(original?.primary?.credentialId).toBe('oauth:anthropic')
+  const entered = deferred<void>()
+  const release = deferred<void>()
+  let peerLists = 0
+  const peer = new ClaustrumScopedRuntime({
+    ...f.options,
+    connect: async () => ({
+      ...f.client,
+      listScoped: async () => {
+        peerLists++
+        entered.resolve()
+        await release.promise
+        return { rows: f.rows, view: 'new-view' }
+      },
+    }),
+  })
+  runtimes.push(peer)
+  const held = peer.refresh()
+  await entered.promise
+  const another = new ClaustrumScopedRuntime(f.options)
+  runtimes.push(another)
+  try {
+    const alreadyCommitted = await another.refresh()
+    expect(alreadyCommitted?.view).toBe(original?.view)
+    expect(alreadyCommitted?.primary?.accountId).toBe('provider-0')
+    expect(alreadyCommitted?.accounts[0]?.claustrumScopedCredentialId).toBe(
+      'oauth:anthropic:work',
+    )
+    expect(peerLists).toBe(1)
+    const receipt = await another.authorize('main')
+    expect(receipt.accountId).toBe('provider-0')
+    expect(f.gets.at(-1)?.credentialId).toBe('oauth:anthropic')
+  } finally {
+    release.resolve()
+    await held
+  }
+})

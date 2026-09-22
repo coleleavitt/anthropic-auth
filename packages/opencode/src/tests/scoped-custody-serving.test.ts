@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
+  acquireRefreshFileLock,
   type ClaustrumScopedClient,
+  getAccountStatePath,
   isOAuthAccount,
   type OAuthAccount,
 } from '@cortexkit/anthropic-auth-core'
 import type { ScopedInventoryRow } from '@cortexkit/claustrum-client'
 import { AnthropicAuthPlugin } from '../index.ts'
+import { drainSidebarWrites, getSidebarStateFile } from '../sidebar-state.ts'
 
 const testDirs: string[] = []
 const originalFetch = globalThis.fetch
@@ -22,6 +25,8 @@ afterEach(async () => {
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
   delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+  delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+  delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
 })
 
 const MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
@@ -71,6 +76,11 @@ describe('OpenCode scoped custody serving', () => {
     const tokenPath = join(root, 'opencode-enrollment.json')
     process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
     process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = join(root, 'dumps')
+    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+      root,
+      'sidebar.json',
+    )
 
     await writeFile(
       tokenPath,
@@ -89,6 +99,7 @@ describe('OpenCode scoped custody serving', () => {
           state: 'active',
         },
       },
+      dump: { enabled: true },
       accounts: [
         {
           id: 'work',
@@ -185,6 +196,25 @@ describe('OpenCode scoped custody serving', () => {
       expect(authorizations).toHaveLength(1)
       expect(authorizations[0]).toBe('Bearer scoped-access-oauth:anthropic')
       expect(gets.some((g) => g.credentialId === 'oauth:anthropic')).toBe(true)
+      await firstResponse.text()
+      await drainSidebarWrites()
+      const serialized = [
+        await readFile(storagePath, 'utf8'),
+        await readFile(getAccountStatePath(storagePath), 'utf8'),
+        await readFile(getSidebarStateFile(), 'utf8'),
+        ...(await Promise.all(
+          (
+            await readdir(process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR!)
+          ).map((name) =>
+            readFile(
+              join(process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR!, name),
+              'utf8',
+            ),
+          ),
+        )),
+      ].join('\n')
+      expect(serialized).not.toContain('scoped-access-oauth:anthropic')
+      expect(serialized).not.toContain('aa'.repeat(32))
 
       // 2. Simulate user adding a 3rd account via `ck auth login`
       const personalRow: ScopedInventoryRow = {
@@ -358,7 +388,7 @@ test('Claustrum mode without a scoped roster refuses to serve even with legacy l
   const plugin = await AnthropicAuthPlugin(
     { directory: root } as any,
     {
-      custodyManifestPollIntervalMs: 0,
+      scopedRosterPollIntervalMs: 0,
     } as any,
   )
   try {
@@ -378,6 +408,195 @@ test('Claustrum mode without a scoped roster refuses to serve even with legacy l
     )
     expect(sends).toBe(0)
   } finally {
+    await plugin.dispose?.()
+  }
+})
+
+test('loader and model request remain usable when a peer holds the scoped roster lease', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-lease-'))
+  testDirs.push(root)
+  const storagePath = join(root, 'anthropic-auth.json')
+  const tokenPath = join(root, 'opencode-enrollment.json')
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
+  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  await writeFile(
+    tokenPath,
+    JSON.stringify({ token: 'cc'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  await writeFile(
+    storagePath,
+    JSON.stringify({
+      version: 1,
+      accounts: [],
+      quota: { enabled: false },
+      claustrum: {
+        mode: 'claustrum',
+        scopedRoster: true,
+        primaryAccount: {
+          credentialId: mainRow.id,
+          accountId: mainRow.accountId,
+          state: 'active',
+        },
+      },
+    }),
+    { mode: 0o600 },
+  )
+  const lease = await acquireRefreshFileLock({
+    name: 'scoped-roster',
+    path: storagePath,
+    ttlMs: 30_000,
+    renew: true,
+  })
+  if (!lease) throw new Error('test could not acquire roster lease')
+  let lists = 0,
+    gets = 0,
+    sends = 0
+  const scopedClient: ClaustrumScopedClient = {
+    listScoped: async () => {
+      lists++
+      throw new Error('peer owns discovery')
+    },
+    getScoped: async ({ credentialId }) => {
+      gets++
+      return {
+        credentialId,
+        accountId: mainRow.accountId,
+        material: 'lease-scoped-access',
+        recordVersion: 42,
+        expiresAtMs: Date.now() + 3_600_000,
+      }
+    },
+    reportAuthFailureScoped: async () => {},
+    close: () => {},
+  }
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    if (!String(input).includes('/v1/messages'))
+      throw new Error('unexpected upstream call')
+    expect(new Headers(init?.headers).get('authorization')).toBe(
+      'Bearer lease-scoped-access',
+    )
+    sends++
+    return new Response('{}', { status: 200 })
+  }) as typeof fetch
+  let plugin: Awaited<ReturnType<typeof AnthropicAuthPlugin>> | undefined
+  try {
+    plugin = await AnthropicAuthPlugin(
+      { directory: root } as never,
+      {
+        claustrumScopedConnect: async () => scopedClient,
+        scopedRosterPollIntervalMs: 0,
+      } as never,
+    )
+    // OpenCode initializes plugins for all providers. A contested roster
+    // must not make an unrelated model's provider initialization fail.
+    const loader = await (plugin as any).auth.loader(
+      async () => ({
+        type: 'oauth',
+        access: '',
+        refresh: 'claustrum-tombstone:v1:anthropic',
+        expires: 0,
+      }),
+      { models: {} },
+    )
+    expect(lists).toBe(0)
+    expect(gets).toBe(0)
+    expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+    expect(gets).toBeGreaterThan(0)
+    expect(sends).toBe(1)
+    expect(lists).toBe(0)
+  } finally {
+    await plugin?.dispose?.()
+    await lease.release()
+  }
+})
+
+test('provider initialization does not wait for a stalled scoped discovery connection', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-loader-'))
+  testDirs.push(root)
+  const storagePath = join(root, 'anthropic-auth.json')
+  const tokenPath = join(root, 'opencode-enrollment.json')
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
+  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  await writeFile(
+    tokenPath,
+    JSON.stringify({ token: 'dd'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  await writeFile(
+    storagePath,
+    JSON.stringify({
+      version: 1,
+      accounts: [],
+      quota: { enabled: false },
+      claustrum: {
+        mode: 'claustrum',
+        scopedRoster: true,
+        primaryAccount: {
+          credentialId: mainRow.id,
+          accountId: mainRow.accountId,
+          state: 'active',
+        },
+      },
+    }),
+    { mode: 0o600 },
+  )
+  let connectStarted!: () => void
+  let releaseConnect!: (value: ClaustrumScopedClient) => void
+  const entered = new Promise<void>((resolve) => {
+    connectStarted = resolve
+  })
+  const blocked = new Promise<ClaustrumScopedClient>((resolve) => {
+    releaseConnect = resolve
+  })
+  const client: ClaustrumScopedClient = {
+    listScoped: async () => ({ rows: [mainRow], view: 'v' }),
+    getScoped: async () => {
+      throw new Error('no dispatch expected')
+    },
+    reportAuthFailureScoped: async () => {},
+    close: () => {},
+  }
+  const plugin = await AnthropicAuthPlugin(
+    { directory: root } as never,
+    {
+      claustrumScopedConnect: () => {
+        connectStarted()
+        return blocked
+      },
+      scopedRosterPollIntervalMs: 0,
+    } as never,
+  )
+  let deadline: ReturnType<typeof setTimeout> | undefined
+  try {
+    await entered
+    const loader = await Promise.race([
+      (plugin as any).auth.loader(
+        async () => ({
+          type: 'oauth',
+          access: '',
+          refresh: 'claustrum-tombstone:v1:anthropic',
+          expires: 0,
+        }),
+        { models: {} },
+      ),
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(
+          () =>
+            reject(
+              new Error('provider initialization waited for scoped discovery'),
+            ),
+          1000,
+        )
+        deadline.unref?.()
+      }),
+    ])
+    expect(loader.fetch).toBeFunction()
+  } finally {
+    if (deadline) clearTimeout(deadline)
+    releaseConnect(client)
     await plugin.dispose?.()
   }
 })

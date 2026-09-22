@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
   CACHE_KEEP_TICK_MS,
+  type ClaustrumScopedClient,
   custodyTombstoneOAuth,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
@@ -45,6 +46,7 @@ const fixtureEnvKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
   'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
 ] as const
 const fixtureEnv = new Map(fixtureEnvKeys.map((key) => [key, process.env[key]]))
 
@@ -154,11 +156,11 @@ async function createFixture(
   const mainVault = mainVaultToken(site)
   const mainProviderAccountId = `main-provider-${site}`
   const accountId = `fallback-${site}`
-  const handle = `ckh_${'F'.repeat(43)}`
-  const mainHandle = `ckh_${'M'.repeat(43)}`
+  const credentialId = `oauth:anthropic:${accountId}`
+  const mainCredentialId = 'oauth:anthropic'
   const intervals: IntervalRecord[] = []
   const records: OutboundRecord[] = []
-  const credentialGets: Array<{ handle?: string; isMain: boolean }> = []
+  const credentialGets: Array<{ credentialId: string; isMain: boolean }> = []
   let refusalPending = options.recovery === true
 
   if (options.now !== undefined) {
@@ -216,7 +218,12 @@ async function createFixture(
       : { enabled: false, failClosedOnUnknownQuota: false },
     claustrum: {
       mode: 'claustrum',
-      handlesFile: '',
+      scopedRoster: true,
+      primaryAccount: {
+        credentialId: mainCredentialId,
+        accountId: mainProviderAccountId as never,
+        state: 'active',
+      },
     },
     ...(options.prime ? { prime: { enabled: true } } : {}),
     ...(options.cachekeep || options.recovery
@@ -229,7 +236,12 @@ async function createFixture(
       {
         id: accountId,
         label: accountId,
-        ...custodyTombstoneOAuth('anthropic'),
+        type: 'oauth',
+        enabled: true,
+        refresh: '',
+        claustrumScopedCredentialId: credentialId,
+        claustrumScopedState: 'active',
+        anthropicAccountUuid: accountId as never,
         ...(options.quotaSnapshot ? { quota: options.quotaSnapshot } : {}),
       },
     ],
@@ -238,34 +250,13 @@ async function createFixture(
   const directory = await mkdtemp(join(tmpdir(), `fallback-census-${site}-`))
   tempDirs.add(directory)
   const accountFile = join(directory, 'anthropic-auth.json')
-  const handlesFile = join(directory, 'opencode-handles.json')
-  storage.claustrum!.handlesFile = handlesFile
+  const tokenFile = join(directory, 'opencode-enrollment.json')
   await writeFile(
-    handlesFile,
-    `${JSON.stringify({
-      version: 1,
-      providers: [
-        {
-          provider: 'anthropic',
-          shape: 'oauth',
-          serve: 'anthropic-auth',
-          accounts: [
-            {
-              label: 'main',
-              handle: mainHandle,
-              credential_id: 'oauth:anthropic:main',
-            },
-            {
-              label: accountId,
-              handle,
-              credential_id: `oauth:anthropic:${accountId}`,
-            },
-          ],
-        },
-      ],
-    })}\n`,
+    tokenFile,
+    JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
   )
-  await chmod(handlesFile, 0o600)
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenFile
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountFile
   process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
     directory,
@@ -284,33 +275,50 @@ async function createFixture(
     await saveAccountState(storage, accountFile, { mainProfile: true })
   }
 
-  const connector = async () =>
-    ({
-      call: async (
-        _moduleId: string,
-        method: string,
-        params?: { handle?: string },
-      ) => {
-        if (method !== 'credential.get') return { result: {} }
-        const isMain = params?.handle === mainHandle
-        credentialGets.push({ handle: params?.handle, isMain })
-        return {
-          result: {
-            payload: Array.from(
-              new TextEncoder().encode(
-                JSON.stringify({
-                  access_token: isMain ? mainVault : vault,
-                  account_uuid: isMain ? mainProviderAccountId : accountId,
-                }),
-              ),
-            ),
-            expires_at_ms: now + 12 * 60 * 60_000,
-            record_version: 103,
-          },
-        }
-      },
-      close() {},
-    }) as never
+  const scopedClient: ClaustrumScopedClient = {
+    listScoped: async () => ({
+      view: `census-${site}`,
+      rows: [
+        {
+          id: mainCredentialId,
+          accountId: mainProviderAccountId,
+          categories: ['anthropic-native'],
+          serves: ['anthropic'],
+          credentialType: 'oauth',
+          refreshAdapter: 'anthropic',
+          operations: ['read'],
+          state: 'active' as const,
+          recordVersion: 103,
+          createdAtMs: null,
+        },
+        {
+          id: credentialId,
+          accountId,
+          categories: ['anthropic-native'],
+          serves: ['anthropic'],
+          credentialType: 'oauth',
+          refreshAdapter: 'anthropic',
+          operations: ['read'],
+          state: 'active' as const,
+          recordVersion: 103,
+          createdAtMs: null,
+        },
+      ],
+    }),
+    getScoped: async (input) => {
+      const isMain = input.credentialId === mainCredentialId
+      credentialGets.push({ credentialId: input.credentialId, isMain })
+      return {
+        credentialId: input.credentialId,
+        accountId: isMain ? mainProviderAccountId : accountId,
+        material: isMain ? mainVault : vault,
+        expiresAtMs: Date.now() + 12 * 60 * 60_000,
+        recordVersion: 103,
+      }
+    },
+    reportAuthFailureScoped: async () => {},
+    close() {},
+  }
 
   const refusalSse = [
     'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
@@ -432,7 +440,11 @@ async function createFixture(
         session: { promptAsync: mock(() => Promise.resolve()) },
       },
     },
-    { claustrumConnector: connector, setInterval, clearInterval },
+    {
+      claustrumScopedConnect: async () => scopedClient,
+      setInterval,
+      clearInterval,
+    },
   )) as any
   activePlugins.add(plugin)
   const result = await plugin.auth.loader(
@@ -561,7 +573,7 @@ describe('vault-served fallback outbound token census', () => {
     const bootstrap = fixture.records.filter((record) =>
       record.url.includes('/claude_cli/bootstrap'),
     )
-    expect(bootstrap.length).toBeGreaterThan(0)
+    expectOnlyVaultToken(bootstrap, 'cachekeep', fixture.credentialGets)
   })
 
   test.serial(
