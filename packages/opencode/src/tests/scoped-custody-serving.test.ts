@@ -324,3 +324,60 @@ describe('OpenCode scoped custody serving', () => {
     }
   })
 })
+
+test('Claustrum mode without a scoped roster refuses to serve even with legacy local fallback material', async () => {
+  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  const root = await mkdtemp(join(tmpdir(), 'opencode-legacy-refusal-'))
+  testDirs.push(root)
+  const storagePath = join(root, 'anthropic-auth.json')
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+  await writeFile(
+    storagePath,
+    JSON.stringify({
+      version: 1,
+      claustrum: { mode: 'claustrum' },
+      accounts: [
+        {
+          id: 'old',
+          label: 'old',
+          type: 'oauth',
+          enabled: true,
+          access: 'stale-local-access',
+          refresh: 'stale-local-refresh',
+          expires: Date.now() + 3600000,
+        },
+      ],
+    }),
+    { mode: 0o600 },
+  )
+  let sends = 0
+  globalThis.fetch = (async () => {
+    sends++
+    throw new Error('request must not reach upstream')
+  }) as unknown as typeof fetch
+  const plugin = await AnthropicAuthPlugin(
+    { directory: root } as any,
+    {
+      custodyManifestPollIntervalMs: 0,
+    } as any,
+  )
+  try {
+    const loader = await (plugin as any).auth.loader(
+      async () => ({
+        type: 'oauth',
+        access: '',
+        refresh: 'claustrum-tombstone:v1:anthropic',
+        expires: 0,
+      }),
+      { models: {} },
+    )
+    const response = await loader.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(503)
+    expect(await response.text()).toContain(
+      'Run setup to enable scoped Claustrum custody',
+    )
+    expect(sends).toBe(0)
+  } finally {
+    await plugin.dispose?.()
+  }
+})

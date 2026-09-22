@@ -5964,6 +5964,29 @@ const anthropicAuthPlugin = async (
         let custodyStorage = await loadAccounts(accountStoragePath)
         if (
           getClaustrumMode(custodyStorage) === 'claustrum' &&
+          !isScopedCustodyActive(custodyStorage)
+        ) {
+          return {
+            apiKey: '',
+            fetch: async () =>
+              new Response(
+                JSON.stringify({
+                  type: 'error',
+                  error: {
+                    type: 'api_error',
+                    message:
+                      'Run setup to enable scoped Claustrum custody; legacy handle bindings cannot serve requests.',
+                  },
+                }),
+                {
+                  status: 503,
+                  headers: { 'content-type': 'application/json' },
+                },
+              ),
+          }
+        }
+        if (
+          getClaustrumMode(custodyStorage) === 'claustrum' &&
           isCustodyTombstoneOAuth(auth, 'anthropic')
         ) {
           await refreshVaultBackedOAuthAccounts(true)
