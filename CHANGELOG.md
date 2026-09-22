@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Restore Pi tool-call name mapping on normalized transcripts: the streaming response uses the exact host tool set resolved for its outgoing request, rather than the missing `context.tools` field on Pi ≥0.86.
 - Prevent background fallback refresh and quota polling from sending retained local OAuth material when a legacy Claustrum configuration is incomplete.
 - Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick so per-request writes no longer clobber a sibling's count with a stale zero.
 

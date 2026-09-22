@@ -80,6 +80,7 @@ import {
   type StopReason,
   type TextContent,
   type ThinkingContent,
+  type Tool,
   type ToolCall,
 } from '@earendil-works/pi-ai'
 
@@ -521,6 +522,7 @@ async function sendAnthropicRequest(options: {
   oauthAccountId?: string
   route?: string
   effortTransitions?: readonly MidConversationEffortTransition[]
+  onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
   await ensurePiMainAccountId(options.storagePath)
   const storage = await loadAccounts(options.storagePath)
@@ -557,7 +559,7 @@ async function sendAnthropicRequest(options: {
             accountIdentity,
           )
         : undefined
-  const { body, bodyText } = await buildAnthropicRequest(
+  const { body, bodyText, hostTools } = await buildAnthropicRequest(
     options.model.id,
     options.context,
     options.streamOptions,
@@ -574,6 +576,7 @@ async function sendAnthropicRequest(options: {
         : getThinkingPrefixMismatchBehavior(storage),
     },
   )
+  options.onResolvedTools?.(hostTools)
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
     ? configureApiRouteHeaders(options.apiAccount, fastMode)
@@ -749,6 +752,7 @@ async function executeWithFallback(options: {
   primaryAccessToken: string
   storagePath: string
   effortTransitions?: readonly MidConversationEffortTransition[]
+  onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
   await ensurePiMainAccountId(options.storagePath)
   let storage = await loadAccounts(options.storagePath)
@@ -1520,6 +1524,7 @@ export function streamCortexKitAnthropic(
         getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum'
       )
         throw new Error('Missing Anthropic OAuth access token')
+      let hostTools: Tool[] = []
       const response = await executeWithFallback({
         model,
         context,
@@ -1527,6 +1532,9 @@ export function streamCortexKitAnthropic(
         primaryAccessToken: accessToken,
         storagePath,
         effortTransitions,
+        onResolvedTools: (tools) => {
+          hostTools = tools
+        },
       })
 
       if (!response.ok) {
@@ -1581,7 +1589,7 @@ export function streamCortexKitAnthropic(
             output.content.push({
               type: 'toolCall',
               id: String(block.id),
-              name: fromClaudeCodeToolName(String(block.name), context.tools),
+              name: fromClaudeCodeToolName(String(block.name), hostTools),
               arguments: {},
               partialJson: '',
               index: event.index,
