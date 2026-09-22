@@ -4,6 +4,8 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+## 1.23.0
+
 ### Minor Changes
 
 - Support Claude Opus 5.5 (`claude-opus-5-5`):

@@ -4,6 +4,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+## 1.23.0
+
 ### Minor Changes
 
 - Support Claude Opus 5.5 (`claude-opus-5-5`) across Core, OpenCode, and Pi:
