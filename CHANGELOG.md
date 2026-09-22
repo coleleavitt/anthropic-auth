@@ -6,6 +6,12 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Minor Changes
 
+- Support Claude Opus 5.5 (`claude-opus-5-5`) across Core, OpenCode, and Pi:
+  - Expose Opus 5.5 model specifications (1,000,000 token context window, 128,000 max output tokens, $4/$20 MTok pricing).
+  - Enforce always-on adaptive thinking with summarized display (`thinking: { type: "adaptive", display: "summarized" }`) per Anthropic's Opus 5.5 specification, automatically rewriting disabled thinking or manual token budgets to adaptive summarized to prevent 400 invalid request errors.
+  - Expose native adaptive `low`, `medium`, `high`, `xhigh`, and `max` effort variants for Opus 5.5 in OpenCode's provider catalog and Pi.
+  - Support Anthropic fast mode (`speed: "fast"` with `fast-mode-2026-02-01` beta header) on Opus 5.5.
+  - Provide refusal recovery and server-side safety fallback parity for Opus 5.5, isolating recovery state between Opus 5 and Opus 5.5.
 - Add unified interactive `opencode-anthropic-auth setup` wizard (`bunx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
 - Add Claustrum vault custody support to Pi with native ambient authentication, per-dispatch scoped credential authorization, atomic roster reconciliation, and version-fenced 401 reporting.
 - Implement zero-bind scoped Claustrum custody across OpenCode and Pi, discovering vaulted Anthropic accounts automatically via `listScoped` under `category:anthropic-native` without manual capability handle minting, manifest files, or process restarts.

@@ -6,6 +6,11 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Minor Changes
 
+- Support Claude Opus 5.5 (`claude-opus-5-5`):
+  - Expose Opus 5.5 in OpenCode's provider catalog with native adaptive `low` through `max` effort variants.
+  - Enforce always-on adaptive summarized thinking per model specification, avoiding 400 errors from disabled thinking or manual token budgets.
+  - Support Anthropic fast mode on Opus 5.5.
+  - Support refusal recovery and server-side safety fallback for Opus 5.5 with isolated recovery state.
 - Add unified interactive `opencode-anthropic-auth setup` wizard (`bunx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
 - Implement zero-bind scoped Claustrum custody in OpenCode, discovering vaulted Anthropic accounts automatically via `listScoped` under `category:anthropic-native` without manual capability handle minting, manifest files, or process restarts.
 

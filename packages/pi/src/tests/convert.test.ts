@@ -1336,3 +1336,29 @@ describe('Pi normalized transcripts', () => {
     ).toBe(true)
   })
 })
+
+describe('buildAnthropicRequest — Opus 5.5 thinking', () => {
+  test('requests summarized adaptive thinking for Opus 5.5 without reasoning', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toBeUndefined()
+  })
+
+  test('maps reasoning to output_config effort for Opus 5.5', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'medium' } as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'medium' })
+  })
+})

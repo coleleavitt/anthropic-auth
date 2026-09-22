@@ -10772,6 +10772,10 @@ describe('provider.models', () => {
       { auth: { type: 'api' } } as never,
     )
 
+    expect(result?.['claude-opus-5-5']?.name).toBe('Claude Opus 5.5')
+    expect(result?.['claude-opus-5-5']?.variants).toEqual(
+      result?.['claude-opus-5']?.variants,
+    )
     expect(result?.['claude-opus-5']?.variants).toEqual({
       low: {
         thinking: { type: 'adaptive', display: 'summarized' },

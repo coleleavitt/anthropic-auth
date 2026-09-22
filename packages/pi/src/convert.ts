@@ -7,12 +7,14 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
@@ -648,7 +650,8 @@ export async function buildAnthropicRequest(
   const isFableOrMythos5 = isClaudeFableOrMythos5Model(modelId)
   const isSonnet5 = isClaudeSonnet5Model(modelId)
   const isOpus5 = isClaudeOpus5Model(modelId)
-  // Sonnet 5 and Opus 5 share Fable/Mythos's adaptive-summarized contract: make
+  const isOpus55 = isClaudeOpus55Model(modelId)
+  // Sonnet 5, Opus 5, and Opus 5.5 share Fable/Mythos's adaptive-summarized contract: make
   // adaptive thinking visible (display defaults to "omitted") and map reasoning
   // to output_config effort. Pi's typed options cannot express
   // thinking-disabled, so there is no disable case here (see transform.ts for
@@ -659,12 +662,14 @@ export async function buildAnthropicRequest(
     body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
   } else if (isSonnet5) {
     body.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
+  } else if (isOpus55) {
+    body.thinking = { ...CLAUDE_OPUS_5_5_ADAPTIVE_THINKING }
   } else if (isOpus5) {
     body.thinking = { ...CLAUDE_OPUS_5_ADAPTIVE_THINKING }
   }
 
   if (options?.reasoning) {
-    if (isFableOrMythos5 || isSonnet5 || isOpus5) {
+    if (isFableOrMythos5 || isSonnet5 || isOpus5 || isOpus55) {
       body.output_config = { effort: options.reasoning }
     } else {
       const budgets: Record<string, number> = {

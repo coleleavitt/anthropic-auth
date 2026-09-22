@@ -28,6 +28,11 @@ import {
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_LOGGING_COMMAND_NAME,
+  CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
+  CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_OPUS_5_5_MODEL_ID,
+  CLAUDE_OPUS_5_5_PRICING,
+  CLAUDE_OPUS_5_5_RELEASE_DATE,
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
@@ -116,7 +121,9 @@ import {
   isCacheKeepSubagentsEnabled,
   isClaudeFable51Model,
   isClaudeFableOrMythos51Model,
+  isClaudeOpus5FamilyModel,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   isCostZeroingEnabled,
   isCustodyTombstoneOAuth,
   isDumpPersistentlyEnabled,
@@ -854,6 +861,7 @@ function buildRestoredNotice(modelId: string): string {
 }
 
 function fallbackModelLabel(modelId: string): string {
+  if (isClaudeOpus55Model(modelId)) return 'Opus 5.5'
   if (isClaudeOpus5Model(modelId)) return 'Opus 5'
   if (isClaudeFableOrMythos51Model(modelId)) {
     if (modelId.startsWith('claude-mythos-5-1')) return 'Mythos 5.1'
@@ -936,6 +944,39 @@ function addFableMythos5Models<
         ]
       }),
     ),
+    ...(models[CLAUDE_OPUS_5_5_MODEL_ID]
+      ? {}
+      : {
+          [CLAUDE_OPUS_5_5_MODEL_ID]: {
+            ...base,
+            id: CLAUDE_OPUS_5_5_MODEL_ID,
+            name: 'Claude Opus 5.5',
+            api: base.api
+              ? { ...base.api, id: CLAUDE_OPUS_5_5_MODEL_ID }
+              : undefined,
+            cost: {
+              input: CLAUDE_OPUS_5_5_PRICING.input,
+              output: CLAUDE_OPUS_5_5_PRICING.output,
+              cache: {
+                read: CLAUDE_OPUS_5_5_PRICING.cacheRead,
+                write: CLAUDE_OPUS_5_5_PRICING.cacheWrite5m,
+              },
+            },
+            limit: {
+              ...(base.limit ?? {}),
+              context: CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
+              output: CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
+            },
+            capabilities: {
+              ...(base.capabilities ?? {}),
+              reasoning: true,
+              attachment: true,
+              toolcall: true,
+            },
+            release_date: CLAUDE_OPUS_5_5_RELEASE_DATE,
+            variants: createClaudeOpus5Variants(),
+          },
+        }),
   } as T
 }
 
@@ -961,7 +1002,7 @@ function applyNativeAdaptiveEffortVariants<
       const modelId = model.api?.id ?? model.id ?? id
       return [
         id,
-        isClaudeOpus5Model(modelId) || isClaudeFable51Model(modelId)
+        isClaudeOpus5FamilyModel(modelId) || isClaudeFable51Model(modelId)
           ? { ...model, variants: createClaudeOpus5Variants() }
           : model,
       ]

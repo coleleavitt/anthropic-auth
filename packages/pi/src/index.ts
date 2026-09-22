@@ -172,6 +172,15 @@ export default async function cortexKitPiAnthropicAuth(
         }
       }),
       {
+        id: 'claude-opus-5-5',
+        name: 'Claude Opus 5.5',
+        reasoning: true,
+        input: textImageInput(),
+        cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 8 },
+        contextWindow: 1_000_000,
+        maxTokens: 128_000,
+      },
+      {
         id: 'claude-opus-5',
         name: 'Claude Opus 5',
         reasoning: true,
