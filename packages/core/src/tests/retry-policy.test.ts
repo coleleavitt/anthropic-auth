@@ -2,11 +2,14 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   backoffDelayMs,
+  classifyProviderBlock,
   classifyRateLimit,
   classifyRetry,
   DEFAULT_MAX_RETRIES,
+  isClaudeCodeVersionTooOldError,
   isLongContextCreditsRequiredError,
   nextRetryDelayMs,
+  requiredClaudeCodeVersion,
   retryAfterMs,
 } from '../retry-policy.ts'
 
@@ -223,5 +226,99 @@ describe('isLongContextCreditsRequiredError', () => {
       ),
     ).toBe(false)
     expect(isLongContextCreditsRequiredError(200, '')).toBe(false)
+  })
+})
+
+describe('isClaudeCodeVersionTooOldError', () => {
+  // Verbatim body from a live 2026-09-22 request for claude-opus-5-5 whose
+  // user agent declared claude-cli/2.1.260.
+  const body = JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'invalid_request_error',
+      message:
+        "Claude Code 2.1.260 does not support this model; version 2.1.280 or newer is required. Run 'claude update', or update the Claude desktop app, then try again.",
+      details: { error_code: 'claude_code_version_too_old' },
+    },
+  })
+
+  test('detects the version gate on a 400', () => {
+    expect(isClaudeCodeVersionTooOldError(400, body)).toBe(true)
+  })
+
+  test('detects it from the message alone when details are stripped', () => {
+    expect(
+      isClaudeCodeVersionTooOldError(
+        400,
+        'Claude Code 2.1.260 does not support this model; version 2.1.280 or newer is required.',
+      ),
+    ).toBe(true)
+  })
+
+  test('is scoped to 400 so a 429 body cannot trip it', () => {
+    expect(isClaudeCodeVersionTooOldError(429, body)).toBe(false)
+    expect(isClaudeCodeVersionTooOldError(200, body)).toBe(false)
+  })
+
+  test('ignores an unrelated 400', () => {
+    expect(
+      isClaudeCodeVersionTooOldError(
+        400,
+        '{"error":{"message":"thinking.type.disabled is not supported for this model"}}',
+      ),
+    ).toBe(false)
+  })
+
+  test('reports the version Anthropic asked for', () => {
+    expect(requiredClaudeCodeVersion(body)).toBe('2.1.280')
+    expect(requiredClaudeCodeVersion('no version here')).toBeUndefined()
+  })
+
+  test('is not retryable: classifyRetry leaves a 400 alone', () => {
+    expect(classifyRetry(400, headers(), body).retryable).toBe(false)
+  })
+})
+
+describe('classifyProviderBlock', () => {
+  test('names a policy_blocked 400', () => {
+    const body =
+      '{"type":"error","error":{"type":"policy_blocked","message":"blocked"}}'
+    const block = classifyProviderBlock(400, body)
+    expect(block?.kind).toBe('policy_blocked')
+    expect(block?.message).toContain('policy')
+    // Already non-retryable; this only names the verdict.
+    expect(classifyRetry(400, headers(), body).retryable).toBe(false)
+  })
+
+  test('names a dlp_request_denied verdict', () => {
+    expect(
+      classifyProviderBlock(
+        403,
+        '{"error":{"details":{"error_code":"dlp_request_denied"}}}',
+      )?.kind,
+    ).toBe('dlp_request_denied')
+  })
+
+  test('names a safety_monitor_blocked verdict', () => {
+    // Pre-wired in Claude Code 2.1.280 (predicate returns false), so this may
+    // never fire; recognizing it costs nothing.
+    expect(classifyProviderBlock(400, 'safety_monitor_blocked')?.kind).toBe(
+      'safety_monitor_blocked',
+    )
+  })
+
+  test('ignores 5xx and 2xx', () => {
+    expect(classifyProviderBlock(500, 'policy_blocked')).toBeNull()
+    expect(classifyProviderBlock(200, 'policy_blocked')).toBeNull()
+  })
+
+  test('ignores an unrelated 400', () => {
+    expect(classifyProviderBlock(400, 'messages.0: invalid role')).toBeNull()
+  })
+
+  test('does not confuse a rate limit with a policy verdict', () => {
+    expect(
+      classifyProviderBlock(429, '{"error":{"type":"rate_limit_error"}}'),
+    ).toBeNull()
   })
 })

@@ -159,3 +159,80 @@ export function buildBillingHeaderValue(
       : '')
   )
 }
+
+// ============================================================================
+// Legacy Body Attestation (optional, environment-gated)
+// ============================================================================
+//
+// The older implementation used HMAC-SHA256 to attest the request body.
+// This is NOT what Claude Code 2.1.260 does (it sends literal cch=00000).
+// However, some users may want to use this for experimentation.
+//
+// Enable with: ANTHROPIC_AUTH_CCH_MODE=hmac
+//
+// Algorithm:
+//   1. Serialize body with "cch=00000;" placeholder
+//   2. HMAC-SHA256(key=CCH_SALT, data=serialized_body)
+//   3. Take first 5 hex chars of the digest
+//   4. Replace "cch=00000" with "cch={hash5}" in the serialized string
+
+import { createHmac } from 'node:crypto'
+
+export type CCHMode = 'native' | 'hmac' | 'xxhash'
+
+export function getCCHMode(): CCHMode {
+  const mode = process.env.ANTHROPIC_AUTH_CCH_MODE?.toLowerCase().trim()
+  if (mode === 'hmac') return 'hmac'
+  if (mode === 'xxhash') return 'xxhash'
+  return 'native' // Default: literal cch=00000 like Claude Code 2.1.260
+}
+
+/**
+ * Compute HMAC-SHA256 body attestation (legacy mode).
+ *
+ * This was used in older versions of the plugin before we discovered
+ * that Claude Code 2.1.260 sends literal cch=00000.
+ */
+export function computeHmacBodyAttestation(serializedBody: string): string {
+  const digest = createHmac('sha256', CCH_SALT)
+    .update(serializedBody)
+    .digest('hex')
+    .slice(0, 5)
+  return serializedBody.replace(CCH_PLACEHOLDER, `cch=${digest};`)
+}
+
+/**
+ * Compute xxHash64 body attestation (experimental mode).
+ *
+ * This uses the xxHash64 hash with the documented seed from the binary.
+ * Requires the body to already have the cch=00000 placeholder.
+ */
+export async function computeXxhashBodyAttestation(
+  serializedBody: string,
+): Promise<string> {
+  const bodyBytes = new TextEncoder().encode(serializedBody)
+  const digest = await computeCCH(bodyBytes)
+  return serializedBody.replace(CCH_PLACEHOLDER, `cch=${digest};`)
+}
+
+/**
+ * Sign the request body according to the configured CCH mode.
+ *
+ * Modes:
+ *   - native (default): Keep cch=00000 literal (matches Claude Code 2.1.260)
+ *   - hmac: HMAC-SHA256 body attestation
+ *   - xxhash: xxHash64 body attestation
+ */
+export async function signRequestBodyWithMode(
+  bodyString: string,
+  mode: CCHMode = getCCHMode(),
+): Promise<string> {
+  switch (mode) {
+    case 'hmac':
+      return computeHmacBodyAttestation(bodyString)
+    case 'xxhash':
+      return computeXxhashBodyAttestation(bodyString)
+    default:
+      return resetBillingHeaderCCH(bodyString)
+  }
+}

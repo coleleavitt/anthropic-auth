@@ -174,6 +174,87 @@ export function isLongContextCreditsRequiredError(
 }
 
 /**
+ * Server-side refusals that are a policy verdict on the request, not a fault to
+ * retry. Claude Code 2.1.280 classifies each of these separately so the user is
+ * told which policy fired instead of seeing a bare 400/403 body:
+ *
+ *  - `policy_blocked`        — HTTP 400, `error.error.type === "policy_blocked"`
+ *                              (`ufo` in chunk-nm3tx8s2.js). New classifier in 2.1.280.
+ *  - `dlp_request_denied`    — `error.error.details.error_code` (`G0e`), the
+ *                              organization's data-loss-prevention rules.
+ *  - `safety_monitor_blocked`— new error kind in 2.1.280 (`fK`). Its predicate
+ *                              is hardcoded `return false` in the shipped build,
+ *                              so it is pre-wiring; recognized here by body text
+ *                              only, and it costs nothing if it never fires.
+ *
+ * All three already fall out of {@link classifyRetry} as non-retryable because
+ * they are non-429 4xx. This exists to NAME them.
+ */
+export type ProviderBlockKind =
+  | 'policy_blocked'
+  | 'dlp_request_denied'
+  | 'safety_monitor_blocked'
+
+const PROVIDER_BLOCK_MESSAGES: Readonly<Record<ProviderBlockKind, string>> = {
+  policy_blocked:
+    'Anthropic refused this request under an account or organization policy. Retrying will not change the verdict.',
+  dlp_request_denied:
+    "Anthropic refused this request under your organization's data-loss-prevention rules. Retrying will not change the verdict.",
+  safety_monitor_blocked:
+    'Anthropic refused this request at a safety monitor. Retrying will not change the verdict.',
+}
+
+export function classifyProviderBlock(
+  status: number,
+  body = '',
+): { kind: ProviderBlockKind; message: string } | null {
+  if (status < 400 || status >= 500) return null
+  const text = body.toLowerCase()
+  const kind = (
+    ['policy_blocked', 'dlp_request_denied', 'safety_monitor_blocked'] as const
+  ).find((candidate) => text.includes(candidate))
+  if (!kind) return null
+  return { kind, message: PROVIDER_BLOCK_MESSAGES[kind] }
+}
+
+/**
+ * Anthropic gates a newly launched model on the Claude Code version the request
+ * declares in its `user-agent` (`claude-cli/<version>`), NOT on the billing
+ * header's `cc_version`. A request whose declared version is below the model's
+ * floor is rejected with HTTP 400 and
+ * `error.error.details.error_code = "claude_code_version_too_old"`:
+ *
+ *   "Claude Code 2.1.260 does not support this model; version 2.1.280 or newer
+ *    is required. Run 'claude update', ..."
+ *
+ * Verified live against `claude-opus-5-5` on 2026-09-22: the same request
+ * succeeds once the user agent declares 2.1.280. Retrying without changing the
+ * declared version is pointless, so this is classified separately from a
+ * generic 400 and surfaced as an actionable message.
+ */
+export const CLAUDE_CODE_VERSION_TOO_OLD_ERROR_CODE =
+  'claude_code_version_too_old'
+
+const VERSION_TOO_OLD_MESSAGE_PATTERN =
+  /does not support this model; version ([0-9]+\.[0-9]+\.[0-9]+) or newer is required/
+
+export function isClaudeCodeVersionTooOldError(
+  status: number,
+  body = '',
+): boolean {
+  if (status !== 400) return false
+  return (
+    body.includes(CLAUDE_CODE_VERSION_TOO_OLD_ERROR_CODE) ||
+    VERSION_TOO_OLD_MESSAGE_PATTERN.test(body)
+  )
+}
+
+/** The minimum version Anthropic named in a version-gate rejection, if present. */
+export function requiredClaudeCodeVersion(body = ''): string | undefined {
+  return VERSION_TOO_OLD_MESSAGE_PATTERN.exec(body)?.[1]
+}
+
+/**
  * Server-directed delay in milliseconds, or undefined when the response leaves
  * the pacing to the client. `retry-after` may be seconds or an HTTP date.
  */

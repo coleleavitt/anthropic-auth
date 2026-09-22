@@ -2027,7 +2027,10 @@ export async function setCache1hPersistentMode(
 }
 
 export function isDumpPersistentlyEnabled(storage: AccountStorage | null) {
-  return storage?.dump?.enabled === true
+  // Dumps are ON by default: request/response capture only turns off when the
+  // user explicitly runs `/claude-dump off` (which persists `enabled: false`).
+  // An absent flag (never configured) means enabled.
+  return storage?.dump?.enabled !== false
 }
 
 export async function setDumpPersistentEnabled(

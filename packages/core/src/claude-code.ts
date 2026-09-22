@@ -329,6 +329,10 @@ export function applyClaudeCodeHeaders(
     parentAgentId?: string
     /** Use the standard context path for an account with the native credits latch. */
     suppressContext1m?: boolean
+    /** Request classification (compaction, workflow, etc.) */
+    requestClass?: string
+    /** Previous tool execution durations for scheduling hints */
+    prevToolDurations?: string
   } = {},
 ): Headers {
   const identity = options.identity ?? getClaudeCodeIdentity(accessToken)
@@ -383,6 +387,16 @@ export function applyClaudeCodeHeaders(
       encodeHeaderValue(options.parentAgentId),
     )
   }
+  if (options.requestClass)
+    headers.set(
+      'x-claude-code-request-class',
+      encodeHeaderValue(options.requestClass),
+    )
+  if (options.prevToolDurations)
+    headers.set(
+      'x-claude-code-prev-tool-durations',
+      encodeHeaderValue(options.prevToolDurations),
+    )
   headers.delete('x-api-key')
   return headers
 }

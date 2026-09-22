@@ -307,7 +307,8 @@ export function buildDumpStatusSummary(input?: { enabled?: boolean }) {
     `- Directory: ${getDumpDirectory()}`,
     '- Persisted: ~/.config/opencode/anthropic-auth.json',
     '- Captures: final rewritten Anthropic body in direct and relay modes; request/relay metadata is redacted',
-    '- Warning: body dumps may contain prompt/session content; turn this off after debugging',
+    '- Default: ON (disable with `/claude-dump off`)',
+    '- Warning: body dumps may contain prompt/session content stored on disk under the dump directory (auto-swept, 512MB cap)',
   ].join('\n')
 }
 

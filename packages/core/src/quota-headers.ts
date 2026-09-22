@@ -51,6 +51,92 @@ function normalizeWindow(
   }
 }
 
+// ============================================================================
+// Overage/Grace Status Headers
+// ============================================================================
+
+export type OverageStatus = 'active' | 'available' | 'disabled' | 'unknown'
+export type OverageScope = 'org' | 'user' | 'unknown'
+
+export interface OverageState {
+  /** Current overage status */
+  status: OverageStatus
+  /** Why overage is disabled (if applicable) */
+  disabledReason?: string
+  /** Scope of overage (org or user level) */
+  scope: OverageScope
+  /** Whether overage is currently in use */
+  inUse: boolean
+}
+
+function parseOverageStatus(value: string | null): OverageStatus {
+  if (value === 'active') return 'active'
+  if (value === 'available') return 'available'
+  if (value === 'disabled') return 'disabled'
+  return 'unknown'
+}
+
+function parseOverageScope(value: string | null): OverageScope {
+  if (value === 'org') return 'org'
+  if (value === 'user') return 'user'
+  return 'unknown'
+}
+
+export function extractOverageState(
+  headers: Headers,
+): OverageState | undefined {
+  const status = headers.get(`${PREFIX}overage-status`)
+  if (!status) return undefined
+
+  return {
+    status: parseOverageStatus(status),
+    disabledReason:
+      headers.get(`${PREFIX}overage-disabled-reason`) ?? undefined,
+    scope: parseOverageScope(headers.get(`${PREFIX}overage-scope`)),
+    inUse: headers.get(`${PREFIX}overage-in-use`) === 'true',
+  }
+}
+
+// ============================================================================
+// Grace Period Headers
+// ============================================================================
+
+export interface GraceState {
+  /** Whether grace period is active */
+  active: boolean
+  /** Grace utilization (0-1) */
+  utilization?: number
+  /** Grace reset timestamp */
+  resetsAt?: string
+}
+
+export function extractGraceState(headers: Headers): GraceState | undefined {
+  // Check for any grace-related headers
+  const utilization = finiteHeaderNumber(headers, `${PREFIX}grace-utilization`)
+  const resetSeconds = finiteHeaderNumber(headers, `${PREFIX}grace-reset`)
+
+  if (utilization === undefined && resetSeconds === undefined) {
+    return undefined
+  }
+
+  const resetDate =
+    resetSeconds == null ? undefined : new Date(resetSeconds * 1000)
+  const resetsAt =
+    resetDate && Number.isFinite(resetDate.getTime())
+      ? resetDate.toISOString()
+      : undefined
+
+  return {
+    active: utilization !== undefined && utilization > 0,
+    utilization,
+    resetsAt,
+  }
+}
+
+// ============================================================================
+// Main Quota Header Normalization
+// ============================================================================
+
 export function normalizeQuotaHeaders(
   headers: Headers,
   now = Date.now(),
