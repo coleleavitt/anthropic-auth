@@ -86,6 +86,21 @@ export function getClaudeCodeUserAgent(
   return `claude-cli/${version} (external, ${details.join(', ')})`
 }
 
+/**
+ * Force the npm-tracked version refresh, ignoring the hourly TTL.
+ *
+ * Used when Anthropic rejects a request with `claude_code_version_too_old`:
+ * a model launched after this process cached its version leaves the cached
+ * value permanently too low for the rest of the TTL, so the gate must be able
+ * to re-check immediately rather than block every request for an hour.
+ */
+export async function refreshClaudeCodeVersion(): Promise<string> {
+  if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_VERSION_CHECK === '1')
+    return getCachedClaudeCodeVersion()
+  cachedAt = 0
+  return getClaudeCodeVersion()
+}
+
 export function resetClaudeCodeVersionCache(): void {
   cachedVersion = null
   cachedAt = 0

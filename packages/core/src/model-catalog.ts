@@ -3,10 +3,15 @@ import { readFileSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
-import { getClaudeCodeUserAgent } from './claude-version.ts'
+import {
+  getCachedClaudeCodeVersion,
+  getClaudeCodeUserAgent,
+} from './claude-version.ts'
 import { OAUTH_BETA } from './constants.ts'
 import {
   CLAUDE_MYTHOS_5_MODEL_ID,
+  CLAUDE_OPUS_5_5_MODEL_ID,
+  CLAUDE_OPUS_5_5_PRICING,
   isClaudeFableOrMythos5Model,
   resolveClaudeFableMythos5Pricing,
 } from './models.ts'
@@ -54,6 +59,15 @@ export type CatalogModel = {
 export type ModelCatalog = {
   models: CatalogModel[]
   fetchedAt: number
+  /**
+   * The Claude Code version this catalog was fetched under. A Claude Code
+   * release is how new models reach the API, and Anthropic gates a new model on
+   * the declared version, so a version change invalidates the cache regardless
+   * of its age — otherwise a launch-day model stays invisible for up to
+   * {@link MODEL_CATALOG_MAX_AGE_MS}. Absent on caches written before this
+   * field existed, which invalidates them exactly once.
+   */
+  claudeCodeVersion?: string
 }
 
 export type ModelCatalogSource = 'live' | 'cache' | 'fallback'
@@ -71,6 +85,17 @@ export type ResolvedModelCatalog = {
  * reporting only — billing is the plan, not per-token cost.
  */
 const MODEL_PRICING: Array<{ prefix: string; cost: ModelCost }> = [
+  {
+    // Opus 5.5 is cheaper than Opus 5 on every axis; it must win the
+    // longest-prefix match below or it inherits Opus 5's rates.
+    prefix: CLAUDE_OPUS_5_5_MODEL_ID,
+    cost: {
+      input: CLAUDE_OPUS_5_5_PRICING.input,
+      output: CLAUDE_OPUS_5_5_PRICING.output,
+      cacheRead: CLAUDE_OPUS_5_5_PRICING.cacheRead,
+      cacheWrite: CLAUDE_OPUS_5_5_PRICING.cacheWrite5m,
+    },
+  },
   {
     prefix: 'claude-opus-5',
     cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
@@ -253,7 +278,11 @@ function coerceCachedCatalogModel(raw: unknown): CatalogModel | null {
 
 function parseCatalog(text: string): ModelCatalog | null {
   try {
-    const parsed = JSON.parse(text) as { models?: unknown; fetchedAt?: unknown }
+    const parsed = JSON.parse(text) as {
+      models?: unknown
+      fetchedAt?: unknown
+      claudeCodeVersion?: unknown
+    }
     if (!Array.isArray(parsed.models)) return null
     const models = parsed.models.flatMap((entry) => {
       const model = coerceCachedCatalogModel(entry)
@@ -266,6 +295,10 @@ function parseCatalog(text: string): ModelCatalog | null {
         typeof parsed.fetchedAt === 'number' && parsed.fetchedAt > 0
           ? parsed.fetchedAt
           : 0,
+      ...(typeof parsed.claudeCodeVersion === 'string' &&
+      parsed.claudeCodeVersion
+        ? { claudeCodeVersion: parsed.claudeCodeVersion }
+        : {}),
     }
   } catch {
     return null
@@ -387,9 +420,25 @@ export async function fetchAnthropicModelCatalog(options: {
 export function isModelCatalogFresh(
   catalog: ModelCatalog | null,
   maxAgeMs = MODEL_CATALOG_MAX_AGE_MS,
+  claudeCodeVersion = getCachedClaudeCodeVersion(),
 ): boolean {
   if (!catalog) return false
+  if (catalog.claudeCodeVersion !== claudeCodeVersion) return false
   return Date.now() - catalog.fetchedAt < maxAgeMs
+}
+
+/**
+ * True when the cache was written under a different Claude Code version than
+ * the one this process declares. New models ship with a Claude Code release and
+ * are version-gated by the API, so this cache is known wrong rather than merely
+ * old — the caller should wait for the refresh instead of serving it.
+ */
+export function modelCatalogVersionChanged(
+  catalog: ModelCatalog | null,
+  claudeCodeVersion = getCachedClaudeCodeVersion(),
+): boolean {
+  if (!catalog) return false
+  return catalog.claudeCodeVersion !== claudeCodeVersion
 }
 
 /**
@@ -429,17 +478,41 @@ export async function resolveAnthropicModelCatalog(options: {
       accessToken,
       timeoutMs: options.timeoutMs,
     })
-    await writeModelCatalogCache({ models, fetchedAt: Date.now() }, path)
+    await writeModelCatalogCache(
+      {
+        models,
+        fetchedAt: Date.now(),
+        claudeCodeVersion: getCachedClaudeCodeVersion(),
+      },
+      path,
+    )
     return models
   }
 
-  if (cached) {
+  if (cached && !modelCatalogVersionChanged(cached)) {
     // Stale but usable: never make the caller wait on the network.
     void refresh().catch((error) => options.onError?.(error))
     return {
       models: cached.models,
       source: 'cache',
       fetchedAt: cached.fetchedAt,
+    }
+  }
+
+  if (cached) {
+    // The Claude Code version moved, so this cache predates whatever models
+    // that release added. Wait for the refresh (bounded by `timeoutMs`) and
+    // fall back to the stale list only if it fails.
+    try {
+      const models = await refresh()
+      return { models, source: 'live', fetchedAt: Date.now() }
+    } catch (error) {
+      options.onError?.(error)
+      return {
+        models: cached.models,
+        source: 'cache',
+        fetchedAt: cached.fetchedAt,
+      }
     }
   }
 

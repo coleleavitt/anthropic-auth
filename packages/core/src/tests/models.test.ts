@@ -1,15 +1,21 @@
 import { describe, expect, test } from 'bun:test'
+import { resolveModelCost } from '../model-catalog'
 import {
+  CLAUDE_OPUS_5_5_MODEL_ID,
+  CLAUDE_OPUS_5_5_PRICING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_MODEL_ID,
   canonicalClaudeModelId,
   clampEffortForModel,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   isClaudeSonnet5Model,
   modelAllowsForcedManualThinking,
+  modelRejectsDisabledThinking,
   modelSupportsAdaptiveThinking,
   modelSupportsMaxEffort,
   modelSupportsXhighEffort,
+  refusalFallbackRouteMap,
   resolveClaudeFableMythos5Pricing,
   resolveRefusalFallbackModel,
   resolveThinkingShape,
@@ -382,5 +388,112 @@ describe('resolveRefusalFallbackModel', () => {
         'claude-opus-4-8',
       ]),
     ).toBeUndefined()
+  })
+})
+
+describe('claude-opus-5-5 (Opus 5.5)', () => {
+  test('exposes the bare id constant', () => {
+    expect(CLAUDE_OPUS_5_5_MODEL_ID).toBe('claude-opus-5-5')
+  })
+
+  test('isClaudeOpus55Model matches the id and dated snapshots only', () => {
+    expect(isClaudeOpus55Model('claude-opus-5-5')).toBe(true)
+    expect(isClaudeOpus55Model('claude-opus-5-5-20260601')).toBe(true)
+    expect(isClaudeOpus55Model('claude-opus-5')).toBe(false)
+    expect(isClaudeOpus55Model('claude-opus-5-20260901')).toBe(false)
+    expect(isClaudeOpus55Model(undefined)).toBe(false)
+  })
+
+  test('stays inside the Opus 5 family predicate for shared behavior', () => {
+    // Server-side fallback eligibility, refusal recovery and the effort
+    // variants are shared with Opus 5, so the family predicate must match.
+    expect(isClaudeOpus5Model('claude-opus-5-5')).toBe(true)
+  })
+
+  test('canonicalizes to its own id, not to Opus 5', () => {
+    expect(canonicalClaudeModelId('claude-opus-5-5')).toBe('claude-opus-5-5')
+    expect(canonicalClaudeModelId('claude-opus-5-5-20260601')).toBe(
+      'claude-opus-5-5',
+    )
+    expect(canonicalClaudeModelId('claude-opus-5-5[1m]')).toBe(
+      'claude-opus-5-5',
+    )
+  })
+
+  test('is adaptive and accepts every effort level', () => {
+    expect(modelSupportsAdaptiveThinking('claude-opus-5-5')).toBe(true)
+    expect(modelSupportsMaxEffort('claude-opus-5-5')).toBe(true)
+    expect(modelSupportsXhighEffort('claude-opus-5-5')).toBe(true)
+    expect(clampEffortForModel('max', 'claude-opus-5-5')).toBe('max')
+    expect(clampEffortForModel('xhigh', 'claude-opus-5-5')).toBe('xhigh')
+  })
+
+  test('never accepts a forced manual token budget', () => {
+    expect(modelAllowsForcedManualThinking('claude-opus-5-5')).toBe(false)
+    expect(resolveThinkingShape('claude-opus-5-5', {})).toBe('adaptive')
+    expect(
+      resolveThinkingShape('claude-opus-5-5', {
+        CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
+      }),
+    ).toBe('adaptive')
+  })
+
+  test('rejects thinking:{type:"disabled"} while Opus 5 accepts it', () => {
+    // Verified live 2026-09-22: opus-5-5 answers a disabled request with 400
+    // "thinking.type.disabled is not supported for this model".
+    expect(modelRejectsDisabledThinking('claude-opus-5-5')).toBe(true)
+    expect(modelRejectsDisabledThinking('claude-opus-5')).toBe(false)
+    expect(modelRejectsDisabledThinking('claude-sonnet-5')).toBe(false)
+    expect(modelRejectsDisabledThinking('claude-fable-5')).toBe(true)
+    expect(modelRejectsDisabledThinking('claude-mythos-5-1')).toBe(true)
+  })
+
+  test('prices below Opus 5 on tokens and cache reads', () => {
+    // Claude Code 2.1.280 tier_4_20_cache_read_0_20.
+    expect(CLAUDE_OPUS_5_5_PRICING).toEqual({
+      input: 4,
+      output: 20,
+      cacheRead: 0.2,
+      cacheWrite5m: 5,
+      cacheWrite1h: 8,
+    })
+    expect(resolveModelCost('claude-opus-5-5')).toEqual({
+      input: 4,
+      output: 20,
+      cacheRead: 0.2,
+      cacheWrite: 5,
+    })
+    // The Opus 5 prefix must not swallow it.
+    expect(resolveModelCost('claude-opus-5')).toEqual({
+      input: 5,
+      output: 25,
+      cacheRead: 0.5,
+      cacheWrite: 6.25,
+    })
+  })
+
+  test('has its own refusal route map, including frontier_llm', () => {
+    // Claude Code 2.1.280 `Mj`: bio -> opus-5, cyber -> opus-4-8,
+    // frontier_llm -> opus-5.
+    expect(refusalFallbackRouteMap('claude-opus-5-5')).toEqual({
+      bio: 'claude-opus-5',
+      cyber: 'claude-opus-4-8',
+      frontier_llm: 'claude-opus-5',
+    })
+    expect(resolveRefusalFallbackModel('claude-opus-5-5', 'bio')).toBe(
+      'claude-opus-5',
+    )
+    expect(resolveRefusalFallbackModel('claude-opus-5-5', 'frontier_llm')).toBe(
+      'claude-opus-5',
+    )
+    expect(resolveRefusalFallbackModel('claude-opus-5-5', 'cyber')).toBe(
+      'claude-opus-4-8',
+    )
+  })
+
+  test('opus-5 keeps its narrower map (no bio, no frontier_llm)', () => {
+    expect(refusalFallbackRouteMap('claude-opus-5')).toEqual({
+      cyber: 'claude-opus-4-8',
+    })
   })
 })

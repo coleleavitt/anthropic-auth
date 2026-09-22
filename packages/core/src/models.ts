@@ -145,12 +145,80 @@ export const CLAUDE_OPUS_5_MODEL_ID = 'claude-opus-5'
 export const CLAUDE_OPUS_5_ADAPTIVE_THINKING =
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
 
+/**
+ * True for every member of the Opus 5 series, including the 5.5 point release
+ * (`claude-opus-5-5`) and dated snapshots. Call sites use this as the FAMILY
+ * predicate — adaptive thinking injection, server-side fallback eligibility,
+ * refusal recovery, effort variants — because those behaviors are shared.
+ * Anything that differs between 5.0 and 5.5 (pricing, disabled-thinking
+ * support, display label) must additionally consult
+ * {@link isClaudeOpus55Model}.
+ */
 export function isClaudeOpus5Model(model: unknown) {
   return (
     typeof model === 'string' &&
     (model === CLAUDE_OPUS_5_MODEL_ID ||
       model.startsWith(`${CLAUDE_OPUS_5_MODEL_ID}-`))
   )
+}
+
+/**
+ * Opus 5.5 — a separate catalog entry in Claude Code 2.1.280, not a snapshot of
+ * Opus 5. It differs from Opus 5 in three ways that change the wire request or
+ * the numbers we report:
+ *
+ *  - pricing: `tier_4_20_cache_read_0_20` ($4 in / $20 out / $0.20 cache read)
+ *    against Opus 5's `tier_5_25` ($5 / $25 / $0.50)
+ *  - thinking: capability `rejects_disabled_thinking` — `{type:"disabled"}` is a
+ *    400 ("\"thinking.type.disabled\" is not supported for this model"), while
+ *    Opus 5 accepts it under `thinking_disabled_effort_cap`
+ *  - default effort: `medium` against Opus 5's `high`
+ *
+ * Matched on the exact id plus dated snapshots, never on Opus 5's prefix.
+ */
+export const CLAUDE_OPUS_5_5_MODEL_ID = 'claude-opus-5-5'
+
+export function isClaudeOpus55Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = model.trim().toLowerCase()
+  return (
+    normalized === CLAUDE_OPUS_5_5_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_OPUS_5_5_MODEL_ID}-`)
+  )
+}
+
+/**
+ * Per-million-token USD pricing for Opus 5.5, mirroring Claude Code 2.1.280's
+ * `tier_4_20_cache_read_0_20`. Opus 5.5 is CHEAPER than Opus 5 on every axis,
+ * so reusing the Opus 5 prefix price overstates cost by 25% on tokens and 2.5x
+ * on cache reads.
+ */
+export const CLAUDE_OPUS_5_5_PRICING = {
+  input: 4,
+  output: 20,
+  cacheRead: 0.2,
+  cacheWrite5m: 5,
+  cacheWrite1h: 8,
+} as const
+
+export const CLAUDE_OPUS_5_5_CONTEXT_WINDOW = 1_000_000
+export const CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS = 128_000
+
+/**
+ * Models that reject `thinking: {type:"disabled"}` outright (HTTP 400,
+ * `invalid_request_error`: use `thinking.type.adaptive` and
+ * `output_config.effort`). Mirrors the `rejects_disabled_thinking` capability
+ * in Claude Code 2.1.280's baked catalog: Fable 5, Fable 5.1, Mythos 5.1, and
+ * Opus 5.5. Mythos 5 ships an empty capability array but is hardcoded adaptive
+ * by Claude Code, and it rejects a disable exactly like Fable, so the whole
+ * Fable/Mythos family is covered here.
+ *
+ * Opus 5 and Sonnet 5 are deliberately absent: both accept an explicit disable
+ * (Opus 5 only caps `effort` at `high` while disabled), so a caller's opt-out
+ * is honored there.
+ */
+export function modelRejectsDisabledThinking(model: unknown): boolean {
+  return isClaudeFableOrMythos5Model(model) || isClaudeOpus55Model(model)
 }
 
 /**
@@ -308,21 +376,33 @@ export const CLAUDE_OPUS_4_8_MODEL_ID = 'claude-opus-4-8'
 
 /**
  * Anthropic refusal categories carried on `message_delta.delta.stop_details`.
- * Only `bio` and `cyber` have configured fallback routes in Claude Code; any
- * other value (or an absent category) is treated as unmapped.
+ * Claude Code 2.1.280 recognizes `bio`/`cyber` (`U5t`) and
+ * `frontier_llm`/`reasoning_extraction` (`Cj`), collapsing anything else to
+ * `other` (`DX`). Only categories present in a model's route map below are
+ * routed; the rest are unmapped.
  */
-export type RefusalCategory = 'bio' | 'cyber' | (string & {})
+export type RefusalCategory =
+  | 'bio'
+  | 'cyber'
+  | 'frontier_llm'
+  | 'reasoning_extraction'
+  | (string & {})
 
 /**
  * Per-model refusal-category → fallback-model route maps, mirrored verbatim from
- * Claude Code 2.1.268 (`chunk-pryvkh3w.js`, functions `Swo`/`ywo`/`_wo`/`bwo`):
+ * Claude Code 2.1.280 (`chunk-8knzj4cj.js`, selector `Lj`):
  *
- *   ywo (default) = { bio: "claude-opus-5",  cyber: "claude-opus-4-8" }
- *   _wo (opus-5)  = { cyber: "claude-opus-4-8" }   // bio has NO route on opus-5
+ *   Pj (default)  = { bio: "claude-opus-5", cyber: "claude-opus-4-8" }
+ *   Dj (opus-5)   = { cyber: "claude-opus-4-8" }   // bio has NO route on opus-5
+ *   Mj (opus-5-5) = { bio: "claude-opus-5", cyber: "claude-opus-4-8",
+ *                     frontier_llm: "claude-opus-5" }
+ *   Ij            = { bio/cyber → opus-4-8 }, selected only when `Hc()` is true,
+ *                   and `Hc` is `return false` in the shipped build — dead.
  *
- * The `bwo` variant (both categories → opus-4-8) is only reached for models that
- * are strictly newer than opus-5; none are in the shipped catalog, so it is not
- * represented here. The maps are keyed on the canonical (snapshot-stripped) id.
+ * `Lj` matches the plain id and the `[1m]` suffixed form, so the maps are keyed
+ * on the canonical (snapshot- and `[1m]`-stripped) id here. Claude Code also
+ * allows a route VALUE to be a chain (array) capped at 3 hops (`Oj`); every
+ * shipped route is a single model, so these stay scalar.
  */
 const REFUSAL_ROUTE_DEFAULT: Readonly<Record<string, string>> = {
   bio: CLAUDE_OPUS_5_MODEL_ID,
@@ -331,6 +411,11 @@ const REFUSAL_ROUTE_DEFAULT: Readonly<Record<string, string>> = {
 const REFUSAL_ROUTE_OPUS_5: Readonly<Record<string, string>> = {
   cyber: CLAUDE_OPUS_4_8_MODEL_ID,
 }
+const REFUSAL_ROUTE_OPUS_5_5: Readonly<Record<string, string>> = {
+  bio: CLAUDE_OPUS_5_MODEL_ID,
+  cyber: CLAUDE_OPUS_4_8_MODEL_ID,
+  frontier_llm: CLAUDE_OPUS_5_MODEL_ID,
+}
 
 /** The safe floor a terminal refusal downgrades to when no category route applies. */
 export const CLAUDE_REFUSAL_CATCH_ALL_MODEL = CLAUDE_OPUS_4_8_MODEL_ID
@@ -338,9 +423,9 @@ export const CLAUDE_REFUSAL_CATCH_ALL_MODEL = CLAUDE_OPUS_4_8_MODEL_ID
 export function refusalFallbackRouteMap(
   model: string,
 ): Readonly<Record<string, string>> {
-  if (canonicalClaudeModelId(model) === CLAUDE_OPUS_5_MODEL_ID) {
-    return REFUSAL_ROUTE_OPUS_5
-  }
+  const canonical = canonicalClaudeModelId(model)
+  if (canonical === CLAUDE_OPUS_5_5_MODEL_ID) return REFUSAL_ROUTE_OPUS_5_5
+  if (canonical === CLAUDE_OPUS_5_MODEL_ID) return REFUSAL_ROUTE_OPUS_5
   return REFUSAL_ROUTE_DEFAULT
 }
 

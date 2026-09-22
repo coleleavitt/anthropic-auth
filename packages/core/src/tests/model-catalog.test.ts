@@ -3,10 +3,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { getCachedClaudeCodeVersion } from '../claude-version.ts'
 import {
   type CatalogModel,
   fetchAnthropicModelCatalog,
   isModelCatalogFresh,
+  modelCatalogVersionChanged,
   normalizeCatalogModel,
   readModelCatalogCache,
   readModelCatalogCacheSync,
@@ -298,13 +300,45 @@ describe('catalog cache', () => {
   })
 
   test('freshness is bounded by max age', () => {
+    const version = getCachedClaudeCodeVersion()
     expect(
-      isModelCatalogFresh({ models: [], fetchedAt: Date.now() }, 1000),
+      isModelCatalogFresh(
+        { models: [], fetchedAt: Date.now(), claudeCodeVersion: version },
+        1000,
+      ),
     ).toBe(true)
     expect(
-      isModelCatalogFresh({ models: [], fetchedAt: Date.now() - 5000 }, 1000),
+      isModelCatalogFresh(
+        {
+          models: [],
+          fetchedAt: Date.now() - 5000,
+          claudeCodeVersion: version,
+        },
+        1000,
+      ),
     ).toBe(false)
     expect(isModelCatalogFresh(null)).toBe(false)
+  })
+
+  test('a Claude Code version change invalidates an otherwise fresh cache', () => {
+    // New models ship with a Claude Code release and are version-gated by the
+    // API, so a version move means the cache predates them.
+    const catalog = {
+      models: [],
+      fetchedAt: Date.now(),
+      claudeCodeVersion: '2.1.278',
+    }
+    expect(isModelCatalogFresh(catalog, 1000, '2.1.280')).toBe(false)
+    expect(isModelCatalogFresh(catalog, 1000, '2.1.278')).toBe(true)
+    expect(modelCatalogVersionChanged(catalog, '2.1.280')).toBe(true)
+    expect(modelCatalogVersionChanged(catalog, '2.1.278')).toBe(false)
+    expect(modelCatalogVersionChanged(null, '2.1.280')).toBe(false)
+  })
+
+  test('a cache written before the version field existed is invalidated once', () => {
+    expect(
+      isModelCatalogFresh({ models: [], fetchedAt: Date.now() }, 1000),
+    ).toBe(false)
   })
 })
 
@@ -380,7 +414,14 @@ describe('resolveAnthropicModelCatalog', () => {
     const path = await tempCatalogPath()
     const stale = normalizeCatalogModel(apiModel({ id: 'claude-opus-4-8' }))
     if (!stale) throw new Error('expected a normalized model')
-    await writeModelCatalogCache({ models: [stale], fetchedAt: 1 }, path)
+    await writeModelCatalogCache(
+      {
+        models: [stale],
+        fetchedAt: 1,
+        claudeCodeVersion: getCachedClaudeCodeVersion(),
+      },
+      path,
+    )
 
     let resolveFetch: (() => void) | undefined
     const fetched = new Promise<void>((resolve) => {
@@ -406,5 +447,55 @@ describe('resolveAnthropicModelCatalog', () => {
     expect((await readModelCatalogCache(path))?.models[0]?.id).toBe(
       'claude-opus-5',
     )
+  })
+
+  test('waits for a refresh when the Claude Code version moved', async () => {
+    const path = await tempCatalogPath()
+    const stale = normalizeCatalogModel(apiModel({ id: 'claude-opus-4-8' }))
+    if (!stale) throw new Error('expected a normalized model')
+    // Written under an older Claude Code release, so it cannot contain the
+    // models that release added.
+    await writeModelCatalogCache(
+      { models: [stale], fetchedAt: Date.now(), claudeCodeVersion: '2.1.278' },
+      path,
+    )
+    stubFetch(
+      () =>
+        new Response(JSON.stringify({ data: [apiModel()] }), { status: 200 }),
+    )
+
+    const resolved = await resolveAnthropicModelCatalog({
+      accessToken: 'token-1',
+      fallback,
+      path,
+    })
+
+    expect(resolved.source).toBe('live')
+    expect(resolved.models[0]?.id).toBe('claude-opus-5')
+    expect((await readModelCatalogCache(path))?.claudeCodeVersion).toBe(
+      getCachedClaudeCodeVersion(),
+    )
+  })
+
+  test('falls back to the stale list when the post-version-change refresh fails', async () => {
+    const path = await tempCatalogPath()
+    const stale = normalizeCatalogModel(apiModel({ id: 'claude-opus-4-8' }))
+    if (!stale) throw new Error('expected a normalized model')
+    await writeModelCatalogCache(
+      { models: [stale], fetchedAt: Date.now(), claudeCodeVersion: '2.1.278' },
+      path,
+    )
+    stubFetch(() => {
+      throw new Error('offline')
+    })
+
+    const resolved = await resolveAnthropicModelCatalog({
+      accessToken: 'token-1',
+      fallback,
+      path,
+    })
+
+    expect(resolved.source).toBe('cache')
+    expect(resolved.models[0]?.id).toBe('claude-opus-4-8')
   })
 })
