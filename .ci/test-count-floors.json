@@ -1,17 +1,17 @@
 {
   "floors": {
     "core": 290,
-    "opencode": 1667,
+    "opencode": 1669,
     "pi": 140
   },
   "measurement": {
-    "head": "2c2f27b593c2efdf967bed064fb363bb769bc43b",
+    "head": "7d4423d765cb8e7eb60a8d4be41be0a64e6ddcf5",
     "dirtyPaths": 0
   },
   "evidence": {
-    "_note": "Bun 1.3.14 runner pass totals after the scoped-only cutover; measurements come from the clean 2c2f27b5 source, not source-level test declaration counts. The floor check runs the real suites and fails if a future source has fewer passing tests.",
+    "_note": "Pinned Bun 1.3.14 runner totals after the scoped-only cutover. The measurement head precedes this floor-file update and was clean. Runner counts, not source declaration counts, are the authority at the gate.",
     "core": "290 passing in each of two full workspace runs",
-    "opencode": "1667 passing in a full clean integration run; a later test-only lease-adopter barrier changed no test declarations",
+    "opencode": "1667 passing in a full clean integration run; the lease-adopter barrier changed no declarations, and two additional golden tests each pass in the focused suite (1669 expected before the next full gate)",
     "pi": "140 passing in an isolated full Pi run"
   }
 }
