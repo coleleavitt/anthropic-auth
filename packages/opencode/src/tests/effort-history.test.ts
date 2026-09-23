@@ -1121,3 +1121,58 @@ test('refuses complete marker loss when an earlier message survives the supposed
     ),
   ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 0')
 })
+
+test('rebinds an identical zero-marker header across ordinary same-effort turns without revoking the newer turn', () => {
+  const first = markOpenCodeEffortTransitions([
+    user('msg_first', 'ses_zero_alias', 'claude-fable-5-1', 'high'),
+  ])
+  const second = markOpenCodeEffortTransitions([
+    user('msg_first', 'ses_zero_alias', 'claude-fable-5-1', 'high'),
+    user('msg_second', 'ses_zero_alias', 'claude-fable-5-1', 'high'),
+  ])
+  expect(first?.markerCount).toBe(0)
+  expect(second?.markerCount).toBe(0)
+  if (!first || !second) throw new Error('Missing same-effort plans')
+  const firstHeader = encodeOpenCodeEffortPlan(first)
+  const secondHeader = encodeOpenCodeEffortPlan(second)
+  expect(firstHeader).toBe(secondHeader)
+
+  const tracker = new OpenCodeEffortPlanTracker()
+  tracker.record(first)
+  tracker.record(second)
+  expect(tracker.resolveHeader(secondHeader)?.messageId).toBe(second.messageId)
+  tracker.clear(first.sessionId, first.messageId)
+  expect(
+    tracker.markHeaders({
+      sessionId: second.sessionId,
+      messageId: second.messageId,
+      headers: {},
+    }),
+  ).toBe(true)
+  expect(tracker.resolveHeader(secondHeader)?.messageId).toBe(second.messageId)
+  tracker.clear(second.sessionId, second.messageId)
+  expect(tracker.resolveHeader(secondHeader)).toBeUndefined()
+})
+
+test('rejects a cross-session plan collision even when its encoded zero-marker header is copied', () => {
+  const first = markOpenCodeEffortTransitions([
+    user('msg_first', 'ses_original', 'claude-fable-5-1', 'high'),
+  ])
+  expect(first?.markerCount).toBe(0)
+  if (!first) throw new Error('Missing plan')
+  const tracker = new OpenCodeEffortPlanTracker()
+  tracker.record(first)
+  const forged = { ...first, sessionId: 'ses_other', messageId: 'msg_other' }
+  expect(encodeOpenCodeEffortPlan(forged)).toBe(encodeOpenCodeEffortPlan(first))
+  expect(() => tracker.record(forged)).toThrow(
+    'Fable 5.1 effort plan header collision',
+  )
+  expect(tracker.resolveHeader(encodeOpenCodeEffortPlan(first))).toEqual(first)
+  expect(
+    tracker.markHeaders({
+      sessionId: forged.sessionId,
+      messageId: forged.messageId,
+      headers: {},
+    }),
+  ).toBe(false)
+})

@@ -903,9 +903,24 @@ export class OpenCodeEffortPlanTracker {
     const header = encodeOpenCodeEffortPlan(plan)
     const previous = this.history.get(header)
     if (previous && this.key(previous.sessionId, previous.messageId) !== key) {
-      throw new EffortMarkerCorrelationError(
-        'Fable 5.1 effort plan header collision',
-      )
+      // A zero-transition header has no current-boundary anchor: successive
+      // same-effort turns in one session legitimately encode identically. It
+      // can name only the latest owner, so move its reverse-index entry before
+      // replacing it. A transition-bearing or cross-session collision remains
+      // an error rather than resurrecting someone else's request plan.
+      if (
+        previous.markerCount !== 0 ||
+        plan.markerCount !== 0 ||
+        previous.sessionId !== plan.sessionId
+      ) {
+        throw new EffortMarkerCorrelationError(
+          'Fable 5.1 effort plan header collision',
+        )
+      }
+      const priorKey = this.key(previous.sessionId, previous.messageId)
+      const priorVersions = this.historyByMessage.get(priorKey)
+      priorVersions?.delete(header)
+      if (priorVersions?.size === 0) this.historyByMessage.delete(priorKey)
     }
     this.history.delete(header)
     this.history.set(header, plan)
