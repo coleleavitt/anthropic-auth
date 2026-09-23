@@ -45,6 +45,8 @@ function pinSharedStoreEnvironment() {
   process.env.ANTHROPIC_ACCOUNTS_DIR = sharedTestDir
   delete process.env.ANTHROPIC_ACCOUNTS_FILE
   process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = '1'
+  // Isolate refusal logging so tests don't pollute the real training log
+  process.env.REFUSAL_LOG_DIR = sharedTestDir
 }
 
 pinSharedStoreEnvironment()

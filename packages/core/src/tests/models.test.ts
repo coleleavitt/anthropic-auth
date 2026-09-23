@@ -474,11 +474,12 @@ describe('claude-opus-5-5 (Opus 5.5)', () => {
 
   test('has its own refusal route map, including frontier_llm', () => {
     // Claude Code 2.1.280 `Mj`: bio -> opus-5, cyber -> opus-4-8,
-    // frontier_llm -> opus-5.
+    // frontier_llm -> opus-5, plus our reasoning_extraction -> opus-5.
     expect(refusalFallbackRouteMap('claude-opus-5-5')).toEqual({
       bio: 'claude-opus-5',
       cyber: 'claude-opus-4-8',
       frontier_llm: 'claude-opus-5',
+      reasoning_extraction: 'claude-opus-5',
     })
     expect(resolveRefusalFallbackModel('claude-opus-5-5', 'bio')).toBe(
       'claude-opus-5',
@@ -494,6 +495,7 @@ describe('claude-opus-5-5 (Opus 5.5)', () => {
   test('opus-5 keeps its narrower map (no bio, no frontier_llm)', () => {
     expect(refusalFallbackRouteMap('claude-opus-5')).toEqual({
       cyber: 'claude-opus-4-8',
+      reasoning_extraction: 'claude-opus-4-8',
     })
   })
 })

@@ -143,6 +143,71 @@ const SECURITY_TERMS: Record<string, number> = {
   'signing key': 0.4,
 }
 
+/**
+ * REASONING_EXTRACTION_TERMS - detects content that might trigger Anthropic's
+ * reasoning_extraction classifier (ToS violation around model output extraction).
+ *
+ * Evidence from real refusals: dense structured verification output comparing
+ * documentation claims to source code with many file:line citations.
+ */
+const REASONING_EXTRACTION_TERMS: Record<string, number> = {
+  // Dense verification patterns
+  'vs real': 0.75,
+  'vs actual': 0.7,
+  'vs source': 0.65,
+  'verified against': 0.7,
+  'verified claim': 0.75,
+  'confirmed against': 0.7,
+  refuted: 0.65,
+  refute: 0.55,
+
+  // Model output extraction language
+  'model output': 0.6,
+  duplicating: 0.45,
+  'duplicate output': 0.7,
+  'extract reasoning': 0.8,
+  'extracting reasoning': 0.8,
+  'model reasoning': 0.6,
+  'reasoning extraction': 0.85,
+
+  // ToS/policy language in technical context
+  'commercial-terms': 0.5,
+  'Terms of Service': 0.4,
+
+  // High-density citation patterns
+  'docs/': 0.25,
+  '.md:': 0.2,
+  '.rs:': 0.15,
+  '.ts:': 0.15,
+}
+
+/**
+ * FRONTIER_LLM_TERMS - detects content about competing AI models that might
+ * trigger Anthropic's frontier_llm classifier.
+ *
+ * This category has less real-world evidence; terms are conservative.
+ */
+const FRONTIER_LLM_TERMS: Record<string, number> = {
+  // Competitor model names
+  'GPT-4': 0.4,
+  'GPT-5': 0.5,
+  Gemini: 0.35,
+  Llama: 0.3,
+  Mistral: 0.3,
+
+  // Model comparison/training
+  'model training': 0.4,
+  'train a model': 0.5,
+  'fine-tune': 0.35,
+  distillation: 0.5,
+  'model distillation': 0.7,
+
+  // Capability comparison
+  outperform: 0.35,
+  'beats Claude': 0.6,
+  'better than Claude': 0.5,
+}
+
 // ========== REWRITE RULES ==========
 
 const REWRITE_RULES: Record<string, string> = {
@@ -337,6 +402,8 @@ function scoreText(text: string): {
     nuclear: 0,
     cyber: 0,
     security: 0,
+    reasoning_extraction: 0,
+    frontier_llm: 0,
   }
   const matched: Record<string, string[]> = {
     bio: [],
@@ -344,6 +411,8 @@ function scoreText(text: string): {
     nuclear: [],
     cyber: [],
     security: [],
+    reasoning_extraction: [],
+    frontier_llm: [],
   }
 
   const termDicts: Array<[string, Record<string, number>]> = [
@@ -352,6 +421,8 @@ function scoreText(text: string): {
     ['nuclear', NUCLEAR_TERMS],
     ['cyber', CYBER_TERMS],
     ['security', SECURITY_TERMS],
+    ['reasoning_extraction', REASONING_EXTRACTION_TERMS],
+    ['frontier_llm', FRONTIER_LLM_TERMS],
   ]
 
   for (const [cat, terms] of termDicts) {

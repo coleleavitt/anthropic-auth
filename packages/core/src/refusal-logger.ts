@@ -16,8 +16,17 @@ import {
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const LOG_DIR = join(homedir(), '.prime/agent')
+/**
+ * Log directory can be overridden via REFUSAL_LOG_DIR for test isolation.
+ * Tests should set this to a temp directory to avoid polluting the real log.
+ */
+const LOG_DIR = process.env.REFUSAL_LOG_DIR || join(homedir(), '.prime/agent')
 const LOG_PATH = join(LOG_DIR, 'refusal-events.jsonl')
+
+/** Exported for tests to verify isolation */
+export function getLogPath(): string {
+  return LOG_PATH
+}
 const MAX_LOG_SIZE = 10 * 1024 * 1024 // 10MB max before rotation
 
 export interface RefusalEvent {

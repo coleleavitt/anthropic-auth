@@ -25,3 +25,5 @@ process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
   testDir,
   'cachekeep-registry',
 )
+// Isolate refusal logging so tests don't pollute the real training log
+process.env.REFUSAL_LOG_DIR = join(testDir, 'refusal-logs')

@@ -407,14 +407,17 @@ export type RefusalCategory =
 const REFUSAL_ROUTE_DEFAULT: Readonly<Record<string, string>> = {
   bio: CLAUDE_OPUS_5_MODEL_ID,
   cyber: CLAUDE_OPUS_4_8_MODEL_ID,
+  reasoning_extraction: CLAUDE_OPUS_5_MODEL_ID,
 }
 const REFUSAL_ROUTE_OPUS_5: Readonly<Record<string, string>> = {
   cyber: CLAUDE_OPUS_4_8_MODEL_ID,
+  reasoning_extraction: CLAUDE_OPUS_4_8_MODEL_ID,
 }
 const REFUSAL_ROUTE_OPUS_5_5: Readonly<Record<string, string>> = {
   bio: CLAUDE_OPUS_5_MODEL_ID,
   cyber: CLAUDE_OPUS_4_8_MODEL_ID,
   frontier_llm: CLAUDE_OPUS_5_MODEL_ID,
+  reasoning_extraction: CLAUDE_OPUS_5_MODEL_ID,
 }
 
 /** The safe floor a terminal refusal downgrades to when no category route applies. */
