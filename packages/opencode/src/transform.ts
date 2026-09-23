@@ -12,6 +12,7 @@ import {
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
   FAST_MODE_BETA,
+  filterRequestBody as filterContent,
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
@@ -1210,6 +1211,18 @@ export async function rewriteRequestBody(
       inputBytes: body.length,
       ...countRewriteShape(parsed),
     })
+
+    // Content filter: sanitize potentially triggering content before sending
+    const filterStart = rewriteNowMs()
+    const filterResult = filterContent(parsed)
+    if (filterResult.filtered) {
+      // Replace the parsed body with the filtered version
+      Object.assign(parsed, filterResult.body)
+      options.perf?.('content_filter', {
+        ms: rewriteRoundMs(rewriteNowMs() - filterStart),
+        changes: filterResult.changes.length,
+      })
+    }
 
     const trailingStart = rewriteNowMs()
     const messagesBeforeStrip = Array.isArray(parsed.messages)

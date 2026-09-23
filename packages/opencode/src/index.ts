@@ -111,6 +111,7 @@ import {
   loadSharedAccountStore,
   log,
   logger,
+  logRefusal,
   mergeAnthropicBetas,
   normalizeQuotaHeaders,
   OAUTH_BETA,
@@ -2658,6 +2659,16 @@ const anthropicAuthPlugin = async (
       outcome.stopReason === 'refusal' ||
       !serverFallbackTargets.delete(plan.recoveryKey)
     ) {
+      // Log the refusal for classifier training
+      if (outcome.stopReason === 'refusal') {
+        logRefusal({
+          timestamp: new Date().toISOString(),
+          sessionId: plan.sessionId,
+          model: plan.requestedModel,
+          category: null, // Category not available in this path
+          wasRerouted: false,
+        })
+      }
       return
     }
     logger.info(

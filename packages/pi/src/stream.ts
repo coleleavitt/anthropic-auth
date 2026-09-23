@@ -37,6 +37,7 @@ import {
   loadAccounts,
   loadSharedAccountStore,
   logger,
+  logRefusal,
   materializeSharedFallbackAccounts,
   mergeAnthropicBetas,
   modelSupportsContext1m,
@@ -2361,14 +2362,13 @@ export function streamCortexKitAnthropic(
                 // one in the log. Report the token counts and refusal category:
                 // they decide whether a refusal is a context-size problem or a
                 // genuine content decline, and whether a re-route will follow.
+                const logStopDetails = (event.delta?.stop_details ?? null) as {
+                  category?: string | null
+                  explanation?: string | null
+                } | null
                 logger.error('pi.stream', 'stream ended with a failing stop', {
                   stopReason: String(rawStopReason),
-                  refusalCategory:
-                    (
-                      event.delta?.stop_details as {
-                        category?: string | null
-                      } | null
-                    )?.category ?? null,
+                  refusalCategory: logStopDetails?.category ?? null,
                   willReroute: Boolean(reroute),
                   model: activeModel.id,
                   sessionId: options?.sessionId,
@@ -2376,6 +2376,20 @@ export function streamCortexKitAnthropic(
                   inputTokens: event.usage?.input_tokens,
                   outputTokens: event.usage?.output_tokens,
                   contextWindow: activeModel.contextWindow,
+                })
+                // Log to refusal classifier database
+                logRefusal({
+                  timestamp: new Date().toISOString(),
+                  sessionId: options?.sessionId,
+                  model: activeModel.id,
+                  category: logStopDetails?.category ?? null,
+                  explanation: logStopDetails?.explanation ?? null,
+                  requestId: response.headers.get('request-id'),
+                  messageCount: context.messages?.length ?? 0,
+                  inputTokens: event.usage?.input_tokens,
+                  outputTokens: event.usage?.output_tokens,
+                  wasRerouted: Boolean(reroute),
+                  fallbackModel: reroute?.target,
                 })
               }
             }
