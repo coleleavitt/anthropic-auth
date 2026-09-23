@@ -10,8 +10,8 @@
   },
   "evidence": {
     "_note": "Pinned Bun 1.3.14 runner totals after the scoped-only cutover. The measurement head precedes this floor-file update and was clean. Runner counts, not source declaration counts, are the authority at the gate.",
-    "core": "290 passing in each of two full workspace runs",
-    "opencode": "1667 passing in a clean full run; one test-only lease barrier changed no declarations, and two canonical-golden, two effort-header alias and one missing-all diagnostic test pass in focused suites (1672 expected before the next full gate)",
-    "pi": "140 passing in an isolated full Pi run"
+    "core": "290 passing on clean CI run 35908244749 at commit 379fb64f",
+    "opencode": "1672 passing on clean CI run 35908244749 at commit 379fb64f with the scoped-only cutover, Fable boundary fixes, and same-message effort-plan regression",
+    "pi": "140 passing on clean CI run 35908244749 at commit 379fb64f"
   }
 }

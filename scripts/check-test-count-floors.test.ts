@@ -330,9 +330,6 @@ test('CI and release each measure unit suites once and keep UNCHECKED blocking',
   for (const workflow of [ci, release]) {
     expect(workflow).toContain('bun run check:workspace-lock')
     expect(workflow).toContain('bun run check:claustrum-golden')
-    expect(workflow).toContain(
-      'bun scripts/check-test-count-floors.ts --base-ref',
-    )
     expect(workflow).not.toContain('--counts')
     expect(workflow).not.toContain('--floor-file')
     expect(workflow).not.toMatch(/run: bun run test\s*\n/)
@@ -342,6 +339,226 @@ test('CI and release each measure unit suites once and keep UNCHECKED blocking',
     )
     expect(workflow).toContain('bun run test:pi-host')
   }
+  expect(ci).toContain('bun scripts/check-test-count-floors.ts --base-ref')
+  expect(release).toContain(
+    'bun scripts/check-test-count-floors.ts --release-ref',
+  )
+  expect(release).toContain('--release-version "$VERSION"')
+  expect(release).toContain(
+    'description: "Release tag to publish from, such as v1.24.0"\n        required: true',
+  )
+  expect(release).not.toContain('--base-ref HEAD^')
   expect(ci).toContain('fetch-depth: 0')
   expect(release).toContain('fetch-depth: 0')
+})
+
+function runReleaseGate(cwd: string, counts: Floors, version = '1.24.0') {
+  const result = Bun.spawnSync(
+    [
+      'bun',
+      script,
+      '--release-ref',
+      `v${version}`,
+      '--release-version',
+      version,
+      '--counts',
+      JSON.stringify(counts),
+    ],
+    { cwd, stdout: 'pipe', stderr: 'pipe' },
+  )
+  return {
+    exitCode: result.exitCode,
+    output: `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`,
+  }
+}
+
+async function makeReleaseHistory(
+  priorFloors: Floors | null,
+  currentFloors: Floors,
+  marker?: LoweringMarker,
+) {
+  const cwd = await mkdtemp(join(tmpdir(), 'test-count-release-'))
+  workspaces.push(cwd)
+  runGit(cwd, ['init', '--initial-branch=main'])
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'seed measurement subject'])
+  const head = runGit(cwd, ['rev-parse', 'HEAD'])
+  if (priorFloors) {
+    await writeFloors(cwd, priorFloors, { head, dirtyPaths: 0 })
+    runGit(cwd, ['add', '.ci/test-count-floors.json'])
+    runGit(cwd, ['commit', '-m', 'publish old floors'])
+  }
+  runGit(cwd, ['tag', '-a', 'v1.23.0', '-m', 'previous release'])
+  await writeFloors(cwd, currentFloors, { head, dirtyPaths: 0 })
+  runGit(cwd, ['add', '.ci/test-count-floors.json'])
+  runGit(cwd, [
+    'commit',
+    '--allow-empty',
+    '-m',
+    'change floor before the release commit',
+  ])
+  if (marker) {
+    await writeFile(
+      join(cwd, '.ci', 'allow-test-count-floor-lowering.json'),
+      `${JSON.stringify(marker, null, 2)}\n`,
+    )
+    runGit(cwd, ['add', '.ci/allow-test-count-floor-lowering.json'])
+    runGit(cwd, ['commit', '-m', 'explain deliberate floor reduction'])
+  }
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'release version bump'])
+  runGit(cwd, ['tag', '-a', 'v1.24.0', '-m', 'new release'])
+  return cwd
+}
+
+test('release compares with the last tag, not HEAD^, when floor lowered earlier', async () => {
+  const current = { core: 10, opencode: 20, pi: 30 }
+  const cwd = await makeReleaseHistory({ ...current, core: 11 }, current)
+  // The old release gate was green because HEAD^ already carried the lower floor.
+  expect(runGate(cwd, current, 'HEAD^').exitCode).toBe(0)
+  const result = runReleaseGate(cwd, current)
+  expect(result.exitCode).toBe(1)
+  expect(result.output).toContain(
+    'core branch floor 10 < release baseline floor 11',
+  )
+})
+
+test('release permits only an explicitly reasoned reduction from its previous tag', async () => {
+  const current = { core: 10, opencode: 20, pi: 30 }
+  const cwd = await makeReleaseHistory({ ...current, core: 11 }, current, {
+    reason: 'Obsolete tests removed after replacing the old custody transport.',
+    lowering: { core: { from: 11, to: 10 } },
+  })
+  const result = runReleaseGate(cwd, current)
+  expect(result.exitCode).toBe(0)
+  expect(result.output).toContain('deliberate lowering authorized')
+})
+
+test('first floor-bearing release uses the verified cutover baseline, not zero', async () => {
+  const baseline = { core: 290, opencode: 1672, pi: 140 }
+  const cwd = await makeReleaseHistory(null, baseline)
+  const result = runReleaseGate(cwd, baseline)
+  expect(result.exitCode).toBe(0)
+  expect(result.output).toContain('verified initial release baseline')
+})
+
+test('first floor-bearing release refuses a reduction below the verified cutover baseline', async () => {
+  const baseline = { core: 290, opencode: 1672, pi: 140 }
+  const current = { ...baseline, opencode: 1600 }
+  const cwd = await makeReleaseHistory(null, current)
+  const result = runReleaseGate(cwd, current)
+  expect(result.exitCode).toBe(1)
+  expect(result.output).toContain(
+    'opencode branch floor 1600 < release baseline floor 1672',
+  )
+})
+
+test('release refuses a floorless tag after the first floor-bearing release', async () => {
+  const baseline = { core: 290, opencode: 1672, pi: 140 }
+  const cwd = await makeReleaseHistory(null, baseline)
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'later release'])
+  runGit(cwd, ['tag', '-a', 'v1.25.0', '-m', 'later release'])
+  // A post-bootstrap tag with no recorded floor cannot silently reset the
+  // provenance chain. Model this by tagging the floorless seed and retagging
+  // v1.24.0 there in the isolated fixture only.
+  runGit(cwd, [
+    'tag',
+    '-f',
+    '-a',
+    'v1.24.0',
+    runGit(cwd, ['rev-parse', 'v1.23.0^{commit}']),
+    '-m',
+    'bad floorless release',
+  ])
+  const result = runReleaseGate(cwd, baseline, '1.25.0')
+  expect(result.exitCode).toBe(2)
+  expect(result.output).toContain('VERDICT: UNCHECKED packages=none')
+})
+
+test('release refuses a stale branch whose previous release tag is not its ancestor', async () => {
+  const floors = { core: 290, opencode: 1672, pi: 140 }
+  const cwd = await makeReleaseHistory(floors, floors)
+  runGit(cwd, ['branch', 'stale', 'v1.23.0^'])
+  runGit(cwd, ['checkout', 'stale'])
+  await writeFloors(cwd, floors, {
+    head: runGit(cwd, ['rev-parse', 'HEAD']),
+    dirtyPaths: 0,
+  })
+  runGit(cwd, ['add', '.ci/test-count-floors.json'])
+  runGit(cwd, ['commit', '-m', 'replay old branch'])
+  runGit(cwd, ['tag', '-a', 'v1.25.0', '-m', 'stale release'])
+  const result = runReleaseGate(cwd, floors, '1.25.0')
+  expect(result.exitCode).toBe(2)
+  expect(result.output).toContain('not an ancestor')
+})
+
+test('release refuses a branch checkout, mismatched dispatch version, and older tag', async () => {
+  const floors = { core: 290, opencode: 1672, pi: 140 }
+  const cwd = await makeReleaseHistory(floors, floors)
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'unreleased head'])
+  const branch = runReleaseGate(cwd, floors)
+  expect(branch.exitCode).toBe(2)
+  expect(branch.output).toContain('release tag does not identify checkout HEAD')
+  runGit(cwd, ['reset', '--hard', 'v1.24.0'])
+  const mismatched = Bun.spawnSync(
+    [
+      'bun',
+      script,
+      '--release-ref',
+      'v1.24.0',
+      '--release-version',
+      '1.24.1',
+      '--counts',
+      JSON.stringify(floors),
+    ],
+    { cwd, stdout: 'pipe', stderr: 'pipe' },
+  )
+  expect(mismatched.exitCode).toBe(2)
+  expect(new TextDecoder().decode(mismatched.stderr)).toContain(
+    'release version does not match checked-out tag',
+  )
+  runGit(cwd, ['reset', '--hard', 'v1.23.0'])
+  const older = runReleaseGate(cwd, floors, '1.23.0')
+  expect(older.exitCode).toBe(2)
+  expect(older.output).toContain('not the latest release tag')
+})
+
+test('a stable release supersedes an earlier prerelease tag without losing the floor baseline', async () => {
+  const floors = { core: 290, opencode: 1672, pi: 140 }
+  const cwd = await makeReleaseHistory(floors, floors)
+  runGit(cwd, [
+    'tag',
+    '-a',
+    'v1.24.0-rc.1',
+    'v1.23.0',
+    '-m',
+    'earlier prerelease',
+  ])
+  const result = runReleaseGate(cwd, floors)
+  expect(result.exitCode).toBe(0)
+  expect(result.output).toContain('VERDICT: PASS packages=core,opencode,pi')
+})
+
+test.each([
+  { from: 291, code: 1, detail: 'core marker must declare from 290 to 289' },
+  { from: 290, code: 0, detail: 'deliberate lowering authorized' },
+])(
+  'first release with floor lowering from $from requires exact baseline values',
+  async ({ from, code, detail }) => {
+    const lowered = { core: 289, opencode: 1672, pi: 140 }
+    const cwd = await makeReleaseHistory(null, lowered, {
+      reason: 'Retired obsolete custody tests.',
+      lowering: { core: { from, to: 289 } },
+    })
+    const result = runReleaseGate(cwd, lowered)
+    expect(result.exitCode).toBe(code)
+    expect(result.output).toContain(detail)
+  },
+)
+
+test('release refuses a repository with no previous version tag', async () => {
+  const floors = { core: 290, opencode: 1672, pi: 140 }
+  const cwd = await makeReleaseHistory(null, floors)
+  runGit(cwd, ['tag', '-d', 'v1.23.0'])
+  const result = runReleaseGate(cwd, floors)
+  expect(result.exitCode).toBe(2)
+  expect(result.output).toContain('no previous release tag to compare')
 })

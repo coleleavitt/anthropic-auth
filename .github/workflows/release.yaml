@@ -10,8 +10,8 @@ on:
         description: "Version to publish, without leading v"
         required: true
       ref:
-        description: "Git ref to publish from, such as v1.1.0"
-        required: false
+        description: "Release tag to publish from, such as v1.24.0"
+        required: true
 
 concurrency:
   group: release-${{ github.ref }}-${{ github.event.inputs.version || '' }}
@@ -67,10 +67,15 @@ jobs:
       - name: Test floor gate tests
         run: bun test scripts/check-test-count-floors.test.ts
 
-      - name: Test
-        # The version/tag commit's parent carries the preceding floor. A missing
-        # predecessor is UNCHECKED and must stop publishing.
-        run: bun scripts/check-test-count-floors.ts --base-ref HEAD^
+      - name: Test and release floor ratchet
+        # HEAD^ may already carry a lowered floor from an earlier direct push.
+        # Require the checked-out tag and compare with the preceding release tag.
+        env:
+          CANDIDATE_REF: ${{ github.event.inputs.ref || github.ref_name }}
+          CANDIDATE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          VERSION="${CANDIDATE_VERSION#v}"
+          bun scripts/check-test-count-floors.ts --release-ref "$CANDIDATE_REF" --release-version "$VERSION"
 
       - name: Pi host tool round-trip
         run: bun run test:pi-host
