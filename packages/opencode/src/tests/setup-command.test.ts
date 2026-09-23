@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { ClaustrumScopedCredentialError } from '@cortexkit/anthropic-auth-core'
 import { runSetupCommand } from '../setup/command.ts'
 import type { CommandRunner, ProcessFence } from '../setup/types.ts'
 
@@ -459,3 +460,215 @@ test('executes Pi Claustrum setup: removes local OAuth and commits scoped roster
     'oauth:anthropic',
   )
 })
+
+test('explicit setup resumes a persisted secret before propose and completes scoped enrollment', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'setup-resume-enrollment-'))
+  testDirs.push(root)
+  const env: NodeJS.ProcessEnv = {
+    HOME: root,
+    XDG_CONFIG_HOME: join(root, 'config'),
+    XDG_DATA_HOME: join(root, 'data'),
+    XDG_STATE_HOME: join(root, 'state'),
+  }
+  const paths = {
+    tokenPath: join(root, 'state', 'opencode-enrollment.json'),
+    statePath: join(root, 'state', 'opencode-enrollment-state.json'),
+  }
+  await mkdir(join(root, 'state'), { recursive: true })
+  const requestSecret = '01'.repeat(32)
+  await writeFile(
+    paths.statePath,
+    JSON.stringify({
+      version: 1,
+      phase: 'pending',
+      proposedName: 'anthropic-auth-opencode',
+      requestSecret,
+      createdAt: 1,
+      updatedAt: 1,
+    }),
+    { mode: 0o600 },
+  )
+  let proposes = 0
+  let polls = 0
+  const enrollmentClient = {
+    enrollPropose: async () => {
+      proposes++
+      const persisted = JSON.parse(await readFile(paths.statePath, 'utf8'))
+      expect(persisted.requestSecret).toBe(requestSecret)
+      return { requestId: 'resumed-request' }
+    },
+    enrollPoll: async () => {
+      polls++
+      if (polls === 1) return { status: 'pending' as const }
+      return {
+        status: 'approved' as const,
+        name: 'anthropic-auth-opencode',
+        token: '02'.repeat(32),
+        tokenGeneration: 1,
+      }
+    },
+  }
+  const approved: string[][] = []
+  const runner = createMockRunner({
+    ck: (args) => {
+      if (args.includes('approve')) approved.push(args)
+      return { exitCode: 0, stdout: '', stderr: '' }
+    },
+  })
+  const row = {
+    id: 'oauth:anthropic',
+    accountId: 'provider-main',
+    categories: ['anthropic-native'],
+    credentialType: 'oauth',
+    refreshAdapter: 'anthropic',
+    state: 'active',
+    operations: ['read'],
+    recordVersion: 1,
+  }
+  const scopedClient = {
+    listScoped: async () => ({ view: 'v1', rows: [row] }),
+    getScoped: async () => ({
+      material: 'mock-access',
+      credentialId: row.id,
+      accountId: row.accountId,
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 3_600_000,
+    }),
+    reportAuthFailureScoped: async () => {},
+    close: () => {},
+  }
+  const { setupClaustrumForHost } = await import('../setup/claustrum.ts')
+  const result = await setupClaustrumForHost('opencode', {
+    env,
+    paths,
+    runner,
+    enrollmentClient,
+    scopedClient: scopedClient as never,
+  })
+  expect(result.ok).toBe(true)
+  expect(result.discoveredAccounts).toEqual([
+    { credentialId: row.id, accountId: row.accountId },
+  ])
+  expect(proposes).toBe(1)
+  expect(polls).toBe(2)
+  expect(approved).toHaveLength(1)
+  expect(approved[0]).toContain('resumed-request')
+  const state = JSON.parse(await readFile(paths.statePath, 'utf8'))
+  expect(state.phase).toBe('approved')
+  expect(JSON.stringify(state)).not.toContain(requestSecret)
+})
+
+test.each(['pending', 'blocked'] as const)(
+  'explicit setup replaces one superseded %s request without approving its dead id',
+  async (phase) => {
+    const root = await mkdtemp(join(tmpdir(), 'setup-expired-enrollment-'))
+    testDirs.push(root)
+    const env: NodeJS.ProcessEnv = {
+      HOME: root,
+      XDG_CONFIG_HOME: join(root, 'config'),
+      XDG_DATA_HOME: join(root, 'data'),
+      XDG_STATE_HOME: join(root, 'state'),
+    }
+    const paths = {
+      tokenPath: join(root, 'state', 'opencode-enrollment.json'),
+      statePath: join(root, 'state', 'opencode-enrollment-state.json'),
+    }
+    await mkdir(join(root, 'state'), { recursive: true })
+    const expiredSecret = '11'.repeat(32)
+    await writeFile(
+      paths.statePath,
+      JSON.stringify({
+        version: 1,
+        phase,
+        proposedName: 'anthropic-auth-opencode',
+        ...(phase === 'pending' && {
+          requestSecret: expiredSecret,
+          requestId: 'expired-id',
+          createdAt: 1,
+        }),
+        ...(phase === 'blocked' && { errorCode: 'superseded' }),
+        updatedAt: 1,
+      }),
+      { mode: 0o600 },
+    )
+    let proposes = 0
+    const polled: string[] = []
+    const enrollmentClient = {
+      enrollPropose: async () => {
+        proposes++
+        const state = JSON.parse(await readFile(paths.statePath, 'utf8'))
+        expect(state.requestSecret).not.toBe(expiredSecret)
+        return { requestId: 'fresh-id' }
+      },
+      enrollPoll: async ({ requestId }: { requestId: string }) => {
+        polled.push(requestId)
+        if (requestId === 'expired-id') {
+          throw new ClaustrumScopedCredentialError(
+            'superseded',
+            'transient',
+            'retry',
+          )
+        }
+        if (polled.filter((id) => id === 'fresh-id').length === 1) {
+          return { status: 'pending' as const }
+        }
+        return {
+          status: 'approved' as const,
+          name: 'anthropic-auth-opencode',
+          token: '22'.repeat(32),
+          tokenGeneration: 1,
+        }
+      },
+    }
+    const approved: string[][] = []
+    const runner = createMockRunner({
+      ck: (args) => {
+        if (args.includes('approve')) approved.push(args)
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    })
+    const row = {
+      id: 'oauth:anthropic',
+      accountId: 'provider-main',
+      categories: ['anthropic-native'],
+      credentialType: 'oauth',
+      refreshAdapter: 'anthropic',
+      state: 'active',
+      operations: ['read'],
+      recordVersion: 1,
+    }
+    const scopedClient = {
+      listScoped: async () => ({ view: 'v1', rows: [row] }),
+      getScoped: async () => ({
+        material: 'mock-access',
+        credentialId: row.id,
+        accountId: row.accountId,
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 3_600_000,
+      }),
+      reportAuthFailureScoped: async () => {},
+      close: () => {},
+    }
+    const { setupClaustrumForHost } = await import('../setup/claustrum.ts')
+    const result = await setupClaustrumForHost('opencode', {
+      env,
+      paths,
+      runner,
+      enrollmentClient,
+      scopedClient: scopedClient as never,
+    })
+    expect(result.ok).toBe(true)
+    expect(proposes).toBe(1)
+    expect(polled).toEqual([
+      ...(phase === 'pending' ? ['expired-id'] : []),
+      'fresh-id',
+      'fresh-id',
+    ])
+    expect(approved).toHaveLength(1)
+    expect(approved[0]).toContain('fresh-id')
+    expect(approved[0]).not.toContain('expired-id')
+    expect(JSON.parse(await readFile(paths.statePath, 'utf8')).phase).toBe(
+      'approved',
+    )
+  },
+)
