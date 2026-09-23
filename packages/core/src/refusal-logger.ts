@@ -1,8 +1,12 @@
 /**
- * Refusal Logger - Captures and logs refusal events to JSONL file
- * for training the local refusal classifier.
+ * Refusal Logger - Captures refusal events and per-request content-filter
+ * outcomes to JSONL files for training and measuring the local classifier.
  *
- * Log file: ~/.prime/agent/refusal-events.jsonl
+ * Log files (directory overridable with REFUSAL_LOG_DIR):
+ * - ~/.prime/agent/refusal-events.jsonl          every refusal
+ * - ~/.prime/agent/content-filter-outcomes.jsonl every finished request with
+ *   the filter summary and the stop reason, so refusal rates can be compared
+ *   between requests the filter changed and requests it passed
  */
 
 import { createHash } from 'node:crypto'
@@ -15,18 +19,27 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import type { ContentFilterSummary } from './content-filter'
+import { logger } from './logger'
 
 /**
- * Log directory can be overridden via REFUSAL_LOG_DIR for test isolation.
- * Tests should set this to a temp directory to avoid polluting the real log.
+ * Log directory. REFUSAL_LOG_DIR overrides it for test isolation. Resolved on
+ * every call so a test setup that sets the variable after this module loads
+ * still redirects writes.
  */
-const LOG_DIR = process.env.REFUSAL_LOG_DIR || join(homedir(), '.prime/agent')
-const LOG_PATH = join(LOG_DIR, 'refusal-events.jsonl')
+function getLogDir(): string {
+  return process.env.REFUSAL_LOG_DIR || join(homedir(), '.prime/agent')
+}
 
 /** Exported for tests to verify isolation */
 export function getLogPath(): string {
-  return LOG_PATH
+  return join(getLogDir(), 'refusal-events.jsonl')
 }
+
+export function getContentFilterOutcomeLogPath(): string {
+  return join(getLogDir(), 'content-filter-outcomes.jsonl')
+}
+
 const MAX_LOG_SIZE = 10 * 1024 * 1024 // 10MB max before rotation
 
 export interface RefusalEvent {
@@ -45,34 +58,60 @@ export interface RefusalEvent {
   triggerTerms?: string[]
 }
 
+export interface ContentFilterOutcomeEvent {
+  timestamp?: string
+  host: 'opencode' | 'pi'
+  sessionId?: string | null
+  model: string
+  requestId?: string | null
+  /** Raw Anthropic stop_reason (end_turn, tool_use, refusal, ...). */
+  stopReason: string
+  refusalCategory?: string | null
+  /** null when the filter did not run for this request. */
+  filter: ContentFilterSummary | null
+}
+
+function appendJsonLine(path: string, record: Record<string, unknown>) {
+  const dir = getLogDir()
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  if (existsSync(path) && statSync(path).size > MAX_LOG_SIZE) {
+    renameSync(path, path.replace(/\.jsonl$/, `-${Date.now()}.jsonl`))
+  }
+  appendFileSync(path, `${JSON.stringify(record)}\n`, 'utf8')
+}
+
 /**
  * Log a refusal event to the JSONL file
  */
 export function logRefusal(event: RefusalEvent): void {
   try {
-    // Ensure directory exists
-    if (!existsSync(LOG_DIR)) {
-      mkdirSync(LOG_DIR, { recursive: true })
-    }
-
-    // Rotate if too large
-    if (existsSync(LOG_PATH)) {
-      const stat = statSync(LOG_PATH)
-      if (stat.size > MAX_LOG_SIZE) {
-        const rotatedPath = LOG_PATH.replace('.jsonl', `-${Date.now()}.jsonl`)
-        renameSync(LOG_PATH, rotatedPath)
-      }
-    }
-
-    // Append the event
-    const line = JSON.stringify({
+    appendJsonLine(getLogPath(), {
       ...event,
       timestamp: event.timestamp || new Date().toISOString(),
     })
-    appendFileSync(LOG_PATH, `${line}\n`, 'utf8')
   } catch (error) {
-    // Don't fail the request on logging errors
-    console.error('[refusal-logger] Failed to log refusal:', error)
+    // Don't fail the request on logging errors. Use the file logger: a
+    // console write would draw over the host TUI.
+    logger.warn('refusal-logger', 'failed to log refusal', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+/**
+ * Log one finished request with its filter summary and stop reason. Never
+ * throws: telemetry must not fail a request.
+ */
+export function logContentFilterOutcome(
+  event: ContentFilterOutcomeEvent,
+): void {
+  try {
+    appendJsonLine(getContentFilterOutcomeLogPath(), {
+      ...event,
+      timestamp: event.timestamp || new Date().toISOString(),
+    })
+  } catch {
+    // Telemetry only.
   }
 }
 

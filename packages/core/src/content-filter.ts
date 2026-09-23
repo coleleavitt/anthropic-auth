@@ -208,6 +208,25 @@ const FRONTIER_LLM_TERMS: Record<string, number> = {
   'better than Claude': 0.5,
 }
 
+/**
+ * Read-only view of the scoring dictionaries, keyed by category. Offline
+ * tools (scripts/refusal-ingest.ts) use it to label learned terms against the
+ * shipped vocabulary.
+ */
+export function getContentFilterTermDictionaries(): Readonly<
+  Record<string, Readonly<Record<string, number>>>
+> {
+  return {
+    bio: BIO_TERMS,
+    chem: CHEM_TERMS,
+    nuclear: NUCLEAR_TERMS,
+    cyber: CYBER_TERMS,
+    security: SECURITY_TERMS,
+    reasoning_extraction: REASONING_EXTRACTION_TERMS,
+    frontier_llm: FRONTIER_LLM_TERMS,
+  }
+}
+
 // ========== REWRITE RULES ==========
 
 const REWRITE_RULES: Record<string, string> = {
@@ -366,8 +385,13 @@ const STRIP_LINE_THRESHOLD = 2.0
 
 // ========== CORE FUNCTIONS ==========
 
-function countOccurrences(text: string, term: string): number {
-  const lowerText = text.toLowerCase()
+/**
+ * Counts occurrences of `term` in text that the caller already lower-cased.
+ * Lower-casing once per text instead of once per term keeps a full request
+ * scan linear in the dictionary size rather than re-copying the text for
+ * every term.
+ */
+function countOccurrences(lowerText: string, term: string): number {
   const lowerTerm = term.toLowerCase()
 
   if (term.length <= 3) {
@@ -425,13 +449,14 @@ function scoreText(text: string): {
     ['frontier_llm', FRONTIER_LLM_TERMS],
   ]
 
+  const lowerText = text.toLowerCase()
   for (const [cat, terms] of termDicts) {
     const catScores = scores[cat]
     const catMatched = matched[cat]
     if (catScores === undefined || !catMatched) continue
 
     for (const [term, weight] of Object.entries(terms)) {
-      const count = countOccurrences(text, term)
+      const count = countOccurrences(lowerText, term)
       if (count > 0) {
         const contribution = weight * (1 + Math.log(count))
         scores[cat] = (scores[cat] ?? 0) + contribution
@@ -566,102 +591,145 @@ export function sanitizeThinking(thinking: string): string {
 }
 
 /**
+ * Per-request filter telemetry. Built from the per-block classifications the
+ * filter already computes, so it adds no extra scan of the request.
+ *
+ * `rawTotals` are the per-block category sums before length normalization,
+ * added across every scanned block. They approximate how much flagged
+ * vocabulary the whole request accumulates, which the per-block (normalized)
+ * scores deliberately ignore.
+ */
+export interface ContentFilterSummary {
+  blocksScanned: number
+  charsScanned: number
+  blocksFlagged: number
+  blocksRewritten: number
+  maxScoreBefore: number
+  maxScoreAfter: number
+  maxCategory: string | null
+  rawTotals: Record<string, number>
+}
+
+function roundScore(value: number): number {
+  return Math.round(value * 10000) / 10000
+}
+
+/**
  * Filter an Anthropic request body before sending.
  * Returns the filtered body and whether changes were made.
+ *
+ * Every decision is local to one block, so the same history block always
+ * rewrites to the same bytes and the prompt cache prefix stays stable.
  */
 export function filterRequestBody(body: Record<string, unknown>): {
   body: Record<string, unknown>
   filtered: boolean
   changes: string[]
+  summary: ContentFilterSummary
 } {
   let filtered = false
   const changes: string[] = []
+  const summary: ContentFilterSummary = {
+    blocksScanned: 0,
+    charsScanned: 0,
+    blocksFlagged: 0,
+    blocksRewritten: 0,
+    maxScoreBefore: 0,
+    maxScoreAfter: 0,
+    maxCategory: null,
+    rawTotals: {},
+  }
+
+  /**
+   * Classifies one text block and returns its replacement, or undefined when
+   * the block stays unchanged. `allowStrip` gates aggressive line stripping;
+   * structured JSON (tool_use input) must never lose lines.
+   */
+  const filterText = (
+    text: string,
+    label: string,
+    allowStrip: boolean,
+  ): string | undefined => {
+    const classification = classify(text)
+    summary.blocksScanned++
+    summary.charsScanned += text.length
+    const lengthScale = Math.sqrt(Math.max(1, text.length / 1000))
+    for (const [cat, score] of Object.entries(classification.scores)) {
+      if (score > 0)
+        summary.rawTotals[cat] =
+          (summary.rawTotals[cat] ?? 0) + score * lengthScale
+    }
+    if (classification.score > summary.maxScoreBefore) {
+      summary.maxScoreBefore = classification.score
+      summary.maxCategory = classification.category
+    }
+    let scoreAfter = classification.score
+    let replacement: string | undefined
+    if (classification.recommendation !== 'pass') {
+      summary.blocksFlagged++
+      const rewriteResult = rewrite(
+        text,
+        allowStrip && classification.recommendation === 'block',
+      )
+      const changed = allowStrip
+        ? rewriteResult.rewritesApplied.length > 0 ||
+          rewriteResult.strippedLines.length > 0
+        : rewriteResult.rewritesApplied.length > 0
+      if (changed) {
+        replacement = rewriteResult.rewritten
+        scoreAfter = rewriteResult.scoreAfter
+        changes.push(
+          `${label}: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
+        )
+      }
+    }
+    if (scoreAfter > summary.maxScoreAfter) summary.maxScoreAfter = scoreAfter
+    return replacement
+  }
+  const markRewritten = () => {
+    filtered = true
+    summary.blocksRewritten++
+  }
 
   // Deep clone to avoid mutation
   const result = JSON.parse(JSON.stringify(body))
 
-  // Filter messages
+  // Filter user content: text blocks and tool_result content (from prior
+  // turns - commands, file contents, etc.)
   const messages = result.messages as
     | Array<{ role: string; content: unknown }>
     | undefined
   if (Array.isArray(messages)) {
     for (const msg of messages) {
-      // Filter user message content (string form)
       if (msg.role === 'user' && typeof msg.content === 'string') {
-        const classification = classify(msg.content)
-        if (classification.recommendation !== 'pass') {
-          const rewriteResult = rewrite(
-            msg.content,
-            classification.recommendation === 'block',
-          )
-          if (
-            rewriteResult.rewritesApplied.length > 0 ||
-            rewriteResult.strippedLines.length > 0
-          ) {
-            msg.content = rewriteResult.rewritten
-            filtered = true
-            changes.push(
-              `user_string: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-            )
-          }
+        const next = filterText(msg.content, 'user_string', true)
+        if (next !== undefined) {
+          msg.content = next
+          markRewritten()
         }
       }
       if (msg.role === 'user' && Array.isArray(msg.content)) {
         for (let i = 0; i < msg.content.length; i++) {
           const block = (msg.content as Array<Record<string, unknown>>)[i]
-          if (
-            block &&
-            block.type === 'text' &&
-            typeof block.text === 'string'
-          ) {
-            const classification = classify(block.text)
-            if (classification.recommendation !== 'pass') {
-              const rewriteResult = rewrite(
-                block.text,
-                classification.recommendation === 'block',
-              )
-              if (
-                rewriteResult.rewritesApplied.length > 0 ||
-                rewriteResult.strippedLines.length > 0
-              ) {
-                block.text = rewriteResult.rewritten
-                filtered = true
-                changes.push(
-                  `message[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-                )
-              }
+          if (!block) continue
+          if (block.type === 'text' && typeof block.text === 'string') {
+            const next = filterText(block.text, `message[${i}]`, true)
+            if (next !== undefined) {
+              block.text = next
+              markRewritten()
             }
           }
-          // Filter tool_result content (from prior turns - commands, file contents, etc.)
           if (
-            block &&
             block.type === 'tool_result' &&
             typeof block.content === 'string'
           ) {
-            const classification = classify(block.content)
-            if (classification.recommendation !== 'pass') {
-              const rewriteResult = rewrite(
-                block.content,
-                classification.recommendation === 'block',
-              )
-              if (
-                rewriteResult.rewritesApplied.length > 0 ||
-                rewriteResult.strippedLines.length > 0
-              ) {
-                block.content = rewriteResult.rewritten
-                filtered = true
-                changes.push(
-                  `tool_result[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-                )
-              }
+            const next = filterText(block.content, `tool_result[${i}]`, true)
+            if (next !== undefined) {
+              block.content = next
+              markRewritten()
             }
           }
-          // Filter tool_result with array content
-          if (
-            block &&
-            block.type === 'tool_result' &&
-            Array.isArray(block.content)
-          ) {
+          if (block.type === 'tool_result' && Array.isArray(block.content)) {
             const contentArray = block.content as Array<Record<string, unknown>>
             for (let j = 0; j < contentArray.length; j++) {
               const subBlock = contentArray[j]
@@ -669,22 +737,14 @@ export function filterRequestBody(body: Record<string, unknown>): {
                 subBlock?.type === 'text' &&
                 typeof subBlock.text === 'string'
               ) {
-                const classification = classify(subBlock.text)
-                if (classification.recommendation !== 'pass') {
-                  const rewriteResult = rewrite(
-                    subBlock.text,
-                    classification.recommendation === 'block',
-                  )
-                  if (
-                    rewriteResult.rewritesApplied.length > 0 ||
-                    rewriteResult.strippedLines.length > 0
-                  ) {
-                    subBlock.text = rewriteResult.rewritten
-                    filtered = true
-                    changes.push(
-                      `tool_result[${i}].content[${j}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-                    )
-                  }
+                const next = filterText(
+                  subBlock.text,
+                  `tool_result[${i}].content[${j}]`,
+                  true,
+                )
+                if (next !== undefined) {
+                  subBlock.text = next
+                  markRewritten()
                 }
               }
             }
@@ -697,100 +757,51 @@ export function filterRequestBody(body: Record<string, unknown>): {
   // Filter assistant blocks (thinking and text from conversation history)
   if (Array.isArray(messages)) {
     for (const msg of messages) {
-      // Filter assistant message content (string form)
       if (msg.role === 'assistant' && typeof msg.content === 'string') {
-        const classification = classify(msg.content)
-        if (classification.recommendation !== 'pass') {
-          const rewriteResult = rewrite(
-            msg.content,
-            classification.recommendation === 'block',
-          )
-          if (
-            rewriteResult.rewritesApplied.length > 0 ||
-            rewriteResult.strippedLines.length > 0
-          ) {
-            msg.content = rewriteResult.rewritten
-            filtered = true
-            changes.push(
-              `assistant_string: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-            )
-          }
+        const next = filterText(msg.content, 'assistant_string', true)
+        if (next !== undefined) {
+          msg.content = next
+          markRewritten()
         }
       }
       if (msg.role === 'assistant' && Array.isArray(msg.content)) {
         for (let i = 0; i < msg.content.length; i++) {
           const block = (msg.content as Array<Record<string, unknown>>)[i]
-          if (
-            block &&
-            block.type === 'thinking' &&
-            typeof block.thinking === 'string'
-          ) {
-            const classification = classify(block.thinking)
-            if (classification.recommendation !== 'pass') {
-              const rewriteResult = rewrite(
-                block.thinking,
-                classification.recommendation === 'block',
-              )
-              if (
-                rewriteResult.rewritesApplied.length > 0 ||
-                rewriteResult.strippedLines.length > 0
-              ) {
-                block.thinking = rewriteResult.rewritten
-                filtered = true
-                changes.push(
-                  `thinking[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-                )
-              }
+          if (!block) continue
+          if (block.type === 'thinking' && typeof block.thinking === 'string') {
+            const next = filterText(block.thinking, `thinking[${i}]`, true)
+            if (next !== undefined) {
+              block.thinking = next
+              markRewritten()
             }
           }
-          // Filter assistant text blocks (from prior turns)
-          if (
-            block &&
-            block.type === 'text' &&
-            typeof block.text === 'string'
-          ) {
-            const classification = classify(block.text)
-            if (classification.recommendation !== 'pass') {
-              const rewriteResult = rewrite(
-                block.text,
-                classification.recommendation === 'block',
-              )
-              if (
-                rewriteResult.rewritesApplied.length > 0 ||
-                rewriteResult.strippedLines.length > 0
-              ) {
-                block.text = rewriteResult.rewritten
-                filtered = true
-                changes.push(
-                  `assistant_text[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-                )
-              }
+          if (block.type === 'text' && typeof block.text === 'string') {
+            const next = filterText(block.text, `assistant_text[${i}]`, true)
+            if (next !== undefined) {
+              block.text = next
+              markRewritten()
             }
           }
-          // Filter assistant tool_use input (code edits, commands from prior turns)
-          // Note: NEVER use aggressive mode here - it strips entire lines which
-          // destroys JSON structure. Only apply term rewrites.
+          // Filter assistant tool_use input (code edits, commands from prior
+          // turns). Never strip lines here: that destroys JSON structure.
+          // Only term rewrites apply.
           if (
-            block &&
             block.type === 'tool_use' &&
             typeof block.input === 'object' &&
             block.input !== null
           ) {
-            const inputStr = JSON.stringify(block.input)
-            const classification = classify(inputStr)
-            if (classification.recommendation !== 'pass') {
-              // Use non-aggressive mode to preserve JSON structure
-              const rewriteResult = rewrite(inputStr, false)
-              if (rewriteResult.rewritesApplied.length > 0) {
-                try {
-                  block.input = JSON.parse(rewriteResult.rewritten)
-                  filtered = true
-                  changes.push(
-                    `tool_use[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-                  )
-                } catch {
-                  // If JSON parse fails, leave input unchanged
-                }
+            const next = filterText(
+              JSON.stringify(block.input),
+              `tool_use[${i}]`,
+              false,
+            )
+            if (next !== undefined) {
+              try {
+                block.input = JSON.parse(next)
+                markRewritten()
+              } catch {
+                // If JSON parse fails, leave input unchanged
+                changes.pop()
               }
             }
           }
@@ -807,29 +818,21 @@ export function filterRequestBody(body: Record<string, unknown>): {
     for (let i = 0; i < system.length; i++) {
       const block = system[i]
       if (block?.type === 'text' && typeof block.text === 'string') {
-        const classification = classify(block.text)
-        if (classification.recommendation !== 'pass') {
-          const rewriteResult = rewrite(
-            block.text,
-            classification.recommendation === 'block',
-          )
-          if (
-            rewriteResult.rewritesApplied.length > 0 ||
-            rewriteResult.strippedLines.length > 0
-          ) {
-            const sysBlock = system[i]
-            if (sysBlock) sysBlock.text = rewriteResult.rewritten
-            filtered = true
-            changes.push(
-              `system[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
-            )
-          }
+        const next = filterText(block.text, `system[${i}]`, true)
+        if (next !== undefined) {
+          block.text = next
+          markRewritten()
         }
       }
     }
   }
 
-  return { body: result, filtered, changes }
+  summary.maxScoreBefore = roundScore(summary.maxScoreBefore)
+  summary.maxScoreAfter = roundScore(summary.maxScoreAfter)
+  for (const cat of Object.keys(summary.rawTotals)) {
+    summary.rawTotals[cat] = roundScore(summary.rawTotals[cat] ?? 0)
+  }
+  return { body: result, filtered, changes, summary }
 }
 
 // ========== TESTING ==========

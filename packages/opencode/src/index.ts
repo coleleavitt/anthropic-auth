@@ -33,6 +33,7 @@ import {
   CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
   CLAUDE_USAGE_COMMAND_NAME,
+  type ContentFilterSummary,
   claimSharedAccountRefresh,
   classifyProviderBlock,
   computeXxhash64Hex,
@@ -110,6 +111,7 @@ import {
   loadAccounts,
   loadSharedAccountStore,
   log,
+  logContentFilterOutcome,
   logger,
   logRefusal,
   mergeAnthropicBetas,
@@ -1386,6 +1388,15 @@ const anthropicAuthPlugin = async (
     streaming: boolean
     dumpWrite: Promise<void>
   }
+  /**
+   * Content-filter summary per request trace. The fetch wrapper owns the trace
+   * and the stream outcome; the account send paths own the body rewrite. The
+   * trace is the one object both see.
+   */
+  const contentFilterSummaryByTrace = new WeakMap<
+    PerfTrace,
+    ContentFilterSummary
+  >()
   const cacheDiagnosticsResponses = new WeakMap<
     Response,
     CacheDiagnosticsResponse
@@ -4572,6 +4583,9 @@ const anthropicAuthPlugin = async (
                 cache1hMode: getCache1hMode(),
                 fastModeEnabled: fastModeRequested,
                 isSubagent: subagentRequest,
+                onContentFilterSummary: (summary) => {
+                  if (trace) contentFilterSummaryByTrace.set(trace, summary)
+                },
                 perf: (stage, data) =>
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
               })
@@ -4810,6 +4824,9 @@ const anthropicAuthPlugin = async (
                 isSubagent: subagentRequest,
                 laneStart: laneStartRequest,
                 cacheDiagnosticsPreviousMessageId,
+                onContentFilterSummary: (summary) => {
+                  if (trace) contentFilterSummaryByTrace.set(trace, summary)
+                },
                 perf: (stage, data) => {
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data })
                   if (
@@ -5640,6 +5657,17 @@ const anthropicAuthPlugin = async (
                   cacheDiagnosticsResponses.get(response)
                 return createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
+                  onFinish: (stopReason, refusalCategory) =>
+                    logContentFilterOutcome({
+                      host: 'opencode',
+                      sessionId: sessionId ?? null,
+                      model:
+                        fablePlan?.effectiveModel ?? requestModel ?? 'unknown',
+                      requestId: response.headers.get('request-id'),
+                      stopReason,
+                      refusalCategory: refusalCategory ?? null,
+                      filter: contentFilterSummaryByTrace.get(trace) ?? null,
+                    }),
                   laneStart: laneStartRequest,
                   laneStartOAuthServed:
                     responseRouteKinds.get(response) !== 'api',

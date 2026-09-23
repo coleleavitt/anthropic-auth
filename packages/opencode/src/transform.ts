@@ -11,6 +11,7 @@ import {
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
+  type ContentFilterSummary,
   FAST_MODE_BETA,
   filterRequestBody as filterContent,
   isClaudeFableOrMythos5Model,
@@ -1201,6 +1202,8 @@ export async function rewriteRequestBody(
     isSubagent?: boolean
     laneStart?: boolean
     cacheDiagnosticsPreviousMessageId?: string | null
+    /** Receives the content-filter summary for outcome telemetry. */
+    onContentFilterSummary?: (summary: ContentFilterSummary) => void
   } = {},
 ): Promise<string> {
   try {
@@ -1215,6 +1218,9 @@ export async function rewriteRequestBody(
     // Content filter: sanitize potentially triggering content before sending
     const filterStart = rewriteNowMs()
     const filterResult = filterContent(parsed)
+    try {
+      options.onContentFilterSummary?.(filterResult.summary)
+    } catch {}
     if (filterResult.filtered) {
       // Replace the parsed body with the filtered version
       Object.assign(parsed, filterResult.body)
@@ -1375,6 +1381,8 @@ type SseEventSummary = {
   contentBlockType?: string
   deltaType?: string
   stopReason?: string
+  /** stop_details.category on a refusal (bio, cyber, ...). */
+  refusalCategory?: string
   rawBytes: number
   dataBytes: number
   textDeltaBytes?: number
@@ -1504,6 +1512,11 @@ function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
   summary.deltaType = stringField(delta, 'type')
   summary.stopReason =
     stringField(delta, 'stop_reason') ?? stringField(data, 'stop_reason')
+  summary.refusalCategory = stringField(
+    asDiagnosticRecord(delta?.stop_details) ??
+      asDiagnosticRecord(data?.stop_details),
+    'category',
+  )
 
   if (summary.deltaType === 'text_delta') {
     summary.textDeltaBytes = stringBytes(stringField(delta, 'text') ?? '')
@@ -1600,7 +1613,7 @@ type SseFinishState = {
 }
 
 type SseFinishUpdate =
-  | { type: 'content-filter' }
+  | { type: 'content-filter'; category?: string }
   | { type: 'complete'; finishReason: string }
 
 /**
@@ -1653,7 +1666,7 @@ function updateSseFinishState(
     state.completed = true
     update ??=
       summary.stopReason === 'refusal'
-        ? { type: 'content-filter' }
+        ? { type: 'content-filter', category: summary.refusalCategory }
         : { type: 'complete', finishReason: summary.stopReason }
   }
   if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
@@ -1896,6 +1909,8 @@ export function createStrippedStream(
     }) => boolean | undefined
     onComplete?: (finishReason: string) => void
     onTruncatedFinish?: (finishReason: string) => void
+    /** Observes every terminal stop_reason, refusals included. */
+    onFinish?: (stopReason: string, refusalCategory?: string) => void
     contentFilterModel?: unknown
     serverSideFallbackModel?: string
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
@@ -1938,7 +1953,10 @@ export function createStrippedStream(
   }
   const sseErrors = createSseErrorState()
   const sseFinish =
-    options.onContentFilter || options.onComplete || options.onTruncatedFinish
+    options.onContentFilter ||
+    options.onComplete ||
+    options.onTruncatedFinish ||
+    options.onFinish
       ? createSseFinishState()
       : undefined
   const laneStartFinish =
@@ -1974,6 +1992,13 @@ export function createStrippedStream(
       text,
       NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
     )
+    if (update && options.onFinish) {
+      const stopReason =
+        update.type === 'content-filter' ? 'refusal' : update.finishReason
+      const category =
+        update.type === 'content-filter' ? update.category : undefined
+      observe(() => options.onFinish?.(stopReason, category))
+    }
     if (update?.type === 'content-filter' && options.onContentFilter) {
       return invokeContentFilter()
         ? retryableFableContentFilterError(options.contentFilterModel)

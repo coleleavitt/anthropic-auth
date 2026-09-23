@@ -7,6 +7,7 @@ import {
   mock,
   test,
 } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -700,6 +701,32 @@ describe('Pi API fallback routing helpers', () => {
     expect(calls()).toBe(2)
     // The retry went out on the mapped fallback model.
     expect(bodies[1]?.model).toBe('claude-opus-4-8')
+  })
+
+  test('logs a filter outcome for the refused attempt and the served retry', async () => {
+    const outcomeLog = join(sharedTestDir, 'content-filter-outcomes.jsonl')
+    const sessionId = `ses_pi_outcome_${Date.now()}`
+    scriptResponses([REFUSAL_EMPTY('cyber'), SERVED_TEXT])
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId,
+    })
+    for await (const _event of stream) {
+    }
+    await stream.result()
+    const outcomes = readFileSync(outcomeLog, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.sessionId === sessionId)
+    expect(outcomes.map((line) => [line.model, line.stopReason])).toEqual([
+      [anthropicModel.id, 'refusal'],
+      ['claude-opus-4-8', 'end_turn'],
+    ])
+    expect(outcomes[0].refusalCategory).toBe('cyber')
+    expect(outcomes[0].host).toBe('pi')
+    expect(outcomes[1].requestId).toBe('req_served')
+    expect(outcomes[1].filter?.blocksScanned).toBeGreaterThan(0)
   })
 
   test('re-routes a category-less refusal to the opus-4-8 catch-all', async () => {

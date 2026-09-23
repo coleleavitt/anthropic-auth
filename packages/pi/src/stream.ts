@@ -6,6 +6,7 @@ import {
   CacheKeepManager,
   CacheKeepSessionRegistry,
   CLAUDE_FABLE_5_MODEL_ID,
+  type ContentFilterSummary,
   classifyProviderBlock,
   classifyRetry,
   createEmptyStorage,
@@ -37,6 +38,7 @@ import {
   killswitchPassesPolicy,
   loadAccounts,
   loadSharedAccountStore,
+  logContentFilterOutcome,
   logger,
   logRefusal,
   materializeSharedFallbackAccounts,
@@ -525,7 +527,31 @@ export async function* parseSse(
  */
 const context1mClampedTokens = new Set<string>()
 
-async function sendAnthropicRequest(options: {
+/**
+ * Filter summary for each response, read when the stream reaches its stop
+ * reason so the outcome log can pair what the filter did with how the request
+ * ended. Weak keys: an abandoned response releases its entry.
+ */
+const contentFilterSummaries = new WeakMap<Response, ContentFilterSummary>()
+
+async function sendAnthropicRequest(
+  options: Omit<
+    Parameters<typeof sendAnthropicRequestUnrecorded>[0],
+    'onContentFilterSummary'
+  >,
+): Promise<Response> {
+  let summary: ContentFilterSummary | undefined
+  const response = await sendAnthropicRequestUnrecorded({
+    ...options,
+    onContentFilterSummary: (value) => {
+      summary = value
+    },
+  })
+  if (summary) contentFilterSummaries.set(response, summary)
+  return response
+}
+
+async function sendAnthropicRequestUnrecorded(options: {
   model: Model<Api>
   context: Context
   streamOptions?: SimpleStreamOptions
@@ -534,6 +560,7 @@ async function sendAnthropicRequest(options: {
   storagePath: string
   oauthAccountId?: string
   route?: string
+  onContentFilterSummary?: (summary: ContentFilterSummary) => void
 }): Promise<Response> {
   const storage = await loadAccounts(options.storagePath)
   setDumpEnabled(isDumpPersistentlyEnabled(storage))
@@ -553,6 +580,7 @@ async function sendAnthropicRequest(options: {
   )
   // Apply content filter to reduce classifier trigger patterns
   const filterResult = filterRequestBody(builtRequest.body)
+  options.onContentFilterSummary?.(filterResult.summary)
   if (filterResult.filtered) {
     logger.debug('pi.filter', 'content filtered', {
       changes: filterResult.changes.length,
@@ -2294,6 +2322,21 @@ export function streamCortexKitAnthropic(
             // absent value would report a healthy stream as a failed one.
             const rawStopReason = event.delta?.stop_reason
             if (rawStopReason) {
+              logContentFilterOutcome({
+                host: 'pi',
+                sessionId: options?.sessionId ?? null,
+                model: activeModel.id,
+                requestId: response.headers.get('request-id'),
+                stopReason: String(rawStopReason),
+                refusalCategory:
+                  (
+                    event.delta?.stop_details as
+                      | { category?: string | null }
+                      | null
+                      | undefined
+                  )?.category ?? null,
+                filter: contentFilterSummaries.get(response) ?? null,
+              })
               output.rawStopReason = String(rawStopReason)
               ;(
                 output as AssistantMessage & { stopReasonRaw?: string }
