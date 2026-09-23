@@ -13,6 +13,7 @@
         "@tsconfig/bun": "1.0.11",
         "@types/bun": "1.4.2",
         "dedent": "^1.7.2",
+        "jsonc-parser": "^3.3.1",
         "lefthook": "2.1.12",
         "miniflare": "^4.20260730.0",
         "typescript": "7.0.2",
@@ -20,28 +21,28 @@
     },
     "packages/core": {
       "name": "@cortexkit/anthropic-auth-core",
-      "version": "1.22.0",
+      "version": "1.23.0",
       "dependencies": {
         "@cortexkit/claustrum-client": "0.3.0",
-        "@cortexkit/subc-client": "^0.11.1",
         "xxhash-wasm": "^1.1.0",
       },
     },
     "packages/e2e-tests": {
       "name": "@cortexkit/anthropic-auth-e2e",
       "dependencies": {
+        "@cortexkit/subc-client": "^0.13.1",
         "@opencode-ai/sdk": "1.18.30",
       },
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-anthropic-auth",
-      "version": "1.22.0",
+      "version": "1.23.0",
       "bin": {
         "opencode-anthropic-auth": "dist/cli.js",
       },
       "dependencies": {
         "@clack/prompts": "^1.6.0",
-        "@cortexkit/anthropic-auth-core": "1.22.0",
+        "@cortexkit/anthropic-auth-core": "1.23.0",
         "@opentui/core": "0.5.11",
         "@opentui/solid": "0.5.11",
         "jsonc-parser": "^3.3.1",
@@ -56,9 +57,9 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-anthropic-auth",
-      "version": "1.22.0",
+      "version": "1.23.0",
       "dependencies": {
-        "@cortexkit/anthropic-auth-core": "1.22.0",
+        "@cortexkit/anthropic-auth-core": "1.23.0",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": ">=0.86.1",
@@ -216,7 +217,7 @@
 
     "@cortexkit/pi-anthropic-auth": ["@cortexkit/pi-anthropic-auth@workspace:packages/pi"],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.11.1", "", {}, "sha512-+T2GzdIHMJKtvS5uPG3FydyGbdvREla7N3B3inLgnVWxsO8v77rzMbmPX63ZD9OcJtnkDZjO5eFbfeIF+RUFWA=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.13.1", "", {}, "sha512-fUPcVhBzBk1RRSLxo0o5Y+P3IVwlsz1MZik609zGDsr1vzA1TnEsIKlEQDz3U8JeuvcnUvKd5v1/F+gafI7+Ig=="],
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 

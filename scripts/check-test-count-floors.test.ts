@@ -328,6 +328,7 @@ test('CI and release each measure unit suites once and keep UNCHECKED blocking',
     'utf8',
   )
   for (const workflow of [ci, release]) {
+    expect(workflow).toContain('bun run check:workspace-lock')
     expect(workflow).toContain('bun run check:claustrum-golden')
     expect(workflow).toContain(
       'bun scripts/check-test-count-floors.ts --base-ref',

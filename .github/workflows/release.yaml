@@ -45,6 +45,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify workspace lockfile
+        run: bun run check:workspace-lock
+
       - name: TypeScript typecheck
         run: bun run typecheck
 

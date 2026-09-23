@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Remove Core's unused direct `@cortexkit/subc-client` dependency and declare it where the E2E mock uses it. Synchronize `bun.lock` workspace versions and dependency declarations during version bumps, and fail CI or release preparation when the lock disagrees with package manifests (which Bun's frozen install alone did not detect).
 - Enforce Core/OpenCode/Pi unit-test count floors in CI and releases with one measured test pass, a merge-target ratchet, and explicit justification for intentional reductions. Both workflows also check canonical Claustrum fixture provenance and the real Pi host tool-call round-trip.
 - Keep Fable 5.1 effort changes correlated through completed tool-call continuations and consecutive host user records merged onto one wire boundary; log safe refusal metadata and apply the last planned effort on each merged boundary. Retain a bounded, revocable history when compaction overwrites an in-flight request plan. Missing anchors still fail closed rather than treating unprovable marker loss as a valid prefix trim.
 - Pin the vendored Claustrum tombstone to the canonical `cortexkit/claustrum` source: update the fixture to the deployed empty-access shape and verify its exact bytes against a commit reachable from canonical `master`. Remove an obsolete "vault path not implemented" refresh error.

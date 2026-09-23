@@ -44,6 +44,9 @@ if [[ "$BRANCH" != "main" && "$BRANCH" != "master" ]]; then
   fi
 fi
 
+echo "→ Verifying workspace lockfile..."
+bun run check:workspace-lock || { echo "Error: Workspace lockfile does not match package manifests"; exit 1; }
+
 echo ""
 echo "  Releasing CortexKit Anthropic auth packages $TAG"
 echo "  ───────────────────────────────────────────────"
@@ -77,6 +80,7 @@ echo ""
 
 echo "→ Syncing version to $VERSION..."
 bun scripts/version-sync.mjs "$VERSION"
+bun run check:workspace-lock
 echo ""
 
 echo "→ Committing version bump..."

@@ -768,12 +768,13 @@ bun run typecheck
 bun run test
 bun run test:e2e
 bun run check:claustrum-golden
+bun run check:workspace-lock
 bun run build
 bun run lint
 bun run format:check
 ```
 
-`bun run test` also runs an isolated Pi host tool-call round-trip against mocked Anthropic responses. The golden check verifies the fixture against canonical Claustrum over HTTPS; CI and releases additionally enforce source-bound unit-test count floors.
+`bun run test` also runs an isolated Pi host tool-call round-trip against mocked Anthropic responses. The golden check verifies the fixture against canonical Claustrum over HTTPS; the workspace-lock check validates `bun.lock` against every package manifest. CI and releases additionally enforce source-bound unit-test count floors.
 
 Inspect package contents:
 
