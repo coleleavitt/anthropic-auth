@@ -143,6 +143,7 @@ async function createFixture(
     quotaEnabled?: boolean
     quotaSnapshot?: ReturnType<typeof quota>
     prime?: boolean
+    primeMainDue?: boolean
     cachekeep?: boolean
     recovery?: boolean
     profile?: boolean
@@ -209,6 +210,14 @@ async function createFixture(
             ? {
                 mainQuota: {
                   ...quota(now, options.recovery ? 0 : 90),
+                  ...(options.primeMainDue
+                    ? {
+                        five_hour: {
+                          ...quota(now).five_hour,
+                          resetsAt: new Date(now - 120_000).toISOString(),
+                        },
+                      }
+                    : {}),
                   accountIdentity: mainProviderAccountId,
                 },
                 mainQuotaCheckedAt: now,
@@ -456,6 +465,7 @@ async function createFixture(
   return {
     accountId,
     credentialGets,
+    scopedClient,
     intervals,
     plugin,
     records,
@@ -695,3 +705,233 @@ describe('vault-served fallback outbound token census', () => {
     expectOnlyVaultToken(profiles, 'profile')
   })
 })
+
+describe('scoped maintenance rotation recovery', () => {
+  async function checkCacheKeepRotation(finalStatus: 200 | 401) {
+    const now = 1_000
+    const fixture = await createFixture('main-cachekeep', {
+      now,
+      cachekeep: true,
+      captureIntervals: true,
+      mainFirst: true,
+    })
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      stream: true,
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    await (
+      await fixture.result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': `cachekeep-rotated-${finalStatus}` },
+        body,
+      })
+    ).text()
+    resetClaudeCodeIdentityCachesForTest()
+    const reports: number[] = []
+    const sent: string[] = []
+    let version = 103
+    const originalGet = fixture.scopedClient.getScoped.bind(
+      fixture.scopedClient,
+    )
+    fixture.scopedClient.getScoped = async (input) => {
+      const receipt = await originalGet(input)
+      return input.credentialId === 'oauth:anthropic'
+        ? {
+            ...receipt,
+            material: `scoped-cachekeep-v${version}`,
+            recordVersion: version,
+          }
+        : receipt
+    }
+    fixture.scopedClient.reportAuthFailureScoped = async ({
+      recordVersion,
+    }) => {
+      reports.push(recordVersion)
+    }
+    const originalRequest = globalThis.fetch
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      const requestBody = typeof init?.body === 'string' ? init.body : ''
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages') &&
+        (JSON.parse(requestBody) as { max_tokens?: number }).max_tokens === 0
+      ) {
+        sent.push(authorization)
+        if (authorization === 'Bearer scoped-cachekeep-v103') {
+          version = 104
+          return Promise.resolve(
+            new Response('rotated token rejected', { status: 401 }),
+          )
+        }
+        if (finalStatus === 401)
+          return Promise.resolve(
+            new Response('current token rejected', { status: 401 }),
+          )
+      }
+      return originalRequest(input as Parameters<typeof fetch>[0], init)
+    }) as unknown as typeof fetch
+    ;(
+      fixture.intervals as IntervalRecord[] & { clock: (now: number) => void }
+    ).clock(now + 55 * 60_000)
+    const interval = fixture.intervals.find(
+      (candidate) => candidate.ms === CACHE_KEEP_TICK_MS,
+    )
+    if (!interval) throw new Error('CacheKeep interval missing')
+    interval.callback()
+    await waitFor(
+      () => sent.length >= 2,
+      'rotated CacheKeep prewarm was not replayed',
+    )
+    await waitFor(
+      () => reports.length >= (finalStatus === 401 ? 1 : 0),
+      'CacheKeep final 401 was not reported',
+    )
+    expect(sent).toEqual([
+      'Bearer scoped-cachekeep-v103',
+      'Bearer scoped-cachekeep-v104',
+    ])
+    expect(reports).toEqual(finalStatus === 401 ? [104] : [])
+  }
+
+  test.serial(
+    'CacheKeep reauthorizes one rotated prewarm without reporting the obsolete receipt',
+    () => checkCacheKeepRotation(200),
+  )
+  test.serial(
+    'CacheKeep reports only the newly served version if the replay also receives 401',
+    () => checkCacheKeepRotation(401),
+  )
+
+  test.serial(
+    'Prime fires only once after in-flight rotation and reports the final rejected version',
+    async () => {
+      const now = Date.now() - 60_000
+      const dueQuota = quota(now)
+      dueQuota.five_hour.resetsAt = new Date(now - 120_000).toISOString()
+      const fixture = await createFixture('prime', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: dueQuota,
+        prime: true,
+      })
+      const reports: number[] = []
+      const sent: string[] = []
+      let version = 103
+      const originalGet = fixture.scopedClient.getScoped.bind(
+        fixture.scopedClient,
+      )
+      fixture.scopedClient.getScoped = async (input) => {
+        const receipt = await originalGet(input)
+        return input.credentialId === `oauth:anthropic:${fixture.accountId}`
+          ? {
+              ...receipt,
+              material: `scoped-prime-v${version}`,
+              recordVersion: version,
+            }
+          : receipt
+      }
+      fixture.scopedClient.reportAuthFailureScoped = async ({
+        recordVersion,
+      }) => {
+        reports.push(recordVersion)
+      }
+      const originalRequest = globalThis.fetch
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        const url = extractUrl(input as string | URL | Request)
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        const requestBody = typeof init?.body === 'string' ? init.body : ''
+        if (
+          url.includes('/v1/messages') &&
+          requestBody &&
+          (JSON.parse(requestBody) as { max_tokens?: number }).max_tokens ===
+            1 &&
+          authorization.startsWith('Bearer scoped-prime-v')
+        ) {
+          sent.push(authorization)
+          if (authorization === 'Bearer scoped-prime-v103') {
+            version = 104
+            return Promise.resolve(
+              new Response('rotated token rejected', { status: 401 }),
+            )
+          }
+          return Promise.resolve(
+            new Response('latest token rejected', { status: 401 }),
+          )
+        }
+        return originalRequest(input as Parameters<typeof fetch>[0], init)
+      }) as unknown as typeof fetch
+      await fixture.plugin.__primeManager.tick()
+      expect(sent).toEqual([
+        'Bearer scoped-prime-v103',
+        'Bearer scoped-prime-v104',
+      ])
+      expect(reports).toEqual([104])
+    },
+  )
+})
+
+test.serial(
+  'Prime quota preflight reports the actual scoped version used after a second 401',
+  async () => {
+    const now = Date.now() - 60_000
+    const dueQuota = quota(now)
+    dueQuota.five_hour.resetsAt = new Date(now - 120_000).toISOString()
+    const fixture = await createFixture('prime', {
+      now,
+      quotaEnabled: true,
+      quotaSnapshot: dueQuota,
+      prime: true,
+      primeMainDue: true,
+    })
+    const sent: string[] = []
+    const reports: number[] = []
+    let version = 103
+    const originalGet = fixture.scopedClient.getScoped.bind(
+      fixture.scopedClient,
+    )
+    fixture.scopedClient.getScoped = async (input) => {
+      const receipt = await originalGet(input)
+      return input.credentialId === 'oauth:anthropic'
+        ? {
+            ...receipt,
+            material: `scoped-prime-quota-v${version}`,
+            recordVersion: version,
+          }
+        : receipt
+    }
+    fixture.scopedClient.reportAuthFailureScoped = async ({
+      recordVersion,
+    }) => {
+      reports.push(recordVersion)
+    }
+    const originalRequest = globalThis.fetch
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (
+        url.includes('/api/oauth/usage') &&
+        authorization.startsWith('Bearer scoped-prime-quota-v')
+      ) {
+        sent.push(authorization)
+        version = 104
+        return Promise.resolve(
+          new Response('quota token rejected', { status: 401 }),
+        )
+      }
+      return originalRequest(input as Parameters<typeof fetch>[0], init)
+    }) as unknown as typeof fetch
+    await fixture.plugin.__primeManager.tick()
+    expect(sent).toEqual([
+      'Bearer scoped-prime-quota-v103',
+      'Bearer scoped-prime-quota-v104',
+    ])
+    expect(reports).toEqual([104])
+  },
+)

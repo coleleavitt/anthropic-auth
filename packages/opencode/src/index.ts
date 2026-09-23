@@ -1249,7 +1249,10 @@ const anthropicAuthPlugin = async (
           accountStoragePath,
           ctx.directory,
         )
-        return runtime.fetchQuota(request.accountId ?? 'main')
+        const routeId = request.kind === 'main' ? 'main' : request.accountId
+        if (!routeId)
+          throw new Error('Claustrum quota request has no account identity')
+        return runtime.fetchQuota(routeId)
       }
       return fetchOAuthQuotaSnapshot({
         accessToken: request.accessToken,
@@ -2313,6 +2316,33 @@ const anthropicAuthPlugin = async (
     onComplete: ({ attempt }) => {
       cacheKeepScopedAttempts.delete(attempt.id)
     },
+    retryOnUnauthorized: async ({ target, headers, attempt }) => {
+      const served = cacheKeepScopedAttempts.get(attempt.id)
+      if (!served) return undefined
+      let current: ClaustrumScopedAttempt | undefined
+      try {
+        current = await getOpenCodeScopedRuntime(
+          accountStoragePath,
+          ctx.directory,
+        ).authorize(target.oauthAccountId ?? 'main', attempt.signal)
+      } catch {
+        return undefined
+      }
+      if (!isScopedCredentialRotation(served, current)) return undefined
+      logger.info(
+        'claustrum',
+        'retrying CacheKeep after scoped credential rotation',
+        {
+          accountId: target.oauthAccountId ?? 'main',
+          previousVersion: served.recordVersion,
+          newVersion: current.recordVersion,
+        },
+      )
+      const rotatedHeaders = new Headers(headers)
+      rotatedHeaders.set('authorization', `Bearer ${current.accessToken}`)
+      cacheKeepScopedAttempts.set(attempt.id, current)
+      return rotatedHeaders
+    },
     prepareHeaders: async (headers, target, attempt) => {
       let accessToken: string | undefined
       let scopedAttempt: ClaustrumScopedAttempt | undefined
@@ -2455,25 +2485,14 @@ const anthropicAuthPlugin = async (
   async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
     const credential = await getCurrentMainCredential()
     await resolveMainQuotaAccountIdentity(credential.accessToken)
-    try {
-      const result = await quotaManager.refreshMainWithMetadata(
-        mainQuotaAccountId,
-        credential.accessToken,
-      )
-      return { quota: result.quota, fresh: result.fetched }
-    } catch (error) {
-      if (
-        credential.scopedAttempt &&
-        (error as { status?: unknown }).status === 401
-      ) {
-        await getOpenCodeScopedRuntime().reportFailure(
-          credential.scopedAttempt,
-          401,
-          'direct',
-        )
-      }
-      throw error
-    }
+    // The quota transport obtains its own per-dispatch scoped receipt and
+    // owns any 401 report. Reporting the earlier identity-preflight receipt
+    // here would misattribute a rotation and potentially invalidate it.
+    const result = await quotaManager.refreshMainWithMetadata(
+      mainQuotaAccountId,
+      credential.accessToken,
+    )
+    return { quota: result.quota, fresh: result.fetched }
   }
 
   async function refreshPrimeFallbackQuota(
@@ -2604,12 +2623,36 @@ const anthropicAuthPlugin = async (
       const primeRequest = rewriteUrl(PRIME_MESSAGES_URL, { baseURL: '' })
       const primeUrl =
         primeRequest.url?.toString() ?? primeRequest.input.toString()
-      const response = await fetch(primeUrl, {
-        method: 'POST',
-        headers,
-        body,
-        signal: AbortSignal.timeout(30_000),
-      })
+      const signal = AbortSignal.timeout(30_000)
+      const primeInit = { method: 'POST', headers, body, signal }
+      let response = await fetch(primeUrl, primeInit)
+      if (response.status === 401 && scopedAttempt && !signal.aborted) {
+        let current: ClaustrumScopedAttempt | undefined
+        try {
+          current = await getOpenCodeScopedRuntime().authorize(
+            accountId,
+            signal,
+          )
+        } catch {
+          // The first 401 belongs to the original physical attempt unless
+          // the vault confirms a newer version of this same account.
+        }
+        if (isScopedCredentialRotation(scopedAttempt, current)) {
+          await response.body?.cancel().catch(() => {})
+          logger.info(
+            'claustrum',
+            'retrying Prime after scoped credential rotation',
+            {
+              accountId,
+              previousVersion: scopedAttempt.recordVersion,
+              newVersion: current.recordVersion,
+            },
+          )
+          scopedAttempt = current
+          headers.set('authorization', `Bearer ${current.accessToken}`)
+          response = await fetch(primeUrl, primeInit)
+        }
+      }
       const ms = Math.round(performance.now() - start)
       if (!response.ok) {
         const reason =

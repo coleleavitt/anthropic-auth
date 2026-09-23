@@ -352,10 +352,44 @@ const cacheKeepManager = new CacheKeepManager({
     }
     return headers
   },
+  retryOnUnauthorized: async ({ target, headers, attempt }) => {
+    const entry = scopedPrewarmAttempts.get(attempt.id)
+    if (!entry) return undefined
+    let current: ClaustrumScopedAttempt | undefined
+    try {
+      current = await entry.runtime.authorize(
+        target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+        attempt.signal,
+      )
+    } catch {
+      return undefined
+    }
+    if (!isScopedCredentialRotation(entry.receipt, current)) return undefined
+    logger.info(
+      'claustrum',
+      'retrying Pi CacheKeep after scoped credential rotation',
+      {
+        accountId: target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+        previousVersion: entry.receipt.recordVersion,
+        newVersion: current.recordVersion,
+      },
+    )
+    const rotatedHeaders = new Headers(headers)
+    rotatedHeaders.set('authorization', `Bearer ${current.accessToken}`)
+    scopedPrewarmAttempts.set(attempt.id, {
+      runtime: entry.runtime,
+      receipt: current,
+    })
+    return rotatedHeaders
+  },
   onResponse: async ({ attempt, status }) => {
     const entry = scopedPrewarmAttempts.get(attempt.id)
-    if (entry)
-      await entry.runtime.reportFailure(entry.receipt, status, 'direct')
+    if (entry && status === 401)
+      await entry.runtime
+        .reportFailure(entry.receipt, status, 'direct')
+        .catch(() => {
+          logger.warn('claustrum', 'Pi CacheKeep scoped 401 report unavailable')
+        })
   },
   onComplete: ({ attempt }) => {
     scopedPrewarmAttempts.delete(attempt.id)
@@ -364,6 +398,13 @@ const cacheKeepManager = new CacheKeepManager({
 
 export async function getPiTrackedCacheKeepSessions() {
   return getPiCacheKeepRegistry().list(cacheKeepManager.trackedSessions())
+}
+
+/** Exercise the real prewarm dispatch without wall-clock or timer mocks. */
+export function __prewarmPiCacheKeepForTest(
+  input: Parameters<CacheKeepManager['prewarmNow']>[0],
+) {
+  return cacheKeepManager.prewarmNow(input)
 }
 
 function mapStopReason(reason: string | null | undefined): StopReason {

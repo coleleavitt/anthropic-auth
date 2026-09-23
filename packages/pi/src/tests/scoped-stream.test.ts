@@ -29,6 +29,7 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import {
+  __prewarmPiCacheKeepForTest,
   closePiScopedRuntime,
   getPiScopedRuntime,
   streamCortexKitAnthropic,
@@ -634,5 +635,71 @@ test.each([200, 401])(
     expect(result.stopReason).toBe(finalStatus === 401 ? 'error' : 'stop')
     expect(relayTokens).toEqual(['Bearer relay-pi-1', 'Bearer relay-pi-2'])
     expect(reports).toEqual(finalStatus === 401 ? [2] : [])
+  },
+)
+
+test.each([200, 401])(
+  'Pi CacheKeep retries a rotated scoped receipt once, final status %i',
+  async (finalStatus) => {
+    const f = await fixture()
+    let version = 1
+    const sent: string[] = []
+    f.client.getScoped = async ({ credentialId }) => ({
+      credentialId,
+      accountId: 'main-provider',
+      material: `pi-cachekeep-v${version}`,
+      recordVersion: version,
+      expiresAtMs: Date.now() + 600_000,
+    })
+    globalThis.fetch = Object.assign(
+      async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        if (!String(input).includes('/v1/messages'))
+          throw new Error('unexpected Pi prewarm destination')
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        sent.push(authorization)
+        if (authorization === 'Bearer pi-cachekeep-v1') {
+          version = 2
+          return new Response('old token', { status: 401 })
+        }
+        return new Response(
+          finalStatus === 401
+            ? 'new token rejected'
+            : JSON.stringify({ usage: { input_tokens: 1 } }),
+          {
+            status: finalStatus,
+          },
+        )
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const result = await __prewarmPiCacheKeepForTest({
+      sessionId: `pi-cachekeep-${finalStatus}`,
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: model.id,
+        max_tokens: 128,
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'warm' }],
+      }),
+      oauthAccountId: 'main',
+      oauthAccountIdentity: 'main-provider',
+      accountStoragePath: f.path,
+    })
+    expect(result.ok).toBe(finalStatus === 200)
+    expect(sent).toEqual(['Bearer pi-cachekeep-v1', 'Bearer pi-cachekeep-v2'])
+    expect(f.reports.map((report) => report.recordVersion)).toEqual(
+      finalStatus === 401 ? [2] : [],
+    )
   },
 )
