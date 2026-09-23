@@ -247,7 +247,7 @@ export class CustodyTombstoneRefreshError extends Error {
 
   constructor(public readonly provider: string) {
     super(
-      `${provider} main slot is vault-custodied; local refresh is forbidden — the vault-served main path is not yet implemented`,
+      `${provider} OAuth credentials are vault-custodied; local token refresh is forbidden`,
     )
     this.name = 'CustodyTombstoneRefreshError'
   }

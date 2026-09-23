@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Pin the vendored Claustrum tombstone to the canonical `cortexkit/claustrum` source: update the fixture to the deployed empty-access shape and verify its exact bytes against a commit reachable from canonical `master`. Remove an obsolete "vault path not implemented" refresh error.
 - Recover in-flight scoped OAuth rotations on replayable model requests, CacheKeep prewarms, Prime fires, and quota/profile queries: reauthorize after a genuine upstream 401 and retry once only when the same account's record version advances. Report only the final rejected send-time version, reauthorize relay-to-direct fallbacks separately, and classify relay-owned 401s without an Anthropic request ID as transport errors rather than account failures.
 - Fix OpenCode main quota polling under scoped custody: resolve the quota account UUID to the `main` route before authorization. This also restores Prime's main-account quota preflight.
 - Restore Pi tool-call name mapping on normalized transcripts: the streaming response uses the exact host tool set resolved for its outgoing request, rather than the missing `context.tools` field on Pi ≥0.86.

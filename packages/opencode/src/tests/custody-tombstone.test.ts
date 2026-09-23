@@ -81,12 +81,8 @@ describe('Claustrum custody tombstones', () => {
   test('recognizes only provider-bound OAuth tombstones', () => {
     const provider = oauthFixture.provider
     const key = custodyTombstoneKey(provider)
-    const productionTombstone = {
-      type: 'oauth',
-      access: '',
-      refresh: key,
-      expires: 0,
-    }
+    const productionTombstone = custodyTombstoneOAuth(provider)
+    expect(oauthFixture.entry).toEqual(productionTombstone)
     const cases: Array<{ name: string; auth: unknown; recognized: boolean }> = [
       {
         name: 'production empty-access tombstone',
@@ -94,8 +90,13 @@ describe('Claustrum custody tombstones', () => {
         recognized: true,
       },
       {
-        name: 'vendored golden sentinel-access tombstone',
+        name: 'vendored canonical empty-access tombstone',
         auth: oauthFixture.entry,
+        recognized: true,
+      },
+      {
+        name: 'noncanonical sentinel-access value is still refused at bearer boundaries',
+        auth: { ...productionTombstone, access: key },
         recognized: true,
       },
       { name: 'API entry', auth: apiFixture.entry, recognized: false },
@@ -154,9 +155,7 @@ describe('Claustrum custody tombstones', () => {
     expect(thrown).not.toHaveProperty('isRefreshError')
     expect(thrown).not.toHaveProperty('permanent')
     expect(thrown).not.toHaveProperty('status')
-    expect(String(thrown)).toContain(
-      'vault-served main path is not yet implemented',
-    )
+    expect(String(thrown)).toContain('local token refresh is forbidden')
   })
 
   test('keeps loader recognition contained by both irreversible boundaries', async () => {
@@ -246,7 +245,7 @@ describe('Claustrum custody tombstones', () => {
         const loaded = await plugin.auth.loader(() => Promise.resolve(auth), {
           models: {},
         } as never)
-        auth.access = String(oauthFixture.entry.access)
+        auth.access = custodyTombstoneKey(oauthFixture.provider)
 
         await expect(
           loaded.fetch('https://api.anthropic.com/v1/messages', {
