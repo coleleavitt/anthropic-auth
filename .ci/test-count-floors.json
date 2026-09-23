@@ -1,17 +1,17 @@
 {
   "floors": {
     "core": 290,
-    "opencode": 1671,
+    "opencode": 1672,
     "pi": 140
   },
   "measurement": {
-    "head": "9dfd9265ac9e2e447550603d34177ec14eb41d34",
+    "head": "2c2f9b60419259ae71633baddd8d1f0787251d55",
     "dirtyPaths": 0
   },
   "evidence": {
     "_note": "Pinned Bun 1.3.14 runner totals after the scoped-only cutover. The measurement head precedes this floor-file update and was clean. Runner counts, not source declaration counts, are the authority at the gate.",
     "core": "290 passing in each of two full workspace runs",
-    "opencode": "1667 passing in a clean full run; one test-only lease barrier changed no declarations, and two canonical-golden plus two effort-header alias tests pass in focused suites (1671 expected before the next full gate)",
+    "opencode": "1667 passing in a clean full run; one test-only lease barrier changed no declarations, and two canonical-golden, two effort-header alias and one missing-all diagnostic test pass in focused suites (1672 expected before the next full gate)",
     "pi": "140 passing in an isolated full Pi run"
   }
 }
