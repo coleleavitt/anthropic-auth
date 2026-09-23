@@ -239,10 +239,14 @@ function convertMessages(
             thinking.thinkingSignature &&
             !hasLoneSurrogate(thinking.thinking)
           ) {
-            // Signed thinking blocks must be sent back verbatim — the signature
-            // is computed over the original text. Sanitizing would alter it and
-            // Anthropic rejects the block as "modified". Anthropic-origin
-            // thinking is valid UTF-8, so this is the normal path.
+            // Signed thinking blocks are sent back verbatim. A live test on
+            // 2026-09-23 (haiku-4-5, opus-4-8, opus-5-5) showed that Anthropic
+            // accepts edited or emptied text on a signed block, both in the
+            // latest tool-use turn and in older turns. So editing is not a 400
+            // risk, but it has no benefit either: the model never sees
+            // older-turn thinking. Verbatim keeps the block byte-stable for
+            // the prompt cache. Anthropic-origin thinking is valid UTF-8, so
+            // this is the normal path.
             blocks.push({
               type: 'thinking',
               thinking: thinking.thinking,
