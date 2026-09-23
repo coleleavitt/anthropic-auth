@@ -42,3 +42,15 @@ temp/
 *.flow
 *.flow.log
 captures/*.txt
+
+# Local tool state and session dumps
+.pi/
+.cortexkit/
+.jython_cache/
+prime-agent-session-*.html
+
+# Local PR extraction workspace (multi-GB, never committed)
+FULL-PR-EXTRACTION/
+
+# Packed build artifacts
+*.tgz
