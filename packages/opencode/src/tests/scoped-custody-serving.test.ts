@@ -364,6 +364,10 @@ test('Claustrum mode without a scoped roster refuses to serve even with legacy l
   testDirs.push(root)
   const storagePath = join(root, 'anthropic-auth.json')
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    root,
+    'enrollment.json',
+  )
   await writeFile(
     storagePath,
     JSON.stringify({
@@ -392,6 +396,12 @@ test('Claustrum mode without a scoped roster refuses to serve even with legacy l
     { directory: root } as any,
     {
       scopedRosterPollIntervalMs: 0,
+      claustrumEnrollmentPollIntervalMs: 0,
+      claustrumEnrollmentConnect: async () => {
+        throw new Error(
+          'Isolated legacy-refusal test must not connect to the host vault',
+        )
+      },
     } as any,
   )
   try {
