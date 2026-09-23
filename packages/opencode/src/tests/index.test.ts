@@ -4183,11 +4183,30 @@ describe('Fable 5.1 request-scoped effort history', () => {
       'Missing or invalid internal Fable 5.1 effort request plan',
     )
 
+    const refusalLogs: LogTestRecord[] = []
+    __setLogTestSink((record) => refusalLogs.push(record))
     const missingAllMarkers = await send('ses_effort_missing_all', [])
     expect(missingAllMarkers.status).toBe(400)
     expect((await missingAllMarkers.json()).error.message).toBe(
       'Fable 5.1 effort marker correlation failed: expected 1, found 0',
     )
+    const missingAllLog = refusalLogs.find(
+      (record) => record.payload?.check === 'missing_all_markers',
+    )
+    expect(missingAllLog).toMatchObject({
+      level: 'warn',
+      channel: 'effort-history',
+      message: 'refused uncorrelated Fable 5.1 request',
+      payload: {
+        markerCount: 1,
+        resolvedPlan: true,
+        plannedBoundaryId: 'msg_marked_high',
+        retainedUserMessageCount: 1,
+        lastUserTextBlockCount: 1,
+        expectedAnchorHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      },
+    })
+    expect(JSON.stringify(missingAllLog)).not.toContain('correlation failure')
 
     const duplicateTransition = await send('ses_effort_duplicate_transition', [
       transitionMarker,
@@ -4199,8 +4218,6 @@ describe('Fable 5.1 request-scoped effort history', () => {
       'Fable 5.1 effort marker correlation failed: expected 1, found 2',
     )
 
-    const refusalLogs: LogTestRecord[] = []
-    __setLogTestSink((record) => refusalLogs.push(record))
     const misplacedAnchor = await auth.fetch(MESSAGES_URL, {
       method: 'POST',
       headers: {

@@ -1176,3 +1176,51 @@ test('rejects a cross-session plan collision even when its encoded zero-marker h
     }),
   ).toBe(false)
 })
+
+test('reports bounded shape metadata when every marker and anchor disappears but older history remains', () => {
+  const messages = [
+    user('msg_low', 'ses_missing_diag', 'claude-fable-5-1', 'low'),
+    user('msg_high', 'ses_missing_diag', 'claude-fable-5-1', 'high'),
+    user('msg_current', 'ses_missing_diag', 'claude-fable-5-1', 'high'),
+  ]
+  const plan = markOpenCodeEffortTransitions(messages)
+  expect(plan?.markerCount).toBe(1)
+  if (!plan) throw new Error('Missing effort plan')
+  const body = {
+    model: 'claude-fable-5-1',
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'operator private text' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'assistant private text' }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'current private text' }],
+      },
+    ],
+  }
+  let refusal: unknown
+  try {
+    applyOpenCodeEffortMarkers(body, true, encodeOpenCodeEffortPlan(plan), plan)
+  } catch (error) {
+    refusal = error
+  }
+  expect(refusal).toMatchObject({
+    check: 'missing_all_markers',
+    details: {
+      markerCount: 1,
+      resolvedPlan: true,
+      plannedBoundaryId: 'msg_current',
+      retainedMessageCount: 3,
+      retainedUserMessageCount: 2,
+      lastUserMessageIndex: 2,
+      lastUserTextBlockCount: 1,
+      lastUserToolResultBlockCount: 0,
+    },
+  })
+  expect(JSON.stringify(refusal)).not.toContain('private text')
+})
