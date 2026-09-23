@@ -656,6 +656,36 @@ export function filterRequestBody(body: Record<string, unknown>): {
               }
             }
           }
+          // Filter assistant tool_use input (code edits, commands from prior turns)
+          if (
+            block &&
+            block.type === 'tool_use' &&
+            typeof block.input === 'object' &&
+            block.input !== null
+          ) {
+            const inputStr = JSON.stringify(block.input)
+            const classification = classify(inputStr)
+            if (classification.recommendation !== 'pass') {
+              const rewriteResult = rewrite(
+                inputStr,
+                classification.recommendation === 'block',
+              )
+              if (
+                rewriteResult.rewritesApplied.length > 0 ||
+                rewriteResult.strippedLines.length > 0
+              ) {
+                try {
+                  block.input = JSON.parse(rewriteResult.rewritten)
+                  filtered = true
+                  changes.push(
+                    `tool_use[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
+                  )
+                } catch {
+                  // If JSON parse fails, leave input unchanged
+                }
+              }
+            }
+          }
         }
       }
     }
