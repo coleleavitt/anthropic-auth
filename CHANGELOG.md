@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Update OpenCode plugin and SDK test dependencies together to 1.18.31, plus Biome 2.5.14, Lefthook 2.1.14 and the dev-only Anthropic SDK 4.0.58; preserve packed TUI and custom-fetch compatibility checks.
 - Remove Core's unused direct `@cortexkit/subc-client` dependency and declare it where the E2E mock uses it. Synchronize `bun.lock` workspace versions and dependency declarations during version bumps, and fail CI or release preparation when the lock disagrees with package manifests (which Bun's frozen install alone did not detect).
 - Enforce Core/OpenCode/Pi unit-test count floors in CI and releases with one measured test pass, a merge-target ratchet, and explicit justification for intentional reductions. Both workflows also check canonical Claustrum fixture provenance and the real Pi host tool-call round-trip.
 - Keep Fable 5.1 effort changes correlated through completed tool-call continuations and consecutive host user records merged onto one wire boundary; log safe refusal metadata and apply the last planned effort on each merged boundary. Retain a bounded, revocable history when compaction overwrites an in-flight request plan. Missing anchors still fail closed rather than treating unprovable marker loss as a valid prefix trim.
