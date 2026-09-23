@@ -515,6 +515,26 @@ export function filterRequestBody(body: Record<string, unknown>): {
     | undefined
   if (Array.isArray(messages)) {
     for (const msg of messages) {
+      // Filter user message content (string form)
+      if (msg.role === 'user' && typeof msg.content === 'string') {
+        const classification = classify(msg.content)
+        if (classification.recommendation !== 'pass') {
+          const rewriteResult = rewrite(
+            msg.content,
+            classification.recommendation === 'block',
+          )
+          if (
+            rewriteResult.rewritesApplied.length > 0 ||
+            rewriteResult.strippedLines.length > 0
+          ) {
+            msg.content = rewriteResult.rewritten
+            filtered = true
+            changes.push(
+              `user_string: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
+            )
+          }
+        }
+      }
       if (msg.role === 'user' && Array.isArray(msg.content)) {
         for (let i = 0; i < msg.content.length; i++) {
           const block = (msg.content as Array<Record<string, unknown>>)[i]
@@ -606,6 +626,26 @@ export function filterRequestBody(body: Record<string, unknown>): {
   // Filter assistant blocks (thinking and text from conversation history)
   if (Array.isArray(messages)) {
     for (const msg of messages) {
+      // Filter assistant message content (string form)
+      if (msg.role === 'assistant' && typeof msg.content === 'string') {
+        const classification = classify(msg.content)
+        if (classification.recommendation !== 'pass') {
+          const rewriteResult = rewrite(
+            msg.content,
+            classification.recommendation === 'block',
+          )
+          if (
+            rewriteResult.rewritesApplied.length > 0 ||
+            rewriteResult.strippedLines.length > 0
+          ) {
+            msg.content = rewriteResult.rewritten
+            filtered = true
+            changes.push(
+              `assistant_string: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
+            )
+          }
+        }
+      }
       if (msg.role === 'assistant' && Array.isArray(msg.content)) {
         for (let i = 0; i < msg.content.length; i++) {
           const block = (msg.content as Array<Record<string, unknown>>)[i]
@@ -657,6 +697,8 @@ export function filterRequestBody(body: Record<string, unknown>): {
             }
           }
           // Filter assistant tool_use input (code edits, commands from prior turns)
+          // Note: NEVER use aggressive mode here - it strips entire lines which
+          // destroys JSON structure. Only apply term rewrites.
           if (
             block &&
             block.type === 'tool_use' &&
@@ -666,14 +708,9 @@ export function filterRequestBody(body: Record<string, unknown>): {
             const inputStr = JSON.stringify(block.input)
             const classification = classify(inputStr)
             if (classification.recommendation !== 'pass') {
-              const rewriteResult = rewrite(
-                inputStr,
-                classification.recommendation === 'block',
-              )
-              if (
-                rewriteResult.rewritesApplied.length > 0 ||
-                rewriteResult.strippedLines.length > 0
-              ) {
+              // Use non-aggressive mode to preserve JSON structure
+              const rewriteResult = rewrite(inputStr, false)
+              if (rewriteResult.rewritesApplied.length > 0) {
                 try {
                   block.input = JSON.parse(rewriteResult.rewritten)
                   filtered = true
