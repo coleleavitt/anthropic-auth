@@ -107,3 +107,71 @@ describe('zero-bind scoped custody', () => {
     }
   }, 120_000)
 })
+
+describe('scoped credential rotations in the OpenCode process', () => {
+  it('replays only the refused turn when the vault rotates before the first 401 arrives', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-scoped-rotation-e2e-'))
+    roots.push(root)
+    const main = credential('scoped-main-v1', 'account-main', 11)
+    const daemon = await startFakeClaustrumDaemon({
+      directory: root,
+      scopedCredentials: { [mainId]: main },
+    })
+    daemons.push(daemon)
+    harness = await E2EHarness.create({
+      childEnv: {
+        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
+        OPENCODE_AUTH_CONTENT: JSON.stringify({
+          anthropic: {
+            type: 'oauth',
+            access: '',
+            refresh: custodyTombstoneKey('anthropic'),
+            expires: 0,
+          },
+        }),
+      },
+      beforeSpawn: async (env) => {
+        await writeFile(join(env.configDir, 'anthropic-auth.json'), JSON.stringify({
+          version: 1,
+          accounts: [],
+          quota: { enabled: false },
+          claustrum: {
+            mode: 'claustrum',
+            scopedRoster: true,
+            primaryAccount: {
+              credentialId: mainId,
+              accountId: main.account_id,
+              state: 'active',
+            },
+          },
+        }), { mode: 0o600 })
+        await writeFile(join(env.configDir, 'claustrum-enrollment.json'),
+          JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }),
+          { mode: 0o600 })
+      },
+    })
+    harness.script([
+      {
+        type: 'error',
+        status: 401,
+        errorType: 'authentication_error',
+        message: 'old record rejected',
+        beforeRespond: () => {
+          main.payload = 'scoped-main-v2'
+          main.record_version = 12
+        },
+      },
+      { type: 'text', text: 'rotated account served' },
+    ])
+    const session = await harness.createSession()
+    await harness.sendPrompt(session, 'test one in-flight rotation')
+    await harness.waitForSessionText(session, 'rotated account served')
+    const requests = harness.anthropic.requests()
+      .filter((request) => request.body.model === 'claude-sonnet-4-5')
+    expect(requests.map((request) => request.headers.authorization)).toEqual([
+      'Bearer scoped-main-v1', 'Bearer scoped-main-v2',
+    ])
+    expect(daemon.reportAuthFailures).toEqual([])
+    expect(daemon.credentialGets.filter((id) => id === mainId).length).toBeGreaterThanOrEqual(2)
+  }, 120_000)
+})

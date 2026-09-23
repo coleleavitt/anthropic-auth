@@ -10,6 +10,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Patch Changes
 
+- Recover an in-flight scoped OAuth rotation on replayable direct and HTTP relay requests: reauthorize on a genuine upstream 401 and retry once only if the served record version changed. Preserve exact-version reporting and reauthorize relay-to-direct fallback. A relay-owned 401 without upstream provenance no longer invalidates an account.
 - Stop background local OAuth refresh or quota probing for incomplete legacy Claustrum configurations, even if old sidecar secrets remain.
 - Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick (opt-out via `cacheKeepAggregateRefreshIntervalMs: 0`) so per-request writes no longer clobber a sibling's count with a stale zero.
 

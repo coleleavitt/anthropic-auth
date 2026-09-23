@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Recover an in-flight scoped OAuth rotation on replayable direct and HTTP relay requests: reauthorize after a genuine upstream 401 and retry once only when the served record version has changed. Preserve exact-version 401 reports for rejected credentials, and reauthorize OpenCode relay-to-direct fallbacks before dispatch. Treat a relay's own 401 without an Anthropic request ID as a transport failure (direct fallback or 502), not a permanent account rejection.
 - Restore Pi tool-call name mapping on normalized transcripts: the streaming response uses the exact host tool set resolved for its outgoing request, rather than the missing `context.tools` field on Pi ≥0.86.
 - Prevent background fallback refresh and quota polling from sending retained local OAuth material when a legacy Claustrum configuration is incomplete.
 - Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick so per-request writes no longer clobber a sibling's count with a stale zero.

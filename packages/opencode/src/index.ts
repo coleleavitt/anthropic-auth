@@ -119,6 +119,7 @@ import {
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
+  isScopedCredentialRotation,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -5913,8 +5914,39 @@ const anthropicAuthPlugin = async (
             }
 
             let usedDirectFetch = false
+            let directAttempt = scopedAttempt
+            let retryDirectAttempt: ClaustrumScopedAttempt | undefined
             const directFetch = async () => {
               usedDirectFetch = true
+              if (scopedAttempt) {
+                // A relay-to-direct fallback is another physical attempt. Its
+                // original receipt may have rotated while the relay was failing.
+                directAttempt =
+                  retryDirectAttempt ??
+                  (relayConfig?.enabled
+                    ? await getOpenCodeScopedRuntime(
+                        accountStoragePath,
+                        ctx.directory,
+                      ).authorize(
+                        oauthAccountId,
+                        init?.signal instanceof AbortSignal
+                          ? init.signal
+                          : undefined,
+                      )
+                    : scopedAttempt)
+                retryDirectAttempt = undefined
+                requestHeaders.set(
+                  'authorization',
+                  `Bearer ${directAttempt.accessToken}`,
+                )
+                served = {
+                  ...served,
+                  accessToken: directAttempt.accessToken,
+                  anthropicAccountUuid: asProviderAccountUuid(
+                    directAttempt.accountId,
+                  ),
+                }
+              }
               try {
                 const response = await fetch(rewritten.input, {
                   ...init,
@@ -5969,7 +6001,7 @@ const anthropicAuthPlugin = async (
               persistedFallbackAccount,
               fallbackAuthLineageId,
             )
-            const served = {
+            let served = {
               accountId: oauthAccountId,
               accessToken,
               authLineageId: fallbackAuthLineageId,
@@ -5984,60 +6016,158 @@ const anthropicAuthPlugin = async (
                 : {}),
             }
             const sendStart = nowMs()
-            const response = await sendViaRelay({
-              config: relayConfig,
-              input: rewritten.input,
-              init,
-              headers: requestHeaders,
-              body,
-              fallback: directFetch,
-              affinity: relayAffinity,
-              optimisticResponse: relayConfig?.transport === 'websocket',
-              authorizeAttempt: scopedAttempt
-                ? async () => {
-                    const runtime = getOpenCodeScopedRuntime(
-                      accountStoragePath,
-                      ctx.directory,
-                    )
-                    const nextAttempt = await runtime.authorize(
-                      oauthAccountId,
-                      init?.signal instanceof AbortSignal
-                        ? init.signal
-                        : undefined,
-                    )
-                    const relayHeaders = new Headers(requestHeaders)
-                    relayHeaders.set(
-                      'authorization',
-                      `Bearer ${nextAttempt.accessToken}`,
-                    )
-                    return {
-                      headers: relayHeaders,
-                      onUpstreamStatus: (status: number) => {
-                        if (status === 401) {
-                          void runtime
-                            .reportFailure(
+            let relay401Attempt: ClaustrumScopedAttempt | undefined
+            let relayReturned = false
+            const reportScoped401 = (
+              attempt: ClaustrumScopedAttempt,
+              source: 'direct' | 'relay_status_field',
+            ) =>
+              getOpenCodeScopedRuntime(accountStoragePath, ctx.directory)
+                .reportFailure(attempt, 401, source)
+                .catch(() => {
+                  logger.warn(
+                    'claustrum',
+                    'OpenCode scoped auth-failure report unavailable',
+                  )
+                })
+            const sendOnce = () =>
+              sendViaRelay({
+                config: relayConfig,
+                input: rewritten.input,
+                init,
+                headers: requestHeaders,
+                body,
+                fallback: directFetch,
+                affinity: relayAffinity,
+                optimisticResponse: relayConfig?.transport === 'websocket',
+                authorizeAttempt: scopedAttempt
+                  ? async () => {
+                      const runtime = getOpenCodeScopedRuntime(
+                        accountStoragePath,
+                        ctx.directory,
+                      )
+                      const nextAttempt = await runtime.authorize(
+                        oauthAccountId,
+                        init?.signal instanceof AbortSignal
+                          ? init.signal
+                          : undefined,
+                      )
+                      served = {
+                        ...served,
+                        accessToken: nextAttempt.accessToken,
+                        anthropicAccountUuid: asProviderAccountUuid(
+                          nextAttempt.accountId,
+                        ),
+                      }
+                      const relayHeaders = new Headers(requestHeaders)
+                      relayHeaders.set(
+                        'authorization',
+                        `Bearer ${nextAttempt.accessToken}`,
+                      )
+                      return {
+                        headers: relayHeaders,
+                        onUpstreamStatus: (status: number) => {
+                          if (status !== 401) return
+                          relay401Attempt = nextAttempt
+                          // A WebSocket can deliver a real upstream 401 after
+                          // its optimistic response has been handed to the host.
+                          if (relayReturned)
+                            void reportScoped401(
                               nextAttempt,
-                              401,
                               'relay_status_field',
                             )
-                            .catch(() => {})
-                        }
-                      },
+                        },
+                      }
                     }
-                  }
-                : undefined,
-              onResponseHeaders: (headers) => {
-                harvestQuotaHeaders(headers, served)
-                billingLineageTracker.commit(
-                  activeBillingLineage,
-                  extractAnthropicRequestId(headers),
+                  : undefined,
+                onResponseHeaders: (headers) => {
+                  harvestQuotaHeaders(headers, served)
+                  billingLineageTracker.commit(
+                    activeBillingLineage,
+                    extractAnthropicRequestId(headers),
+                  )
+                },
+                onDumpCreated: (handle) => {
+                  relayDump = handle
+                },
+                dumpTag: laneStartRequest ? 'start' : undefined,
+              })
+            let response = await sendOnce()
+            if (
+              !usedDirectFetch &&
+              relay401Attempt &&
+              response.status === 401 &&
+              typeof body === 'string' &&
+              (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
+              !init?.signal?.aborted
+            ) {
+              let rotated: ClaustrumScopedAttempt | undefined
+              try {
+                rotated = await getOpenCodeScopedRuntime(
+                  accountStoragePath,
+                  ctx.directory,
+                ).authorize(
+                  oauthAccountId,
+                  init?.signal instanceof AbortSignal ? init.signal : undefined,
                 )
-              },
-              onDumpCreated: (handle) => {
-                relayDump = handle
-              },
-              dumpTag: laneStartRequest ? 'start' : undefined,
-            })
+              } catch {
+                // Keep the 401 and report the exact relay-served record below.
+              }
+              if (isScopedCredentialRotation(relay401Attempt, rotated)) {
+                await response.body?.cancel().catch(() => {})
+                logger.info(
+                  'claustrum',
+                  'retrying after scoped credential rotation',
+                  {
+                    accountId: oauthAccountId,
+                    previousVersion: relay401Attempt.recordVersion,
+                    newVersion: rotated.recordVersion,
+                    transport: 'relay',
+                  },
+                )
+                relay401Attempt = undefined
+                // sendOnce obtains its own fresh receipt for this HTTP retry.
+                response = await sendOnce()
+              }
+            }
+            if (
+              usedDirectFetch &&
+              directAttempt &&
+              response.status === 401 &&
+              typeof body === 'string' &&
+              (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
+              !init?.signal?.aborted
+            ) {
+              let rotated: ClaustrumScopedAttempt | undefined
+              try {
+                rotated = await getOpenCodeScopedRuntime(
+                  accountStoragePath,
+                  ctx.directory,
+                ).authorize(
+                  oauthAccountId,
+                  init?.signal instanceof AbortSignal ? init.signal : undefined,
+                )
+              } catch {
+                // Preserve the genuine 401 if no replacement can be verified.
+              }
+              if (isScopedCredentialRotation(directAttempt, rotated)) {
+                await response.body?.cancel().catch(() => {})
+                logger.info(
+                  'claustrum',
+                  'retrying after scoped credential rotation',
+                  {
+                    accountId: oauthAccountId,
+                    previousVersion: directAttempt.recordVersion,
+                    newVersion: rotated.recordVersion,
+                    transport: 'direct',
+                  },
+                )
+                retryDirectAttempt = rotated
+                // Transport failures on the new attempt must propagate. They
+                // are not evidence that the new record's token was rejected.
+                response = await directFetch()
+              }
+            }
             trace?.mark('send_headers_received', {
               route,
               ms: roundMs(nowMs() - sendStart),
@@ -6065,19 +6195,12 @@ const anthropicAuthPlugin = async (
               status: response.status,
               streaming,
             })
-            if (scopedAttempt && response.status === 401) {
-              const runtime = getOpenCodeScopedRuntime(
-                accountStoragePath,
-                ctx.directory,
-              )
-              await runtime
-                .reportFailure(scopedAttempt, 401, 'direct')
-                .catch(() => {
-                  logger.warn(
-                    'claustrum',
-                    'OpenCode scoped auth-failure report unavailable',
-                  )
-                })
+            if (usedDirectFetch && directAttempt && response.status === 401) {
+              await reportScoped401(directAttempt, 'direct')
+            }
+            relayReturned = true
+            if (!usedDirectFetch && relay401Attempt) {
+              await reportScoped401(relay401Attempt, 'relay_status_field')
             }
             return response
           }

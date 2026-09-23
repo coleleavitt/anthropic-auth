@@ -307,6 +307,7 @@ describe('OpenCode scoped custody serving', () => {
       close: () => {},
     }
 
+    let modelSends = 0
     globalThis.fetch = (async (input: unknown) => {
       const url = String(input)
       if (url.includes('/api/oauth/usage')) {
@@ -315,6 +316,7 @@ describe('OpenCode scoped custody serving', () => {
           seven_day: { utilization: 10 },
         })
       }
+      modelSends++
       return new Response(
         '{"type":"error","error":{"type":"authentication_error"}}',
         {
@@ -343,6 +345,7 @@ describe('OpenCode scoped custody serving', () => {
 
       await result.fetch(MESSAGES_URL, EMPTY_POST).catch(() => {})
 
+      expect(modelSends).toBe(1)
       expect(reports).toHaveLength(1)
       expect(reports[0]).toMatchObject({
         credentialId: 'oauth:anthropic',
@@ -598,5 +601,471 @@ test('provider initialization does not wait for a stalled scoped discovery conne
     if (deadline) clearTimeout(deadline)
     releaseConnect(client)
     await plugin.dispose?.()
+  }
+})
+
+test.each([
+  { outcome: '200', finalStatus: 200 },
+  { outcome: '401', finalStatus: 401 },
+  { outcome: 'network-error', finalStatus: 'network-error' },
+] as const)(
+  'a scoped main rotated during HTTP dispatch retries once, final outcome $outcome',
+  async ({ finalStatus }) => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-rotation-'))
+    testDirs.push(root)
+    const storagePath = join(root, 'anthropic-auth.json')
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+      root,
+      'enrollment.json',
+    )
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    await writeFile(
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    await writeFile(
+      storagePath,
+      JSON.stringify({
+        version: 1,
+        accounts: [],
+        quota: { enabled: false },
+        claustrum: {
+          mode: 'claustrum',
+          scopedRoster: true,
+          primaryAccount: {
+            credentialId: mainRow.id,
+            accountId: mainRow.accountId,
+            state: 'active',
+          },
+        },
+      }),
+      { mode: 0o600 },
+    )
+    let version = 1
+    const reports: number[] = []
+    const wireTokens: string[] = []
+    const scopedClient: ClaustrumScopedClient = {
+      listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+      getScoped: async ({ credentialId }) => ({
+        credentialId,
+        accountId: mainRow.accountId,
+        material: `scoped-version-${version}`,
+        recordVersion: version,
+        expiresAtMs: Date.now() + 3_600_000,
+      }),
+      reportAuthFailureScoped: async ({ recordVersion }) => {
+        reports.push(recordVersion)
+      },
+      close: () => {},
+    }
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (!String(input).includes('/v1/messages'))
+        throw new Error('unexpected upstream call')
+      const token = new Headers(init?.headers).get('authorization') ?? ''
+      wireTokens.push(token)
+      if (token === 'Bearer scoped-version-1') {
+        version = 2 // The vault rotates after getScoped, before Anthropic responds.
+        return new Response('old token rejected', { status: 401 })
+      }
+      if (finalStatus === 'network-error')
+        throw new Error('new record transport failed')
+      return new Response('rotated token response', { status: finalStatus })
+    }) as typeof fetch
+    const plugin = await AnthropicAuthPlugin(
+      { directory: root } as never,
+      {
+        claustrumScopedConnect: async () => scopedClient,
+        scopedRosterPollIntervalMs: 0,
+      } as never,
+    )
+    try {
+      const loader = await (plugin as any).auth.loader(
+        async () => ({
+          type: 'oauth',
+          access: '',
+          refresh: 'claustrum-tombstone:v1:anthropic',
+          expires: 0,
+        }),
+        { models: {} },
+      )
+      if (finalStatus === 'network-error') {
+        await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow(
+          'new record transport failed',
+        )
+      } else {
+        const response = await loader.fetch(MESSAGES_URL, EMPTY_POST)
+        expect(response.status).toBe(finalStatus)
+        expect(await response.text()).toBe('rotated token response')
+      }
+      expect(wireTokens).toEqual([
+        'Bearer scoped-version-1',
+        'Bearer scoped-version-2',
+      ])
+      expect(reports).toEqual(finalStatus === 401 ? [2] : [])
+    } finally {
+      await plugin.dispose?.()
+    }
+  },
+)
+
+test.each(['transport-error', 'relay-auth-401'] as const)(
+  'relay-to-direct after %s reauthorizes and reports only the direct credential',
+  async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-relay-direct-'))
+    testDirs.push(root)
+    const storagePath = join(root, 'anthropic-auth.json')
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+      root,
+      'enrollment.json',
+    )
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    await writeFile(
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    await writeFile(
+      storagePath,
+      JSON.stringify({
+        version: 1,
+        accounts: [],
+        quota: { enabled: false },
+        relay: {
+          enabled: true,
+          transport: 'http',
+          url: 'https://relay.example.test/forward',
+          token: 'relay-test',
+          fallbackToDirect: true,
+        },
+        claustrum: {
+          mode: 'claustrum',
+          scopedRoster: true,
+          primaryAccount: {
+            credentialId: mainRow.id,
+            accountId: mainRow.accountId,
+            state: 'active',
+          },
+        },
+      }),
+      { mode: 0o600 },
+    )
+    let version = 1
+    const gets: number[] = [],
+      reports: number[] = [],
+      direct: string[] = []
+    const scopedClient: ClaustrumScopedClient = {
+      listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+      getScoped: async ({ credentialId }) => {
+        gets.push(version)
+        return {
+          credentialId,
+          accountId: mainRow.accountId,
+          material: `scoped-version-${version}`,
+          recordVersion: version,
+          expiresAtMs: Date.now() + 3_600_000,
+        }
+      },
+      reportAuthFailureScoped: async ({ recordVersion }) => {
+        reports.push(recordVersion)
+      },
+      close: () => {},
+    }
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (String(input).includes('relay.example.test')) {
+        version = 2
+        if (mode === 'relay-auth-401')
+          return new Response('relay secret rejected', { status: 401 })
+        throw new Error('relay transport unavailable before Anthropic response')
+      }
+      if (!String(input).includes('/v1/messages'))
+        throw new Error('unexpected upstream call')
+      direct.push(new Headers(init?.headers).get('authorization') ?? '')
+      return new Response('rejected latest record', { status: 401 })
+    }) as typeof fetch
+    const plugin = await AnthropicAuthPlugin(
+      { directory: root } as never,
+      {
+        claustrumScopedConnect: async () => scopedClient,
+        scopedRosterPollIntervalMs: 0,
+      } as never,
+    )
+    try {
+      const loader = await (plugin as any).auth.loader(
+        async () => ({
+          type: 'oauth',
+          access: '',
+          refresh: 'claustrum-tombstone:v1:anthropic',
+          expires: 0,
+        }),
+        { models: {} },
+      )
+      const response = await loader.fetch(MESSAGES_URL, {
+        ...EMPTY_POST,
+        headers: { 'x-session-affinity': 'relay-direct-rotation' },
+      })
+      expect(response.status).toBe(401)
+      expect(direct).toEqual(['Bearer scoped-version-2'])
+      expect(gets).toEqual([1, 1, 2, 2])
+      expect(reports).toEqual([2])
+    } finally {
+      await plugin.dispose?.()
+    }
+  },
+)
+
+test.each([200, 401])(
+  'HTTP relay retries once after scoped rotation; final upstream status %i',
+  async (finalStatus) => {
+    const root = await mkdtemp(
+      join(tmpdir(), 'opencode-scoped-relay-rotation-'),
+    )
+    testDirs.push(root)
+    const storagePath = join(root, 'anthropic-auth.json')
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+      root,
+      'enrollment.json',
+    )
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    await writeFile(
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    await writeFile(
+      storagePath,
+      JSON.stringify({
+        version: 1,
+        accounts: [],
+        quota: { enabled: false },
+        relay: {
+          enabled: true,
+          transport: 'http',
+          url: 'https://relay.example.test/forward',
+          token: 'relay-test',
+          fallbackToDirect: true,
+        },
+        claustrum: {
+          mode: 'claustrum',
+          scopedRoster: true,
+          primaryAccount: {
+            credentialId: mainRow.id,
+            accountId: mainRow.accountId,
+            state: 'active',
+          },
+        },
+      }),
+      { mode: 0o600 },
+    )
+    let version = 1
+    const reports: number[] = [],
+      relayTokens: string[] = []
+    const scopedClient: ClaustrumScopedClient = {
+      listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+      getScoped: async ({ credentialId }) => ({
+        credentialId,
+        accountId: mainRow.accountId,
+        material: `scoped-version-${version}`,
+        recordVersion: version,
+        expiresAtMs: Date.now() + 3_600_000,
+      }),
+      reportAuthFailureScoped: async ({ recordVersion }) => {
+        reports.push(recordVersion)
+      },
+      close: () => {},
+    }
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (!String(input).includes('relay.example.test'))
+        throw new Error('unexpected direct fetch')
+      const payload = JSON.parse(String(init?.body)) as {
+        upstream: { headers: Record<string, string> }
+      }
+      const token = payload.upstream.headers.authorization
+      if (!token) throw new Error('relay omitted upstream bearer')
+      relayTokens.push(token)
+      if (token === 'Bearer scoped-version-1') {
+        version = 2
+        return new Response('old relay token rejected', {
+          status: 401,
+          headers: { 'request-id': 'req_upstream_rotated' },
+        })
+      }
+      return new Response('new relay token response', {
+        status: finalStatus,
+        headers: { 'request-id': 'req_upstream_success' },
+      })
+    }) as typeof fetch
+    const plugin = await AnthropicAuthPlugin(
+      { directory: root } as never,
+      {
+        claustrumScopedConnect: async () => scopedClient,
+        scopedRosterPollIntervalMs: 0,
+      } as never,
+    )
+    try {
+      const loader = await (plugin as any).auth.loader(
+        async () => ({
+          type: 'oauth',
+          access: '',
+          refresh: 'claustrum-tombstone:v1:anthropic',
+          expires: 0,
+        }),
+        { models: {} },
+      )
+      const response = await loader.fetch(MESSAGES_URL, {
+        ...EMPTY_POST,
+        headers: { 'x-session-affinity': 'relay-rotation' },
+      })
+      expect(response.status).toBe(finalStatus)
+      expect(await response.text()).toBe('new relay token response')
+      expect(relayTokens).toEqual([
+        'Bearer scoped-version-1',
+        'Bearer scoped-version-2',
+      ])
+      expect(reports).toEqual(finalStatus === 401 ? [2] : [])
+    } finally {
+      await plugin.dispose?.()
+    }
+  },
+)
+
+test('optimistic WebSocket reports only the scoped version used by its real upstream 401', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-ws-401-'))
+  testDirs.push(root)
+  const server = Bun.serve({
+    port: 0,
+    fetch: (request, server) =>
+      server.upgrade(request)
+        ? undefined
+        : new Response('unexpected HTTP relay', { status: 500 }),
+    websocket: {
+      open: (socket) => {
+        socket.send(JSON.stringify({ protocol: 2, type: 'ready', state: null }))
+      },
+      message: (socket, data) => {
+        const payload = JSON.parse(String(data)) as {
+          id: string
+          next_hash: string
+          revision: number
+          upstream: { headers: Record<string, string> }
+        }
+        relayTokens.push(payload.upstream.headers.authorization ?? '')
+        socket.send(
+          JSON.stringify({
+            protocol: 2,
+            type: 'accepted',
+            id: payload.id,
+            hash: payload.next_hash,
+            revision: payload.revision,
+          }),
+        )
+        socket.send(
+          JSON.stringify({
+            protocol: 2,
+            type: 'response_start',
+            id: payload.id,
+            status: 401,
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+        )
+        socket.send(
+          JSON.stringify({ protocol: 2, type: 'done', id: payload.id }),
+        )
+      },
+    },
+  })
+  const relayTokens: string[] = []
+  const storagePath = join(root, 'anthropic-auth.json')
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    root,
+    'enrollment.json',
+  )
+  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  await writeFile(
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+    JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  await writeFile(
+    storagePath,
+    JSON.stringify({
+      version: 1,
+      accounts: [],
+      quota: { enabled: false },
+      relay: {
+        enabled: true,
+        transport: 'websocket',
+        url: server.url.href,
+        token: 'relay-test',
+        fallbackToDirect: false,
+      },
+      claustrum: {
+        mode: 'claustrum',
+        scopedRoster: true,
+        primaryAccount: {
+          credentialId: mainRow.id,
+          accountId: mainRow.accountId,
+          state: 'active',
+        },
+      },
+    }),
+    { mode: 0o600 },
+  )
+  let gets = 0
+  const reports: number[] = []
+  const scopedClient: ClaustrumScopedClient = {
+    listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+    getScoped: async ({ credentialId }) => {
+      const version = Math.min(++gets, 2)
+      return {
+        credentialId,
+        accountId: mainRow.accountId,
+        material: `scoped-version-${version}`,
+        recordVersion: version,
+        expiresAtMs: Date.now() + 3_600_000,
+      }
+    },
+    reportAuthFailureScoped: async ({ recordVersion }) => {
+      reports.push(recordVersion)
+    },
+    close: () => {},
+  }
+  globalThis.fetch = (async () => {
+    throw new Error('unexpected direct send')
+  }) as unknown as typeof fetch
+  const plugin = await AnthropicAuthPlugin(
+    { directory: root } as never,
+    {
+      claustrumScopedConnect: async () => scopedClient,
+      scopedRosterPollIntervalMs: 0,
+    } as never,
+  )
+  try {
+    const loader = await (plugin as any).auth.loader(
+      async () => ({
+        type: 'oauth',
+        access: '',
+        refresh: 'claustrum-tombstone:v1:anthropic',
+        expires: 0,
+      }),
+      { models: {} },
+    )
+    const response = await loader.fetch(MESSAGES_URL, {
+      ...EMPTY_POST,
+      headers: { 'x-session-affinity': `ws-scoped-401-${root}` },
+    })
+    expect(response.status).toBe(200) // local optimistic status, not Anthropic's 401
+    await response.text().catch(() => {})
+    for (let attempt = 0; attempt < 50 && reports.length === 0; attempt++)
+      await Bun.sleep(10)
+    expect(relayTokens).toEqual(['Bearer scoped-version-2'])
+    expect(reports).toEqual([2])
+  } finally {
+    await plugin.dispose?.()
+    await server.stop(true)
   }
 })

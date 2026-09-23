@@ -54,6 +54,8 @@ export type MockResponse =
       errorType: string
       message: string
       headers?: Record<string, string>
+      /** Test-only synchronization point after request capture, before refusal. */
+      beforeRespond?: () => void
     }
 
 export type CapturedAnthropicRequest = {
@@ -179,6 +181,7 @@ export class MockAnthropicServer {
       text: 'ok',
     }
     if (response.type === 'error') {
+      response.beforeRespond?.()
       return new Response(
         JSON.stringify({
           type: 'error',

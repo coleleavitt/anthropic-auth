@@ -37,6 +37,7 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isPermanentRefreshError,
+  isScopedCredentialRotation,
   isValidApiBaseURL,
   killswitchPassesPolicy,
   loadAccounts,
@@ -641,12 +642,49 @@ async function sendAnthropicRequest(options: {
   }
   const directFetch = async () => {
     // Every physical attempt, including relay-to-direct fallback, is authorized.
-    const attempt = scoped
+    let attempt = scoped
       ? await scoped.authorize(routeId, options.streamOptions?.signal)
       : undefined
     if (attempt) headers.set('authorization', `Bearer ${attempt.accessToken}`)
     try {
-      const response = await fetch(input, init)
+      let response = await fetch(input, init)
+      if (attempt && response.status === 401 && !init.signal?.aborted) {
+        let rotated: ClaustrumScopedAttempt | undefined
+        try {
+          rotated = await scoped?.authorize(
+            routeId,
+            options.streamOptions?.signal,
+          )
+        } catch {
+          // A failed lookup is not proof of a replacement: report the token
+          // that received the genuine 401 below, without using local material.
+        }
+        if (isScopedCredentialRotation(attempt, rotated)) {
+          await dumpDirectRequest({
+            affinity: relayAffinity,
+            route: options.route ?? 'oauth',
+            status: response.status,
+            bodyText,
+            url: input.toString(),
+            method: init.method,
+            headers,
+          })
+          await response.body?.cancel().catch(() => {})
+          logger.info(
+            'claustrum',
+            'retrying after scoped credential rotation',
+            {
+              accountId: routeId,
+              previousVersion: attempt.recordVersion,
+              newVersion: rotated.recordVersion,
+              transport: 'direct',
+            },
+          )
+          attempt = rotated
+          headers.set('authorization', `Bearer ${rotated.accessToken}`)
+          response = await fetch(input, init)
+        }
+      }
       if (attempt) await report(attempt, response.status, 'direct')
       await dumpDirectRequest({
         affinity: relayAffinity,
@@ -678,34 +716,70 @@ async function sendAnthropicRequest(options: {
 
   if (options.apiAccount) return directFetch()
 
-  return sendViaRelay({
-    config: getRelayConfig(storage),
-    input,
-    init,
-    headers,
-    body: bodyText,
-    fallback: directFetch,
-    affinity: relayAffinity,
-    authorizeAttempt: scoped
-      ? async () => {
-          const attempt = await scoped.authorize(
-            routeId,
-            options.streamOptions?.signal,
-          )
-          const authorizedHeaders = new Headers(headers)
-          authorizedHeaders.set(
-            'authorization',
-            `Bearer ${attempt.accessToken}`,
-          )
-          return {
-            headers: authorizedHeaders,
-            onUpstreamStatus: (status) => {
-              void report(attempt, status, 'relay_status_field')
-            },
+  let relay401Attempt: ClaustrumScopedAttempt | undefined
+  let relayReturned = false
+  const sendRelayAttempt = () =>
+    sendViaRelay({
+      config: getRelayConfig(storage),
+      input,
+      init,
+      headers,
+      body: bodyText,
+      fallback: directFetch,
+      affinity: relayAffinity,
+      authorizeAttempt: scoped
+        ? async () => {
+            const attempt = await scoped.authorize(
+              routeId,
+              options.streamOptions?.signal,
+            )
+            const authorizedHeaders = new Headers(headers)
+            authorizedHeaders.set(
+              'authorization',
+              `Bearer ${attempt.accessToken}`,
+            )
+            return {
+              headers: authorizedHeaders,
+              onUpstreamStatus: (status) => {
+                if (status !== 401) return
+                relay401Attempt = attempt
+                // WebSocket upstream status can arrive after the response was
+                // returned; HTTP status is held until a rotation check finishes.
+                if (relayReturned)
+                  void report(attempt, status, 'relay_status_field')
+              },
+            }
           }
-        }
-      : undefined,
-  })
+        : undefined,
+    })
+  let response = await sendRelayAttempt()
+  if (
+    scoped &&
+    relay401Attempt &&
+    response.status === 401 &&
+    !init.signal?.aborted
+  ) {
+    let rotated: ClaustrumScopedAttempt | undefined
+    try {
+      rotated = await scoped.authorize(routeId, options.streamOptions?.signal)
+    } catch {
+      // Report the actual rejected record below if no replacement can be read.
+    }
+    if (isScopedCredentialRotation(relay401Attempt, rotated)) {
+      await response.body?.cancel().catch(() => {})
+      logger.info('claustrum', 'retrying after scoped credential rotation', {
+        accountId: routeId,
+        previousVersion: relay401Attempt.recordVersion,
+        newVersion: rotated.recordVersion,
+        transport: 'relay',
+      })
+      relay401Attempt = undefined
+      response = await sendRelayAttempt()
+    }
+  }
+  relayReturned = true
+  if (relay401Attempt) await report(relay401Attempt, 401, 'relay_status_field')
+  return response
 }
 
 function quotaSnapshotIsExhausted(
