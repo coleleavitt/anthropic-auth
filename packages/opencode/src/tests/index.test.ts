@@ -8672,6 +8672,124 @@ describe('auth.loader', () => {
     expect(models).toEqual(['claude-fable-5', 'claude-opus-4-8'])
   })
 
+  test('logs a refusal with its category and the Opus recovery target', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    const previousLogDir = process.env.REFUSAL_LOG_DIR
+    const logDir = await mkdtemp(join(tmpdir(), 'oc-refusal-log-'))
+    process.env.REFUSAL_LOG_DIR = logDir
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: false },
+        cacheKeep: { enabled: false },
+      }),
+    )
+    const models: string[] = []
+    let firstFable = true
+    const refusalSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"category":"cyber"}},"usage":{"output_tokens":0}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    const successSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (body.max_tokens === 0) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      models.push(String(body.model))
+      if (body.model === 'claude-fable-5' && firstFable) {
+        firstFable = false
+        return Promise.resolve(new Response(refusalSse, { status: 200 }))
+      }
+      return Promise.resolve(new Response(successSse, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_refusal_log' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 128_000,
+        stream: true,
+        system: [{ type: 'text', text: 'stable system' }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    // First request hits the refusal — onContentFilter fires, stream rejects.
+    // The second request must carry the downgraded Opus model.
+    const filtered = await result.fetch(MESSAGES_URL, request)
+    await expect(filtered.text()).rejects.toThrow()
+    const second = await result.fetch(MESSAGES_URL, request)
+    await second.text()
+
+    try {
+      expect(models).toEqual(['claude-fable-5', 'claude-opus-4-8'])
+      const refusals = (
+        await readFile(join(logDir, 'refusal-events.jsonl'), 'utf8')
+      )
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+      expect(refusals).toHaveLength(1)
+      expect(refusals[0]).toMatchObject({
+        sessionId: 'ses_refusal_log',
+        model: 'claude-fable-5',
+        category: 'cyber',
+        wasRerouted: true,
+        fallbackModel: 'claude-opus-4-8',
+      })
+      const outcomes = (
+        await readFile(join(logDir, 'content-filter-outcomes.jsonl'), 'utf8')
+      )
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+      expect(outcomes.map((line) => [line.model, line.stopReason])).toEqual([
+        ['claude-fable-5', 'refusal'],
+        ['claude-opus-4-8', 'end_turn'],
+      ])
+      expect(outcomes[0].refusalCategory).toBe('cyber')
+      expect(outcomes[0].filter?.blocksScanned).toBeGreaterThan(0)
+    } finally {
+      if (previousLogDir === undefined) delete process.env.REFUSAL_LOG_DIR
+      else process.env.REFUSAL_LOG_DIR = previousLogDir
+      await rm(logDir, { recursive: true, force: true })
+    }
+  })
+
   test('server mode — absorbed server-side fallback does NOT activate client-side downgrade', async () => {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await useTempAccountFile(

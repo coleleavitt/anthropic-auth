@@ -207,6 +207,7 @@ import {
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
 import {
+  FABLE_FALLBACK_MODEL_ID,
   FableFallbackManager,
   type FableFallbackPlan,
   type FableStandbyCacheAnchor,
@@ -2661,16 +2662,8 @@ const anthropicAuthPlugin = async (
       outcome.stopReason === 'refusal' ||
       !serverFallbackTargets.delete(plan.recoveryKey)
     ) {
-      // Log the refusal for classifier training
-      if (outcome.stopReason === 'refusal') {
-        logRefusal({
-          timestamp: new Date().toISOString(),
-          sessionId: plan.sessionId,
-          model: plan.requestedModel,
-          category: null, // Category not available in this path
-          wasRerouted: false,
-        })
-      }
+      // The refusal itself is logged by the stream's onFinish hook, which
+      // sees stop_details.category for every route.
       return
     }
     logger.info(
@@ -5648,17 +5641,39 @@ const anthropicAuthPlugin = async (
                   cacheDiagnosticsResponses.get(response)
                 return createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
-                  onFinish: (stopReason, refusalCategory) =>
+                  onFinish: (stopReason, refusalCategory) => {
+                    const servedModel =
+                      fablePlan?.effectiveModel ?? requestModel ?? 'unknown'
+                    const requestId = response.headers.get('request-id')
                     logContentFilterOutcome({
                       host: 'opencode',
                       sessionId: sessionId ?? null,
-                      model:
-                        fablePlan?.effectiveModel ?? requestModel ?? 'unknown',
-                      requestId: response.headers.get('request-id'),
+                      model: servedModel,
+                      requestId,
                       stopReason,
                       refusalCategory: refusalCategory ?? null,
                       filter: contentFilterSummaryByTrace.get(trace) ?? null,
-                    }),
+                    })
+                    if (stopReason !== 'refusal') return
+                    // Client recovery re-issues on Opus 4.8 only for an
+                    // OAuth-served Fable/Opus 5 request not yet downgraded.
+                    const willRecover = Boolean(
+                      fablePlan &&
+                        !fablePlan.downgraded &&
+                        fableRequest?.warmTarget,
+                    )
+                    logRefusal({
+                      timestamp: new Date().toISOString(),
+                      ...(sessionId ? { sessionId } : {}),
+                      model: servedModel,
+                      category: refusalCategory ?? null,
+                      requestId,
+                      wasRerouted: willRecover,
+                      ...(willRecover
+                        ? { fallbackModel: FABLE_FALLBACK_MODEL_ID }
+                        : {}),
+                    })
+                  },
                   laneStart: laneStartRequest,
                   laneStartOAuthServed:
                     responseRouteKinds.get(response) !== 'api',
