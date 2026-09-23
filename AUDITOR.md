@@ -14,6 +14,7 @@ Guidance for future audits of intentional tradeoffs in this repository.
 - **Pi cache-marker behavior intentionally does not yet mirror OpenCode hybrid anchoring.** OpenCode receives already-shaped provider request JSON and has Magic Context-specific anchor logic; Pi builds Anthropic bodies from Pi messages. Treat Pi cache parity as a product/design task rather than a drive-by perf fix.
 - **CCH/signing and cache rewrites parse/stringify request bodies.** This is expected because signing must cover the final serialized body and cache markers are JSON-structural. Optimizations should preserve exact wire-body semantics and be backed by benchmarks.
 - **Relay patch creation is linear in body size.** This is currently acceptable relative to JSON serialization/signing and network upload costs. Replacing it should be justified by measurements and must preserve hash-gated reconstruction.
+- **Total loss of Fable 5.1 effort markers and the current-user anchor remains fail-closed (#237/#242).** A resolved request-plan header alone cannot prove that the retained wire history is an exact suffix; a retained earlier user/assistant pair with all marker text stripped is a concrete counterexample. An anchored full prefix trim already folds safely. Missing-all refusals log only bounded shape and hashed plan metadata, never prompt text or marker bytes; accepting an unanchored trim needs independent proof of the surviving boundary, not a count check.
 
 ## Quota and fallback policy
 

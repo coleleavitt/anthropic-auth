@@ -636,8 +636,40 @@ export function applyOpenCodeEffortMarkers(
   if (!hasCandidate) {
     if (!requestPlan) return { found: 0, inserted: 0 }
     if (requestPlan.markerCount !== 0) {
+      // Without any surviving anchor we cannot prove a prefix trim, even when
+      // an older request plan still resolves. Log only shape and trusted plan
+      // metadata so the next occurrence can distinguish full history removal
+      // from downstream marker stripping without exposing user content.
+      const lastUserMessageIndex = body.messages.findLastIndex(
+        (message) => isRecord(message) && message.role === 'user',
+      )
+      const lastUserMessage = body.messages[lastUserMessageIndex]
+      const lastUserContent =
+        isRecord(lastUserMessage) && Array.isArray(lastUserMessage.content)
+          ? lastUserMessage.content
+          : []
       throw new EffortMarkerCorrelationError(
         `Fable 5.1 effort marker correlation failed: expected ${requestPlan.markerCount}, found 0`,
+        'missing_all_markers',
+        {
+          markerCount: requestPlan.markerCount,
+          resolvedPlan: expectedPlan !== null,
+          plannedBoundaryId: expectedPlan?.anchor?.boundary ?? null,
+          expectedAnchorHash: expectedPlan?.anchor
+            ? digest(expectedPlan.anchor.token)
+            : null,
+          retainedMessageCount: body.messages.length,
+          retainedUserMessageCount: body.messages.filter(
+            (message) => isRecord(message) && message.role === 'user',
+          ).length,
+          lastUserMessageIndex,
+          lastUserTextBlockCount: lastUserContent.filter(
+            (block) => isRecord(block) && block.type === 'text',
+          ).length,
+          lastUserToolResultBlockCount: lastUserContent.filter(
+            (block) => isRecord(block) && block.type === 'tool_result',
+          ).length,
+        },
       )
     }
     if (
