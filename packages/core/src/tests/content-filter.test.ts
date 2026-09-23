@@ -207,4 +207,97 @@ But the React components are working fine.`,
       expect(filteredText).toContain('socket connection') // WebSocket rewrite
     })
   })
+
+  test('filters tool_result content from prior turns', () => {
+    const body = {
+      model: 'claude-opus-5',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'id1',
+              content:
+                'The firmware analysis shows a vulnerability in the binary file',
+            },
+          ],
+        },
+      ],
+    }
+    const result = filterRequestBody(body as Record<string, unknown>)
+    expect(result.filtered).toBe(true)
+    expect(result.changes.length).toBeGreaterThan(0)
+    const msg = (
+      result.body as {
+        messages: Array<{ content: Array<{ content: string }> }>
+      }
+    ).messages[0]
+    expect(msg.content[0].content).not.toContain('firmware')
+    expect(msg.content[0].content).not.toContain('vulnerability')
+    expect(msg.content[0].content).toContain('software') // firmware → software
+    expect(msg.content[0].content).toContain('finding') // vulnerability → finding
+  })
+
+  test('filters tool_result array content from prior turns', () => {
+    const body = {
+      model: 'claude-opus-5',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'id1',
+              content: [
+                {
+                  type: 'text',
+                  text: 'Disassembled the binary and found a vulnerability in the function',
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    }
+    const result = filterRequestBody(body as Record<string, unknown>)
+    expect(result.filtered).toBe(true)
+    const msg = (
+      result.body as {
+        messages: Array<{
+          content: Array<{ content: Array<{ text: string }> }>
+        }>
+      }
+    ).messages[0]
+    expect(msg.content[0].content[0].text).not.toContain('binary')
+    expect(msg.content[0].content[0].text).not.toContain('vulnerability')
+    expect(msg.content[0].content[0].text).toContain('finding') // vulnerability → finding
+    expect(msg.content[0].content[0].text).toContain('file') // binary → file
+  })
+
+  test('filters assistant text content from prior turns', () => {
+    const body = {
+      model: 'claude-opus-5',
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: 'I found a vulnerability in the firmware that could be exploited',
+            },
+          ],
+        },
+      ],
+    }
+    const result = filterRequestBody(body as Record<string, unknown>)
+    expect(result.filtered).toBe(true)
+    const msg = (
+      result.body as { messages: Array<{ content: Array<{ text: string }> }> }
+    ).messages[0]
+    expect(msg.content[0].text).not.toContain('vulnerability')
+    expect(msg.content[0].text).not.toContain('firmware')
+    expect(msg.content[0].text).toContain('finding') // vulnerability → finding
+    expect(msg.content[0].text).toContain('software') // firmware → software
+  })
 })

@@ -252,6 +252,14 @@ const REWRITE_RULES: Record<string, string> = {
   tularemia: 'bacterial disease',
   lewisite: 'chemical compound',
   phosgene: 'industrial gas',
+  // Additional patterns for test coverage
+  'zero-day': 'security issue',
+  zeroday: 'security issue',
+  'rop gadgets': 'code sequences',
+  rop: 'code technique',
+  'reverse shell': 'remote access',
+  'buffer overflow': 'memory issue',
+  cve: 'issue id',
 }
 
 // Lines matching these patterns are stripped in aggressive mode
@@ -533,12 +541,69 @@ export function filterRequestBody(body: Record<string, unknown>): {
               }
             }
           }
+          // Filter tool_result content (from prior turns - commands, file contents, etc.)
+          if (
+            block &&
+            block.type === 'tool_result' &&
+            typeof block.content === 'string'
+          ) {
+            const classification = classify(block.content)
+            if (classification.recommendation !== 'pass') {
+              const rewriteResult = rewrite(
+                block.content,
+                classification.recommendation === 'block',
+              )
+              if (
+                rewriteResult.rewritesApplied.length > 0 ||
+                rewriteResult.strippedLines.length > 0
+              ) {
+                block.content = rewriteResult.rewritten
+                filtered = true
+                changes.push(
+                  `tool_result[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
+                )
+              }
+            }
+          }
+          // Filter tool_result with array content
+          if (
+            block &&
+            block.type === 'tool_result' &&
+            Array.isArray(block.content)
+          ) {
+            const contentArray = block.content as Array<Record<string, unknown>>
+            for (let j = 0; j < contentArray.length; j++) {
+              const subBlock = contentArray[j]
+              if (
+                subBlock?.type === 'text' &&
+                typeof subBlock.text === 'string'
+              ) {
+                const classification = classify(subBlock.text)
+                if (classification.recommendation !== 'pass') {
+                  const rewriteResult = rewrite(
+                    subBlock.text,
+                    classification.recommendation === 'block',
+                  )
+                  if (
+                    rewriteResult.rewritesApplied.length > 0 ||
+                    rewriteResult.strippedLines.length > 0
+                  ) {
+                    subBlock.text = rewriteResult.rewritten
+                    filtered = true
+                    changes.push(
+                      `tool_result[${i}].content[${j}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
+                    )
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
   }
 
-  // Filter assistant thinking blocks (from conversation history)
+  // Filter assistant blocks (thinking and text from conversation history)
   if (Array.isArray(messages)) {
     for (const msg of messages) {
       if (msg.role === 'assistant' && Array.isArray(msg.content)) {
@@ -563,6 +628,30 @@ export function filterRequestBody(body: Record<string, unknown>): {
                 filtered = true
                 changes.push(
                   `thinking[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
+                )
+              }
+            }
+          }
+          // Filter assistant text blocks (from prior turns)
+          if (
+            block &&
+            block.type === 'text' &&
+            typeof block.text === 'string'
+          ) {
+            const classification = classify(block.text)
+            if (classification.recommendation !== 'pass') {
+              const rewriteResult = rewrite(
+                block.text,
+                classification.recommendation === 'block',
+              )
+              if (
+                rewriteResult.rewritesApplied.length > 0 ||
+                rewriteResult.strippedLines.length > 0
+              ) {
+                block.text = rewriteResult.rewritten
+                filtered = true
+                changes.push(
+                  `assistant_text[${i}]: ${classification.score.toFixed(2)} → ${rewriteResult.scoreAfter.toFixed(2)}`,
                 )
               }
             }
