@@ -27,11 +27,17 @@ const ENROLLMENT_SCHEMA = 1
 const ENROLLMENT_FILE_MAX_BYTES = 16 * 1024
 const ENROLLMENT_LOCK_TTL_MS = 30_000
 const TOKEN_RE = /^[0-9a-f]{64}$/
-// claustrum#69: the transport labels every module refusal transient/retry, so code wins over action.
+// Claustrum's closed EnrollmentRefusal vocabulary marks every code here
+// permanent. claustrum#69: the client currently relabels module Error frames
+// transient/retry, so the producer's code must take precedence over action.
+// pending_queue_full, store_error and transport_error remain retryable.
 const TERMINAL_ENROLLMENT_CODES = new Set([
-  'superseded',
+  'invalid_params',
+  'pending_exists',
   'not_found',
   'already_consumed',
+  'superseded',
+  'stale_generation',
 ])
 
 export interface ClaustrumEnrollmentClient {

@@ -500,7 +500,14 @@ describe('ClaustrumEnrollmentManager', () => {
   })
 
   test('blocks a retryable poll refusal whose code is protocol-terminal and stops re-polling', async () => {
-    for (const code of ['superseded', 'not_found', 'already_consumed']) {
+    for (const code of [
+      'invalid_params',
+      'pending_exists',
+      'not_found',
+      'already_consumed',
+      'superseded',
+      'stale_generation',
+    ]) {
       const paths = await fixture()
       await seedPendingRequest(paths, 'request-1')
       let polls = 0
@@ -528,7 +535,14 @@ describe('ClaustrumEnrollmentManager', () => {
   })
 
   test('blocks a retryable propose refusal whose code is protocol-terminal', async () => {
-    for (const code of ['superseded', 'not_found', 'already_consumed']) {
+    for (const code of [
+      'invalid_params',
+      'pending_exists',
+      'not_found',
+      'already_consumed',
+      'superseded',
+      'stale_generation',
+    ]) {
       const paths = await fixture()
       await seedPendingRequest(paths)
       const instance = manager(
@@ -551,7 +565,11 @@ describe('ClaustrumEnrollmentManager', () => {
   })
 
   test('keeps genuinely retryable poll refusals pending', async () => {
-    for (const code of ['pending_queue_full', 'transport_error']) {
+    for (const code of [
+      'pending_queue_full',
+      'store_error',
+      'transport_error',
+    ]) {
       const paths = await fixture()
       await seedPendingRequest(paths, 'request-1')
       const instance = manager(
