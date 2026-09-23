@@ -32,6 +32,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
 
       - uses: actions/setup-node@v6
         with:
@@ -55,8 +56,21 @@ jobs:
         env:
           TUI_SMOKE_SKIP_BUILD: "1"
 
+      - name: Claustrum golden provenance
+        run: bun run check:claustrum-golden
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Test floor gate tests
+        run: bun test scripts/check-test-count-floors.test.ts
+
       - name: Test
-        run: bun run test
+        # The version/tag commit's parent carries the preceding floor. A missing
+        # predecessor is UNCHECKED and must stop publishing.
+        run: bun scripts/check-test-count-floors.ts --base-ref HEAD^
+
+      - name: Pi host tool round-trip
+        run: bun run test:pi-host
 
       - name: Install OpenCode CLI for e2e
         run: npm install -g opencode-ai@1.17.13

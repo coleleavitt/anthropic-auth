@@ -51,7 +51,11 @@ function readSource(value: unknown): Source {
 }
 
 export async function verifyClaustrumGolden(
-  options: { fixtureDir?: string; fetchImpl?: typeof fetch } = {},
+  options: {
+    fixtureDir?: string
+    fetchImpl?: typeof fetch
+    githubToken?: string
+  } = {},
 ): Promise<string> {
   const fixtureDir = options.fixtureDir ?? defaultFixtureDir
   const fetchImpl = options.fetchImpl ?? fetch
@@ -70,13 +74,23 @@ export async function verifyClaustrumGolden(
   )
 
   // Comparing an arbitrary fork with itself proves nothing. The pinned SHA
-  // must be reachable from the canonical repository's default branch.
+  // must be reachable from the canonical repository's default branch. CI uses
+  // its read-only GitHub token to avoid shared-IP anonymous API limits; never
+  // forward that token to the raw fixture host or echo it in diagnostics.
+  const githubToken = options.githubToken ?? process.env.GITHUB_TOKEN
+  if (
+    githubToken !== undefined &&
+    !/^[A-Za-z0-9._-]{1,4096}$/.test(githubToken)
+  ) {
+    throw new Error('Invalid GitHub token format for golden provenance check')
+  }
   const compare = await fetchImpl(
     `https://api.github.com/repos/${CANONICAL_REPO}/compare/${source.ref}...${CANONICAL_BRANCH}`,
     {
       headers: {
         accept: 'application/vnd.github+json',
         'user-agent': 'cortexkit-anthropic-auth-golden-check',
+        ...(githubToken && { authorization: `Bearer ${githubToken}` }),
       },
     },
   )

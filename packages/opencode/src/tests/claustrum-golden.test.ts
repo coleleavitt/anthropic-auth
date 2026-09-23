@@ -32,9 +32,14 @@ function producer(options: {
   http?: number
 }) {
   const calls: string[] = []
-  const fetchImpl = (async (input: string | URL | Request) => {
+  const authorizations: Array<string | null> = []
+  const fetchImpl = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
     const url = String(input)
     calls.push(url)
+    authorizations.push(new Headers(init?.headers).get('authorization'))
     if (url.includes('/compare/')) {
       return new Response(
         JSON.stringify({
@@ -49,7 +54,7 @@ function producer(options: {
     }
     throw new Error(`Unexpected producer URL: ${url}`)
   }) as typeof fetch
-  return { calls, fetchImpl }
+  return { calls, authorizations, fetchImpl }
 }
 
 test('pins the canonical repository, ancestor SHA, exact path and bytes', async () => {
@@ -136,4 +141,28 @@ test('rejects mutated local bytes even if canonical provenance passes', async ()
   await expect(
     verifyClaustrumGolden({ fixtureDir: dir, fetchImpl }),
   ).rejects.toThrow('DRIFT')
+})
+
+test('sends a CI token only to the canonical GitHub comparison endpoint', async () => {
+  const { dir, bytes } = await fixture()
+  const { authorizations, fetchImpl } = producer({ bytes })
+  await verifyClaustrumGolden({
+    fixtureDir: dir,
+    fetchImpl,
+    githubToken: 'ghs_readonly_example',
+  })
+  expect(authorizations).toEqual(['Bearer ghs_readonly_example', null])
+})
+
+test('rejects an unsafe token value without repeating it or making a request', async () => {
+  const { dir, bytes } = await fixture()
+  const { calls, fetchImpl } = producer({ bytes })
+  await expect(
+    verifyClaustrumGolden({
+      fixtureDir: dir,
+      fetchImpl,
+      githubToken: 'sensitive-value\r\ninjected-header',
+    }),
+  ).rejects.toThrow('Invalid GitHub token format')
+  expect(calls).toEqual([])
 })

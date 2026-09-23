@@ -40,7 +40,7 @@ function fail(message: string): never {
   throw new Error(message)
 }
 
-function parseFloors(raw: string, source: string): Floors {
+function parseFloors(raw: string, source: string, allowZero = false): Floors {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
@@ -63,9 +63,11 @@ function parseFloors(raw: string, source: string): Floors {
     if (
       typeof value !== 'number' ||
       !Number.isSafeInteger(value) ||
-      value <= 0
+      value < (allowZero ? 0 : 1)
     ) {
-      fail(`${source}.${packageName} must be a positive integer`)
+      fail(
+        `${source}.${packageName} must be a ${allowZero ? 'non-negative' : 'positive'} integer`,
+      )
     }
     floors[packageName] = value
   }
@@ -128,7 +130,7 @@ function parseOptions(args: string[]): Options {
 
     if (flag === '--base-ref') options.baseRef = value
     else if (flag === '--counts')
-      options.counts = parseFloors(value, '--counts')
+      options.counts = parseFloors(value, '--counts', true)
     else if (flag === '--floor-file') options.floorFile = value
     else fail(`unknown argument: ${flag}`)
     index += 1
@@ -304,11 +306,7 @@ async function main() {
   }
   if (!options.baseRef) {
     console.error(
-      verdict(
-        'UNCHECKED',
-        packageScope(branchDocument.floors),
-        'merge target ref was not provided',
-      ),
+      verdict('UNCHECKED', 'none', 'merge target ref was not provided'),
     )
     process.exitCode = 2
     return
@@ -322,7 +320,7 @@ async function main() {
     console.error(
       verdict(
         'UNCHECKED',
-        packageScope(branchDocument.floors),
+        'none',
         `could not resolve merge target floor ${options.baseRef}:${options.floorFile}`,
       ),
     )
@@ -332,13 +330,7 @@ async function main() {
 
   const branchStampError = stampError(branchDocument, 'HEAD', 'branch')
   if (branchStampError) {
-    console.error(
-      verdict(
-        'UNCHECKED',
-        packageScope(branchDocument.floors),
-        branchStampError,
-      ),
-    )
+    console.error(verdict('UNCHECKED', 'none', branchStampError))
     process.exitCode = 2
     return
   }
@@ -348,24 +340,13 @@ async function main() {
     'merge target',
   )
   if (targetStampError) {
-    console.error(
-      verdict(
-        'UNCHECKED',
-        packageScope(branchDocument.floors),
-        targetStampError,
-      ),
-    )
+    console.error(verdict('UNCHECKED', 'none', targetStampError))
     process.exitCode = 2
     return
   }
 
   const counts = options.counts ?? measureTests()
   const scope = packageScope(counts)
-  if (scope === 'none') {
-    console.error(verdict('UNCHECKED', scope, 'no packages were evaluated'))
-    process.exitCode = 2
-    return
-  }
   const branchFloors = branchDocument.floors
   const targetFloors = targetDocument.floors
   const failures: string[] = []
@@ -386,6 +367,9 @@ async function main() {
   )
   const marker = await readLoweringMarker()
   const invalidMarker = markerError(marker, lowered, branchFloors, targetFloors)
+  if (marker && lowered.length === 0) {
+    failures.push('RATCHET: stale deliberate-lowering marker must be removed')
+  }
   for (const packageName of packageNames) {
     if (lowered.includes(packageName)) continue
     console.log(

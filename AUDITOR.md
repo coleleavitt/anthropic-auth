@@ -29,3 +29,9 @@ Guidance for future audits of intentional tradeoffs in this repository.
 - **Session affinity intentionally outranks moment-to-moment quota ranking.** Once assigned, a session remains on its OAuth account across transient transport/provider/quota-probe failures and relative quota changes so its large prompt cache is not rewritten on another account.
 - **A confirmed five-hour exhaustion does not migrate when reset is within 15 minutes.** The route returns `Retry-After` and remains assigned; longer 5h exhaustion, 7d/model-scoped exhaustion, killswitch blocks, removed/disabled accounts, and permanent re-login failures may migrate.
 - **API-key routes are not candidates for quota-balanced first assignment.** Their existing confirmed-main-exhaustion gate remains authoritative.
+
+## CI test-count floor gate
+
+- **COUNT compares with the branch's own declared floor, even if it exceeds the merge target's floor.** Raising a floor is an assertion that the branch already has at least that many passing tests. A measured count below the newly raised floor must fail rather than silently accepting a false assertion merely because it exceeds the older target floor.
+- **UNCHECKED is distinct from FAIL but deliberately blocks CI and release.** A missing merge target or unverified measurement cannot be treated as a green test-count check. The verdict and exit code explain the cause; `continue-on-error` would turn an inability to verify the ratchet into a bypass.
+- **Only Core, OpenCode, and Pi unit tests have count floors.** Process-level E2E and the real Pi host round-trip remain separately required workflow steps; their pass/fail status is not claimed by the unit-count verdict. The gate runs the three unit suites once in place of the old `bun run test` step, not in addition to it.

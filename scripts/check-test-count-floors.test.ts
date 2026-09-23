@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -16,18 +16,28 @@ type LoweringMarker = {
 }
 
 function runGit(cwd: string, args: string[]) {
-  const result = Bun.spawnSync(['git', ...args], {
-    cwd,
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: 'Test Runner',
-      GIT_AUTHOR_EMAIL: 'test@example.com',
-      GIT_COMMITTER_NAME: 'Test Runner',
-      GIT_COMMITTER_EMAIL: 'test@example.com',
+  // The harness injects a git hooksPath for the active project. These are
+  // throwaway Git repositories, so isolate their commits from inherited hooks
+  // rather than waiting for an unrelated hook to run in each fixture.
+  const env = { ...process.env }
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('GIT_CONFIG_')) delete env[key]
+  }
+  const result = Bun.spawnSync(
+    ['git', '-c', 'core.hooksPath=/dev/null', ...args],
+    {
+      cwd,
+      env: {
+        ...env,
+        GIT_AUTHOR_NAME: 'Test Runner',
+        GIT_AUTHOR_EMAIL: 'test@example.com',
+        GIT_COMMITTER_NAME: 'Test Runner',
+        GIT_COMMITTER_EMAIL: 'test@example.com',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
     },
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
+  )
   if (result.exitCode !== 0) {
     throw new Error(new TextDecoder().decode(result.stderr))
   }
@@ -197,9 +207,7 @@ test('reports an unchecked non-zero verdict when the merge target is unavailable
   const result = runGate(cwd, floors, 'missing-target')
 
   expect(result.exitCode).toBe(2)
-  expect(result.output).toContain(
-    'VERDICT: UNCHECKED packages=core,opencode,pi',
-  )
+  expect(result.output).toContain('VERDICT: UNCHECKED packages=none')
 })
 
 test('reports an unchecked verdict when CI supplies an empty merge target', async () => {
@@ -208,9 +216,7 @@ test('reports an unchecked verdict when CI supplies an empty merge target', asyn
   const result = runGate(cwd, floors, '')
 
   expect(result.exitCode).toBe(2)
-  expect(result.output).toContain(
-    'VERDICT: UNCHECKED packages=core,opencode,pi',
-  )
+  expect(result.output).toContain('VERDICT: UNCHECKED packages=none')
 })
 
 test('reports an unchecked verdict for a floor stamped by an unrelated commit', async () => {
@@ -252,13 +258,14 @@ test('fails as a noncompliant source when the branch floor file is absent', asyn
   )
 })
 
-test('does not pass when no packages are evaluated', async () => {
+test('rejects incomplete --counts input without claiming a measurement', async () => {
   const floors = { core: 10, opencode: 20, pi: 30 }
   const cwd = await makeStaleBranch(floors, floors)
   const result = runGateWithCounts(cwd, '{}')
 
   expect(result.exitCode).toBe(1)
   expect(result.output).toContain('VERDICT: FAIL packages=none')
+  expect(result.output).toContain('--counts must contain exactly')
   expect(result.output).not.toContain('VERDICT: PASS')
 })
 
@@ -278,4 +285,59 @@ test('replays a stale branch after main raises the floor and rejects the replay'
   expect(result.output).toContain(
     'core branch floor 10 < merge target floor 11',
   )
+})
+
+test('counts a zero-test suite as a real floor violation, not invalid CLI input', async () => {
+  const floors = { core: 10, opencode: 20, pi: 30 }
+  const cwd = await makeStaleBranch(floors, floors)
+  const result = runGate(cwd, { core: 0, opencode: 20, pi: 30 })
+  expect(result.exitCode).toBe(1)
+  expect(result.output).toContain('core measured 0 < branch floor 10')
+  expect(result.output).toContain('VERDICT: FAIL packages=core,opencode,pi')
+})
+
+test('rejects a branch that claims more tests than it actually has', async () => {
+  const cwd = await makeStaleBranch(
+    { core: 10, opencode: 20, pi: 30 },
+    { core: 10, opencode: 25, pi: 30 },
+  )
+  const result = runGate(cwd, { core: 10, opencode: 22, pi: 30 })
+  expect(result.exitCode).toBe(1)
+  expect(result.output).toContain('opencode measured 22 < branch floor 25')
+  expect(result.output).not.toContain('opencode branch floor 25 < merge target')
+})
+
+test('rejects a leftover lowering marker when no branch floor is lowered', async () => {
+  const floors = { core: 10, opencode: 20, pi: 30 }
+  const cwd = await makeStaleBranch(floors, floors, {
+    reason: 'A previous branch lowered core, but this one does not.',
+    lowering: { core: { from: 11, to: 10 } },
+  })
+  const result = runGate(cwd, floors)
+  expect(result.exitCode).toBe(1)
+  expect(result.output).toContain(
+    'stale deliberate-lowering marker must be removed',
+  )
+})
+
+test('CI and release each measure unit suites once and keep UNCHECKED blocking', async () => {
+  const root = resolve(import.meta.dir, '..')
+  const ci = await readFile(join(root, '.github/workflows/ci.yml'), 'utf8')
+  const release = await readFile(
+    join(root, '.github/workflows/release.yaml'),
+    'utf8',
+  )
+  for (const workflow of [ci, release]) {
+    expect(workflow).toContain('bun run check:claustrum-golden')
+    expect(workflow).toContain(
+      'bun scripts/check-test-count-floors.ts --base-ref',
+    )
+    expect(workflow).not.toMatch(/run: bun run test\s*\n/)
+    expect(workflow).not.toMatch(
+      /check-test-count-floors\.ts[^\n]*\n\s*continue-on-error:/,
+    )
+    expect(workflow).toContain('bun run test:pi-host')
+  }
+  expect(ci).toContain('fetch-depth: 0')
+  expect(release).toContain('fetch-depth: 0')
 })
