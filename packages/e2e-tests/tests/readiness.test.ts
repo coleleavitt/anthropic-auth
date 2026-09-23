@@ -80,7 +80,10 @@ test('the announced endpoint belongs to the spawned child, without a parent port
   child.stdout?.on('data', (chunk) => { stdout += String(chunk) })
   try {
     const endpoint = await waitForOpencodeListening(child, () => stdout)
-    expect((await (await fetch(endpoint.url)).json()).pid).toBe(child.pid)
+    const payload: unknown = await (await fetch(endpoint.url)).json()
+    if (!payload || typeof payload !== 'object' || !('pid' in payload))
+      throw new Error('announced listener did not return a process ID')
+    expect(payload.pid).toBe(child.pid)
   } finally { await terminateChildProcess(child) }
 })
 

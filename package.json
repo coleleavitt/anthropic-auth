@@ -14,7 +14,7 @@
     "analyze:cache": "node scripts/analyze-cache-usage.mjs",
     "test": "bun run build && cd packages/core && bun test src/tests && cd ../opencode && bun run test && cd ../pi && bun run test",
     "test:e2e": "cd packages/core && bun run build && cd ../.. && bun run --cwd packages/e2e-tests test",
-    "typecheck": "cd packages/core && bun run build && bun run typecheck && cd ../opencode && bun run typecheck && cd ../pi && bun run typecheck && cd ../.. && tsc -p tsconfig.scripts.json",
+    "typecheck": "cd packages/core && bun run build && bun run typecheck && cd ../opencode && bun run typecheck && cd ../pi && bun run typecheck && cd ../e2e-tests && bun run typecheck && cd ../.. && tsc -p tsconfig.scripts.json",
     "types": "bun run typecheck",
     "format": "biome check --write --unsafe .",
     "format:check": "biome format .",

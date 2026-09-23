@@ -298,11 +298,10 @@ describe('OpenCode Anthropic auth e2e', () => {
     )
     await harness.waitForSessionText(sessionId, 'Switched to Opus 4.8')
 
+    const anthropic = harness.anthropic
     await harness.waitFor(
       () =>
-        harness.anthropic
-          .requests()
-          .some((request) => request.body.max_tokens === 0),
+        anthropic.requests().some((request) => request.body.max_tokens === 0),
       { timeoutMs: 5_000, label: 'source-model prewarm request' },
     )
 
@@ -463,7 +462,11 @@ describe('OpenCode Anthropic auth e2e', () => {
     expect(
       generationRequests.slice(11, 23).map((request) => request.body.model),
     ).toEqual(Array.from({ length: 12 }, () => 'claude-fable-5'))
-    expect(generationRequests[23].body.model).toBe('claude-opus-4-8')
+    const firstCycleOpus = generationRequests.at(10)
+    const finalOpus = generationRequests.at(23)
+    if (!firstCycleOpus || !finalOpus)
+      throw new Error('expected two complete model recovery cycles')
+    expect(finalOpus.body.model).toBe('claude-opus-4-8')
 
     const markedMessageIndexes = (body: Record<string, unknown>) => {
       const messages = Array.isArray(body.messages) ? body.messages : []
@@ -497,8 +500,8 @@ describe('OpenCode Anthropic auth e2e', () => {
       return blocks - 1
     }
 
-    const lastFirstCycleOpus = generationRequests[10].body
-    const secondCycleOpus = generationRequests[23].body
+    const lastFirstCycleOpus = firstCycleOpus.body
+    const secondCycleOpus = finalOpus.body
     const oldOpusTail = markedMessageIndexes(lastFirstCycleOpus).at(-1)
     const secondCycleMarkers = markedMessageIndexes(secondCycleOpus)
     expect(oldOpusTail).toBeNumber()
