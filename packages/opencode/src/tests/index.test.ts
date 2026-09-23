@@ -4248,6 +4248,8 @@ describe('Fable 5.1 request-scoped effort history', () => {
         anchorMatchesExpected: true,
       }),
     })
+    expect(JSON.stringify(refusalLogs)).not.toContain(anchorMarker)
+    expect(JSON.stringify(refusalLogs)).not.toContain(transitionMarker)
     expect(messagesCalled).toBe(false)
   })
 })

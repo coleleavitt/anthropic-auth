@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { E2EHarness } from '../src/harness.ts'
@@ -574,5 +574,88 @@ describe('OpenCode Anthropic auth e2e', () => {
     await harness.waitFor(() => harness!.anthropic.requests().length >= 1, {
       label: 'upstream request captured',
     })
+  }, 90_000)
+})
+
+
+describe('Fable 5.1 effort correlation through real OpenCode lowering', () => {
+  it('keeps the current effort anchor across a tool-result continuation', async () => {
+    harness = await E2EHarness.create()
+    harness.script([
+      { type: 'text', text: 'initial low response' },
+      { type: 'tool_use', name: 'mcp_Read', input: { filePath: harness.sampleFilePath() } },
+      { type: 'text', text: 'high effort tool continuation completed' },
+    ])
+    const sessionId = await harness.createSession()
+    await harness.sendPrompt(sessionId, 'first low request', 60_000, 'claude-fable-5-1', 'low')
+    const result = await harness.sendPrompt(sessionId, 'switch to high and read the sample file', 60_000, 'claude-fable-5-1', 'high')
+    expect(JSON.stringify(result)).toContain('high effort tool continuation completed')
+
+    const requests = harness.anthropic.requests().filter((request) =>
+      request.body.model === 'claude-fable-5-1' &&
+      !JSON.stringify(request.body).includes('Generate a title for this conversation'),
+    )
+    expect(requests).toHaveLength(3)
+    const continuation = requests[2]?.body
+    expect(JSON.stringify(continuation?.messages)).toContain('tool_result')
+    expect(continuation?.output_config).toEqual({ effort: 'low' })
+    expect(continuation?.messages).toContainEqual({
+      role: 'system', content: [], output_config: { effort: 'high' },
+    })
+    for (const request of requests) expect(JSON.stringify(request.body)).not.toContain('cortexkit-internal-effort')
+  }, 90_000)
+
+  it('applies the last planned effort when OpenCode merges two host user records', async () => {
+    harness = await E2EHarness.create({
+      beforeSpawn: async (env) => {
+        const configPath = join(env.configDir, 'opencode.json')
+        const config = JSON.parse(await readFile(configPath, 'utf8')) as { plugin: string[] }
+        const injector = join(env.configDir, 'inject-consecutive-users.mjs')
+        await writeFile(injector, `export default async function () {
+  return {
+    'experimental.chat.messages.transform': async (_input, output) => {
+      const messages = output.messages
+      const current = messages.at(-1)
+      if (current?.info?.role !== 'user' || current.info.model?.variant !== 'max') return
+      const previous = current.parts?.find((part) => part.type === 'text')
+      if (!previous) throw new Error('No lowerable user text to clone')
+      const id = 'msg_e2e_injected_high'
+      messages.splice(messages.length - 1, 0, {
+        info: { ...current.info, id, model: { ...current.info.model, variant: 'high' } },
+        parts: [{ ...previous, id: 'prt_e2e_injected_high', messageID: id, text: 'injected high effort boundary' }],
+      })
+    },
+  }
+}\n`)
+        config.plugin.unshift(`file://${injector}`)
+        await writeFile(configPath, JSON.stringify(config))
+      },
+    })
+    harness.script([
+      { type: 'text', text: 'low response before merged boundary' },
+      { type: 'text', text: 'max response after merged boundary' },
+    ])
+    const sessionId = await harness.createSession()
+    await harness.sendPrompt(sessionId, 'start at low', 60_000, 'claude-fable-5-1', 'low')
+    const result = await harness.sendPrompt(sessionId, 'raise to max', 60_000, 'claude-fable-5-1', 'max')
+    expect(JSON.stringify(result)).toContain('max response after merged boundary')
+
+    const requests = harness.anthropic.requests().filter((request) =>
+      request.body.model === 'claude-fable-5-1' &&
+      !JSON.stringify(request.body).includes('Generate a title for this conversation'),
+    )
+    expect(requests).toHaveLength(2)
+    const body = requests[1]?.body
+    const merged = (Array.isArray(body?.messages) ? body.messages : []).filter((message) =>
+      message.role === 'user' &&
+      JSON.stringify(message.content).includes('injected high effort boundary') &&
+      JSON.stringify(message.content).includes('raise to max'),
+    )
+    expect(merged).toHaveLength(1)
+    expect(body?.output_config).toEqual({ effort: 'low' })
+    expect(body?.messages).toContainEqual({
+      role: 'system', content: [], output_config: { effort: 'max' },
+    })
+    expect(JSON.stringify(body)).not.toContain('cortexkit-internal-effort')
   }, 90_000)
 })

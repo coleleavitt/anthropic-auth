@@ -7,6 +7,7 @@ import {
 
 const MAX_EFFORT_MARKERS = 512
 const MAX_TRACKED_EFFORT_PLANS = 1024
+const MAX_TRACKED_EFFORT_PLAN_HISTORY = 4096
 const MARKER_CHECK_HEX_LENGTH = 32
 const SCOPE_HEX_LENGTH = 32
 const MESSAGE_ID_PATTERN = '[A-Za-z0-9_-]{1,128}'
@@ -849,14 +850,17 @@ export function applyOpenCodeEffortMarkers(
 
 export class OpenCodeEffortPlanTracker {
   private readonly plans = new Map<string, OpenCodeEffortMarkerPlan>()
+  // A prefix trim may re-record the same user message before an older request
+  // header is consumed. Keep both versions, but revoke them together on clear.
+  private readonly history = new Map<string, OpenCodeEffortMarkerPlan>()
+  private readonly historyByMessage = new Map<string, Set<string>>()
 
   record(plan: OpenCodeEffortMarkerPlan): void {
     const key = this.key(plan.sessionId, plan.messageId)
+    const stored = { ...plan, transitionTokens: [...plan.transitionTokens] }
+    this.remember(key, stored)
     this.plans.delete(key)
-    this.plans.set(key, {
-      ...plan,
-      transitionTokens: [...plan.transitionTokens],
-    })
+    this.plans.set(key, stored)
     while (this.plans.size > MAX_TRACKED_EFFORT_PLANS) {
       const oldest = this.plans.keys().next().value
       if (typeof oldest !== 'string') break
@@ -865,7 +869,12 @@ export class OpenCodeEffortPlanTracker {
   }
 
   clear(sessionId: string, messageId: string): void {
-    this.plans.delete(this.key(sessionId, messageId))
+    const key = this.key(sessionId, messageId)
+    this.plans.delete(key)
+    for (const header of this.historyByMessage.get(key) ?? []) {
+      this.history.delete(header)
+    }
+    this.historyByMessage.delete(key)
   }
 
   markHeaders(input: {
@@ -876,11 +885,9 @@ export class OpenCodeEffortPlanTracker {
     const key = this.key(input.sessionId, input.messageId)
     const plan = this.plans.get(key)
     if (!plan) return false
-    input.headers[EFFORT_PLAN_REQUEST_HEADER] = encodeOpenCodeEffortPlan(plan)
-    // OpenCode retries the same StreamInput after transient provider failures.
-    // Its message transform runs once before the retry loop, while chat.headers
-    // runs for every attempt, so keep the plan available for the same message.
-    // Refresh its insertion order so an actively retried plan remains recent.
+    // The host retries the same StreamInput without re-running the messages
+    // transform. Refresh both indexes so active retries remain recent.
+    input.headers[EFFORT_PLAN_REQUEST_HEADER] = this.remember(key, plan)
     this.plans.delete(key)
     this.plans.set(key, plan)
     return true
@@ -889,11 +896,33 @@ export class OpenCodeEffortPlanTracker {
   resolveHeader(
     value: string | undefined,
   ): OpenCodeEffortMarkerPlan | undefined {
-    if (!value) return undefined
-    for (const plan of this.plans.values()) {
-      if (encodeOpenCodeEffortPlan(plan) === value) return plan
+    return value ? this.history.get(value) : undefined
+  }
+
+  private remember(key: string, plan: OpenCodeEffortMarkerPlan): string {
+    const header = encodeOpenCodeEffortPlan(plan)
+    const previous = this.history.get(header)
+    if (previous && this.key(previous.sessionId, previous.messageId) !== key) {
+      throw new EffortMarkerCorrelationError(
+        'Fable 5.1 effort plan header collision',
+      )
     }
-    return undefined
+    this.history.delete(header)
+    this.history.set(header, plan)
+    const versions = this.historyByMessage.get(key) ?? new Set<string>()
+    versions.add(header)
+    this.historyByMessage.set(key, versions)
+    while (this.history.size > MAX_TRACKED_EFFORT_PLAN_HISTORY) {
+      const oldest = this.history.entries().next().value
+      if (!oldest) break
+      const [oldHeader, oldPlan] = oldest
+      this.history.delete(oldHeader)
+      const oldKey = this.key(oldPlan.sessionId, oldPlan.messageId)
+      const oldVersions = this.historyByMessage.get(oldKey)
+      oldVersions?.delete(oldHeader)
+      if (oldVersions?.size === 0) this.historyByMessage.delete(oldKey)
+    }
+    return header
   }
 
   private key(sessionId: string, messageId: string): string {

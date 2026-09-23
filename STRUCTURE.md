@@ -68,7 +68,7 @@ anthropic-auth/
 
 **`scripts/`:**
 - Purpose: Development, release, and analysis utilities
-- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `check-claustrum-golden.ts` (validates Claustrum golden fixtures against upstream contracts), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` (cross-package version alignment)
+- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `check-claustrum-golden.ts` (pins canonical Claustrum tombstone ancestry and exact fixture bytes), `check-pi-tool-mapping.ts` (runs an isolated real Pi host tool round-trip against deterministic SSE), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` (cross-package version alignment)
 
 ## Key File Locations
 
@@ -139,7 +139,7 @@ anthropic-auth/
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing, prime status, and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
-- `packages/opencode/src/effort-history.ts`: Carries bounded Fable 5.1 effort transitions across OpenCode host lowering with stable checksum-bound user-boundary markers, a plan-bound current-user anchor, and a fixed-size request-plan header retained across same-message provider retries; accepts only exact-suffix transition survival after downstream prefix compaction, folds consumed changes into the retained baseline, strips internal state before dispatch, and fails locally on non-prefix correlation loss
+- `packages/opencode/src/effort-history.ts`: Carries bounded Fable 5.1 effort transitions across OpenCode host lowering with stable checksum-bound user-boundary markers, a plan-bound current-user anchor, and a fixed-size request-plan header retained across same-message provider retries; accepts correlated tool-result continuations and ordered transitions merged onto one wire user boundary, retains bounded and revocable history for overwritten in-flight plans, folds exact-suffix-trimmed changes into the baseline only with an authenticated surviving anchor, strips internal state before dispatch, and fails locally on unprovable total marker loss or non-prefix correlation loss
 - `packages/opencode/src/billing-lineage.ts`: Correlates user message prompt UUIDs and upstream Anthropic request IDs across tool turns via internal headers, excludes background and synthetic turns, tracks session sequence/generations, and commits valid `req_*` responses to feed `previousRequestId` into the billing header
 - `packages/opencode/src/custody-mode.ts`: Scoped-only startup verdict and fail-closed mismatch classification
 - `packages/opencode/src/custody-dimensions.ts`: Classification of scoped roster, main tombstone, and OAuth fallback dimensions

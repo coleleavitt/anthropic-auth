@@ -1013,3 +1013,111 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     ).toThrow('Fable 5.1 effort marker scope mismatch')
   })
 })
+
+test('preserves a header in flight when the same message plan is re-recorded after a prefix trim', () => {
+  const full = [
+    user('msg_low', 'ses_overwrite', 'claude-fable-5-1', 'low'),
+    user('msg_medium', 'ses_overwrite', 'claude-fable-5-1', 'medium'),
+    user('msg_high', 'ses_overwrite', 'claude-fable-5-1', 'high'),
+    user('msg_current', 'ses_overwrite', 'claude-fable-5-1', 'high'),
+  ]
+  const first = markOpenCodeEffortTransitions(full)
+  expect(first?.markerCount).toBe(2)
+  if (!first) throw new Error('Missing first effort plan')
+  const tracker = new OpenCodeEffortPlanTracker()
+  tracker.record(first)
+  const firstHeaders: Record<string, string> = {}
+  expect(
+    tracker.markHeaders({
+      sessionId: first.sessionId,
+      messageId: first.messageId,
+      headers: firstHeaders,
+    }),
+  ).toBe(true)
+  const firstHeader = firstHeaders['x-cortexkit-effort-plan']
+  expect(firstHeader).toBe(encodeOpenCodeEffortPlan(first))
+
+  const second = markOpenCodeEffortTransitions(full.slice(2))
+  expect(second?.markerCount).toBe(0)
+  if (!second) throw new Error('Missing re-recorded effort plan')
+  tracker.record(second)
+  const secondHeaders: Record<string, string> = {}
+  expect(
+    tracker.markHeaders({
+      sessionId: second.sessionId,
+      messageId: second.messageId,
+      headers: secondHeaders,
+    }),
+  ).toBe(true)
+  expect(secondHeaders['x-cortexkit-effort-plan']).not.toBe(firstHeader)
+  expect(tracker.resolveHeader(firstHeader)).toEqual(first)
+  expect(
+    tracker.resolveHeader(secondHeaders['x-cortexkit-effort-plan']),
+  ).toEqual(second)
+
+  // Explicitly retiring the message revokes both headers. Re-recording alone
+  // must preserve the old one while it is still in flight.
+  tracker.clear(first.sessionId, first.messageId)
+  expect(tracker.resolveHeader(firstHeader)).toBeUndefined()
+  expect(
+    tracker.resolveHeader(secondHeaders['x-cortexkit-effort-plan']),
+  ).toBeUndefined()
+})
+
+test('bounds the plan history and its reverse index while retaining the newest header', () => {
+  const tracker = new OpenCodeEffortPlanTracker()
+  const cap = 4096
+  const plan = (index: number) => ({
+    scope: 'a'.repeat(32),
+    baseline: 'high' as const,
+    markerCount: 0,
+    digest: index.toString(16).padStart(64, '0'),
+    transitionTokens: [],
+    sessionId: `ses_history_${index}`,
+    messageId: `msg_history_${index}`,
+  })
+  const oldest = plan(0)
+  const newest = plan(cap)
+  for (let index = 0; index <= cap; index++) tracker.record(plan(index))
+  const internals = tracker as unknown as {
+    history: Map<string, unknown>
+    historyByMessage: Map<string, Set<string>>
+  }
+  expect(internals.history.size).toBe(cap)
+  expect(internals.historyByMessage.size).toBe(cap)
+  expect(
+    tracker.resolveHeader(encodeOpenCodeEffortPlan(oldest)),
+  ).toBeUndefined()
+  expect(tracker.resolveHeader(encodeOpenCodeEffortPlan(newest))).toEqual(
+    newest,
+  )
+})
+
+test('refuses complete marker loss when an earlier message survives the supposed prefix trim', () => {
+  const messages = [
+    user('msg_low', 'ses_nonprefix_zero', 'claude-fable-5-1', 'low'),
+    user('msg_medium', 'ses_nonprefix_zero', 'claude-fable-5-1', 'medium'),
+    user('msg_high', 'ses_nonprefix_zero', 'claude-fable-5-1', 'high'),
+    user('msg_current', 'ses_nonprefix_zero', 'claude-fable-5-1', 'high'),
+  ]
+  const plan = markOpenCodeEffortTransitions(messages)
+  expect(plan?.markerCount).toBe(2)
+  if (!plan) throw new Error('Missing effort plan')
+  const body = {
+    model: 'claude-fable-5-1',
+    output_config: { effort: 'low' },
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'old reply' }] },
+      { role: 'user', content: [{ type: 'text', text: 'msg_current' }] },
+    ],
+  }
+  expect(() =>
+    applyOpenCodeEffortMarkers(
+      body,
+      true,
+      encodeOpenCodeEffortPlan(plan),
+      plan,
+    ),
+  ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 0')
+})

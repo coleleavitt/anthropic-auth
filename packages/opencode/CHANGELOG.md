@@ -10,6 +10,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Patch Changes
 
+- Preserve authenticated Fable 5.1 effort transitions through tool-result continuations and merged user boundaries, logging refusal metadata without markers; keep bounded, revocable request-plan history after in-flight compaction without accepting missing-anchor marker loss.
 - Align the tombstone golden fixture with canonical Claustrum's empty-access form and verify its pinned commit ancestry and exact bytes rather than trusting a fork-controlled source.
 - Recover in-flight scoped OAuth rotations on replayable model requests, CacheKeep prewarms, Prime fires, and quota/profile queries: retry once only when the same account's record version advances, report only the final rejected send-time version, and reauthorize relay-to-direct fallback separately. A relay-owned 401 without upstream provenance no longer invalidates an account.
 - Fix scoped main quota polling by authorizing the `main` route rather than passing the provider account UUID as a fallback route ID; Prime's main-account preflight now reaches the usage endpoint.
