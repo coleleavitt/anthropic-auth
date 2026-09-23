@@ -1,0 +1,10 @@
+# ripgrep / fd ignore list (not a git ignore; these files stay tracked).
+#
+# These files hold dense lists of words that Anthropic's safety classifiers
+# react to. When an agent session greps the repo, matches from them land in
+# the session context and can trigger refusals on unrelated work. Every
+# refused request measured on 2026-09-23 carried these lists in context.
+# Open them directly when the vocabulary itself is the task.
+packages/core/src/content-filter-terms.ts
+packages/core/src/tests/content-filter.test.ts
+docs/investigations/2026-09-22-refusal-classifier-analysis.md

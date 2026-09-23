@@ -20,6 +20,7 @@ import {
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ContentFilterSummary } from './content-filter'
+import { LEGACY_TRIGGER_PATTERNS } from './content-filter-terms'
 import { logger } from './logger'
 
 /**
@@ -127,55 +128,9 @@ export function hashRequestBody(body: string | object): string {
  * Extract trigger terms from content using the known trigger patterns
  */
 export function extractTriggerTerms(content: string): string[] {
-  const TRIGGER_PATTERNS = [
-    // High confidence (0.8+)
-    'exploit',
-    'vulnerability',
-    'hack',
-    'malware',
-    'payload',
-    'shellcode',
-    'rootkit',
-    'backdoor',
-    'bypass',
-    'injection',
-    'man-in-the-middle',
-    'mitm',
-    'privilege escalation',
-    'buffer overflow',
-    'heap spray',
-    'rop chain',
-    'code execution',
-    // Medium confidence (0.5-0.8)
-    'firmware',
-    'binary',
-    'reverse engineer',
-    'disassemble',
-    'decompile',
-    'intercept',
-    'sniff',
-    'reconnaissance',
-    'enumeration',
-    'attack surface',
-    'probe',
-    'scan',
-    'brute force',
-    // Tool names
-    'ida',
-    'ghidra',
-    'radare',
-    'objdump',
-    'gdb',
-    'frida',
-    'burp',
-    'metasploit',
-    'nmap',
-    'wireshark',
-  ]
-
   const contentLower = content.toLowerCase()
   const found: string[] = []
-  for (const term of TRIGGER_PATTERNS) {
+  for (const term of LEGACY_TRIGGER_PATTERNS) {
     if (contentLower.includes(term.toLowerCase())) {
       found.push(term)
     }
