@@ -27,6 +27,12 @@ const ENROLLMENT_SCHEMA = 1
 const ENROLLMENT_FILE_MAX_BYTES = 16 * 1024
 const ENROLLMENT_LOCK_TTL_MS = 30_000
 const TOKEN_RE = /^[0-9a-f]{64}$/
+// claustrum#69: the transport labels every module refusal transient/retry, so code wins over action.
+const TERMINAL_ENROLLMENT_CODES = new Set([
+  'superseded',
+  'not_found',
+  'already_consumed',
+])
 
 export interface ClaustrumEnrollmentClient {
   enrollPropose(input: {
@@ -517,8 +523,8 @@ export class ClaustrumEnrollmentManager {
         } catch (error) {
           if (error instanceof ClaustrumCredentialError) {
             if (
-              error.code === 'pending_queue_full' ||
-              error.action === 'retry'
+              !TERMINAL_ENROLLMENT_CODES.has(error.code) &&
+              (error.code === 'pending_queue_full' || error.action === 'retry')
             ) {
               return {
                 state: 'pending',
@@ -574,7 +580,10 @@ export class ClaustrumEnrollmentManager {
         return statusFromState(approved)
       } catch (error) {
         if (!(error instanceof ClaustrumCredentialError)) throw error
-        if (error.action === 'retry') {
+        if (
+          !TERMINAL_ENROLLMENT_CODES.has(error.code) &&
+          error.action === 'retry'
+        ) {
           return {
             state: 'pending',
             proposedName: state.proposedName,
