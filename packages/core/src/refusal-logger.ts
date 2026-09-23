@@ -7,6 +7,9 @@
  * - ~/.prime/agent/content-filter-outcomes.jsonl every finished request with
  *   the filter summary and the stop reason, so refusal rates can be compared
  *   between requests the filter changed and requests it passed
+ * - ~/.prime/agent/refused-bodies/*.json.gz      the exact request body of
+ *   every refusal, saved when the refusal arrives (the dump directory is
+ *   swept by size and loses them). Capped at 256MB, oldest removed first.
  */
 
 import { createHash } from 'node:crypto'
@@ -14,11 +17,15 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   renameSync,
   statSync,
+  unlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { gzipSync } from 'node:zlib'
 import type { ContentFilterSummary } from './content-filter'
 import { LEGACY_TRIGGER_PATTERNS } from './content-filter-terms'
 import { logger } from './logger'
@@ -41,7 +48,13 @@ export function getContentFilterOutcomeLogPath(): string {
   return join(getLogDir(), 'content-filter-outcomes.jsonl')
 }
 
+export function getRefusedBodyDir(): string {
+  return join(getLogDir(), 'refused-bodies')
+}
+
 const MAX_LOG_SIZE = 10 * 1024 * 1024 // 10MB max before rotation
+/** Total size cap for saved refused bodies; oldest files go first. */
+const REFUSED_BODY_MAX_BYTES = 256 * 1024 * 1024
 
 export interface RefusalEvent {
   timestamp: string
@@ -57,6 +70,8 @@ export interface RefusalEvent {
   wasRerouted: boolean
   fallbackModel?: string
   triggerTerms?: string[]
+  /** Saved request body for this refusal (see saveRefusedRequestBody). */
+  bodyFile?: string
 }
 
 export interface ContentFilterOutcomeEvent {
@@ -96,6 +111,90 @@ export function logRefusal(event: RefusalEvent): void {
     logger.warn('refusal-logger', 'failed to log refusal', {
       error: error instanceof Error ? error.message : String(error),
     })
+  }
+}
+
+export interface RefusedRequestBody {
+  host: 'opencode' | 'pi'
+  /** The exact request body sent to Anthropic (after the content filter). */
+  body: string
+  sessionId?: string | null
+  model: string
+  requestId?: string | null
+  category?: string | null
+}
+
+function safeFileSegment(value: string) {
+  return value.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64)
+}
+
+/**
+ * Removes the oldest saved bodies until the directory fits the cap. File
+ * names start with an ISO timestamp, so name order is age order. The file
+ * just written is never removed.
+ */
+function pruneRefusedBodies(dir: string, maxBytes: number, keep: string) {
+  const files = readdirSync(dir)
+    .filter((name) => name.endsWith('.json.gz'))
+    .sort()
+    .map((name) => {
+      const path = join(dir, name)
+      try {
+        return { path, size: statSync(path).size }
+      } catch {
+        return { path, size: 0 }
+      }
+    })
+  let total = files.reduce((sum, file) => sum + file.size, 0)
+  for (const file of files) {
+    if (total <= maxBytes) break
+    if (file.path === keep) continue
+    try {
+      unlinkSync(file.path)
+      total -= file.size
+    } catch {
+      // A concurrent process may have removed it already.
+    }
+  }
+}
+
+/**
+ * Saves the body of a refused request as gzip JSON under
+ * getRefusedBodyDir(), private to the user (dir 0700, file 0600). Returns the
+ * file path, or undefined when saving failed. Never throws.
+ */
+export function saveRefusedRequestBody(
+  input: RefusedRequestBody,
+  options: { maxBytes?: number } = {},
+): string | undefined {
+  try {
+    const dir = getRefusedBodyDir()
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const id = safeFileSegment(
+      input.requestId ||
+        createHash('sha256').update(input.body).digest('hex').slice(0, 16),
+    )
+    const path = join(dir, `${stamp}-${input.host}-${id}.json.gz`)
+    const record = JSON.stringify({
+      savedAt: new Date().toISOString(),
+      host: input.host,
+      sessionId: input.sessionId ?? null,
+      model: input.model,
+      requestId: input.requestId ?? null,
+      category: input.category ?? null,
+      body: input.body,
+    })
+    const temp = `${path}.${process.pid}.tmp`
+    writeFileSync(temp, gzipSync(record), { mode: 0o600 })
+    renameSync(temp, path)
+    pruneRefusedBodies(dir, options.maxBytes ?? REFUSED_BODY_MAX_BYTES, path)
+    return path
+  } catch (error) {
+    logger.warn('refusal-logger', 'failed to save refused request body', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return undefined
   }
 }
 

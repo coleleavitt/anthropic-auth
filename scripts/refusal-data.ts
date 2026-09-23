@@ -4,6 +4,7 @@
  */
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 
 const UUID_PREFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-/
 /** Real host sessions are UUIDs; test fixtures use names like ses_pi_*. */
@@ -120,4 +121,48 @@ export function readTail(
     .subarray(diff.firstByte, diff.lastCurrentByte + 1)
     .toString('utf8')
     .replace(/\\[nrt"\\]/g, ' ')
+}
+
+export type SavedRefusedBody = {
+  path: string
+  requestId: string | null
+  sessionId: string | null
+  model: string
+  category: string | null
+  body: string
+}
+
+/**
+ * Reads the bodies the hosts save at refusal time
+ * (<logDir>/refused-bodies/*.json.gz). Unlike dumps, these are not swept by
+ * size, so they are the durable record of what was refused.
+ */
+export function loadSavedRefusedBodies(logDir: string): SavedRefusedBody[] {
+  const dir = join(logDir, 'refused-bodies')
+  if (!existsSync(dir)) return []
+  const out: SavedRefusedBody[] = []
+  for (const name of readdirSync(dir).sort()) {
+    if (!name.endsWith('.json.gz')) continue
+    const path = join(dir, name)
+    try {
+      const record = JSON.parse(
+        gunzipSync(readFileSync(path)).toString('utf8'),
+      ) as Record<string, unknown>
+      if (typeof record.body !== 'string' || typeof record.model !== 'string')
+        continue
+      out.push({
+        path,
+        requestId:
+          typeof record.requestId === 'string' ? record.requestId : null,
+        sessionId:
+          typeof record.sessionId === 'string' ? record.sessionId : null,
+        model: record.model,
+        category: typeof record.category === 'string' ? record.category : null,
+        body: record.body,
+      })
+    } catch {
+      // Skip a partial or foreign file.
+    }
+  }
+  return out
 }

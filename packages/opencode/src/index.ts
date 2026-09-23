@@ -162,6 +162,7 @@ import {
   saveAccountState,
   saveAccounts,
   saveOAuthProfileState,
+  saveRefusedRequestBody,
   saveTrustedDeviceToken,
   sendViaRelay,
   setAccountEnabledPersistent,
@@ -1389,6 +1390,8 @@ const anthropicAuthPlugin = async (
     PerfTrace,
     ContentFilterSummary
   >()
+  /** Final request body per trace, saved to disk only when it is refused. */
+  const requestBodyByTrace = new WeakMap<PerfTrace, string>()
   const cacheDiagnosticsResponses = new WeakMap<
     Response,
     CacheDiagnosticsResponse
@@ -4573,6 +4576,7 @@ const anthropicAuthPlugin = async (
                 perf: (stage, data) =>
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
               })
+              if (trace) requestBodyByTrace.set(trace, body)
               configureApiRouteHeaders(requestHeaders, account)
               const apiBetas = mergeAnthropicBetas(
                 requestHeaders.get('anthropic-beta'),
@@ -4831,6 +4835,7 @@ const anthropicAuthPlugin = async (
                   }
                 },
               })
+              if (trace) requestBodyByTrace.set(trace, body)
               if (
                 fableRequest?.plan.downgraded &&
                 cacheEnabled &&
@@ -5662,12 +5667,27 @@ const anthropicAuthPlugin = async (
                         !fablePlan.downgraded &&
                         fableRequest?.warmTarget,
                     )
+                    // Keep the refused body before the dump sweeper can
+                    // drop it.
+                    const refusedBody = requestBodyByTrace.get(trace)
+                    const bodyFile =
+                      refusedBody === undefined
+                        ? undefined
+                        : saveRefusedRequestBody({
+                            host: 'opencode',
+                            body: refusedBody,
+                            sessionId: sessionId ?? null,
+                            model: servedModel,
+                            requestId,
+                            category: refusalCategory ?? null,
+                          })
                     logRefusal({
                       timestamp: new Date().toISOString(),
                       ...(sessionId ? { sessionId } : {}),
                       model: servedModel,
                       category: refusalCategory ?? null,
                       requestId,
+                      ...(bodyFile ? { bodyFile } : {}),
                       wasRerouted: willRecover,
                       ...(willRecover
                         ? { fallbackModel: FABLE_FALLBACK_MODEL_ID }

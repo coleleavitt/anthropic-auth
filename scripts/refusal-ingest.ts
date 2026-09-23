@@ -7,6 +7,7 @@
  *
  *   refusal-events.jsonl           -> refusals
  *   content-filter-outcomes.jsonl  -> filter_outcomes (efficacy data)
+ *   refused-bodies/*.json.gz       -> request_bodies (durable, not swept)
  *   request dumps (+ refusal join) -> request_bodies, body_labels
  *   refused vs accepted dump tails -> term_tail_stats, term_cooccurrence,
  *                                     learned_terms (candidates)
@@ -39,6 +40,7 @@ import {
   type DumpRecord,
   isRealSession,
   loadDumps,
+  loadSavedRefusedBodies,
   matchRefusal,
   type RefusalRow,
   readJsonLines,
@@ -373,6 +375,42 @@ function ingestDumps(
   return { matched: refusedDumps.size, bodiesStored, tails }
 }
 
+// ---------- 3b. bodies saved at refusal time ----------
+
+function lastMessageText(bodyText: string): string {
+  try {
+    const body = JSON.parse(bodyText) as { messages?: unknown[] }
+    const last = body.messages?.at(-1) as { content?: unknown } | undefined
+    return typeof last?.content === 'string'
+      ? last.content
+      : JSON.stringify(last?.content ?? '')
+  } catch {
+    return ''
+  }
+}
+
+function ingestSavedBodies(db: Database, logDir: string) {
+  const saved = loadSavedRefusedBodies(logDir)
+  const insert = db.prepare(`INSERT OR IGNORE INTO request_bodies
+    (request_hash, body_compressed, extracted_terms) VALUES (?, ?, ?)`)
+  let stored = 0
+  let fixtures = 0
+  db.transaction(() => {
+    for (const record of saved) {
+      if (!isRealSession(record.sessionId)) {
+        fixtures++
+        continue
+      }
+      stored += insert.run(
+        record.requestId ?? sha16(record.body),
+        Bun.gzipSync(record.body),
+        JSON.stringify(dictionaryTermsIn(lastMessageText(record.body))),
+      ).changes
+    }
+  })()
+  return { total: saved.length, stored, fixtures }
+}
+
 // ---------- 4. learn ----------
 
 function learnDictionaryStats(db: Database, tails: LabeledTail[]) {
@@ -633,6 +671,10 @@ function main() {
   const outcomes = ingestOutcomes(db, args.logDir)
   console.log(
     `filter outcomes: ${outcomes.total} read, ${outcomes.fixtures} fixtures skipped, ${outcomes.inserted} new`,
+  )
+  const savedBodies = ingestSavedBodies(db, args.logDir)
+  console.log(
+    `saved refused bodies: ${savedBodies.total} read, ${savedBodies.fixtures} fixtures skipped, ${savedBodies.stored} new`,
   )
   const dumps = loadDumps(args.dumps)
   const joined = ingestDumps(db, refusals.real, dumps, args.maxTailBytes)

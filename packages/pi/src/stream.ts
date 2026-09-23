@@ -62,6 +62,7 @@ import {
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
   StickySessionRouter,
+  saveRefusedRequestBody,
   sendViaRelay,
   setDumpEnabled,
   sharedAccountIsAvailable,
@@ -533,21 +534,28 @@ const context1mClampedTokens = new Set<string>()
  * ended. Weak keys: an abandoned response releases its entry.
  */
 const contentFilterSummaries = new WeakMap<Response, ContentFilterSummary>()
+/** The exact body sent for each response, saved to disk only on a refusal. */
+const requestBodyTexts = new WeakMap<Response, string>()
 
 async function sendAnthropicRequest(
   options: Omit<
     Parameters<typeof sendAnthropicRequestUnrecorded>[0],
-    'onContentFilterSummary'
+    'onContentFilterSummary' | 'onRequestBody'
   >,
 ): Promise<Response> {
   let summary: ContentFilterSummary | undefined
+  let bodyText: string | undefined
   const response = await sendAnthropicRequestUnrecorded({
     ...options,
     onContentFilterSummary: (value) => {
       summary = value
     },
+    onRequestBody: (value) => {
+      bodyText = value
+    },
   })
   if (summary) contentFilterSummaries.set(response, summary)
+  if (bodyText !== undefined) requestBodyTexts.set(response, bodyText)
   return response
 }
 
@@ -561,6 +569,7 @@ async function sendAnthropicRequestUnrecorded(options: {
   oauthAccountId?: string
   route?: string
   onContentFilterSummary?: (summary: ContentFilterSummary) => void
+  onRequestBody?: (bodyText: string) => void
 }): Promise<Response> {
   const storage = await loadAccounts(options.storagePath)
   setDumpEnabled(isDumpPersistentlyEnabled(storage))
@@ -600,6 +609,7 @@ async function sendAnthropicRequestUnrecorded(options: {
     serverFallbackEnabled || markersChanged || filterResult.filtered
       ? JSON.stringify(body)
       : builtRequest.bodyText
+  options.onRequestBody?.(bodyText)
   const fastMode = body.speed === 'fast'
   const relayAffinity = options.streamOptions?.sessionId ?? null
   const input = options.apiAccount
@@ -2430,12 +2440,26 @@ export function streamCortexKitAnthropic(
                   outputTokens: event.usage?.output_tokens,
                   contextWindow: activeModel.contextWindow,
                 })
+                // Keep the refused body before the dump sweeper can drop it.
+                const refusedBody = requestBodyTexts.get(response)
+                const bodyFile =
+                  refusedBody === undefined
+                    ? undefined
+                    : saveRefusedRequestBody({
+                        host: 'pi',
+                        body: refusedBody,
+                        sessionId: options?.sessionId ?? null,
+                        model: activeModel.id,
+                        requestId: response.headers.get('request-id'),
+                        category: logStopDetails?.category ?? null,
+                      })
                 // Log to refusal classifier database
                 logRefusal({
                   timestamp: new Date().toISOString(),
                   sessionId: options?.sessionId,
                   model: activeModel.id,
                   category: logStopDetails?.category ?? null,
+                  ...(bodyFile ? { bodyFile } : {}),
                   explanation: logStopDetails?.explanation ?? null,
                   requestId: response.headers.get('request-id'),
                   messageCount: context.messages?.length ?? 0,

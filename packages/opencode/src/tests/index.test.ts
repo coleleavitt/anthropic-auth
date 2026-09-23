@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
   type AccountStorage,
@@ -8771,6 +8772,19 @@ describe('auth.loader', () => {
         wasRerouted: true,
         fallbackModel: 'claude-opus-4-8',
       })
+      // The refused body is saved outside the swept dump directory.
+      expect(
+        refusals[0].bodyFile.startsWith(join(logDir, 'refused-bodies')),
+      ).toBe(true)
+      const saved = JSON.parse(
+        gunzipSync(await readFile(refusals[0].bodyFile)).toString('utf8'),
+      )
+      expect(saved).toMatchObject({
+        host: 'opencode',
+        model: 'claude-fable-5',
+        category: 'cyber',
+      })
+      expect(JSON.parse(saved.body).model).toBe('claude-fable-5')
       const outcomes = (
         await readFile(join(logDir, 'content-filter-outcomes.jsonl'), 'utf8')
       )

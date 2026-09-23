@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import { saveAccounts, tokenFingerprint } from '@cortexkit/anthropic-auth-core'
 
 import {
@@ -727,6 +728,20 @@ describe('Pi API fallback routing helpers', () => {
     expect(outcomes[0].host).toBe('pi')
     expect(outcomes[1].requestId).toBe('req_served')
     expect(outcomes[1].filter?.blocksScanned).toBeGreaterThan(0)
+    const refusal = readFileSync(
+      join(sharedTestDir, 'refusal-events.jsonl'),
+      'utf8',
+    )
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .find((line) => line.sessionId === sessionId)
+    expect(refusal?.bodyFile).toBeDefined()
+    const saved = JSON.parse(
+      gunzipSync(readFileSync(refusal.bodyFile)).toString('utf8'),
+    )
+    expect(saved).toMatchObject({ host: 'pi', category: 'cyber' })
+    expect(JSON.parse(saved.body).model).toBe(anthropicModel.id)
   })
 
   test('re-routes a category-less refusal to the opus-4-8 catch-all', async () => {

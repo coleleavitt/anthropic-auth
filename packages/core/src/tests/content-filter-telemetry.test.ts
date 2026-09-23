@@ -1,12 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import { filterRequestBody } from '../content-filter'
 import {
   getContentFilterOutcomeLogPath,
   getLogPath,
+  getRefusedBodyDir,
   logContentFilterOutcome,
+  saveRefusedRequestBody,
 } from '../refusal-logger'
 
 describe('filterRequestBody summary', () => {
@@ -126,5 +136,83 @@ describe('logContentFilterOutcome', () => {
       }),
     ).not.toThrow()
     expect(existsSync('/proc/definitely-not-writable')).toBe(false)
+  })
+})
+
+describe('saveRefusedRequestBody', () => {
+  let dir: string
+  let previous: string | undefined
+  beforeEach(() => {
+    previous = process.env.REFUSAL_LOG_DIR
+    dir = mkdtempSync(join(tmpdir(), 'refused-body-'))
+    process.env.REFUSAL_LOG_DIR = dir
+  })
+  afterEach(() => {
+    if (previous === undefined) delete process.env.REFUSAL_LOG_DIR
+    else process.env.REFUSAL_LOG_DIR = previous
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('writes the exact body as private gzip JSON', () => {
+    const body = JSON.stringify({ model: 'claude-opus-5', messages: [] })
+    const path = saveRefusedRequestBody({
+      host: 'pi',
+      body,
+      sessionId: 's1',
+      model: 'claude-opus-5',
+      requestId: 'req_abc/../x',
+      category: 'cyber',
+    })
+    expect(path).toBeDefined()
+    expect(path?.startsWith(getRefusedBodyDir())).toBe(true)
+    // Path separators in the request id cannot escape the directory.
+    expect(path).toContain('req_abc____x')
+    const record = JSON.parse(
+      gunzipSync(readFileSync(path as string)).toString('utf8'),
+    )
+    expect(record).toMatchObject({
+      host: 'pi',
+      sessionId: 's1',
+      model: 'claude-opus-5',
+      requestId: 'req_abc/../x',
+      category: 'cyber',
+      body,
+    })
+    if (process.platform !== 'win32') {
+      expect(statSync(path as string).mode & 0o777).toBe(0o600)
+      expect(statSync(getRefusedBodyDir()).mode & 0o777).toBe(0o700)
+    }
+  })
+
+  it('removes the oldest files once over the cap, never the newest', async () => {
+    const big = 'x'.repeat(20_000)
+    const paths: string[] = []
+    for (let i = 0; i < 4; i++) {
+      paths.push(
+        saveRefusedRequestBody(
+          {
+            host: 'opencode',
+            body: `${big}${i}${Math.random()}`.repeat(3),
+            model: 'm',
+            requestId: `req_${i}`,
+          },
+          // gzip shrinks the repeated text to well under 1KB per file.
+          { maxBytes: 1 },
+        ) as string,
+      )
+      await Bun.sleep(2)
+    }
+    const left = readdirSync(getRefusedBodyDir())
+    expect(left).toHaveLength(1)
+    expect(join(getRefusedBodyDir(), left[0] as string)).toBe(
+      paths[3] as string,
+    )
+  })
+
+  it('never throws when the directory cannot be created', () => {
+    process.env.REFUSAL_LOG_DIR = '/proc/definitely-not-writable/x'
+    expect(
+      saveRefusedRequestBody({ host: 'pi', body: '{}', model: 'm' }),
+    ).toBeUndefined()
   })
 })
