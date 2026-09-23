@@ -567,8 +567,9 @@ async function sendAnthropicRequest(options: {
     body,
     serverFallbackEnabled,
   )
+  // Always serialize the filtered body - builtRequest.bodyText is pre-filter
   const bodyText =
-    serverFallbackEnabled || markersChanged
+    serverFallbackEnabled || markersChanged || filterResult.filtered
       ? JSON.stringify(body)
       : builtRequest.bodyText
   const fastMode = body.speed === 'fast'
