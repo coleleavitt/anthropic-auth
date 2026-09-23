@@ -332,7 +332,10 @@ test('CI and release each measure unit suites once and keep UNCHECKED blocking',
     expect(workflow).toContain(
       'bun scripts/check-test-count-floors.ts --base-ref',
     )
+    expect(workflow).not.toContain('--counts')
+    expect(workflow).not.toContain('--floor-file')
     expect(workflow).not.toMatch(/run: bun run test\s*\n/)
+    expect(workflow).toContain('bun run test:e2e')
     expect(workflow).not.toMatch(
       /check-test-count-floors\.ts[^\n]*\n\s*continue-on-error:/,
     )
