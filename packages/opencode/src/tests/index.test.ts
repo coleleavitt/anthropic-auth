@@ -17183,6 +17183,20 @@ describe('claude-prime direct request', () => {
       refresh: refreshToken,
       expires: Date.now() + 5 * 60 * 60_000,
     }
+    let observedExpiredRefresh!: () => void
+    const expiredRefreshRead = new Promise<void>((resolve) => {
+      observedExpiredRefresh = resolve
+    })
+    let expiredReads = 0
+    const getAuth = () => {
+      // The request reads auth once on entry, then re-reads before checking the
+      // other process's refresh lease. A wall-clock sleep cannot guarantee it
+      // reached that second read under a busy test runner.
+      if (hostAuth.expires < Date.now() && ++expiredReads === 2) {
+        observedExpiredRefresh()
+      }
+      return Promise.resolve({ ...hostAuth })
+    }
     let observedAuthorization: string | null = null
     globalThis.fetch = mock((_input: any, init?: RequestInit) => {
       observedAuthorization = new Headers(init?.headers).get('authorization')
@@ -17195,32 +17209,44 @@ describe('claude-prime direct request', () => {
     }) as unknown as typeof fetch
 
     const plugin = await getPlugin()
-    const result = await plugin.auth.loader(() => Promise.resolve(hostAuth), {
-      models: {},
-    })
-    hostAuth.expires = Date.now() - 1
-    const request = result.fetch(MESSAGES_URL, EMPTY_POST)
-    await Bun.sleep(25)
-    hostAuth = {
-      type: 'oauth',
-      access: 'main-access-b',
-      refresh: 'main-refresh-b',
-      expires: Date.now() + 60 * 60_000,
-    }
-    const response = await request
+    try {
+      const result = await plugin.auth.loader(getAuth, { models: {} })
+      hostAuth.expires = Date.now() - 1
+      const request = result.fetch(MESSAGES_URL, EMPTY_POST)
+      try {
+        await withDeadlockGuard(
+          expiredRefreshRead,
+          4_000,
+          'request did not read the expiring token before adopting the refresh lease',
+        )
+        hostAuth = {
+          type: 'oauth',
+          access: 'main-access-b',
+          refresh: 'main-refresh-b',
+          expires: Date.now() + 60 * 60_000,
+        }
+        const response = await request
 
-    expect(response.status).toBe(200)
-    expect(String(observedAuthorization)).toContain('main-access-b')
-    const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8')) as {
-      main?: {
-        primeAuthLineageId?: string
-        primeAuthLineageRefreshTokenFingerprint?: string
+        expect(response.status).toBe(200)
+        expect(String(observedAuthorization)).toContain('main-access-b')
+        const state = JSON.parse(
+          await readFile(getAccountStatePath(), 'utf8'),
+        ) as {
+          main?: {
+            primeAuthLineageId?: string
+            primeAuthLineageRefreshTokenFingerprint?: string
+          }
+        }
+        expect(state.main?.primeAuthLineageId).toBe(lineage)
+        expect(state.main?.primeAuthLineageRefreshTokenFingerprint).toBe(
+          tokenFingerprint(refreshToken),
+        )
+      } finally {
+        await request.catch(() => {})
       }
+    } finally {
+      await plugin.dispose?.()
     }
-    expect(state.main?.primeAuthLineageId).toBe(lineage)
-    expect(state.main?.primeAuthLineageRefreshTokenFingerprint).toBe(
-      tokenFingerprint(refreshToken),
-    )
   })
 
   test('fallback prime uses fallback OAuth token', async () => {
