@@ -700,3 +700,41 @@ test('Pi token-only status uses its own consumer name', async () => {
     await readClaustrumEnrollmentStatus(paths, 'anthropic-auth-pi'),
   ).toEqual(await instance.status())
 })
+
+test('a terminal refusal committed by one process stops an older process on its next tick', async () => {
+  const paths = await fixture()
+  await seedPendingRequest(paths, 'expired-request')
+  let oldProcessPolls = 0
+  const oldProcess = manager(
+    paths,
+    client({
+      enrollPoll: async () => {
+        oldProcessPolls++
+        return { status: 'pending' }
+      },
+    }),
+  )
+  const newProcess = manager(
+    paths,
+    client({
+      enrollPoll: async () => {
+        throw new ClaustrumCredentialError('superseded', 'transient', 'retry')
+      },
+    }),
+  )
+  expect(await oldProcess.reconcile()).toMatchObject({ state: 'pending' })
+  expect(oldProcessPolls).toBe(1)
+  expect(await newProcess.reconcile()).toEqual({
+    state: 'blocked',
+    proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+    code: 'superseded',
+  })
+  expect(await oldProcess.reconcile()).toMatchObject({
+    state: 'blocked',
+    code: 'superseded',
+  })
+  expect(oldProcessPolls).toBe(1)
+  expect(
+    JSON.parse(await readFile(paths.statePath, 'utf8')),
+  ).not.toHaveProperty('requestSecret')
+})
