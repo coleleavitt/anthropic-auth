@@ -950,20 +950,11 @@ const anthropicAuthPlugin = async (
   ctx: Parameters<Plugin>[0],
   timerOverrides: PluginRuntimeTimerOverrides = {},
 ) => {
-  const _baseSI = timerOverrides.setInterval ?? globalThis.setInterval
-  const _wrapSI = ((...a: unknown[]) => {
-    console.error(
-      'DBGSI',
-      new Error().stack?.split('\n').slice(2, 4).join(' | '),
-    )
-    return (_baseSI as (...x: unknown[]) => unknown)(...a)
-  }) as typeof globalThis.setInterval
   const runtimeTimers = {
     setTimeout: globalThis.setTimeout,
-    setInterval: _wrapSI,
+    setInterval: globalThis.setInterval,
     clearInterval: globalThis.clearInterval,
     ...timerOverrides,
-    ...(timerOverrides.setInterval ? {} : { setInterval: _wrapSI }),
   }
   startEventLoopLagMonitor()
   const { client } = ctx
