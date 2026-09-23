@@ -91,6 +91,17 @@ export interface SidebarState {
     accounts: PrimeSidebarAccountState[]
   }
   fableRecoveries?: FableRecoverySidebarState[]
+  /**
+   * Session heat tracking for refusal probability monitoring.
+   * Present when turn tracking is active.
+   */
+  heat?: {
+    turn: number
+    refusalCount: number
+    heat: number // P(refusal) 0-1
+    level: 'safe' | 'warm' | 'hot'
+    suggestion?: string // Current suggestion based on state
+  }
   lastUpdated: number
 }
 

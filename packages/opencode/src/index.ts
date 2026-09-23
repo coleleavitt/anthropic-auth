@@ -31,6 +31,7 @@ import {
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  CLAUDE_SPLIT_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
   CLAUDE_USAGE_COMMAND_NAME,
   type ContentFilterSummary,
@@ -56,6 +57,8 @@ import {
   executeLoggingCommand,
   executePrimeCommand,
   executeRoutingCommand,
+  // Session heat and split command
+  executeSplitCommand,
   executeUsageCommand,
   FallbackAccountManager,
   fetchOAuthAccountProfile,
@@ -240,6 +243,11 @@ import {
   resolveContentFilterFallbackMode,
   type ServerSideFallbackOutcome,
 } from './server-fallback.ts'
+import {
+  formatHeatForSidebar,
+  getSessionHeat,
+  recordTurn,
+} from './session-heat-tracker.ts'
 import {
   getSharedAnthropicAuthType,
   type OpenCodeAnthropicAuth,
@@ -2062,6 +2070,8 @@ const anthropicAuthPlugin = async (
     mainRefreshToken?: string
     routingAuthoritative?: boolean
     useHydratedProfiles?: boolean
+    /** Current session ID for heat tracking */
+    sessionId?: string
   }
 
   function mergeHydratedProfilesForSidebar(
@@ -2197,6 +2207,9 @@ const anthropicAuthPlugin = async (
         fableRecoveryNotices.size > 0
           ? [...fableRecoveryNotices.values()]
           : undefined,
+      heat: options.sessionId
+        ? formatHeatForSidebar(getSessionHeat(options.sessionId))
+        : undefined,
       lastUpdated: Date.now(),
     }
   }
@@ -3378,6 +3391,32 @@ const anthropicAuthPlugin = async (
         },
       }
     }
+    if (command === 'claude-split') {
+      // Get current session heat state
+      const heatState = sessionId ? getSessionHeat(sessionId) : undefined
+      const sessionContext = {
+        sessionId: sessionId ?? 'unknown',
+        turn: heatState?.turn ?? 0,
+        heat: heatState?.heat ?? 0,
+        refusalCount: heatState?.refusalCount ?? 0,
+      }
+      const result = executeSplitCommand({
+        argumentsText: args,
+        sessionContext,
+      })
+      return {
+        command,
+        text: result.text,
+        knobs: {
+          heat: sessionContext.heat,
+          turn: sessionContext.turn,
+          refusalCount: sessionContext.refusalCount,
+          ...(result.clipboardText
+            ? { clipboardText: result.clipboardText }
+            : {}),
+        },
+      }
+    }
     if (command !== 'claude-killswitch') {
       const unhandledCommand: never = command
       throw new Error(`Unhandled command modal: ${unhandledCommand}`)
@@ -3677,6 +3716,11 @@ const anthropicAuthPlugin = async (
           template: KILLSWITCH_COMMAND_NAME,
           description:
             'Manage killswitch — hard-block requests when quota drops below per-account thresholds.',
+        },
+        [CLAUDE_SPLIT_COMMAND_NAME]: {
+          template: CLAUDE_SPLIT_COMMAND_NAME,
+          description:
+            'Show session heat status and get context summary for starting a fresh session.',
         },
       }
     },
@@ -5659,6 +5703,10 @@ const anthropicAuthPlugin = async (
                       refusalCategory: refusalCategory ?? null,
                       filter: contentFilterSummaryByTrace.get(trace) ?? null,
                     })
+                    // Update session heat for all completed turns
+                    if (sessionId) {
+                      recordTurn(sessionId, stopReason === 'refusal')
+                    }
                     if (stopReason !== 'refusal') return
                     // Client recovery re-issues on Opus 4.8 only for an
                     // OAuth-served Fable/Opus 5 request not yet downgraded.
