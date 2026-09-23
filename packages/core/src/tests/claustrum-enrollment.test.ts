@@ -61,6 +61,25 @@ function manager(
   })
 }
 
+async function seedPendingRequest(
+  paths: Awaited<ReturnType<typeof fixture>>,
+  requestId?: string,
+) {
+  await writeFile(
+    paths.statePath,
+    `${JSON.stringify({
+      version: 1,
+      phase: 'pending',
+      proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+      requestSecret: secret,
+      ...(requestId === undefined ? {} : { requestId }),
+      createdAt: 1,
+      updatedAt: 1,
+    })}\n`,
+    { mode: 0o600 },
+  )
+}
+
 afterEach(async () => {
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
@@ -477,6 +496,81 @@ describe('ClaustrumEnrollmentManager', () => {
         proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
         code,
       })
+    }
+  })
+
+  test('blocks a retryable poll refusal whose code is protocol-terminal and stops re-polling', async () => {
+    for (const code of ['superseded', 'not_found', 'already_consumed']) {
+      const paths = await fixture()
+      await seedPendingRequest(paths, 'request-1')
+      let polls = 0
+      const instance = manager(
+        paths,
+        client({
+          enrollPoll: async () => {
+            polls += 1
+            throw new ClaustrumCredentialError(code, 'transient', 'retry')
+          },
+        }),
+      )
+      const blocked = {
+        state: 'blocked' as const,
+        proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+        code,
+      }
+      await expect(instance.reconcile()).resolves.toEqual(blocked)
+      expect(JSON.parse(await readFile(paths.statePath, 'utf8')).phase).toBe(
+        'blocked',
+      )
+      await expect(instance.reconcile()).resolves.toEqual(blocked)
+      expect(polls).toBe(1)
+    }
+  })
+
+  test('blocks a retryable propose refusal whose code is protocol-terminal', async () => {
+    for (const code of ['superseded', 'not_found', 'already_consumed']) {
+      const paths = await fixture()
+      await seedPendingRequest(paths)
+      const instance = manager(
+        paths,
+        client({
+          enrollPropose: async () => {
+            throw new ClaustrumCredentialError(code, 'transient', 'retry')
+          },
+        }),
+      )
+      await expect(instance.reconcile()).resolves.toEqual({
+        state: 'blocked',
+        proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+        code,
+      })
+      expect(JSON.parse(await readFile(paths.statePath, 'utf8')).phase).toBe(
+        'blocked',
+      )
+    }
+  })
+
+  test('keeps genuinely retryable poll refusals pending', async () => {
+    for (const code of ['pending_queue_full', 'transport_error']) {
+      const paths = await fixture()
+      await seedPendingRequest(paths, 'request-1')
+      const instance = manager(
+        paths,
+        client({
+          enrollPoll: async () => {
+            throw new ClaustrumCredentialError(code, 'transient', 'retry')
+          },
+        }),
+      )
+      await expect(instance.reconcile()).resolves.toEqual({
+        state: 'pending',
+        proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+        requestId: 'request-1',
+        retryCode: code,
+      })
+      expect(JSON.parse(await readFile(paths.statePath, 'utf8')).phase).toBe(
+        'pending',
+      )
     }
   })
 
