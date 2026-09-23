@@ -2,15 +2,16 @@
 
 import { afterEach, describe, expect, it } from 'bun:test'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { E2EHarness } from '../src/harness.ts'
 
 let harness: E2EHarness | null = null
 
 afterEach(async () => {
-  await harness?.dispose()
+  const finished = harness
   harness = null
+  await finished?.dispose()
 })
 
 describe('OpenCode Anthropic auth e2e', () => {
@@ -40,9 +41,15 @@ describe('OpenCode Anthropic auth e2e', () => {
 
       expect(await Bun.file(globalStateFile).text()).toBe(sentinel)
       expect(await Bun.file(isolatedStateFile).exists()).toBe(true)
+      const hostLog = await Bun.file(
+        join(harness.opencode.env.dataDir, 'opencode', 'log', 'opencode.log'),
+      ).text()
+      expect(hostLog).not.toContain(`path=${join(homedir(), '.opencode')}`)
+      expect(hostLog).not.toContain(join(homedir(), '.claude', 'skills'))
     } finally {
-      await harness?.dispose()
+      const finished = harness
       harness = null
+      await finished?.dispose()
       await rm(fakeTmpDir, { recursive: true, force: true })
     }
   }, 90_000)

@@ -10,12 +10,19 @@ import { startFakeClaustrumDaemon, type FakeClaustrumCredential } from '../src/m
 let harness: E2EHarness | null = null
 const roots: string[] = []
 const daemons: Array<{ stop: () => Promise<void> }> = []
-afterEach(async () => {
-  await harness?.dispose()
+async function disposeFixture() {
+  // A timed-out hook may finish after the next test has installed its own
+  // resources. Claim all of this test's slots before awaiting teardown so
+  // its eventual completion cannot erase a newer harness or stop its daemon.
+  const finished = harness
   harness = null
-  await Promise.all(daemons.splice(0).map((daemon) => daemon.stop()))
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
-})
+  const retiredDaemons = daemons.splice(0)
+  const retiredRoots = roots.splice(0)
+  await finished?.dispose()
+  await Promise.all(retiredDaemons.map((daemon) => daemon.stop()))
+  await Promise.all(retiredRoots.map((root) => rm(root, { recursive: true, force: true })))
+}
+afterEach(disposeFixture)
 
 const credential = (access: string, accountId: string, recordVersion: number): FakeClaustrumCredential => ({
   payload: access, account_id: accountId, record_version: recordVersion,
@@ -174,4 +181,44 @@ describe('scoped credential rotations in the OpenCode process', () => {
     expect(daemon.reportAuthFailures).toEqual([])
     expect(daemon.credentialGets.filter((id) => id === mainId).length).toBeGreaterThanOrEqual(2)
   }, 120_000)
+})
+
+
+it('late fixture cleanup cannot dispose the next test’s harness, daemon or directory', async () => {
+  const previousRoot = await mkdtemp(join(tmpdir(), 'anthropic-auth-retired-'))
+  const nextRoot = await mkdtemp(join(tmpdir(), 'anthropic-auth-next-'))
+  let entered!: () => void
+  let release!: () => void
+  const started = new Promise<void>((resolve) => { entered = resolve })
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let previousStops = 0
+  let nextStops = 0
+  harness = {
+    dispose: async () => { entered(); await gate },
+  } as unknown as E2EHarness
+  roots.push(previousRoot)
+  daemons.push({ stop: async () => { previousStops++ } })
+  const retiring = disposeFixture()
+  try {
+    await started
+    harness = {
+      dispose: async () => { nextStops++ },
+    } as unknown as E2EHarness
+    await writeFile(join(nextRoot, 'marker'), 'new fixture')
+    roots.push(nextRoot)
+    daemons.push({ stop: async () => { nextStops++ } })
+    release()
+    await retiring
+    expect(previousStops).toBe(1)
+    expect(nextStops).toBe(0)
+    expect(harness).not.toBeNull()
+    expect(await readFile(join(nextRoot, 'marker'), 'utf8')).toBe('new fixture')
+  } finally {
+    release()
+    await retiring
+    await rm(previousRoot, { recursive: true, force: true })
+    if (!roots.includes(nextRoot))
+      await rm(nextRoot, { recursive: true, force: true })
+    // The registered afterEach owns the next fake fixture when installed.
+  }
 })

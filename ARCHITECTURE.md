@@ -37,7 +37,7 @@
 **End-to-End Tests:**
 - Purpose: Integration tests for the full OpenCode plugin flow with mock Anthropic, relay, and Claustrum servers
 - Location: `packages/e2e-tests/`
-- Contains: Test harness (`src/harness.ts`), mock servers (`src/mock-anthropic.ts`, `src/mock-relay.ts`, `src/mock-claustrum.ts`), OpenCode runner (`src/opencode-runner.ts` with orphaned process and temp directory hygiene), test files (`tests/tool-prefix.test.ts`, `tests/quota-header-relay.test.ts`, `tests/tmp-hygiene.test.ts`, `tests/custody-mode.test.ts`, `tests/mock-claustrum.test.ts`)
+- Contains: Test harness (`src/harness.ts`), mock servers (`src/mock-anthropic.ts`, `src/mock-relay.ts`, `src/mock-claustrum.ts`), OpenCode runner (`src/opencode-runner.ts` with child-owned ephemeral ports, isolated HOME/XDG/config/data paths, lazy project-bootstrap readiness, and orphaned process/temp directory hygiene), test files (`tests/tool-prefix.test.ts`, `tests/quota-header-relay.test.ts`, `tests/tmp-hygiene.test.ts`, `tests/custody-mode.test.ts`, `tests/mock-claustrum.test.ts`)
 
 ## Data Flow
 

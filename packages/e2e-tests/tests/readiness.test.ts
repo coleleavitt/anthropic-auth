@@ -7,6 +7,7 @@ import {
   terminateChildProcess,
   waitForOpencodeReady,
   waitForOpencodeListening,
+  waitForOpencodeProjectReady,
 } from '../src/opencode-runner.ts'
 
 const noLogs = () => ({ stdout: '', stderr: '' })
@@ -104,4 +105,70 @@ test('harness polling awaits an asynchronous predicate rather than accepting its
   }, { intervalMs: 1, timeoutMs: 200 })
   expect(found).toBe('committed-roster')
   expect(attempts).toBe(3)
+})
+
+
+test('project readiness waits for lazy config bootstrap, not just an open listener', async () => {
+  let entered!: () => void
+  let release!: () => void
+  const reached = new Promise<void>((resolve) => { entered = resolve })
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const requested: string[] = []
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (request) => {
+      const url = new URL(request.url)
+      requested.push(url.pathname + url.search)
+      if (url.pathname !== '/config')
+        return new Response('unexpected request', { status: 404 })
+      entered()
+      await gate
+      return Response.json({ configured: true })
+    },
+  })
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  })
+  const directory = '/private/tmp/anthropic auth-work'
+  let settled = false
+  const pending = waitForOpencodeProjectReady(
+    child, server.url.href.replace(/\/$/, ''), directory,
+  )
+  void pending.then(() => { settled = true }, () => {})
+  try {
+    await reached
+    expect(settled).toBe(false)
+    release()
+    await pending
+    expect(requested).toEqual([`/config?directory=${encodeURIComponent(directory)}`])
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(child.listenerCount('error')).toBe(0)
+  } finally {
+    release()
+    await terminateChildProcess(child)
+    await server.stop(true)
+  }
+})
+
+test('project readiness rejects an exited child before contacting any listener', async () => {
+  let requests = 0
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => { requests++; return Response.json({ configured: true }) },
+  })
+  const child = spawn(process.execPath, ['-e', 'process.exit(17)'], {
+    stdio: 'ignore',
+  })
+  try {
+    await once(child, 'exit')
+    await expect(waitForOpencodeProjectReady(
+      child, server.url.href.replace(/\/$/, ''), '/tmp/work',
+    )).rejects.toThrow('code=17')
+    expect(requests).toBe(0)
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(child.listenerCount('error')).toBe(0)
+  } finally {
+    await terminateChildProcess(child)
+    await server.stop(true)
+  }
 })
