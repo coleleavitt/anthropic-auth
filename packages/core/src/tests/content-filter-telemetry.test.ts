@@ -65,6 +65,10 @@ describe('filterRequestBody summary', () => {
       maxScoreAfter: 0,
       maxCategory: null,
       rawTotals: {},
+      finalThresholdMultiplier: 1, // New field: no accumulation = 1.0
+      totalCappedContribution: 0, // New field: no blocks = 0
+      blocksEvicted: 0, // New field: nothing evicted
+      charsEvicted: 0, // New field: no chars removed
     })
   })
 })

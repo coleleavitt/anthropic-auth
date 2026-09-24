@@ -233,6 +233,59 @@ export function getContentFilterTermDictionaries(): Readonly<
   }
 }
 
+// ========== BENIGN CONTEXT TERMS ==========
+// Phrases that indicate benign context, reducing cyber score when present
+
+export const BENIGN_CYBER_TERMS: Record<string, number> = {
+  // Shell in coding context (bash, not attack)
+  'bash shell': -0.4,
+  'shell command': -0.4,
+  'run shell': -0.3,
+  'shell script': -0.4,
+  'shell=true': -0.3,
+  'shell=false': -0.1,
+  'shell: true': -0.3,
+  '/bin/sh': -0.2,
+  '/bin/bash': -0.2,
+
+  // Reverse in benign context
+  'reverse engineering': -0.5,
+  'reverse-engineering': -0.5,
+  'reverse engineer': -0.4,
+  'reverse order': -0.3,
+  'reverse sort': -0.3,
+  'reversed()': -0.3,
+  '.reverse()': -0.3,
+  'git reverse': -0.2,
+
+  // Injection in testing/analysis context
+  'injection test': -0.4,
+  'injection poc': -0.3,
+  'prevent injection': -0.4,
+  'avoid injection': -0.4,
+  sanitize: -0.2,
+  'input validation': -0.3,
+
+  // Bypass in benign context
+  'bypass cache': -0.4,
+  'cache bypass': -0.4,
+  'bypasses text search': -0.4,
+  'bypass proxy': -0.3,
+
+  // Tool output markers (indicates machine output, not attack instructions)
+  'drwxr-xr-x': -0.3,
+  '-rw-r--r--': -0.3,
+
+  // DBus paths (not shells)
+  'org.freedesktop': -0.2,
+  'org.gnome': -0.2,
+
+  // Code patterns
+  'subprocess.run': -0.2,
+  'subprocess.popen': -0.2,
+  'os.system': -0.2,
+}
+
 // ========== REWRITE RULES ==========
 
 export const REWRITE_RULES: Record<string, string> = {

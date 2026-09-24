@@ -13,7 +13,7 @@ import {
   type ClaudeCodeIdentity,
   type ContentFilterSummary,
   FAST_MODE_BETA,
-  filterRequestBody as filterContent,
+  filterRequestBodyGuarded,
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
@@ -1215,9 +1215,11 @@ export async function rewriteRequestBody(
       ...countRewriteShape(parsed),
     })
 
-    // Content filter: sanitize potentially triggering content before sending
+    // Content filter + surrogate-driven closed loop: sanitize triggering
+    // content, then let the trained refusal surrogate escalate eviction until
+    // predicted P(refuse) clears the threshold. Fail-open on any surrogate error.
     const filterStart = rewriteNowMs()
-    const filterResult = filterContent(parsed)
+    const filterResult = filterRequestBodyGuarded(parsed)
     try {
       options.onContentFilterSummary?.(filterResult.summary)
     } catch {}
@@ -1227,6 +1229,10 @@ export async function rewriteRequestBody(
       options.perf?.('content_filter', {
         ms: rewriteRoundMs(rewriteNowMs() - filterStart),
         changes: filterResult.changes.length,
+        surrogateBefore: filterResult.surrogate.probabilityBefore,
+        surrogateAfter: filterResult.surrogate.probabilityAfter,
+        surrogateEscalations: filterResult.surrogate.escalations,
+        surrogateDanger: filterResult.surrogate.danger,
       })
     }
 

@@ -27,7 +27,8 @@
     "pack:core:dry": "cd packages/core && bun pm pack --dry-run",
     "pack:opencode:dry": "cd packages/opencode && bun pm pack --dry-run",
     "pack:pi:dry": "cd packages/pi && bun pm pack --dry-run",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "dev:install": "bun scripts/dev-install.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.10",
