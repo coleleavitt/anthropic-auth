@@ -2265,7 +2265,8 @@ const anthropicAuthPlugin = async (
           ctx.directory,
         ).authorize(target.oauthAccountId ?? 'main', attempt.signal)
       } catch {
-        return undefined
+        // No verified replacement: fall through so the decision records
+        // reauthorize-failed, then keep the original 401.
       }
       if (!decideScopedRetryAfter401('cachekeep', served, current))
         return undefined

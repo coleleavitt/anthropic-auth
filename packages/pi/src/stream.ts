@@ -362,7 +362,8 @@ const cacheKeepManager = new CacheKeepManager({
         attempt.signal,
       )
     } catch {
-      return undefined
+      // No verified replacement: fall through so the decision records
+      // reauthorize-failed, then keep the original 401.
     }
     if (!decideScopedRetryAfter401('pi-cachekeep', entry.receipt, current))
       return undefined
