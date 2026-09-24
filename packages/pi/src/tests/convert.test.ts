@@ -4,13 +4,9 @@ import {
   computeCcVersionSuffix,
   type ProviderAccountUuid,
 } from '@cortexkit/anthropic-auth-core'
-import {
-  type Context,
-  type Message,
-  normalizeContext,
-  Type,
-} from '@earendil-works/pi-ai'
+import { type Context, type Message, Type } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
+import { normalizeContext } from '../transcript.ts'
 
 function userMsg(text: string): Message {
   return { role: 'user', content: text, timestamp: 0 }

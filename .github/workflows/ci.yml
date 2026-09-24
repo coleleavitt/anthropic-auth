@@ -22,6 +22,7 @@ jobs:
       - run: bun run check:workspace-lock
       - run: bun run types
       - run: bun run build
+      - run: bun run check:pi-dist-imports
       - run: bun run check:claustrum-golden
         env:
           GITHUB_TOKEN: ${{ github.token }}
