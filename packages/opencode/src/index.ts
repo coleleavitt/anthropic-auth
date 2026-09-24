@@ -1388,10 +1388,16 @@ const anthropicAuthPlugin = async (
         model,
         credentialAccountUuid ?? mainSlotQuotaKey,
       )
-      // Non-oat adapters retain their local slot for quota fencing, but it is
-      // not a provider identity and must never reach a provider-facing field.
-      const quotaKey = mainSlotQuotaKey
       const currentStorage = await loadAccounts(accountStoragePath)
+      // Scoped custody binds main runtime state to the roster's primary
+      // account id: core's state fence drops any main quota keyed otherwise,
+      // so a slot-keyed quota would never persist. Outside scoped custody,
+      // non-oat adapters keep their local slot for quota fencing; it is not a
+      // provider identity and must never reach a provider-facing field.
+      const quotaKey =
+        (isScopedCustodyActive(currentStorage)
+          ? currentStorage?.claustrum?.primaryAccount?.accountId
+          : undefined) ?? mainSlotQuotaKey
       const persistedProviderAccountUuid =
         currentStorage?.main?.profile?.providerAccountUuid ??
         (currentStorage?.main?.profile?.accountIdentity as
