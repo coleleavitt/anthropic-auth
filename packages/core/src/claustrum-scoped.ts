@@ -49,6 +49,28 @@ export type ScopedRetrySite =
   | 'cachekeep'
   | 'prime'
   | 'quota-profile'
+  | 'pi-model'
+  | 'pi-model-relay'
+  | 'pi-cachekeep'
+
+/** Why a scoped 401 did or did not retry. Never carries credential material. */
+export type ScopedRetryReason =
+  | 'rotated'
+  | 'reauthorize-failed'
+  | 'credential-changed'
+  | 'account-changed'
+  | 'version-unchanged'
+
+function scopedRetryReason(
+  served: ClaustrumScopedAttempt,
+  current: ClaustrumScopedAttempt | undefined,
+): ScopedRetryReason {
+  if (current === undefined) return 'reauthorize-failed'
+  if (current.credentialId !== served.credentialId) return 'credential-changed'
+  if (current.accountId !== served.accountId) return 'account-changed'
+  if (current.recordVersion === served.recordVersion) return 'version-unchanged'
+  return 'rotated'
+}
 
 /**
  * Decide whether a request that got a 401 should retry with the freshly
@@ -69,6 +91,7 @@ export function decideScopedRetryAfter401(
     servedVersion: served.recordVersion,
     currentVersion: current?.recordVersion ?? null,
     retry,
+    reason: scopedRetryReason(served, current),
   })
   return retry
 }

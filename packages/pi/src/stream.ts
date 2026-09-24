@@ -10,6 +10,7 @@ import {
   type ClaustrumScopedRuntimeOptions,
   connectClaustrumScopedClient,
   createStickyNoRouteResponse,
+  decideScopedRetryAfter401,
   decideStickyQuotaFailure,
   dumpDirectRequest,
   FAST_MODE_BETA,
@@ -37,7 +38,6 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isPermanentRefreshError,
-  isScopedCredentialRotation,
   isValidApiBaseURL,
   killswitchPassesPolicy,
   loadAccounts,
@@ -364,7 +364,8 @@ const cacheKeepManager = new CacheKeepManager({
     } catch {
       return undefined
     }
-    if (!isScopedCredentialRotation(entry.receipt, current)) return undefined
+    if (!decideScopedRetryAfter401('pi-cachekeep', entry.receipt, current))
+      return undefined
     logger.info(
       'claustrum',
       'retrying Pi CacheKeep after scoped credential rotation',
@@ -700,7 +701,7 @@ async function sendAnthropicRequest(options: {
           // A failed lookup is not proof of a replacement: report the token
           // that received the genuine 401 below, without using local material.
         }
-        if (isScopedCredentialRotation(attempt, rotated)) {
+        if (decideScopedRetryAfter401('pi-model', attempt, rotated)) {
           await dumpDirectRequest({
             affinity: relayAffinity,
             route: options.route ?? 'oauth',
@@ -806,7 +807,7 @@ async function sendAnthropicRequest(options: {
     } catch {
       // Report the actual rejected record below if no replacement can be read.
     }
-    if (isScopedCredentialRotation(relay401Attempt, rotated)) {
+    if (decideScopedRetryAfter401('pi-model-relay', relay401Attempt, rotated)) {
       await response.body?.cancel().catch(() => {})
       logger.info('claustrum', 'retrying after scoped credential rotation', {
         accountId: routeId,

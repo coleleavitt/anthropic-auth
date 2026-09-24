@@ -486,8 +486,16 @@ test('records both arms of a scoped 401 retry decision without credential materi
     decideScopedRetryAfter401('model', served, rotated),
     decideScopedRetryAfter401('cachekeep', served, { ...served }),
     decideScopedRetryAfter401('prime', served, undefined),
+    decideScopedRetryAfter401('pi-model', served, {
+      ...rotated,
+      accountId: 'other-account',
+    }),
+    decideScopedRetryAfter401('pi-model-relay', served, {
+      ...rotated,
+      credentialId: 'oauth:anthropic:other',
+    }),
   ])
-  expect(retried).toEqual([true, false, false])
+  expect(retried).toEqual([true, false, false, false, false])
   expect(
     records
       .filter((record) => record.message === 'scoped 401 re-authorized')
@@ -499,6 +507,7 @@ test('records both arms of a scoped 401 retry decision without credential materi
       servedVersion: 7,
       currentVersion: 8,
       retry: true,
+      reason: 'rotated',
     },
     {
       site: 'cachekeep',
@@ -506,6 +515,7 @@ test('records both arms of a scoped 401 retry decision without credential materi
       servedVersion: 7,
       currentVersion: 7,
       retry: false,
+      reason: 'version-unchanged',
     },
     {
       site: 'prime',
@@ -513,6 +523,23 @@ test('records both arms of a scoped 401 retry decision without credential materi
       servedVersion: 7,
       currentVersion: null,
       retry: false,
+      reason: 'reauthorize-failed',
+    },
+    {
+      site: 'pi-model',
+      credentialId: identity.credentialId,
+      servedVersion: 7,
+      currentVersion: 8,
+      retry: false,
+      reason: 'account-changed',
+    },
+    {
+      site: 'pi-model-relay',
+      credentialId: identity.credentialId,
+      servedVersion: 7,
+      currentVersion: 8,
+      retry: false,
+      reason: 'credential-changed',
     },
   ])
   expect(JSON.stringify(records)).not.toContain('secret')
