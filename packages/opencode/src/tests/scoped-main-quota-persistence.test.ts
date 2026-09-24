@@ -363,6 +363,7 @@ test('a scoped main receipt never binds its quota to a roster primary that chang
     const result = await (plugin as any).auth.loader(TOMBSTONE_AUTH, {
       models: {},
     } as any)
+    let requestError: unknown
     const response = await result
       .fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -373,13 +374,25 @@ test('a scoped main receipt never binds its quota to a roster primary that chang
           messages: [{ role: 'user', content: 'hello' }],
         }),
       })
-      .catch(() => undefined)
+      .catch((error: unknown) => {
+        requestError = error
+        return undefined
+      })
     await response?.text().catch(() => {})
     await Bun.sleep(300)
     await drainSidebarWrites()
 
+    // The race really happened: A's receipt was served and the roster primary
+    // moved to B while it was in flight.
+    expect(getScopedCalls).toBeGreaterThan(0)
+    const stored = JSON.parse(await readFile(storagePath, 'utf8'))
+    expect(stored.claustrum.primaryAccount.accountId).toBe(NEW_PRIMARY)
+    // The request failed closed on the identity fence before sending A's
+    // bearer, instead of failing for an unrelated reason.
+    expect(String(requestError)).toContain('Main OAuth identity changed')
+    expect(messageAuthorizations).toEqual([])
+    // And A's quota was never bound to B.
     const quota = await readMainQuota(storagePath)
-    // Whatever happened to the request, A's quota must never be bound to B.
     expect(quota?.accountIdentity).not.toBe(NEW_PRIMARY)
   } finally {
     await plugin.dispose?.()

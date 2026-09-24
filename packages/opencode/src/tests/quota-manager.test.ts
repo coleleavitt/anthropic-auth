@@ -2032,6 +2032,26 @@ describe('QuotaManager', () => {
       expect(qm.isMainStale()).toBe(true)
     })
 
+    test('a poll attempt for a previous main account does not delay the new account first poll', async () => {
+      let usageCalls = 0
+      const qm = createQM((async () => {
+        usageCalls += 1
+        return new Response('{"error":{"type":"permission_error"}}', {
+          status: 403,
+        })
+      }) as unknown as typeof fetch)
+      qm.pushMainFromHeaders('account-a', headerSnapshot())
+      await qm.refreshMain('account-a', 'access-a').catch(() => {})
+      expect(usageCalls).toBe(1)
+      qm.pushMainFromHeaders('account-a', headerSnapshot())
+      expect(qm.isMainStale()).toBe(false)
+
+      // The main account changes within the same interval: the new account has
+      // only header data and must still get its first usage poll.
+      qm.pushMainFromHeaders('account-b', headerSnapshot())
+      expect(qm.isMainStale()).toBe(true)
+    })
+
     test('header push never introduces poll-owned scoped data', () => {
       const qm = createQM()
       const incoming = {

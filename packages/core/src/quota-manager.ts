@@ -139,7 +139,11 @@ export class QuotaManager {
   // Bounds the header-only staleness rule below: a usage 403 deliberately does
   // not arm quota backoff, so without this a failing poll would repeat on
   // every request that checks main staleness.
-  private lastMainPollAttemptAt: number | undefined
+  // Bound to the account it polled for, so a poll for a previous main account
+  // never delays the first poll of a new one.
+  private lastMainPollAttempt:
+    | { accountId: string | undefined; at: number }
+    | undefined
   private inflightMainAccountId: string | undefined
   private inflightMainAccessToken: string | undefined
   private inflightMainToken = 0
@@ -554,8 +558,9 @@ export class QuotaManager {
       // An empty array is a real poll result and does not qualify.
       (this.main.quota.source === 'headers' &&
         this.main.quota.scoped === undefined &&
-        (this.lastMainPollAttemptAt === undefined ||
-          this.now() - this.lastMainPollAttemptAt >=
+        (this.lastMainPollAttempt === undefined ||
+          this.lastMainPollAttempt.accountId !== this.mainAccountId ||
+          this.now() - this.lastMainPollAttempt.at >=
             getQuotaCheckIntervalMs(this.storage)))
     )
   }
@@ -936,7 +941,7 @@ export class QuotaManager {
     generation: number,
     inflightToken: number,
   ): Promise<QuotaRefreshResult> {
-    this.lastMainPollAttemptAt = this.now()
+    this.lastMainPollAttempt = { accountId: mainAccountId, at: this.now() }
     return this._enqueueApiFetch(async () => {
       try {
         // Re-check backoff inside gate — may have been set by
