@@ -44,22 +44,30 @@ function clauseNames(clause: string): string[] {
 }
 
 /**
- * Names one host specifier is imported for, or `undefined` when the statement is
- * not a named-import clause. The specifier comes from Bun's scanner, so comment
- * and string text can never reach here.
+ * Names one host specifier is imported for across every import statement in the
+ * file, or `undefined` when any statement for it is not a named-import clause
+ * (namespace or default). A file may import the same specifier more than once,
+ * so every clause is read, not just the first. The specifier comes from Bun's
+ * scanner, so comment and string text can never reach here.
  */
 function hostImportNames(
   source: string,
   specifier: string,
 ): string[] | undefined {
   const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const named = new RegExp(
-    `import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${escaped}['"]`,
-  ).exec(source)
-  if (named?.[1] !== undefined) return clauseNames(named[1])
-  return new RegExp(`import\\s+[^'";]+from\\s*['"]${escaped}['"]`).test(source)
-    ? undefined
-    : []
+  const statements = [
+    ...source.matchAll(
+      new RegExp(`import\\s*([^'";]*?)\\s*from\\s*['"]${escaped}['"]`, 'g'),
+    ),
+  ]
+  const names: string[] = []
+  for (const statement of statements) {
+    const clause = statement[1]?.trim() ?? ''
+    const named = /^\{([^}]*)\}$/.exec(clause)
+    if (!named) return undefined
+    names.push(...clauseNames(named[1] ?? ''))
+  }
+  return names
 }
 
 export async function verifyPiDistRuntimeImports(): Promise<string> {
@@ -105,7 +113,11 @@ export async function verifyPiDistRuntimeImports(): Promise<string> {
           )
         }
       }
-      if (names.length === 0) {
+      const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      if (
+        names.length === 0 ||
+        new RegExp(`import\\s*['"]${escaped}['"]`).test(source)
+      ) {
         findings.push(
           `${origin}: side-effect import of '${specifier}' loads the host's copy`,
         )
@@ -114,8 +126,12 @@ export async function verifyPiDistRuntimeImports(): Promise<string> {
   }
 
   if (findings.length > 0) {
+    // Bun's scanner reports each import statement, so a file importing the same
+    // specifier twice would otherwise repeat its findings.
     throw new Error(
-      `Pi extension reaches into host SDK packages at runtime:\n${findings
+      `Pi extension reaches into host SDK packages at runtime:\n${[
+        ...new Set(findings),
+      ]
         .map((finding) => `  ${finding}`)
         .join('\n')}`,
     )
