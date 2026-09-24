@@ -1808,6 +1808,152 @@ describe('Pi credential fallback', () => {
     )
   })
 
+  async function runSharedWithMessages(
+    respond: (authorization: string, call: number) => Response,
+  ) {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-shared-401-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+    const seenTokens: string[] = []
+    let refreshCalls = 0
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (url.includes('/v1/oauth/token')) {
+          refreshCalls += 1
+          const body = String(init?.body ?? '')
+          if (body.includes('sk-ant-ort01-rrr')) {
+            return Promise.resolve(
+              new Response(JSON.stringify({ error: 'invalid_grant' }), {
+                status: 400,
+              }),
+            )
+          }
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                access_token: 'sk-ant-oat01-refreshed-after-401',
+                refresh_token: 'sk-ant-ort01-rotated-after-401',
+                expires_in: 3600,
+              }),
+              { status: 200 },
+            ),
+          )
+        }
+        if (!url.includes('/v1/messages')) {
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        }
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        seenTokens.push(authorization)
+        return Promise.resolve(respond(authorization, seenTokens.length))
+      },
+    ) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      sessionId: 'ses_pi_shared_401',
+    } as never)
+    const terminalTypes: string[] = []
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error')
+        terminalTypes.push(event.type)
+    }
+    return {
+      terminalTypes,
+      result: await stream.result(),
+      seenTokens,
+      refreshCalls: () => refreshCalls,
+    }
+  }
+
+  const okSse =
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+  function unauthorizedResponse() {
+    return new Response(
+      JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'authentication_error',
+          message: 'Invalid bearer token',
+        },
+      }),
+      { status: 401, headers: { 'request-id': 'req_shared_401' } },
+    )
+  }
+
+  test('refreshes and resends when a live-looking shared token is rejected with 401', async () => {
+    // Anthropic can revoke an access token before its local expires_at (a peer
+    // rotated the refresh token, a logout). Selection only checks expiry, so the
+    // 401 itself must trigger one forced refresh instead of failing the turn.
+    const shared = sharedOAuthAccount('shared-main', 'a')
+    await writeSharedStore([shared])
+
+    const run = await runSharedWithMessages((authorization) =>
+      authorization.includes('refreshed-after-401')
+        ? new Response(okSse, { status: 200 })
+        : unauthorizedResponse(),
+    )
+
+    expect(run.terminalTypes).toEqual(['done'])
+    expect(run.seenTokens).toEqual([
+      `Bearer ${shared.credential.access}`,
+      'Bearer sk-ant-oat01-refreshed-after-401',
+    ])
+    expect(run.refreshCalls()).toBe(1)
+  })
+
+  test('surfaces status and request id when a rejected shared token cannot be refreshed', async () => {
+    // The 'r' fixture's refresh token is revoked, so recovery fails. The error
+    // must still carry a structured diagnostic; before, the host only saw the
+    // error string and traces logged request_id: null.
+    await writeSharedStore([sharedOAuthAccount('shared-main', 'r')])
+
+    const run = await runSharedWithMessages(() => unauthorizedResponse())
+
+    expect(run.terminalTypes).toEqual(['error'])
+    expect(run.seenTokens).toHaveLength(1)
+    const diagnostic = run.result.diagnostics?.find(
+      (entry) => entry.type === 'provider_stream_failure',
+    ) as { details?: Record<string, unknown> } | undefined
+    expect(diagnostic?.details).toMatchObject({
+      kind: 'auth',
+      status: 401,
+      requestId: 'req_shared_401',
+      providerErrorType: 'authentication_error',
+    })
+  })
+
+  test('records a structured diagnostic for non-401 HTTP failures', async () => {
+    await writeSharedStore([sharedOAuthAccount('shared-main', 'a')])
+
+    const run = await runSharedWithMessages(
+      () =>
+        new Response(
+          JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'bad request' },
+          }),
+          { status: 400, headers: { 'request-id': 'req_bad_request' } },
+        ),
+    )
+
+    expect(run.terminalTypes).toEqual(['error'])
+    expect(run.refreshCalls()).toBe(0)
+    const diagnostic = run.result.diagnostics?.find(
+      (entry) => entry.type === 'provider_stream_failure',
+    ) as { details?: Record<string, unknown> } | undefined
+    expect(diagnostic?.details).toMatchObject({
+      kind: 'invalid_request',
+      status: 400,
+      requestId: 'req_bad_request',
+    })
+  })
+
   function expiredSharedOAuthAccount(id: string, suffix: string) {
     const account = sharedOAuthAccount(id, suffix)
     account.credential.expires_at = Date.now() - 60 * 60_000

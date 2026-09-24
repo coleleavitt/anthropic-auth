@@ -1030,6 +1030,110 @@ async function refreshExpiredSharedAccount(
   return undefined
 }
 
+/**
+ * The shared store picker trusts the stored `expires_at`, but the server can
+ * revoke an access token early (another client rotated the refresh token, a
+ * logout, a server-side invalidation). When the key we sent comes back 401,
+ * force one refresh of the account that owns it. `refreshAnthropicToken` runs
+ * under the cross-process claim and adopts a peer's rotation when one exists,
+ * so this never double-spends the refresh token. Returns the new access token,
+ * or undefined when the rejected key is not a refreshable shared-store key.
+ */
+function recoverSharedAccessTokenAfter401(
+  rejectedAccess: string,
+): Promise<string | undefined> {
+  return withAuthSpan('auth.route', undefined, async (span) => {
+    span.setAttributes({ 'auth.reason': '401-retry' })
+    const loaded = await loadSharedAccountStore().catch(() => null)
+    const account = loaded?.store.accounts.find(
+      (candidate) =>
+        candidate.credential.type === 'oauth' &&
+        candidate.credential.access === rejectedAccess,
+    )
+    if (account?.credential.type !== 'oauth' || !account.credential.refresh) {
+      span.setAttributes({ 'auth.outcome': 'not-shared' })
+      return undefined
+    }
+    span.setAttributes({ 'auth.selected': accountSpanId(account.id) })
+    try {
+      const rotated = await refreshAnthropicToken(
+        {
+          refresh: account.credential.refresh,
+          access: account.credential.access,
+          expires: account.credential.expires_at,
+        },
+        { reason: '401-retry' },
+      )
+      if (!rotated.access || rotated.access === rejectedAccess) {
+        span.setAttributes({ 'auth.outcome': 'unchanged' })
+        return undefined
+      }
+      logger.info(
+        'pi.stream',
+        'shared access token rejected with 401; refreshed',
+        {
+          accountId: account.id,
+        },
+      )
+      span.setAttributes({ 'auth.outcome': 'refreshed' })
+      return rotated.access
+    } catch (error) {
+      logger.warn('pi.stream', 'shared access token 401 refresh failed', {
+        accountId: account.id,
+        error: errorText(error),
+      })
+      span.setAttributes({ 'auth.outcome': 'refresh-failed' })
+      return undefined
+    }
+  })
+}
+
+/**
+ * Structured failure record for a non-2xx response, in the shape prime-agent
+ * reads (`provider_stream_failure` diagnostics): without it the host only sees
+ * the error string and traces carry no status or request id.
+ */
+function httpFailureDiagnostic(response: Response, bodyText: string) {
+  const status = response.status
+  let providerErrorType: string | undefined
+  try {
+    const parsed = JSON.parse(bodyText) as { error?: { type?: unknown } }
+    if (typeof parsed?.error?.type === 'string')
+      providerErrorType = parsed.error.type
+  } catch {}
+  const kind =
+    status === 401
+      ? 'auth'
+      : status === 403
+        ? 'permission'
+        : status === 429
+          ? 'rate_limit'
+          : status === 529 || providerErrorType === 'overloaded_error'
+            ? 'overloaded'
+            : status >= 500
+              ? 'server_error'
+              : status >= 400
+                ? 'invalid_request'
+                : 'unknown'
+  const requestId = response.headers.get('request-id') ?? undefined
+  const retryAfterRaw = response.headers.get('retry-after')
+  const retryAfterSeconds = retryAfterRaw === null ? NaN : Number(retryAfterRaw)
+  return {
+    type: 'provider_stream_failure' as const,
+    timestamp: Date.now(),
+    details: {
+      kind,
+      status,
+      ...(providerErrorType ? { providerErrorType } : {}),
+      ...(requestId ? { requestId } : {}),
+      ...(Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+        ? { retryAfterMs: retryAfterSeconds * 1000 }
+        : {}),
+      raw: bodyText.slice(0, 500),
+    },
+  }
+}
+
 /** Mirrors `isPermanentRefreshError` for a thrown error rather than a stored one. */
 function refreshErrorIsPermanent(error: unknown) {
   if (typeof error !== 'object' || error === null) return false
@@ -2075,7 +2179,8 @@ export function streamCortexKitAnthropic(
       // the router reports a different canonical main account.
       const hostKey = options?.apiKey?.trim()
       const sharedKey = await sharedAccessToken()
-      const accessToken = sharedKey || hostKey || ''
+      let accessToken = sharedKey || hostKey || ''
+      let sharedKeyRecovered = false
       logger.debug('pi.stream', 'primary credential resolved', {
         source: sharedKey
           ? 'shared account store'
@@ -2145,9 +2250,28 @@ export function streamCortexKitAnthropic(
           storagePath,
         })
 
+        if (
+          response.status === 401 &&
+          sharedKey &&
+          !sharedKeyRecovered &&
+          !options?.signal?.aborted
+        ) {
+          sharedKeyRecovered = true
+          const recovered = await recoverSharedAccessTokenAfter401(accessToken)
+          if (recovered) {
+            accessToken = recovered
+            continue
+          }
+        }
+
         if (!response.ok) {
+          output.diagnostics = [
+            ...(output.diagnostics ?? []),
+            httpFailureDiagnostic(response, bodyText ?? ''),
+          ]
           logger.warn('pi.stream', 'request failed', {
             status: response.status,
+            requestId: response.headers.get('request-id') ?? undefined,
             durationMs: Date.now() - requestStartedAt,
             body: (bodyText ?? '').slice(0, 300),
           })
