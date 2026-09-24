@@ -1,5 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
+import { parse } from '@babel/parser'
 
 /**
  * Host SDK packages whose bare specifier a Pi host rewrites.
@@ -34,44 +35,159 @@ const ALLOWED_HOST_RUNTIME_IMPORTS: Record<string, readonly string[]> = {
   ],
 }
 
-/** Names in one emitted `import { … }` clause, ignoring re-aliasing. */
-function clauseNames(clause: string): string[] {
-  return clause
-    .split(',')
-    .map((entry) => entry.trim().replace(/^type\s+/, ''))
-    .filter(Boolean)
-    .map((entry) => entry.split(/\s+as\s+/)[0]?.trim() ?? '')
+type AstNode = { type: string; [key: string]: unknown }
+
+function isNode(value: unknown): value is AstNode {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { type?: unknown }).type === 'string'
+  )
+}
+
+/** Name of an import/export binding, which may be an identifier or a string. */
+function moduleExportName(node: unknown): string | undefined {
+  if (!isNode(node)) return undefined
+  if (node.type === 'Identifier' && typeof node.name === 'string')
+    return node.name
+  if (node.type === 'StringLiteral' && typeof node.value === 'string')
+    return node.value
+  return undefined
+}
+
+function stringValue(node: unknown): string | undefined {
+  return isNode(node) &&
+    node.type === 'StringLiteral' &&
+    typeof node.value === 'string'
+    ? node.value
+    : undefined
+}
+
+/** Every node in the program, for dynamic imports that can appear anywhere. */
+function* walk(root: AstNode): Generator<AstNode> {
+  const stack: AstNode[] = [root]
+  while (stack.length > 0) {
+    const node = stack.pop() as AstNode
+    yield node
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'loc' || key === 'extra') continue
+      if (Array.isArray(value)) {
+        for (const item of value) if (isNode(item)) stack.push(item)
+      } else if (isNode(value)) {
+        stack.push(value)
+      }
+    }
+  }
 }
 
 /**
- * Names one host specifier is imported for across every import statement in the
- * file, or `undefined` when any statement for it is not a named-import clause
- * (namespace or default). A file may import the same specifier more than once,
- * so every clause is read, not just the first. The specifier comes from Bun's
- * scanner, so comment and string text can never reach here.
+ * Violations in one emitted module, found from its syntax tree rather than from
+ * its import spelling, so quoted export names, repeated statements, re-exports
+ * and dynamic imports are all seen. Imports inside comments and strings are not
+ * statements and are ignored.
  */
-function hostImportNames(
+export function findHostImportViolations(
   source: string,
-  specifier: string,
-): string[] | undefined {
-  const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const statements = [
-    ...source.matchAll(
-      new RegExp(`import\\s*([^'";]*?)\\s*from\\s*['"]${escaped}['"]`, 'g'),
-    ),
-  ]
-  const names: string[] = []
-  for (const statement of statements) {
-    const clause = statement[1]?.trim() ?? ''
-    const named = /^\{([^}]*)\}$/.exec(clause)
-    if (!named) return undefined
-    names.push(...clauseNames(named[1] ?? ''))
+  origin: string,
+): string[] {
+  // Walked structurally: only node `type` fields and the few properties read
+  // below are relied on, so the full @babel/types surface is not needed.
+  const program: unknown = parse(source, { sourceType: 'module' }).program
+  if (!isNode(program) || !Array.isArray(program.body)) {
+    throw new Error(`${origin}: could not read the module body`)
   }
-  return names
+  const findings: string[] = []
+  const check = (specifier: string, names: string[] | 'opaque' | 'bare') => {
+    const matched = HOST_PI_PACKAGE.exec(specifier)
+    if (!matched) return
+    const allowed = ALLOWED_HOST_RUNTIME_IMPORTS[`@oh-my-pi/${matched[1]}`]
+    if (!allowed) {
+      findings.push(
+        `${origin}: runtime import from '${specifier}' — port what is needed locally (see packages/pi/src/transcript.ts)`,
+      )
+      return
+    }
+    if (names === 'bare') {
+      findings.push(
+        `${origin}: side-effect import of '${specifier}' loads the host's copy`,
+      )
+      return
+    }
+    if (names === 'opaque') {
+      findings.push(
+        `${origin}: '${specifier}' must be imported only by name, not as a namespace, default or dynamic import`,
+      )
+      return
+    }
+    for (const name of names) {
+      if (!allowed.includes(name)) {
+        findings.push(
+          `${origin}: '${specifier}' exports '${name}' to this build, but the host's compat surface is not guaranteed to`,
+        )
+      }
+    }
+  }
+
+  for (const statement of program.body.filter(isNode)) {
+    if (statement.type === 'ImportDeclaration') {
+      const specifier = stringValue(statement.source)
+      if (specifier === undefined || statement.importKind === 'type') continue
+      const specifiers = (statement.specifiers as AstNode[]) ?? []
+      if (specifiers.length === 0) {
+        check(specifier, 'bare')
+        continue
+      }
+      if (specifiers.some((entry) => entry.type !== 'ImportSpecifier')) {
+        check(specifier, 'opaque')
+      }
+      check(
+        specifier,
+        specifiers
+          .filter(
+            (entry) =>
+              entry.type === 'ImportSpecifier' && entry.importKind !== 'type',
+          )
+          .map((entry) => moduleExportName(entry.imported) ?? ''),
+      )
+    } else if (statement.type === 'ExportNamedDeclaration') {
+      const specifier = stringValue(statement.source)
+      if (specifier === undefined || statement.exportKind === 'type') continue
+      const specifiers = (statement.specifiers as AstNode[]) ?? []
+      if (specifiers.some((entry) => entry.type !== 'ExportSpecifier')) {
+        check(specifier, 'opaque')
+      }
+      check(
+        specifier,
+        specifiers
+          .filter((entry) => entry.type === 'ExportSpecifier')
+          .map((entry) => moduleExportName(entry.local) ?? ''),
+      )
+    } else if (statement.type === 'ExportAllDeclaration') {
+      const specifier = stringValue(statement.source)
+      if (specifier !== undefined) check(specifier, 'opaque')
+    }
+  }
+
+  for (const node of walk(program)) {
+    const argument =
+      node.type === 'ImportExpression'
+        ? node.source
+        : node.type === 'CallExpression' &&
+            isNode(node.callee) &&
+            node.callee.type === 'Import'
+          ? (node.arguments as unknown[])[0]
+          : undefined
+    const specifier = stringValue(argument)
+    if (specifier !== undefined) check(specifier, 'opaque')
+  }
+
+  // A module can import the same specifier more than once.
+  return [...new Set(findings)]
 }
 
-export async function verifyPiDistRuntimeImports(): Promise<string> {
-  const distRoot = join(import.meta.dir, '..', 'packages', 'pi', 'dist')
+export async function verifyPiDistRuntimeImports(
+  distRoot = join(import.meta.dir, '..', 'packages', 'pi', 'dist'),
+): Promise<string> {
   let files: string[]
   try {
     files = (await readdir(distRoot, { recursive: true }))
@@ -82,56 +198,25 @@ export async function verifyPiDistRuntimeImports(): Promise<string> {
       `Missing ${relative(process.cwd(), distRoot)}: run \`bun run build\` first`,
     )
   }
+  if (files.length === 0) {
+    throw new Error(
+      `No JavaScript in ${relative(process.cwd(), distRoot)}: run \`bun run build\` first`,
+    )
+  }
 
-  const transpiler = new Bun.Transpiler({ loader: 'js' })
   const findings: string[] = []
   for (const file of files) {
-    const source = await readFile(file, 'utf8')
-    const origin = relative(distRoot, file)
-    for (const { path: specifier } of transpiler.scanImports(source)) {
-      const matched = HOST_PI_PACKAGE.exec(specifier)
-      if (!matched) continue
-      const canonical = `@oh-my-pi/${matched[1]}`
-      const allowed = ALLOWED_HOST_RUNTIME_IMPORTS[canonical]
-      if (!allowed) {
-        findings.push(
-          `${origin}: runtime import from '${specifier}' — port what is needed locally (see packages/pi/src/transcript.ts)`,
-        )
-        continue
-      }
-      const names = hostImportNames(source, specifier)
-      if (!names) {
-        findings.push(
-          `${origin}: '${specifier}' must be imported only by name, not as a namespace or default`,
-        )
-        continue
-      }
-      for (const name of names) {
-        if (!allowed.includes(name)) {
-          findings.push(
-            `${origin}: '${specifier}' exports '${name}' to this build, but the host's compat surface is not guaranteed to`,
-          )
-        }
-      }
-      const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      if (
-        names.length === 0 ||
-        new RegExp(`import\\s*['"]${escaped}['"]`).test(source)
-      ) {
-        findings.push(
-          `${origin}: side-effect import of '${specifier}' loads the host's copy`,
-        )
-      }
-    }
+    findings.push(
+      ...findHostImportViolations(
+        await readFile(file, 'utf8'),
+        relative(distRoot, file),
+      ),
+    )
   }
 
   if (findings.length > 0) {
-    // Bun's scanner reports each import statement, so a file importing the same
-    // specifier twice would otherwise repeat its findings.
     throw new Error(
-      `Pi extension reaches into host SDK packages at runtime:\n${[
-        ...new Set(findings),
-      ]
+      `Pi extension reaches into host SDK packages at runtime:\n${findings
         .map((finding) => `  ${finding}`)
         .join('\n')}`,
     )
