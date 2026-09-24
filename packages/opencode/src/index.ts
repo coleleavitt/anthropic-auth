@@ -50,6 +50,7 @@ import {
   createEmptyStorage,
   createStickyNoRouteResponse,
   type DumpHandle,
+  decideScopedRetryAfter401,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
   dumpDirectRequest,
@@ -118,7 +119,6 @@ import {
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
-  isScopedCredentialRotation,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -2290,9 +2290,11 @@ const anthropicAuthPlugin = async (
           ctx.directory,
         ).authorize(target.oauthAccountId ?? 'main', attempt.signal)
       } catch {
-        return undefined
+        // No verified replacement: fall through so the decision records
+        // reauthorize-failed, then keep the original 401.
       }
-      if (!isScopedCredentialRotation(served, current)) return undefined
+      if (!decideScopedRetryAfter401('cachekeep', served, current))
+        return undefined
       logger.info(
         'claustrum',
         'retrying CacheKeep after scoped credential rotation',
@@ -2608,7 +2610,7 @@ const anthropicAuthPlugin = async (
           // The first 401 belongs to the original physical attempt unless
           // the vault confirms a newer version of this same account.
         }
-        if (isScopedCredentialRotation(scopedAttempt, current)) {
+        if (decideScopedRetryAfter401('prime', scopedAttempt, current)) {
           await response.body?.cancel().catch(() => {})
           logger.info(
             'claustrum',
@@ -6151,7 +6153,13 @@ const anthropicAuthPlugin = async (
               } catch {
                 // Keep the 401 and report the exact relay-served record below.
               }
-              if (isScopedCredentialRotation(relay401Attempt, rotated)) {
+              if (
+                decideScopedRetryAfter401(
+                  'model-relay',
+                  relay401Attempt,
+                  rotated,
+                )
+              ) {
                 await response.body?.cancel().catch(() => {})
                 logger.info(
                   'claustrum',
@@ -6188,7 +6196,7 @@ const anthropicAuthPlugin = async (
               } catch {
                 // Preserve the genuine 401 if no replacement can be verified.
               }
-              if (isScopedCredentialRotation(directAttempt, rotated)) {
+              if (decideScopedRetryAfter401('model', directAttempt, rotated)) {
                 await response.body?.cancel().catch(() => {})
                 logger.info(
                   'claustrum',
