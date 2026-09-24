@@ -941,7 +941,6 @@ export class QuotaManager {
     generation: number,
     inflightToken: number,
   ): Promise<QuotaRefreshResult> {
-    this.lastMainPollAttempt = { accountId: mainAccountId, at: this.now() }
     return this._enqueueApiFetch(async () => {
       try {
         // Re-check backoff inside gate — may have been set by
@@ -979,6 +978,13 @@ export class QuotaManager {
         }
         try {
           const fetchStartedAt = this.now()
+          // Record only a physical usage request. Backed-off, superseded or
+          // lock-losing contenders return above without polling and must not
+          // defer the header-only poll this process still owes.
+          this.lastMainPollAttempt = {
+            accountId: mainAccountId,
+            at: fetchStartedAt,
+          }
           const quota = this.fetchQuotaSnapshot
             ? await this.fetchQuotaSnapshot({
                 kind: 'main',

@@ -2032,6 +2032,36 @@ describe('QuotaManager', () => {
       expect(qm.isMainStale()).toBe(true)
     })
 
+    test('losing the cross-process quota lock does not count as a header-only poll attempt', async () => {
+      let usageCalls = 0
+      const qm = createQM((async () => {
+        usageCalls += 1
+        return Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 10 },
+        })
+      }) as unknown as typeof fetch)
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(true)
+
+      // Another process owns the main quota refresh: this contender returns
+      // its fresh header cache without sending a usage request.
+      const lock = await acquireRefreshFileLock({
+        name: 'opencode-main-quota-refresh',
+        ttlMs: 30_000,
+      })
+      expect(lock).not.toBeNull()
+      try {
+        await qm.refreshMain('token', 'access-token').catch(() => {})
+      } finally {
+        await lock?.release()
+      }
+
+      expect(usageCalls).toBe(0)
+      // No physical poll happened, so the header-only entry is still due.
+      expect(qm.isMainStale()).toBe(true)
+    })
+
     test('a poll attempt for a previous main account does not delay the new account first poll', async () => {
       let usageCalls = 0
       const qm = createQM((async () => {
