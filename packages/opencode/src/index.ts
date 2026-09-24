@@ -275,6 +275,12 @@ import {
   setOAuthHeaders,
 } from './transform.ts'
 
+/** Persisted account JSON may carry an `email` field outside the typed schema. */
+function accountEmail(account: object | undefined): string | undefined {
+  const email = (account as { email?: unknown } | undefined)?.email
+  return typeof email === 'string' && email ? email : undefined
+}
+
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
 const HTTP_SERVER_RESPONSE_TYPE_ID = '~effect/http/HttpServerResponse'
 const HTTP_COOKIES_TYPE_ID = '~effect/http/Cookies'
@@ -5091,16 +5097,17 @@ const anthropicAuthPlugin = async (
               const currentStore = await getRequestStorage()
               const foundAccount = currentStore?.accounts?.find(
                 (a) => a.id === oauthAccountId,
-              ) as any
+              )
+              const firstAccount = currentStore?.accounts?.[0]
               // In fallback accounts, id is the email. For main, use first account's id or label.
               const accEmail =
-                foundAccount?.email ||
+                accountEmail(foundAccount) ||
                 foundAccount?.id ||
                 foundAccount?.label ||
                 (oauthAccountId === 'main'
-                  ? (currentStore?.accounts?.[0] as any)?.email ||
-                    (currentStore?.accounts?.[0] as any)?.id ||
-                    (currentStore?.accounts?.[0] as any)?.label ||
+                  ? accountEmail(firstAccount) ||
+                    firstAccount?.id ||
+                    firstAccount?.label ||
                     'main'
                   : oauthAccountId)
 

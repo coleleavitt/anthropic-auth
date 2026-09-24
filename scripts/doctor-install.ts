@@ -12,7 +12,7 @@
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
-import { cp, mkdir, rename, rm, symlink } from 'node:fs/promises'
+import { mkdir, rename, symlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 

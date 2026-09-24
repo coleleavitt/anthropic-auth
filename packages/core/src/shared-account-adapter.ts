@@ -356,6 +356,7 @@ export async function backfillSharedAccountIdentities(
       results.push({ id: account.id, skipped: 'profile unavailable' })
       continue
     }
+    const accountUuid = identity.accountUuid
 
     await updateSharedAccountStore((store) => {
       const target = store.accounts.find(
@@ -363,7 +364,7 @@ export async function backfillSharedAccountIdentities(
       )
       if (target?.credential.type !== 'oauth') return false
       target.credential.account = {
-        uuid: identity.accountUuid!,
+        uuid: accountUuid,
         ...(identity.email ? { email_address: identity.email } : {}),
       }
       if (identity.organizationUuid) {

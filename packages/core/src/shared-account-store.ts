@@ -1095,7 +1095,7 @@ export function claimSharedAccountRefresh(
     const account = store.accounts.find(
       (candidate) => candidate.id === accountId,
     )
-    if (!account || account.credential.type !== 'oauth') {
+    if (account?.credential.type !== 'oauth') {
       outcome = { status: 'unknown-account' }
       return false
     }
@@ -1156,7 +1156,7 @@ export function markSharedRefreshTokenDead(
     const account = store.accounts.find(
       (candidate) => candidate.id === accountId,
     )
-    if (!account || account.credential.type !== 'oauth') return false
+    if (account?.credential.type !== 'oauth') return false
     // Only mark the token the account still holds: a later rotation must not
     // inherit a predecessor's verdict.
     if (account.credential.refresh !== refreshToken) return false

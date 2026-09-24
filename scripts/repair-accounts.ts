@@ -109,7 +109,8 @@ const merged = await updateSharedAccountStore((store) => {
     if (group.length < 2) continue
     // A row Anthropic has already rejected is never the one to keep.
     const live = group.filter((a) => !a.dead_refresh_fingerprint)
-    const keep = live[0] ?? group[0]!
+    const keep = live[0] ?? group[0]
+    if (!keep) continue
     const email =
       keep.email ??
       (keep.credential.type === 'oauth'

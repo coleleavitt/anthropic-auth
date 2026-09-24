@@ -141,8 +141,10 @@ export type RecordUsageInput = {
   statusCode?: number
 }
 
-let requestsDbInstance: any = null
-let usageDbInstance: any = null
+type SqliteDatabase = import('bun:sqlite').Database
+
+let requestsDbInstance: SqliteDatabase | null = null
+let usageDbInstance: SqliteDatabase | null = null
 
 function getRequestsDb() {
   if (requestsDbInstance) return requestsDbInstance
@@ -153,9 +155,9 @@ function getRequestsDb() {
     }
     // Natively import Bun:sqlite
     const { Database } = require('bun:sqlite')
-    requestsDbInstance = new Database(ANTHROPIC_REQUESTS_DB_PATH)
-    requestsDbInstance.run('PRAGMA journal_mode = WAL;')
-    requestsDbInstance.run(`
+    const db: SqliteDatabase = new Database(ANTHROPIC_REQUESTS_DB_PATH)
+    db.run('PRAGMA journal_mode = WAL;')
+    db.run(`
       CREATE TABLE IF NOT EXISTS requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -175,7 +177,7 @@ function getRequestsDb() {
         account_name TEXT
       );
     `)
-    requestsDbInstance.run(`
+    db.run(`
       CREATE TABLE IF NOT EXISTS daily_aggregates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date DATE NOT NULL,
@@ -192,7 +194,8 @@ function getRequestsDb() {
         UNIQUE(date, agent, model, account_email)
       );
     `)
-    return requestsDbInstance
+    requestsDbInstance = db
+    return db
   } catch (err) {
     console.error('[anthropic-auth] SQLite requests DB init error:', err)
     return null
@@ -207,9 +210,9 @@ function getUsageDb() {
       mkdirSync(dir, { recursive: true })
     }
     const { Database } = require('bun:sqlite')
-    usageDbInstance = new Database(ANTHROPIC_USAGE_DB_PATH)
-    usageDbInstance.run('PRAGMA journal_mode = WAL;')
-    usageDbInstance.run(`
+    const db: SqliteDatabase = new Database(ANTHROPIC_USAGE_DB_PATH)
+    db.run('PRAGMA journal_mode = WAL;')
+    db.run(`
       CREATE TABLE IF NOT EXISTS usage_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         account_id TEXT NOT NULL,
@@ -225,7 +228,7 @@ function getUsageDb() {
         status_code INTEGER
       );
     `)
-    usageDbInstance.run(`
+    db.run(`
       CREATE TABLE IF NOT EXISTS daily_summary (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         account_id TEXT NOT NULL,
@@ -238,7 +241,8 @@ function getUsageDb() {
         UNIQUE(account_id, date)
       );
     `)
-    return usageDbInstance
+    usageDbInstance = db
+    return db
   } catch (err) {
     console.error('[anthropic-auth] SQLite usage DB init error:', err)
     return null
@@ -295,7 +299,7 @@ export function recordRequestUsage(input: RecordUsageInput): boolean {
           name,
         )
 
-      const today = new Date().toISOString().split('T')[0]
+      const today = new Date().toISOString().slice(0, 10)
       try {
         rDb
           .prepare(`
@@ -366,7 +370,7 @@ export function recordRequestUsage(input: RecordUsageInput): boolean {
           statusCode,
         )
 
-      const today = new Date().toISOString().split('T')[0]
+      const today = new Date().toISOString().slice(0, 10)
       try {
         uDb
           .prepare(`
@@ -412,13 +416,30 @@ export function recordRequestUsage(input: RecordUsageInput): boolean {
   }
 }
 
+type UsageTotalsRow = {
+  cnt: number
+  total_in: number
+  total_out: number
+  cache_r: number
+  cache_w: number
+  total_cost: number
+}
+
+type AccountUsageRow = {
+  account_email: string | null
+  cnt: number
+  total_in: number
+  total_out: number
+  total_cost: number
+}
+
 export function getUsageSummaryReport(): string {
   try {
     const rDb = getRequestsDb()
     if (!rDb) return 'Database unavailable.'
 
     const totals = rDb
-      .prepare(`
+      .prepare<UsageTotalsRow, []>(`
       SELECT 
         COUNT(*) as cnt,
         COALESCE(SUM(input_tokens), 0) as total_in,
@@ -431,7 +452,7 @@ export function getUsageSummaryReport(): string {
       .get()
 
     const accounts = rDb
-      .prepare(`
+      .prepare<AccountUsageRow, []>(`
       SELECT 
         account_email,
         COUNT(*) as cnt,
@@ -443,6 +464,8 @@ export function getUsageSummaryReport(): string {
       ORDER BY total_cost DESC
     `)
       .all()
+
+    if (!totals) return 'No usage recorded yet.'
 
     const lines: string[] = [
       '## Anthropic Usage Report',
