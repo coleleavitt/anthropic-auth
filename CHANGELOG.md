@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Update the shared Claustrum client to 0.4.0 (with Subc client 0.16.x) for scoped custody. The client no longer reconnects on a terminal `unknown_module` response from a daemon without the Claustrum module.
 - Show an approved Claustrum enrollment as active in `/claude-account` and the account modal when the main account is vault-served; stop telling already configured users to rerun setup or request a grant. Clarify that `enrollment-reset` only clears terminal state.
 - Fix packed OpenCode CLI startup under Node: keep `jsonc-parser` external so its CommonJS `./impl/*` modules resolve from the installed dependency, and run the packed CLI's `--help` path alongside the TUI smoke gate (#257).
 - Stop unsolicited Claustrum enrollment on OpenCode boot and account-status views: only explicit offline setup proposes and polls, while `/claude-account enrollment-reset` clears terminal state under lock without starting another request. Setup resumes crash-persisted secrets and replaces one daemon-confirmed dead request; all producer-permanent refusal codes stop polling even when older client transports mislabel them retryable. This removes the per-process enrollment poll loop (#255) without changing scoped account-discovery polling.
