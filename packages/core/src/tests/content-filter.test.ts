@@ -170,7 +170,7 @@ But the React components are working fine.`,
       const result = classify(remarkableContent)
       expect(result.recommendation).toBe('block')
       expect(result.score).toBeGreaterThan(1.0)
-      expect(result.matchedTerms.security.length).toBeGreaterThan(5)
+      expect(result.matchedTerms.security!.length).toBeGreaterThan(5)
     })
 
     test('rewrites remarkable content to safe score', () => {
@@ -232,11 +232,11 @@ But the React components are working fine.`,
       result.body as {
         messages: Array<{ content: Array<{ content: string }> }>
       }
-    ).messages[0]
-    expect(msg.content[0].content).not.toContain('firmware')
-    expect(msg.content[0].content).not.toContain('vulnerability')
-    expect(msg.content[0].content).toContain('software') // firmware → software
-    expect(msg.content[0].content).toContain('finding') // vulnerability → finding
+    ).messages[0]!
+    expect(msg.content[0]!.content).not.toContain('firmware')
+    expect(msg.content[0]!.content).not.toContain('vulnerability')
+    expect(msg.content[0]!.content).toContain('software') // firmware → software
+    expect(msg.content[0]!.content).toContain('finding') // vulnerability → finding
   })
 
   test('filters tool_result array content from prior turns', () => {
@@ -268,11 +268,11 @@ But the React components are working fine.`,
           content: Array<{ content: Array<{ text: string }> }>
         }>
       }
-    ).messages[0]
-    expect(msg.content[0].content[0].text).not.toContain('binary')
-    expect(msg.content[0].content[0].text).not.toContain('vulnerability')
-    expect(msg.content[0].content[0].text).toContain('finding') // vulnerability → finding
-    expect(msg.content[0].content[0].text).toContain('file') // binary → file
+    ).messages[0]!
+    expect(msg.content[0]!.content[0]!.text).not.toContain('binary')
+    expect(msg.content[0]!.content[0]!.text).not.toContain('vulnerability')
+    expect(msg.content[0]!.content[0]!.text).toContain('finding') // vulnerability → finding
+    expect(msg.content[0]!.content[0]!.text).toContain('file') // binary → file
   })
 
   test('filters assistant text content from prior turns', () => {
@@ -294,10 +294,10 @@ But the React components are working fine.`,
     expect(result.filtered).toBe(true)
     const msg = (
       result.body as { messages: Array<{ content: Array<{ text: string }> }> }
-    ).messages[0]
-    expect(msg.content[0].text).not.toContain('vulnerability')
-    expect(msg.content[0].text).not.toContain('firmware')
-    expect(msg.content[0].text).toContain('finding') // vulnerability → finding
-    expect(msg.content[0].text).toContain('software') // firmware → software
+    ).messages[0]!
+    expect(msg.content[0]!.text).not.toContain('vulnerability')
+    expect(msg.content[0]!.text).not.toContain('firmware')
+    expect(msg.content[0]!.text).toContain('finding') // vulnerability → finding
+    expect(msg.content[0]!.text).toContain('software') // firmware → software
   })
 })

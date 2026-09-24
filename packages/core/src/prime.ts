@@ -51,7 +51,7 @@ export type PrimeCommandAction =
 export type PrimeAccountStatus = {
   id: string
   label: string
-  nextDueAt?: number
+  nextDueAt?: number | null
   lastPrimedAt?: number | null
   lastResult?: 'ok' | 'error'
   usage?: import('./accounts.ts').PrimeUsageCounters

@@ -56,7 +56,7 @@ function apiModel(overrides: Record<string, unknown> = {}) {
 }
 
 function stubFetch(handler: (url: string, init?: RequestInit) => Response) {
-  globalThis.fetch = ((input: URL | RequestInfo, init?: RequestInit) =>
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) =>
     Promise.resolve(handler(String(input), init))) as typeof fetch
 }
 
@@ -211,7 +211,7 @@ describe('resolveModelCost', () => {
 describe('fetchAnthropicModelCatalog', () => {
   test('sends the OAuth bearer token and parses the model list', async () => {
     let seenUrl = ''
-    let seenAuth: string | null = null
+    let seenAuth = null as string | null
     stubFetch((url, init) => {
       seenUrl = url
       seenAuth = new Headers(init?.headers).get('authorization')

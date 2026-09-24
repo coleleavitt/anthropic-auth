@@ -60,10 +60,10 @@ describe('wire-level eviction (size-based, escalating)', () => {
     const messages = [userText(big(EVICT_FLOOR_DEFAULT + 500)), ...recentTail()]
     const { body, summary } = filterRequestBody({ messages })
     const first = (
-      (body.messages as Array<Record<string, unknown>>)[0].content as Array<
+      (body.messages as Array<Record<string, unknown>>)[0]!.content as Array<
         Record<string, unknown>
       >
-    )[0]
+    )[0]!
     expect(summary.blocksEvicted).toBeGreaterThanOrEqual(1)
     expect(first.text as string).toContain('omitted')
   })
@@ -85,10 +85,10 @@ describe('wire-level eviction (size-based, escalating)', () => {
     ]
     const { body, summary } = filterRequestBody({ messages })
     const first = (
-      (body.messages as Array<Record<string, unknown>>)[0].content as Array<
+      (body.messages as Array<Record<string, unknown>>)[0]!.content as Array<
         Record<string, unknown>
       >
-    )[0]
+    )[0]!
     // 900 < default 1500 but >= compact 800 -> evicted only because we compacted.
     expect(EVICT_FLOOR_COMPACT).toBeLessThanOrEqual(900)
     expect(first.text as string).toContain('omitted')
@@ -114,10 +114,10 @@ describe('wire-level eviction (size-based, escalating)', () => {
     ]
     const { body, summary } = filterRequestBody({ messages })
     const tu = (
-      (body.messages as Array<Record<string, unknown>>)[0].content as Array<
+      (body.messages as Array<Record<string, unknown>>)[0]!.content as Array<
         Record<string, unknown>
       >
-    )[0]
+    )[0]!
     // tool_use block survives (id intact) but its input is evicted to a marker.
     expect(tu.type).toBe('tool_use')
     expect(tu.id).toBe('t1')
@@ -133,8 +133,8 @@ describe('wire-level eviction (size-based, escalating)', () => {
     const { body } = filterRequestBody({ messages })
     const outMsgs = body.messages as Array<Record<string, unknown>>
     const last = (
-      outMsgs[outMsgs.length - 1].content as Array<Record<string, unknown>>
-    )[0]
+      outMsgs[outMsgs.length - 1]!.content as Array<Record<string, unknown>>
+    )[0]!
     expect(last.text as string).not.toContain('omitted to manage context')
   })
 
@@ -149,10 +149,10 @@ describe('wire-level eviction (size-based, escalating)', () => {
     ]
     const { body, summary } = filterRequestBody({ messages })
     const block = (
-      (body.messages as Array<Record<string, unknown>>)[0].content as Array<
+      (body.messages as Array<Record<string, unknown>>)[0]!.content as Array<
         Record<string, unknown>
       >
-    )[0]
+    )[0]!
     expect(block.signature).toBe('abc123')
     expect(block.text as string).not.toContain('omitted to manage context')
     // (other blocks in the padded region are still evicted)
@@ -178,8 +178,8 @@ describe('wire-level eviction (size-based, escalating)', () => {
     ]
     const { body } = filterRequestBody({ messages })
     const outMsgs = body.messages as Array<Record<string, unknown>>
-    const tu = (outMsgs[0].content as Array<Record<string, unknown>>)[0]
-    const tr = (outMsgs[1].content as Array<Record<string, unknown>>)[0]
+    const tu = (outMsgs[0]!.content as Array<Record<string, unknown>>)[0]!
+    const tr = (outMsgs[1]!.content as Array<Record<string, unknown>>)[0]!
     expect(tu.id).toBe('t9')
     expect(tr.tool_use_id).toBe('t9')
     expect(tr.content as string).toContain('omitted')
@@ -197,10 +197,10 @@ describe('wire-level eviction (size-based, escalating)', () => {
     ]
     const { body, summary } = filterRequestBody({ messages })
     const think = (
-      (body.messages as Array<Record<string, unknown>>)[0].content as Array<
+      (body.messages as Array<Record<string, unknown>>)[0]!.content as Array<
         Record<string, unknown>
       >
-    )[0]
+    )[0]!
     expect(think.type).toBe('thinking')
     expect(think.signature).toBe('sig-old-1') // signature preserved
     expect(think.thinking as string).toContain('omitted') // text evicted
@@ -221,8 +221,8 @@ describe('wire-level eviction (size-based, escalating)', () => {
     const { body } = filterRequestBody({ messages })
     const outMsgs = body.messages as Array<Record<string, unknown>>
     const think = (
-      outMsgs[outMsgs.length - 1].content as Array<Record<string, unknown>>
-    )[0]
+      outMsgs[outMsgs.length - 1]!.content as Array<Record<string, unknown>>
+    )[0]!
     expect(think.signature).toBe('sig-recent')
     expect(think.thinking as string).not.toContain('omitted to manage context')
     expect((think.thinking as string).length).toBeGreaterThan(1000)

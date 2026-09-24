@@ -99,7 +99,7 @@ describe('Accumulation State Management', () => {
     })
 
     expect(state.blockScores.length).toBe(1)
-    expect(state.blockScores[0].messageIndex).toBe(0)
+    expect(state.blockScores[0]!.messageIndex).toBe(0)
   })
 })
 
@@ -153,7 +153,7 @@ describe('Counter-Signal Injection', () => {
   it('generates appropriate prefix for detected topic', () => {
     const config = { enabled: true, mode: 'auto' as const }
     const signal = generateCounterSignal('self-hosting', config)
-    expect(signal).toBe(LEGITIMACY_PREFIXES['self-hosting'])
+    expect(signal).toBe(LEGITIMACY_PREFIXES['self-hosting']!)
   })
 
   it('uses custom prefix when provided', () => {

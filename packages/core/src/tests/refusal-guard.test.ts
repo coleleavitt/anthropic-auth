@@ -97,7 +97,7 @@ describe('refusal guard — closed loop (e2e)', () => {
   it('preserves signatures through escalated eviction', () => {
     const session = hotSession()
     // inject signed thinking into old turns
-    ;(session.messages[0].content as Array<Record<string, unknown>>).push({
+    ;(session.messages[0]!.content as Array<Record<string, unknown>>).push({
       type: 'thinking',
       thinking: hotText.slice(0, 3000),
       signature: 'sig-keep',

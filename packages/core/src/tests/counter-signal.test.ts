@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'bun:test'
 import {
   autoInjectCounterSignal,
   type CounterSignalConfig,
@@ -80,7 +80,7 @@ describe('generateCounterSignal', () => {
   it('returns appropriate prefix for topic', () => {
     const config: CounterSignalConfig = { enabled: true, mode: 'auto' }
     expect(generateCounterSignal('self-hosting', config)).toBe(
-      LEGITIMACY_PREFIXES['self-hosting'],
+      LEGITIMACY_PREFIXES['self-hosting']!,
     )
   })
 
@@ -92,7 +92,7 @@ describe('generateCounterSignal', () => {
   it('returns prefix for specific topic in adaptive mode', () => {
     const config: CounterSignalConfig = { enabled: true, mode: 'adaptive' }
     expect(generateCounterSignal('security-research', config)).toBe(
-      LEGITIMACY_PREFIXES['security-research'],
+      LEGITIMACY_PREFIXES['security-research']!,
     )
   })
 })
@@ -104,8 +104,8 @@ describe('injectCounterSignal', () => {
     const result = injectCounterSignal(original, 'self-hosting', config)
 
     expect(result.length).toBe(2)
-    expect(result[0].text).toBe(LEGITIMACY_PREFIXES['self-hosting'])
-    expect(result[1].text).toBe('Original prompt')
+    expect(result[0]!.text).toBe(LEGITIMACY_PREFIXES['self-hosting'])
+    expect(result[1]!.text).toBe('Original prompt')
   })
 
   it('does not duplicate injection', () => {
@@ -136,7 +136,7 @@ describe('autoInjectCounterSignal', () => {
     const result = autoInjectCounterSignal(original, config)
 
     expect(result.length).toBe(2)
-    expect(result[0].text).toBe(LEGITIMACY_PREFIXES['self-hosting'])
+    expect(result[0]!.text).toBe(LEGITIMACY_PREFIXES['self-hosting'])
   })
 
   it('respects adaptive mode threshold', () => {

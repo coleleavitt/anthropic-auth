@@ -15,6 +15,7 @@ import {
   type LogTestRecord,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  type PrimeUsageCounters,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 // Source-side logger import — installed as a second sink so PrimeManager logs
@@ -41,7 +42,6 @@ import {
   type PrimeAccountStatus,
   PrimeManager,
   type PrimeSendResult,
-  type PrimeUsageCounters,
   parsePrimeCommandAction,
   primeAccountMarkerDir,
   primeIsEligible,
@@ -386,7 +386,7 @@ async function makeHarness(opts: {
       return result
     },
     sendPrime: async (id) => {
-      const result = opts.send
+      const result: PrimeSendResult = opts.send
         ? await opts.send(id)
         : {
             ok: true,
