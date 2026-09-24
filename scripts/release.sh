@@ -75,6 +75,9 @@ bun run test 2>&1 || { echo "Error: Tests failed"; exit 1; }
 echo "  bun build..."
 bun run build 2>&1 || { echo "Error: Build failed"; exit 1; }
 
+echo "  packed CLI and TUI smoke..."
+TUI_SMOKE_SKIP_BUILD=1 bun run --cwd packages/opencode smoke:tui 2>&1 || { echo "Error: Packed CLI/TUI smoke failed"; exit 1; }
+
 echo "  ✓ All checks passed"
 echo ""
 
