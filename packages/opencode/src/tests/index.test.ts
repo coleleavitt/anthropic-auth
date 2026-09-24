@@ -648,8 +648,6 @@ type PluginRuntimeOverrides = Partial<{
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
   scopedRosterPollIntervalMs: number
-  claustrumEnrollmentConnect: () => Promise<unknown>
-  claustrumEnrollmentPollIntervalMs: number
   cacheKeepAggregateRefreshIntervalMs: number
 }>
 
@@ -661,13 +659,7 @@ function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
     ) as unknown as typeof setInterval,
     clearInterval: mock(() => {}) as unknown as typeof clearInterval,
     scopedRosterPollIntervalMs: 0,
-    claustrumEnrollmentPollIntervalMs: 0,
     cacheKeepAggregateRefreshIntervalMs: 0,
-    claustrumEnrollmentConnect: async () => ({
-      enrollPropose: async () => ({ requestId: 'test-enrollment-request' }),
-      enrollPoll: async () => ({ status: 'pending' as const }),
-      close() {},
-    }),
   }
 }
 
@@ -705,6 +697,103 @@ async function getPlugin(
   }
   return plugin
 }
+
+describe('scoped enrollment is explicit', () => {
+  test('boot and account status are read-only for an unscoped Claustrum configuration', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ accounts: [], claustrum: { mode: 'claustrum' } }),
+    )
+    const enrollmentFile =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+    if (!enrollmentFile) throw new Error('Missing isolated enrollment path')
+    const stateFile = enrollmentFile.replace(/\.json$/, '-state.json')
+    const previousConnection =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+      tempConfigDir ?? '',
+      'missing-connection.json',
+    )
+    const client = createMockClient()
+    const plugin = await getPlugin(client)
+    try {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: 'ses_read_only',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      await expect(readFile(stateFile, 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      // Pin the structural boundary as well: the old fire-and-forget adoption
+      // can outlive an otherwise successful boot/status assertion.
+      const pluginSource = await readFile(
+        join(import.meta.dir, '..', 'index.ts'),
+        'utf8',
+      )
+      expect(pluginSource.includes('adoptClaustrumEnrollment')).toBe(false)
+    } finally {
+      await plugin.dispose?.()
+      if (previousConnection === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+      else
+        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
+          previousConnection
+    }
+  })
+
+  test('enrollment-reset only clears terminal state; setup owns the next proposal', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ accounts: [], claustrum: { mode: 'claustrum' } }),
+    )
+    const enrollmentFile =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+    if (!enrollmentFile) throw new Error('Missing isolated enrollment path')
+    const stateFile = enrollmentFile.replace(/\.json$/, '-state.json')
+    const previousConnection =
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+      tempConfigDir ?? '',
+      'missing-connection.json',
+    )
+    await writeFile(
+      stateFile,
+      JSON.stringify({
+        version: 1,
+        phase: 'blocked',
+        proposedName: 'anthropic-auth-opencode',
+        errorCode: 'superseded',
+        updatedAt: Date.now(),
+      }),
+      { mode: 0o600 },
+    )
+    const client = createMockClient()
+    const plugin = await getPlugin(client)
+    try {
+      await expect(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: 'enrollment-reset',
+          sessionID: 'ses_reset_only',
+        }),
+      ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+      await expect(readFile(stateFile, 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      const text = (client.session.promptAsync as any).mock.calls.at(-1)?.[0]
+        ?.body.parts[0]?.text
+      expect(text).toContain('setup')
+    } finally {
+      await plugin.dispose?.()
+      if (previousConnection === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+      else
+        process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
+          previousConnection
+    }
+  })
+})
 
 describe('desktop notice identity (#230)', () => {
   test('orders repeated notices before the same assistant with bounded IDs', async () => {
@@ -898,7 +987,11 @@ describe('fallback quota persistence ordering', () => {
 async function readFeedEntries() {
   const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
   try {
-    const files = await readdir(directory)
+    // The producer writes a complete .tmp before renaming it into a committed
+    // .json lease. Match the real consumer: transient files are not published.
+    const files = (await readdir(directory)).filter((name) =>
+      name.endsWith('.json'),
+    )
     const records = await Promise.all(
       files.map(async (file) =>
         JSON.parse(await readFile(join(directory, file), 'utf8')),
@@ -1129,6 +1222,21 @@ describe('quota header feed integration', () => {
     return { published, persisted }
   }
 
+  test('does not treat a complete but uncommitted .tmp lease as a published feed entry', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
+    await mkdir(directory, { recursive: true })
+    await writeFile(
+      join(directory, 'pretend.json.uncommitted.tmp'),
+      JSON.stringify({
+        version: 3,
+        entries: { a: { account_ref: 'not-yet-published' } },
+      }),
+      { mode: 0o600 },
+    )
+    expect(await readFeedEntries()).toEqual([])
+  })
+
   test('non-oat main feed leaves provider UUID null while retaining its quota slot', async () => {
     const originalNow = Date.now
     let clock = 1_000_000
@@ -1176,7 +1284,9 @@ describe('quota header feed integration', () => {
         (entries) => entries.length === 1,
         'one published entry',
       )
-      const files = await readdir(feedDirectory)
+      const files = (await readdir(feedDirectory)).filter((name) =>
+        name.endsWith('.json'),
+      )
       expect(files).toHaveLength(1)
       const record = JSON.parse(
         await readFile(join(feedDirectory, files[0]!), 'utf8'),

@@ -21,6 +21,7 @@ import {
   type ClaustrumEnrollmentClient,
   ClaustrumEnrollmentManager,
   getClaustrumEnrollmentPaths,
+  getHostClaustrumEnrollmentPaths,
   readClaustrumEnrollmentStatus,
   readClaustrumEnrollmentToken,
 } from '../claustrum-enrollment.ts'
@@ -755,4 +756,61 @@ test('a terminal refusal committed by one process stops an older process on its 
   expect(
     JSON.parse(await readFile(paths.statePath, 'utf8')),
   ).not.toHaveProperty('requestSecret')
+})
+
+test('OpenCode and Pi resolve separate owner-only enrollment paths from the same state root', () => {
+  const env = { XDG_STATE_HOME: join(tmpdir(), 'shared-state') }
+  const opencode = getHostClaustrumEnrollmentPaths('opencode', env)
+  const pi = getHostClaustrumEnrollmentPaths('pi', env)
+  expect(opencode.tokenPath).toBe(
+    join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'opencode-enrollment.json',
+    ),
+  )
+  expect(opencode.statePath).toBe(
+    join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'opencode-enrollment-state.json',
+    ),
+  )
+  expect(pi.tokenPath).toBe(
+    join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'pi-enrollment.json',
+    ),
+  )
+  expect(pi.statePath).toBe(
+    join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'pi-enrollment-state.json',
+    ),
+  )
+  expect(pi.tokenPath).not.toBe(opencode.tokenPath)
+})
+
+test('host-specific overrides resolve absolute and project-relative enrollment paths without crossing hosts', () => {
+  const project = join(tmpdir(), 'enrollment-project')
+  const piToken = join(project, 'owner', 'pi.json')
+  const env = {
+    XDG_STATE_HOME: join(project, 'state'),
+    PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: piToken,
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: 'owner/opencode.json',
+  }
+  expect(getHostClaustrumEnrollmentPaths('pi', env, project)).toEqual({
+    tokenPath: piToken,
+    statePath: join(project, 'owner', 'pi-state.json'),
+  })
+  expect(getHostClaustrumEnrollmentPaths('opencode', env, project)).toEqual({
+    tokenPath: join(project, 'owner', 'opencode.json'),
+    statePath: join(project, 'owner', 'opencode-state.json'),
+  })
 })

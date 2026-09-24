@@ -405,7 +405,7 @@ describe('executeAccountCommand status', () => {
     expect(result.text).toContain('**Work account** [fallback] · vault reauth')
   })
 
-  test('renders the pending enrollment approval command in account status', async () => {
+  test('directs pending enrollment to explicit setup instead of manual approval', async () => {
     const result = await executeAccountCommand({
       argumentsText: '',
       storage: baseStorage(),
@@ -421,11 +421,12 @@ describe('executeAccountCommand status', () => {
     })
     expect(result.text).toContain('Enrollment: pending approval (request_123)')
     expect(result.text).toContain(
-      'ck auth enroll approve --request-id request_123',
+      'bunx @cortexkit/opencode-anthropic-auth setup',
     )
+    expect(result.text).not.toContain('ck auth enroll approve')
   })
 
-  test('labels an approved enrollment as ceremony-only and prints the native grant', async () => {
+  test('directs an approved but unconfigured host to explicit setup', async () => {
     const result = await executeAccountCommand({
       argumentsText: '',
       storage: baseStorage(),
@@ -442,8 +443,9 @@ describe('executeAccountCommand status', () => {
     })
     expect(result.text).toContain('scoped serving not active yet')
     expect(result.text).toContain(
-      '--selector anthropic-native --operation read',
+      'bunx @cortexkit/opencode-anthropic-auth setup',
     )
+    expect(result.text).not.toContain('ck auth grant')
   })
 
   test('does not interpolate unsafe enrollment identifiers into shell commands', async () => {
@@ -460,8 +462,11 @@ describe('executeAccountCommand status', () => {
         accounts: [],
       },
     })
-    expect(result.text).toContain('inspect it with `ck auth enroll list`')
-    expect(result.text).not.toContain('--request-id request`')
+    expect(result.text).toContain('pending approval')
+    expect(result.text).toContain(
+      'bunx @cortexkit/opencode-anthropic-auth setup',
+    )
+    expect(result.text).not.toContain('request`touch')
   })
 
   test('routes enrollment-reset only in Claustrum mode', async () => {

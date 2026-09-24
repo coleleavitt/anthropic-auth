@@ -24,6 +24,7 @@ test('HTTP patch recovery reauthorizes and binds status to the final upstream at
     upstream: { headers: Record<string, string> }
   }> = []
   const server = Bun.serve({
+    hostname: '127.0.0.1',
     port: 0,
     fetch: async (request) => {
       const payload = (await request.json()) as {
@@ -94,6 +95,7 @@ test('revocation before a retry cannot fall through to HTTP or direct dispatch',
     gets = 0,
     fallbacks = 0
   const server = Bun.serve({
+    hostname: '127.0.0.1',
     port: 0,
     fetch: () => new Response('', { status: ++posts === 1 ? 200 : 409 }),
   })
@@ -132,6 +134,7 @@ test('a relay transport 401 without upstream provenance falls back direct withou
   let observed = 0
   let direct = 0
   const server = Bun.serve({
+    hostname: '127.0.0.1',
     port: 0,
     fetch: () => new Response('wrong relay secret', { status: 401 }),
   })
@@ -169,6 +172,7 @@ test('optimistic WebSocket reconnect uses a fresh receipt without reporting its 
     upstream: { headers: Record<string, string> }
   }> = []
   const server = Bun.serve({
+    hostname: '127.0.0.1',
     port: 0,
     fetch: (request, server) =>
       server.upgrade(request)
@@ -243,6 +247,7 @@ test('optimistic WebSocket reconnect uses a fresh receipt without reporting its 
 
 test('a relay-only transport 401 without upstream provenance is not surfaced as an account 401', async () => {
   const server = Bun.serve({
+    hostname: '127.0.0.1',
     port: 0,
     fetch: () => new Response('wrong relay secret', { status: 401 }),
   })

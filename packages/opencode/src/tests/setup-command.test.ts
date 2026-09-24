@@ -464,7 +464,10 @@ test('executes Pi Claustrum setup: removes local OAuth and commits scoped roster
   )
 })
 
-async function enrollmentSetupFixture(prefix: string) {
+async function enrollmentSetupFixture(
+  prefix: string,
+  host: 'opencode' | 'pi' = 'opencode',
+) {
   const root = await mkdtemp(join(tmpdir(), prefix))
   testDirs.push(root)
   const env: NodeJS.ProcessEnv = {
@@ -472,10 +475,12 @@ async function enrollmentSetupFixture(prefix: string) {
     XDG_CONFIG_HOME: join(root, 'config'),
     XDG_DATA_HOME: join(root, 'data'),
     XDG_STATE_HOME: join(root, 'state'),
+    // Pi path resolution uses its explicit agent-dir variable, not env.HOME.
+    PI_AGENT_DIR: join(root, 'pi-agent'),
   }
   const paths = {
-    tokenPath: join(root, 'state', 'opencode-enrollment.json'),
-    statePath: join(root, 'state', 'opencode-enrollment-state.json'),
+    tokenPath: join(root, 'state', `${host}-enrollment.json`),
+    statePath: join(root, 'state', `${host}-enrollment-state.json`),
   }
   await mkdir(join(root, 'state'), { recursive: true })
   const approved: string[][] = []
@@ -511,9 +516,10 @@ async function enrollmentSetupFixture(prefix: string) {
     paths,
     approved,
     row,
+    proposedName: `anthropic-auth-${host}`,
     async run(enrollmentClient: ClaustrumEnrollmentClient) {
       const { setupClaustrumForHost } = await import('../setup/claustrum.ts')
-      return setupClaustrumForHost('opencode', {
+      return setupClaustrumForHost(host, {
         env,
         paths,
         runner,
@@ -524,56 +530,58 @@ async function enrollmentSetupFixture(prefix: string) {
   }
 }
 
-test('explicit setup resumes a persisted secret before propose and completes scoped enrollment', async () => {
-  const { paths, approved, row, run } = await enrollmentSetupFixture(
-    'setup-resume-enrollment-',
-  )
-  const requestSecret = '01'.repeat(32)
-  await writeFile(
-    paths.statePath,
-    JSON.stringify({
-      version: 1,
-      phase: 'pending',
-      proposedName: 'anthropic-auth-opencode',
-      requestSecret,
-      createdAt: 1,
-      updatedAt: 1,
-    }),
-    { mode: 0o600 },
-  )
-  let proposes = 0
-  let polls = 0
-  const result = await run({
-    enrollPropose: async () => {
-      proposes++
-      const persisted = JSON.parse(await readFile(paths.statePath, 'utf8'))
-      expect(persisted.requestSecret).toBe(requestSecret)
-      return { requestId: 'resumed-request' }
-    },
-    enrollPoll: async () => {
-      polls++
-      return polls === 1
-        ? { status: 'pending' as const }
-        : {
-            status: 'approved' as const,
-            name: 'anthropic-auth-opencode',
-            token: '02'.repeat(32),
-            tokenGeneration: 1,
-          }
-    },
-  })
-  expect(result.ok).toBe(true)
-  expect(result.discoveredAccounts).toEqual([
-    { credentialId: row.id, accountId: row.accountId },
-  ])
-  expect(proposes).toBe(1)
-  expect(polls).toBe(2)
-  expect(approved).toHaveLength(1)
-  expect(approved[0]).toContain('resumed-request')
-  const state = JSON.parse(await readFile(paths.statePath, 'utf8'))
-  expect(state.phase).toBe('approved')
-  expect(JSON.stringify(state)).not.toContain(requestSecret)
-})
+test.each(['opencode', 'pi'] as const)(
+  'explicit setup for %s resumes a persisted secret before propose and completes scoped enrollment',
+  async (host) => {
+    const { paths, approved, row, proposedName, run } =
+      await enrollmentSetupFixture('setup-resume-enrollment-', host)
+    const requestSecret = '01'.repeat(32)
+    await writeFile(
+      paths.statePath,
+      JSON.stringify({
+        version: 1,
+        phase: 'pending',
+        proposedName,
+        requestSecret,
+        createdAt: 1,
+        updatedAt: 1,
+      }),
+      { mode: 0o600 },
+    )
+    let proposes = 0
+    let polls = 0
+    const result = await run({
+      enrollPropose: async () => {
+        proposes++
+        const persisted = JSON.parse(await readFile(paths.statePath, 'utf8'))
+        expect(persisted.requestSecret).toBe(requestSecret)
+        return { requestId: 'resumed-request' }
+      },
+      enrollPoll: async () => {
+        polls++
+        return polls === 1
+          ? { status: 'pending' as const }
+          : {
+              status: 'approved' as const,
+              name: proposedName,
+              token: '02'.repeat(32),
+              tokenGeneration: 1,
+            }
+      },
+    })
+    expect(result.ok).toBe(true)
+    expect(result.discoveredAccounts).toEqual([
+      { credentialId: row.id, accountId: row.accountId },
+    ])
+    expect(proposes).toBe(1)
+    expect(polls).toBe(2)
+    expect(approved).toHaveLength(1)
+    expect(approved[0]).toContain('resumed-request')
+    const state = JSON.parse(await readFile(paths.statePath, 'utf8'))
+    expect(state.phase).toBe('approved')
+    expect(JSON.stringify(state)).not.toContain(requestSecret)
+  },
+)
 
 test.each(['pending', 'blocked'] as const)(
   'explicit setup replaces one superseded %s request without approving its dead id',

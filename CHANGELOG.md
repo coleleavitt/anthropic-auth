@@ -6,10 +6,11 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Breaking Changes
 
-- Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. OpenCode and Pi now require enrolled, zero-bind scoped custody; an older Claustrum configuration without a scoped roster refuses serving until `setup` completes. Local OAuth and API-key routes are unaffected.
+- Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. OpenCode and Pi now require enrolled, zero-bind scoped custody; an older Claustrum configuration without a scoped roster refuses serving until `setup` completes. Remove Core's process-shared enrollment-registry export; host path resolution remains available through the Core enrollment module. Local OAuth and API-key routes are unaffected.
 
 ### Patch Changes
 
+- Stop unsolicited Claustrum enrollment on OpenCode boot and account-status views: only explicit offline setup proposes and polls, while `/claude-account enrollment-reset` clears terminal state under lock without starting another request. Setup resumes crash-persisted secrets and replaces one daemon-confirmed dead request; all producer-permanent refusal codes stop polling even when older client transports mislabel them retryable. This removes the per-process enrollment poll loop (#255) without changing scoped account-discovery polling.
 - Update OpenCode plugin and SDK test dependencies together to 1.18.31, plus Biome 2.5.14, Lefthook 2.1.14 and the dev-only Anthropic SDK 4.0.58; preserve packed TUI and custom-fetch compatibility checks.
 - Remove Core's unused direct `@cortexkit/subc-client` dependency and declare it where the E2E mock uses it. Synchronize `bun.lock` workspace versions and dependency declarations during version bumps, and fail CI or release preparation when the lock disagrees with package manifests (which Bun's frozen install alone did not detect).
 - Enforce Core/OpenCode/Pi unit-test count floors in CI and releases with one measured test pass, a PR merge-target ratchet and a release ratchet against the previous version tag rather than only the release commit's parent. A reduction requires an explicit from/to marker and reason; release checks reject stale tags or missing floor provenance, with v1.23.0's verified floorless baseline seeded at 290/1672/140. Both workflows check canonical Claustrum fixture provenance and the real Pi host tool-call round-trip.

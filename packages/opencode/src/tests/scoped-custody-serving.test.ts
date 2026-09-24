@@ -396,12 +396,6 @@ test('Claustrum mode without a scoped roster refuses to serve even with legacy l
     { directory: root } as any,
     {
       scopedRosterPollIntervalMs: 0,
-      claustrumEnrollmentPollIntervalMs: 0,
-      claustrumEnrollmentConnect: async () => {
-        throw new Error(
-          'Isolated legacy-refusal test must not connect to the host vault',
-        )
-      },
     } as any,
   )
   try {
@@ -946,6 +940,7 @@ test('optimistic WebSocket reports only the scoped version used by its real upst
   const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-ws-401-'))
   testDirs.push(root)
   const server = Bun.serve({
+    hostname: '127.0.0.1',
     port: 0,
     fetch: (request, server) =>
       server.upgrade(request)

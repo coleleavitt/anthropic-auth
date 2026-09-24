@@ -301,7 +301,7 @@ Run `bunx @cortexkit/opencode-anthropic-auth setup` with OpenCode stopped to enr
 
 Each model send, quota/profile query, CacheKeep prewarm, and Prime fire obtains fresh scoped authorization with a five-minute serving margin. The vault alone refreshes OAuth credentials; the plugin never serves or refreshes a stale local token in Claustrum mode. A 401 report carries the exact record version sent for that attempt. An older Claustrum configuration without `scopedRoster: true` fails closed, even if obsolete local fallback material remains. Account and sidebar projections contain no bearer material.
 
-`/claude-account` displays the roster and enrollment status. `/claude-account claustrum` provides offline setup guidance and `/claude-account local` explains the verified local login requirement; neither command switches authority while OpenCode is active. A denied or locally blocked enrollment can be reset with `/claude-account enrollment-reset`; an approved token cannot be reset by that command. API-key routes remain separate.
+`/claude-account` displays the roster and reads enrollment status without proposing or polling. Only the offline `setup` command enrolls a host; it resumes crash-persisted requests and replaces a daemon-proven dead request at most once. `/claude-account claustrum` provides setup guidance and `/claude-account local` explains the verified local login requirement; neither switches authority while OpenCode is active. `/claude-account enrollment-reset` clears denied or blocked local state under lock without starting a new proposal; run setup afterward. Approved tokens cannot be reset by that command. API-key routes remain separate.
 
 ## Quota-aware routing
 

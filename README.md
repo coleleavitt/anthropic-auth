@@ -311,7 +311,8 @@ Use `bunx @cortexkit/opencode-anthropic-auth setup` to enroll each host, grant `
 
 Claustrum's scoped inventory is the authority for every OAuth account, including main. New accounts added via `ck auth login --provider anthropic` are discovered automatically without per-account binding or a restart. The plugin stores only secret-free routing preferences, fetches initial quota for new accounts, and authorizes each outbound request via `getScoped`. A vault refusal never falls back to local OAuth tokens. API-key routes remain separate. An older Claustrum configuration without a scoped roster fails closed until setup completes.
 
-`/claude-account` shows custody and enrollment status. `/claude-account claustrum` directs you to the offline setup wizard; `/claude-account local` explains the verified local re-login requirement rather than changing custody while OpenCode is running. `/claude-account enrollment-reset` clears only denied or blocked ceremony state, never an approved token.
+`/claude-account` reads custody and enrollment status without creating or polling a request. Only the offline setup wizard enrolls a host; it can resume a pending request or renew a proven-expired one. `/claude-account claustrum` directs you to setup; `/claude-account local` explains the verified local re-login requirement rather than changing custody while OpenCode is running. `/claude-account enrollment-reset` only clears denied or blocked ceremony state under lock, never proposes a replacement or resets an approved token. Run setup afterward.
+
 ## Quota-aware routing
 
 When `quota.enabled` is true, the plugin checks Anthropic's OAuth usage endpoint and applies the configured remaining-quota thresholds to both main and fallback accounts.

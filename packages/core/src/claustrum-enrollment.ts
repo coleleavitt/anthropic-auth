@@ -9,7 +9,15 @@ import {
   stat,
   unlink,
 } from 'node:fs/promises'
-import { basename, dirname, extname, join } from 'node:path'
+import { homedir } from 'node:os'
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  resolve,
+} from 'node:path'
 import {
   ClaustrumCredentialError,
   type ClaustrumClientOptions as ClaustrumEnrollmentClientOptions,
@@ -127,6 +135,29 @@ export function getClaustrumEnrollmentPaths(
     statePath: join(dirname(tokenPath), `${stem}-state${extension}`),
     tokenPath,
   }
+}
+
+/** Resolve the independently enrolled host's owner-only token and state paths. */
+export function getHostClaustrumEnrollmentPaths(
+  host: 'opencode' | 'pi',
+  env: NodeJS.ProcessEnv = process.env,
+  cwd = process.cwd(),
+): ClaustrumEnrollmentPaths {
+  const configured =
+    env[
+      `${host.toUpperCase()}_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`
+    ]?.trim()
+  const tokenPath = configured
+    ? isAbsolute(configured)
+      ? configured
+      : resolve(cwd, configured)
+    : join(
+        env.XDG_STATE_HOME || join(homedir(), '.local', 'state'),
+        'cortexkit',
+        'anthropic-auth',
+        `${host}-enrollment.json`,
+      )
+  return getClaustrumEnrollmentPaths(tokenPath)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

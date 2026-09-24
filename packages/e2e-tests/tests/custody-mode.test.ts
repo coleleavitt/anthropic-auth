@@ -109,6 +109,11 @@ describe('zero-bind scoped custody', () => {
       await harness.waitForSessionStatusType(session, 'retry', 15_000)
       expect(harness.anthropic.requests()).toHaveLength(0)
       expect(daemon.credentialGets).toHaveLength(0)
+      expect(daemon.enrollmentProposals).toHaveLength(0)
+      await expect(readFile(
+        join(harness.opencode.env.configDir, 'claustrum-enrollment-state.json'),
+        'utf8',
+      )).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       await harness.abortSession(session)
     }

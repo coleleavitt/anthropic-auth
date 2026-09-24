@@ -37,8 +37,7 @@ import {
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
-  type ClaustrumEnrollmentConnection,
-  type ClaustrumEnrollmentStatus,
+  CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
   type ClaustrumScopedAttempt,
   type ClaustrumScopedClient,
   ClaustrumScopedRuntime,
@@ -47,7 +46,6 @@ import {
   CustodyTombstoneLoginError,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
-  connectClaustrumEnrollmentClient,
   connectClaustrumScopedClient,
   createEmptyStorage,
   createStickyNoRouteResponse,
@@ -83,6 +81,7 @@ import {
   getClaustrumMode,
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
+  getHostClaustrumEnrollmentPaths,
   getKillswitchConfig,
   getOrCreateMainAccountId,
   getOrCreatePrimeAuthLineageId,
@@ -165,11 +164,13 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  readClaustrumEnrollmentStatus,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
   remapRequestBodyModel,
   removeAccountPersistent,
   reorderAccountsPersistent,
+  resetClaustrumEnrollmentState,
   resolveClaudeCodeIdentity,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
@@ -218,11 +219,6 @@ import {
   summarizeCacheTtl,
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
-import {
-  adoptClaustrumEnrollment,
-  type ClaustrumEnrollmentAdoption,
-  getOpenCodeClaustrumEnrollmentPaths,
-} from './claustrum-enrollment-registry.ts'
 import {
   custodyStateFor,
   fallbackCustodyDimensions,
@@ -983,9 +979,7 @@ type PluginRuntimeOverrides = Partial<{
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
   scopedRosterPollIntervalMs: number
-  claustrumEnrollmentConnect: () => Promise<ClaustrumEnrollmentConnection>
   claustrumScopedConnect: () => Promise<ClaustrumScopedClient>
-  claustrumEnrollmentPollIntervalMs: number
   cacheKeepAggregateRefreshIntervalMs: number
 }>
 
@@ -1075,63 +1069,6 @@ const anthropicAuthPlugin = async (
       cause: error instanceof Error ? error : undefined,
     })
   }
-  let claustrumEnrollmentStatus: ClaustrumEnrollmentStatus = { state: 'idle' }
-  let claustrumEnrollmentAdoption: ClaustrumEnrollmentAdoption | null = null
-  function ensureClaustrumEnrollmentAdoption(): ClaustrumEnrollmentAdoption {
-    if (claustrumEnrollmentAdoption) return claustrumEnrollmentAdoption
-    const identity = {
-      project_root: ctx.directory ?? process.cwd(),
-      harness: 'opencode',
-      session: `store-${primeStorageFingerprint(accountStoragePath)}`,
-    }
-    claustrumEnrollmentAdoption = adoptClaustrumEnrollment({
-      paths: getOpenCodeClaustrumEnrollmentPaths(),
-      connect: () =>
-        runtimeOverrides.claustrumEnrollmentConnect?.() ??
-        connectClaustrumEnrollmentClient({
-          projectRoot: ctx.directory ?? process.cwd(),
-          storagePath: accountStoragePath,
-          identity,
-          logger: (errorClass) =>
-            logger.warn('claustrum', 'unknown enrollment error class', {
-              errorClass,
-            }),
-          ...(getConfiguredClaustrumConnectionFile() && {
-            connectionFile: getConfiguredClaustrumConnectionFile(),
-          }),
-        }),
-      setTimeoutImpl: runtimeTimers.setTimeout,
-      clearTimeoutImpl: runtimeTimers.clearTimeout,
-      onStatus: (status) => {
-        const previous = claustrumEnrollmentStatus
-        claustrumEnrollmentStatus = status
-        if (
-          status.state === 'unavailable' &&
-          (previous.state !== 'unavailable' || previous.code !== status.code)
-        ) {
-          logger.warn('claustrum', 'enrollment ceremony unavailable', {
-            error: status.code,
-          })
-        } else if (
-          status.state === 'approved' &&
-          previous.state !== 'approved'
-        ) {
-          logger.info('claustrum', 'enrollment ceremony approved', {
-            generation: status.tokenGeneration,
-          })
-        }
-      },
-      ...(runtimeOverrides.claustrumEnrollmentPollIntervalMs !== undefined && {
-        pollIntervalMs: runtimeOverrides.claustrumEnrollmentPollIntervalMs,
-      }),
-    })
-    return claustrumEnrollmentAdoption
-  }
-  function stopClaustrumEnrollmentAdoption(): void {
-    claustrumEnrollmentAdoption?.release()
-    claustrumEnrollmentAdoption = null
-    claustrumEnrollmentStatus = { state: 'idle' }
-  }
   function isScopedCustodyActive(
     storage: AccountStorage | null | undefined,
   ): boolean {
@@ -1158,7 +1095,7 @@ const anthropicAuthPlugin = async (
       }
       runtime = new ClaustrumScopedRuntime({
         storagePath,
-        tokenPath: getOpenCodeClaustrumEnrollmentPaths().tokenPath,
+        tokenPath: getHostClaustrumEnrollmentPaths('opencode').tokenPath,
         connect: () =>
           runtimeOverrides.claustrumScopedConnect
             ? runtimeOverrides.claustrumScopedConnect()
@@ -1188,8 +1125,6 @@ const anthropicAuthPlugin = async (
 
   if (isScopedCustodyActive(initialStorage)) {
     getOpenCodeScopedRuntime(accountStoragePath, ctx.directory).start()
-  } else if (getClaustrumMode(initialStorage) === 'claustrum') {
-    ensureClaustrumEnrollmentAdoption()
   }
 
   const fallbackMode = resolveContentFilterFallbackMode(
@@ -2862,13 +2797,6 @@ const anthropicAuthPlugin = async (
       })
     }
     try {
-      stopClaustrumEnrollmentAdoption()
-    } catch (error) {
-      logger.warn('claustrum', 'failed to stop enrollment ceremony', {
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
-    try {
       quotaManager.close()
     } catch {}
     try {
@@ -4115,19 +4043,22 @@ const anthropicAuthPlugin = async (
             : 'Local exit requires replacing the OpenCode auth tombstone with a verified local OAuth login while OpenCode is stopped. Do not change custody mode alone.',
       }),
       resetEnrollment: async () => {
-        const adoption = ensureClaustrumEnrollmentAdoption()
-        const reset = await adoption.resetTerminal()
+        const reset = await resetClaustrumEnrollmentState(
+          getHostClaustrumEnrollmentPaths('opencode'),
+          CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+        )
         switch (reset) {
           case 'reset':
             return {
-              text: 'Claustrum enrollment reset; a new request is being prepared.',
+              text: 'Terminal Claustrum enrollment state cleared. Run setup to enroll OpenCode again.',
             }
           case 'idle':
-            await adoption.reconcileNow()
-            return { text: 'Claustrum enrollment request is being prepared.' }
+            return {
+              text: 'No Claustrum enrollment state to reset. Run setup to enroll OpenCode.',
+            }
           case 'refused-pending':
             return {
-              text: 'Claustrum enrollment is still pending. Deny or approve that request before resetting it.',
+              text: 'Claustrum enrollment is still pending. Run setup to resume it or renew an expired request.',
             }
           case 'refused-approved':
             return {
@@ -4135,7 +4066,7 @@ const anthropicAuthPlugin = async (
             }
           case 'busy':
             return {
-              text: 'Another plugin process is reconciling Claustrum enrollment; retry shortly.',
+              text: 'Another process is updating Claustrum enrollment; retry shortly.',
             }
         }
       },
@@ -4278,14 +4209,18 @@ const anthropicAuthPlugin = async (
       getConfiguredClaustrumConnectionFile(),
     )
     const custodyMode = getClaustrumMode(accountStorage)
-    if (custodyMode === 'claustrum') ensureClaustrumEnrollmentAdoption()
+    const claustrumEnrollment =
+      custodyMode === 'claustrum'
+        ? await readClaustrumEnrollmentStatus(
+            getHostClaustrumEnrollmentPaths('opencode'),
+            CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+          )
+        : undefined
     return {
       accounts,
       claustrumDetection: detection.status,
       custodyMode,
-      ...(custodyMode === 'claustrum' && {
-        claustrumEnrollment: claustrumEnrollmentStatus,
-      }),
+      ...(claustrumEnrollment && { claustrumEnrollment }),
     }
   }
 

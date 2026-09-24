@@ -187,42 +187,34 @@ export function formatEnrollmentStatus(
   status: ClaustrumEnrollmentStatus,
   scopedServing = false,
 ): string[] {
+  const setup =
+    '- Next: Quit the host and run `bunx @cortexkit/opencode-anthropic-auth setup`'
   switch (status.state) {
     case 'idle':
       return ['- Enrollment: not enrolled']
     case 'busy':
-      return ['- Enrollment: another plugin process is reconciling']
+      return ['- Enrollment: setup is busy']
     case 'unavailable':
       return ['- Enrollment: temporarily unavailable']
     case 'pending':
       return status.requestId && /^[A-Za-z0-9_-]{1,128}$/.test(status.requestId)
-        ? [
-            `- Enrollment: pending approval (${status.requestId})`,
-            `- Approve: \`ck auth enroll approve --request-id ${status.requestId}\``,
+        ? [`- Enrollment: pending approval (${status.requestId})`, setup]
+        : [
+            status.requestId
+              ? '- Enrollment: pending approval'
+              : '- Enrollment: request not sent',
+            setup,
           ]
-        : status.requestId
-          ? [
-              '- Enrollment: pending approval; inspect it with `ck auth enroll list`',
-            ]
-          : ['- Enrollment: preparing request']
     case 'approved': {
       const name = status.approvedName ?? status.proposedName
       return /^[A-Za-z0-9_-]{1,128}$/.test(name)
         ? [
             `- Enrollment: approved as enrolled:${name} (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
-            ...(scopedServing
-              ? []
-              : [
-                  `- Grant: \`ck auth grant --principal enrolled:${name} --selector-kind category --selector anthropic-native --operation read\``,
-                ]),
+            ...(scopedServing ? [] : [setup]),
           ]
         : [
             `- Enrollment: approved (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
-            ...(scopedServing
-              ? []
-              : [
-                  '- Inspect the approved name with `ck auth enroll list` before granting access.',
-                ]),
+            ...(scopedServing ? [] : [setup]),
           ]
     }
     case 'denied':

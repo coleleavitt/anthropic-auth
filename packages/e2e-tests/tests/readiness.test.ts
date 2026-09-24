@@ -13,7 +13,7 @@ import {
 const noLogs = () => ({ stdout: '', stderr: '' })
 
 test('readiness fails on terminal child exit instead of polling until its deadline', async () => {
-  const server = Bun.serve({ port: 0, fetch: () => new Response('not ready', { status: 503 }) })
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('not ready', { status: 503 }) })
   const child = spawn(process.execPath, ['-e', 'process.exit(23)'], { stdio: 'ignore' })
   try {
     await expect(waitForOpencodeReady(child, server.url.href.replace(/\/$/, ''), noLogs)).rejects.toThrow('code=23')
@@ -27,7 +27,7 @@ test('readiness fails on terminal child exit instead of polling until its deadli
 
 test('readiness rejects an already exited process without issuing a health request', async () => {
   let requests = 0
-  const server = Bun.serve({ port: 0, fetch: () => { requests++; return new Response('healthy') } })
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => { requests++; return new Response('healthy') } })
   const child = spawn(process.execPath, ['-e', 'process.exit(17)'], { stdio: 'ignore' })
   try {
     await once(child, 'exit')
@@ -40,7 +40,7 @@ test('readiness rejects an already exited process without issuing a health reque
 })
 
 test('successful readiness removes temporary child listeners', async () => {
-  const server = Bun.serve({ port: 0, fetch: () => Response.json({ healthy: true }) })
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ healthy: true }) })
   const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
   try {
     await waitForOpencodeReady(child, server.url.href.replace(/\/$/, ''), noLogs)
@@ -118,6 +118,7 @@ test('project readiness waits for lazy config bootstrap, not just an open listen
   const gate = new Promise<void>((resolve) => { release = resolve })
   const requested: string[] = []
   const server = Bun.serve({
+    hostname: '127.0.0.1',
     port: 0,
     fetch: async (request) => {
       const url = new URL(request.url)
@@ -156,6 +157,7 @@ test('project readiness waits for lazy config bootstrap, not just an open listen
 test('project readiness rejects an exited child before contacting any listener', async () => {
   let requests = 0
   const server = Bun.serve({
+    hostname: '127.0.0.1',
     port: 0,
     fetch: () => { requests++; return Response.json({ configured: true }) },
   })
