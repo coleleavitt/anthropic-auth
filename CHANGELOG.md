@@ -4,6 +4,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+## 2.0.0
+
 ### Breaking Changes
 
 - Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. OpenCode and Pi now require enrolled, zero-bind scoped custody; an older Claustrum configuration without a scoped roster refuses serving until `setup` completes. Remove Core's process-shared enrollment-registry export; host path resolution remains available through the Core enrollment module. Local OAuth and API-key routes are unaffected.

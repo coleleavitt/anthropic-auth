@@ -88,7 +88,7 @@ Pinning is strongly recommended for any OpenCode plugin:
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-anthropic-auth@1.0.0"]
+  "plugin": ["@cortexkit/opencode-anthropic-auth@2.0.0"]
 }
 ```
 
@@ -102,7 +102,7 @@ After changing plugin config, restart OpenCode.
 Install the Pi package with Pi's package manager:
 
 ```bash
-pi install npm:@cortexkit/pi-anthropic-auth@1.0.0
+pi install npm:@cortexkit/pi-anthropic-auth@2.0.0
 ```
 
 For an unpinned install:
@@ -380,7 +380,7 @@ Pinning is recommended, matching the main plugin entry:
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-anthropic-auth@1.0.0"]
+  "plugin": ["@cortexkit/opencode-anthropic-auth@2.0.0"]
 }
 ```
 

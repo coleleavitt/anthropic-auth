@@ -4,6 +4,8 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+## 2.0.0
+
 ### Breaking Changes
 
 - Remove legacy capability-handle and manifest-based Claustrum custody. The plugin serves OAuth only via enrolled scoped credentials; old Claustrum configurations without `scopedRoster: true` fail closed until the offline `setup` wizard completes.
