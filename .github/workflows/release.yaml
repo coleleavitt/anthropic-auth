@@ -54,6 +54,12 @@ jobs:
       - name: Build
         run: bun run build
 
+      - name: Pi host-import guard tests
+        run: bun test scripts/check-pi-dist-imports.test.ts
+
+      - name: Pi host-import guard
+        run: bun run check:pi-dist-imports
+
       - name: Packed TUI smoke test
         run: bun run --cwd packages/opencode smoke:tui
         env:

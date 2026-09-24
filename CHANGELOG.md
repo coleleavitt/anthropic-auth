@@ -10,6 +10,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Persist scoped main quota under the discovered primary account rather than the local host slot, and let `/claude-quota` poll with a freshly authorized scoped credential. A header-only main quota remains due for its first usage poll; failed polls are spaced by account without treating usage 403 as rate-limit backoff or counting requests that lose the cross-process refresh lock.
+- Load the Pi extension through Oh My Pi's legacy SDK compatibility layer by keeping transcript system-prompt and tool replay in the extension instead of importing helpers absent from the host. Check built Pi imports with a syntax-aware allowlist in CI and release workflows.
+- Add debug diagnostics for scoped 401 retry decisions and delivered failure reports across OpenCode and Pi, recording served and current record versions and a non-secret decision reason without logging bearer material.
 - Update the shared Claustrum client to 0.4.0 (with Subc client 0.16.x) for scoped custody. The client no longer reconnects on a terminal `unknown_module` response from a daemon without the Claustrum module.
 - Show an approved Claustrum enrollment as active in `/claude-account` and the account modal when the main account is vault-served; stop telling already configured users to rerun setup or request a grant. Clarify that `enrollment-reset` only clears terminal state.
 - Fix packed OpenCode CLI startup under Node: keep `jsonc-parser` external so its CommonJS `./impl/*` modules resolve from the installed dependency, and run the packed CLI's `--help` path alongside the TUI smoke gate (#257).

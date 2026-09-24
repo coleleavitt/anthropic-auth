@@ -177,8 +177,18 @@ export function findHostImportViolations(
             node.callee.type === 'Import'
           ? (node.arguments as unknown[])[0]
           : undefined
+    if (argument === undefined) continue
     const specifier = stringValue(argument)
-    if (specifier !== undefined) check(specifier, 'opaque')
+    if (specifier !== undefined) {
+      check(specifier, 'opaque')
+    } else {
+      // Template literals and computed specifiers may resolve to a host SDK
+      // at runtime. We cannot prove their targets from emitted JavaScript, so
+      // reject them rather than silently letting an unsupported import ship.
+      findings.push(
+        `${origin}: runtime dynamic import cannot be verified against the host SDK allowlist`,
+      )
+    }
   }
 
   // A module can import the same specifier more than once.

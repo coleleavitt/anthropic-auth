@@ -10,6 +10,8 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Patch Changes
 
+- Persist scoped main quotas with the vault's primary account identity, restore `/claude-quota` polling with scoped credentials, and discover model-scoped limits from usage polls even when response headers keep general windows fresh. A failed usage poll is bounded per account, without counting lock-losing contenders.
+- Log scoped OAuth 401 re-authorization decisions and delivered failure reports at debug level with record-version provenance but no bearer tokens.
 - Update scoped Claustrum transport through the shared 0.4.0 client; a daemon that does not serve the Claustrum module now fails without a futile reconnect.
 - Correct approved enrollment status in `/claude-account` and the TUI account dialog when the main account is vault-served; do not prompt configured users to rerun setup, and describe `enrollment-reset` as a state clear rather than an automatic retry.
 - Fix the packed CLI failing before `setup` under Node by externalizing `jsonc-parser` from the split bundle and checking a fresh packed CLI install in the smoke gate (#257).

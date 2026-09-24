@@ -60,7 +60,7 @@ anthropic-auth/
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
 - Contains: Extension entry point, command registration, request building, streaming provider
-- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, bounded process-local billing-suffix pinning, origin-aware thinking-signature filtering, configurable Fable 5.1 prefix behavior, mid-conversation effort markers, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `effort-history.ts` (compaction-aware Pi thinking-level timeline), `paths.ts` (Pi-specific path resolution)
+- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, bounded process-local billing-suffix pinning, origin-aware thinking-signature filtering, configurable Fable 5.1 prefix behavior, mid-conversation effort markers, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `transcript.ts` (host-independent system-prompt and tool replay for Pi and Oh My Pi), `effort-history.ts` (compaction-aware Pi thinking-level timeline), `paths.ts` (Pi-specific path resolution)
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic, relay, and Claustrum servers
@@ -68,7 +68,7 @@ anthropic-auth/
 
 **`scripts/`:**
 - Purpose: Development, release, and analysis utilities
-- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `check-claustrum-golden.ts` (pins canonical Claustrum tombstone ancestry and exact fixture bytes), `check-pi-tool-mapping.ts` (runs an isolated real Pi host tool round-trip against deterministic SSE), `check-test-count-floors.ts` (runs unit suites once; compares floors against the merge target in PR CI and the previous version tag at release), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` / `workspace-lock.mjs` (cross-package versions, surgical Bun lockfile synchronization, and manifest-to-lock validation)
+- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `check-claustrum-golden.ts` (pins canonical Claustrum tombstone ancestry and exact fixture bytes), `check-pi-tool-mapping.ts` (runs an isolated real Pi host tool round-trip against deterministic SSE), `check-pi-dist-imports.ts` (AST-validates emitted Pi host-SDK imports, rejecting unsupported or unverifiable dynamic imports in CI and release), `check-test-count-floors.ts` (runs unit suites once; compares floors against the merge target in PR CI and the previous version tag at release), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` / `workspace-lock.mjs` (cross-package versions, surgical Bun lockfile synchronization, and manifest-to-lock validation)
 
 ## Key File Locations
 
@@ -148,6 +148,7 @@ anthropic-auth/
 - `packages/pi/src/commands.ts`: Pi slash command registration (`/claude-*`) and persistent setting handlers
 - `packages/pi/src/paths.ts`: Pi-specific storage and config path resolution
 - `packages/pi/src/convert.ts`: Pi-to-Anthropic request conversion, including ordered system prompt block flattening, session-stable Claude Code billing suffixes, same-origin thinking-signature replay, configurable Fable 5.1 compaction behavior, mid-conversation effort markers, redacted_thinking mapping, Pi documentation-prompt relocation, and four-slot cache breakpoint placement
+- `packages/pi/src/transcript.ts`: Locally replays host system messages and tool changes rather than importing helpers absent from Oh My Pi's legacy SDK shim
 - `packages/pi/src/effort-history.ts`: Rebuilds Fable 5.1 effort transitions from Pi's active branch and compaction-aware context entries (locally derived when buildContextEntries is absent)
 - `packages/pi/src/stream.ts`: Pi provider streaming implementation, including preservation of Anthropic redacted-thinking blocks for later replay, request-resolved host tool names for SSE tool-call mapping, API-key route versioned URL composition, and safe custom header application
 

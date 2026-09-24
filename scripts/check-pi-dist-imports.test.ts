@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -67,6 +67,21 @@ describe('Pi dist host-import guard', () => {
     }
   })
 
+  test('rejects template-literal and computed dynamic import specifiers that evade static host checks', () => {
+    expect(
+      violations(
+        'export async function load() { return import(`@earendil-works/pi-ai`) }',
+      ),
+    ).toContain(
+      'stream.js: runtime dynamic import cannot be verified against the host SDK allowlist',
+    )
+    expect(
+      violations('export async function load(name) { return import(name) }'),
+    ).toContain(
+      'stream.js: runtime dynamic import cannot be verified against the host SDK allowlist',
+    )
+  })
+
   test('rejects a disallowed name re-exported from the host', () => {
     expect(
       violations(`export { normalizeContext } from '@earendil-works/pi-ai'`),
@@ -110,6 +125,27 @@ describe('Pi dist host-import guard', () => {
         ].join('\n'),
       ),
     ).toEqual([])
+  })
+
+  test('CI and release verify the built Pi import surface before publication', async () => {
+    const root = join(import.meta.dir, '..')
+    for (const workflow of [
+      '.github/workflows/ci.yml',
+      '.github/workflows/release.yaml',
+    ]) {
+      const source = await readFile(join(root, workflow), 'utf8')
+      const build = source.indexOf('bun run build')
+      const test = source.indexOf(
+        'bun test scripts/check-pi-dist-imports.test.ts',
+      )
+      const guard = source.indexOf('bun run check:pi-dist-imports')
+      expect(build).toBeGreaterThan(-1)
+      expect(test).toBeGreaterThan(build)
+      expect(guard).toBeGreaterThan(test)
+      if (workflow.endsWith('release.yaml')) {
+        expect(guard).toBeLessThan(source.indexOf('publish-npm:'))
+      }
+    }
   })
 
   test('fails when the dist directory holds no JavaScript', async () => {
