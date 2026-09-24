@@ -1389,15 +1389,34 @@ const anthropicAuthPlugin = async (
         credentialAccountUuid ?? mainSlotQuotaKey,
       )
       const currentStorage = await loadAccounts(accountStoragePath)
+      const scopedCustodyActive = isScopedCustodyActive(currentStorage)
+      const rosterPrimaryAccountId = scopedCustodyActive
+        ? currentStorage?.claustrum?.primaryAccount?.accountId
+        : undefined
+      // A scoped receipt may only bind quota to the account it was served
+      // for. If the roster primary or the custody mode changed after the
+      // receipt was issued, the receipt's quota must not land on the new
+      // account: fail closed without touching the global main identity.
+      if (
+        (scopedCustodyActive &&
+          (credentialAccountUuid === undefined ||
+            credentialAccountUuid !== rosterPrimaryAccountId)) ||
+        (!scopedCustodyActive && credentialAccountUuid !== undefined)
+      ) {
+        return {
+          quotaKey: undefined,
+          providerAccountUuid: undefined,
+          generation: quotaManager.getMainQuotaIdentityGeneration(),
+          stale: true,
+          state: 'on-identity-mismatch' as const,
+        }
+      }
       // Scoped custody binds main runtime state to the roster's primary
       // account id: core's state fence drops any main quota keyed otherwise,
       // so a slot-keyed quota would never persist. Outside scoped custody,
       // non-oat adapters keep their local slot for quota fencing; it is not a
       // provider identity and must never reach a provider-facing field.
-      const quotaKey =
-        (isScopedCustodyActive(currentStorage)
-          ? currentStorage?.claustrum?.primaryAccount?.accountId
-          : undefined) ?? mainSlotQuotaKey
+      const quotaKey = rosterPrimaryAccountId ?? mainSlotQuotaKey
       const persistedProviderAccountUuid =
         currentStorage?.main?.profile?.providerAccountUuid ??
         (currentStorage?.main?.profile?.accountIdentity as
@@ -2429,7 +2448,14 @@ const anthropicAuthPlugin = async (
 
   async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
     const credential = await getCurrentMainCredential()
-    await resolveMainQuotaAccountIdentity(credential.accessToken)
+    const resolution = await resolveMainQuotaAccountIdentity(
+      credential.accessToken,
+      undefined,
+      credential.credentialAccountId,
+    )
+    if (resolution.stale && credential.credentialAccountId !== undefined) {
+      throw new Error('Main account identity changed before the prime refresh')
+    }
     // The quota transport obtains its own per-dispatch scoped receipt and
     // owns any 401 report. Reporting the earlier identity-preflight receipt
     // here would misattribute a rotation and potentially invalidate it.
@@ -3260,11 +3286,16 @@ const anthropicAuthPlugin = async (
             : undefined
         if (auth.type === 'oauth' && commandAccessToken) {
           mainAccessToken = commandAccessToken
-          await resolveMainQuotaAccountIdentity(
+          const resolution = await resolveMainQuotaAccountIdentity(
             commandAccessToken,
             undefined,
             scopedMainCredential?.credentialAccountId,
           )
+          if (resolution.stale && scopedMainCredential) {
+            throw new Error(
+              'Main account identity changed while checking quota; try again',
+            )
+          }
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
           // returns the last cached snapshot when the API is backed off.

@@ -135,6 +135,11 @@ export class QuotaManager {
 
   // --- Inflight deduplication ---
   private inflightMain: Promise<QuotaRefreshResult> | null = null
+  // When this process last started a main usage poll, whatever its outcome.
+  // Bounds the header-only staleness rule below: a usage 403 deliberately does
+  // not arm quota backoff, so without this a failing poll would repeat on
+  // every request that checks main staleness.
+  private lastMainPollAttemptAt: number | undefined
   private inflightMainAccountId: string | undefined
   private inflightMainAccessToken: string | undefined
   private inflightMainToken = 0
@@ -548,7 +553,10 @@ export class QuotaManager {
       // seen headers would never learn its scoped (e.g. Fable weekly) limits.
       // An empty array is a real poll result and does not qualify.
       (this.main.quota.source === 'headers' &&
-        this.main.quota.scoped === undefined)
+        this.main.quota.scoped === undefined &&
+        (this.lastMainPollAttemptAt === undefined ||
+          this.now() - this.lastMainPollAttemptAt >=
+            getQuotaCheckIntervalMs(this.storage)))
     )
   }
 
@@ -928,6 +936,7 @@ export class QuotaManager {
     generation: number,
     inflightToken: number,
   ): Promise<QuotaRefreshResult> {
+    this.lastMainPollAttemptAt = this.now()
     return this._enqueueApiFetch(async () => {
       try {
         // Re-check backoff inside gate — may have been set by

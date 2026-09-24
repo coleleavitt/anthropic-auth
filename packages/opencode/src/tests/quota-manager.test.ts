@@ -2009,6 +2009,29 @@ describe('QuotaManager', () => {
       expect(qm.isMainStale()).toBe(false)
     })
 
+    test('a failed first usage poll does not re-arm header-only staleness until the next interval', async () => {
+      let usageCalls = 0
+      const qm = createQM((async () => {
+        usageCalls += 1
+        return new Response('{"error":{"type":"permission_error"}}', {
+          status: 403,
+        })
+      }) as unknown as typeof fetch)
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(true)
+
+      await qm.refreshMain('token', 'access-token').catch(() => {})
+      expect(usageCalls).toBe(1)
+      // A usage 403 arms no quota backoff; the header-only rule must not
+      // turn every subsequent request into another poll.
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(false)
+
+      now += 5 * 60_000
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(true)
+    })
+
     test('header push never introduces poll-owned scoped data', () => {
       const qm = createQM()
       const incoming = {

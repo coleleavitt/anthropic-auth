@@ -292,3 +292,96 @@ test('scoped custody persists main quota under the roster primary account id', a
     await plugin.dispose?.()
   }
 })
+
+test('a scoped main receipt never binds its quota to a roster primary that changed mid-request', async () => {
+  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-primary-race-'))
+  testDirs.push(root)
+  const storagePath = await setupScopedSeat(root)
+  const NEW_PRIMARY = '11111111-2222-4333-8444-555555555555'
+
+  let getScopedCalls = 0
+  const racingClient: ClaustrumScopedClient = {
+    listScoped: async () => ({ view: 'view-1', rows: [mainRow] }),
+    getScoped: async (input) => {
+      getScopedCalls += 1
+      // The roster primary moves to B after the plugin authorized main but
+      // before the receipt for A is used to bind quota.
+      if (getScopedCalls === 1) {
+        const stored = JSON.parse(await readFile(storagePath, 'utf8'))
+        stored.claustrum.primaryAccount.accountId = NEW_PRIMARY
+        await writeFile(storagePath, JSON.stringify(stored, null, 2), {
+          mode: 0o600,
+        })
+      }
+      return {
+        credentialId: input.credentialId,
+        accountId: PRIMARY_ACCOUNT_ID,
+        material: 'scoped-access-main',
+        recordVersion: 10,
+        expiresAtMs: Date.now() + 3_600_000,
+      }
+    },
+    reportAuthFailureScoped: async () => {},
+    close: () => {},
+  }
+
+  const resetSeconds = Math.floor(Date.now() / 1000) + 3_600
+  const messageAuthorizations: string[] = []
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes('/v1/messages')) {
+      messageAuthorizations.push(
+        new Headers(init?.headers).get('authorization') ?? '',
+      )
+      return new Response(
+        '{"id":"msg_1","type":"message","content":[{"type":"text","text":"ok"}]}',
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'anthropic-ratelimit-unified-5h-utilization': '0.4',
+            'anthropic-ratelimit-unified-5h-reset': String(resetSeconds),
+            'anthropic-ratelimit-unified-7d-utilization': '0.13',
+            'anthropic-ratelimit-unified-7d-reset': String(
+              resetSeconds + 86_400,
+            ),
+          },
+        },
+      )
+    }
+    return new Response('not found', { status: 404 })
+  }) as typeof fetch
+
+  const plugin = await AnthropicAuthPlugin(
+    { directory: root } as any,
+    {
+      claustrumScopedConnect: async () => racingClient,
+    } as any,
+  )
+  try {
+    const result = await (plugin as any).auth.loader(TOMBSTONE_AUTH, {
+      models: {},
+    } as any)
+    const response = await result
+      .fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-5',
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+      .catch(() => undefined)
+    await response?.text().catch(() => {})
+    await Bun.sleep(300)
+    await drainSidebarWrites()
+
+    const quota = await readMainQuota(storagePath)
+    // Whatever happened to the request, A's quota must never be bound to B.
+    expect(quota?.accountIdentity).not.toBe(NEW_PRIMARY)
+  } finally {
+    await plugin.dispose?.()
+  }
+})
