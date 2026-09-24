@@ -44,9 +44,130 @@ const mainRow: ScopedInventoryRow = {
 async function readMainQuota(storagePath: string) {
   const state = JSON.parse(
     await readFile(getAccountStatePath(storagePath), 'utf8'),
-  ) as { main?: { quota?: { accountIdentity?: string } } }
+  ) as {
+    main?: {
+      quota?: {
+        accountIdentity?: string
+        scoped?: Array<{ id?: string }>
+      }
+    }
+  }
   return state.main?.quota
 }
+
+async function setupScopedSeat(root: string) {
+  const storagePath = join(root, 'anthropic-auth.json')
+  const tokenPath = join(root, 'opencode-enrollment.json')
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
+  process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+    root,
+    'sidebar.json',
+  )
+  await writeFile(
+    tokenPath,
+    JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  const initialStorage: AccountStorage = {
+    version: 1,
+    mainAccountId: SLOT_ID,
+    claustrum: {
+      mode: 'claustrum',
+      scopedRoster: true,
+      primaryAccount: {
+        credentialId: mainRow.id,
+        accountId: PRIMARY_ACCOUNT_ID as any,
+        state: 'active',
+      },
+    },
+    accounts: [],
+  }
+  await writeFile(storagePath, JSON.stringify(initialStorage, null, 2), {
+    mode: 0o600,
+  })
+  return storagePath
+}
+
+const scopedClient: ClaustrumScopedClient = {
+  listScoped: async () => ({ view: 'view-1', rows: [mainRow] }),
+  getScoped: async (input) => ({
+    credentialId: input.credentialId,
+    accountId: PRIMARY_ACCOUNT_ID,
+    material: 'scoped-access-main',
+    recordVersion: 10,
+    expiresAtMs: Date.now() + 3_600_000,
+  }),
+  reportAuthFailureScoped: async () => {},
+  close: () => {},
+}
+
+const TOMBSTONE_AUTH = () =>
+  Promise.resolve({
+    type: 'oauth',
+    access: '',
+    refresh: 'claustrum-tombstone:v1:anthropic',
+    expires: 0,
+  })
+
+test('/claude-quota polls main through scoped custody and persists its scoped windows', async () => {
+  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-quota-cmd-'))
+  testDirs.push(root)
+  const storagePath = await setupScopedSeat(root)
+  const usageAuthorizations: string[] = []
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes('/api/oauth/usage')) {
+      usageAuthorizations.push(
+        new Headers(init?.headers).get('authorization') ?? '',
+      )
+      return Response.json({
+        five_hour: { utilization: 40, resets_at: null },
+        seven_day: { utilization: 13, resets_at: null },
+        limits: [
+          {
+            kind: 'weekly_scoped',
+            group: 'weekly',
+            percent: 22,
+            scope: {
+              model: { id: 'claude-fable-5-1', display_name: 'Fable' },
+            },
+          },
+        ],
+      })
+    }
+    return new Response('not found', { status: 404 })
+  }) as typeof fetch
+
+  const plugin = await AnthropicAuthPlugin(
+    { directory: root, client: { session: {} } } as any,
+    { claustrumScopedConnect: async () => scopedClient } as any,
+  )
+  try {
+    await (plugin as any).auth.loader(TOMBSTONE_AUTH, { models: {} } as any)
+    await (plugin as any)
+      ['command.execute.before']({
+        command: 'claude-quota',
+        arguments: '',
+        sessionID: 'session-1',
+      })
+      .catch(() => {})
+    await drainSidebarWrites()
+    expect(usageAuthorizations).toContain('Bearer scoped-access-main')
+    let quota = await readMainQuota(storagePath)
+    for (let i = 0; i < 60 && !quota?.scoped; i++) {
+      await Bun.sleep(50)
+      quota = await readMainQuota(storagePath)
+    }
+    expect(quota?.accountIdentity).toBe(PRIMARY_ACCOUNT_ID)
+    expect(quota?.scoped?.map((window) => window.id)).toEqual([
+      'claude-weekly-scoped-claude-fable-5-1',
+    ])
+  } finally {
+    await plugin.dispose?.()
+  }
+})
 
 test('scoped custody persists main quota under the roster primary account id', async () => {
   process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'

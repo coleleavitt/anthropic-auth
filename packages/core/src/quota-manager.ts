@@ -541,7 +541,14 @@ export class QuotaManager {
     }
     return (
       this.now() >= this.main.refreshAfter ||
-      this.scopedWindowIsStale(this.main, modelId)
+      this.scopedWindowIsStale(this.main, modelId) ||
+      // Model-scoped windows come only from the usage poll, and main has no
+      // background poll: header harvests keep five_hour/seven_day fresh and
+      // carry a polled `scoped` forward, so a main entry that has only ever
+      // seen headers would never learn its scoped (e.g. Fable weekly) limits.
+      // An empty array is a real poll result and does not qualify.
+      (this.main.quota.source === 'headers' &&
+        this.main.quota.scoped === undefined)
     )
   }
 

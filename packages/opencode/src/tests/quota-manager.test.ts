@@ -1992,6 +1992,23 @@ describe('QuotaManager', () => {
       expect(pushed.quota.scoped).toEqual([])
     })
 
+    test('a header-only main entry stays due for its first usage poll', () => {
+      const qm = createQM()
+      qm.pushMainFromHeaders('token', headerSnapshot())
+
+      // Headers keep five_hour/seven_day fresh but never carry scoped windows,
+      // so without a poll the entry would never learn model-scoped limits.
+      expect(qm.isMainStale()).toBe(true)
+
+      qm.setMain('token', {
+        quota: { scoped: [], checkedAt: now, source: 'poll' },
+        checkedAt: now,
+        refreshAfter: now + 60_000,
+      })
+      qm.pushMainFromHeaders('token', headerSnapshot())
+      expect(qm.isMainStale()).toBe(false)
+    })
+
     test('header push never introduces poll-owned scoped data', () => {
       const qm = createQM()
       const incoming = {

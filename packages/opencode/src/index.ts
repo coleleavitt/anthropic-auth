@@ -3246,15 +3246,31 @@ const anthropicAuthPlugin = async (
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
-        if (auth.type === 'oauth' && auth.access) {
-          mainAccessToken = mainServedAccessToken ?? auth.access
-          await resolveMainQuotaAccountIdentity(mainAccessToken)
+        // Under scoped custody the host slot is a tombstone with empty access;
+        // main's credential comes from the vault per attempt instead.
+        const scopedMainCredential =
+          auth.type === 'oauth' &&
+          isScopedCustodyActive(await loadAccounts(accountStoragePath))
+            ? await getCurrentMainCredential()
+            : undefined
+        const commandAccessToken = scopedMainCredential
+          ? scopedMainCredential.accessToken
+          : auth.access
+            ? (mainServedAccessToken ?? auth.access)
+            : undefined
+        if (auth.type === 'oauth' && commandAccessToken) {
+          mainAccessToken = commandAccessToken
+          await resolveMainQuotaAccountIdentity(
+            commandAccessToken,
+            undefined,
+            scopedMainCredential?.credentialAccountId,
+          )
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
           // returns the last cached snapshot when the API is backed off.
           const quota = await quotaManager.refreshMain(
             mainQuotaAccountId,
-            mainAccessToken,
+            commandAccessToken,
           )
           accounts.push({
             name: 'OpenCode anthropic',
