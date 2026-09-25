@@ -75,6 +75,25 @@ async function buildMessages(
   return body.messages
 }
 
+describe('fast mode model eligibility', () => {
+  test.each([
+    ['claude-opus-4-6', false],
+    ['claude-opus-4-7', false],
+    ['claude-opus-4-8', true],
+    ['claude-opus-5', true],
+    ['claude-opus-5-5', true],
+  ])('Pi sends speed only for eligible %s', async (model, enabled) => {
+    const { body } = await buildAnthropicRequest(
+      model,
+      { messages: [userMsg('hello')], tools: [] } as Context,
+      undefined,
+      defaultCache,
+      true,
+    )
+    expect(body.speed).toBe(enabled ? 'fast' : undefined)
+  })
+})
+
 describe('buildAnthropicRequest — prefill stripping', () => {
   test('strips single trailing assistant message', async () => {
     const messages = await buildMessages([
