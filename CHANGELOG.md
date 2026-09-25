@@ -12,6 +12,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Stop sending `speed: "fast"` to Opus 4.7, where it returns 400, and Opus 4.6, where it has no effect. Fast mode now applies only to Opus 4.8, Opus 5, and Opus 5.5 in OpenCode and Pi (#267).
+- Remove Opus 5.5's unsupported forced `tool_choice` for OpenCode structured-output requests while retaining the schema tool. OpenCode still records validated structured output and reports an error if the model does not call it. Keep named `tool_choice` references aligned with prefixed tool definitions on other models (#268).
+- Isolate OpenCode tests from live account files, sidebar state, CacheKeep leases, RPC directories, and Claustrum sockets even when a test clears a feature-specific override. Setup detection now uses the supplied environment for its connection file (#264, #265).
 - Persist scoped main quota under the discovered primary account rather than the local host slot, and let `/claude-quota` poll with a freshly authorized scoped credential. A header-only main quota remains due for its first usage poll; failed polls are spaced by account without treating usage 403 as rate-limit backoff or counting requests that lose the cross-process refresh lock.
 - Load the Pi extension through Oh My Pi's legacy SDK compatibility layer by keeping transcript system-prompt and tool replay in the extension instead of importing helpers absent from the host. Check built Pi imports with a syntax-aware allowlist in CI and release workflows.
 - Add debug diagnostics for scoped 401 retry decisions and delivered failure reports across OpenCode and Pi, recording served and current record versions and a non-secret decision reason without logging bearer material.

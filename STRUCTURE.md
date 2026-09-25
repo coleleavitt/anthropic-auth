@@ -154,9 +154,9 @@ anthropic-auth/
 
 **Tests:**
 - `packages/core/src/tests/`: Core-only unit tests (dump, killswitch, models, prime, quota surfaces, accounts persistence, custom headers, model remap, claustrum)
-- `packages/opencode/src/tests/`: One test file per module (50+ test files covering core + opencode), including Claustrum client/custody, credential-handle blindness, billing lineage tracking, and fail-closed network-guard suites
+- `packages/opencode/src/tests/`: OpenCode unit and integration tests, including scoped Claustrum custody, billing lineage, a fail-closed network guard, and test-host filesystem/daemon isolation. `preload-sandbox.ts` initializes a disposable sandbox before `setup.ts` imports Core (whose logger/dump defaults are fixed at module load), then `setup.ts` restores account, sidebar, cache, RPC, dump, and daemon paths before/after tests so clearing a feature override cannot reach live state.
 - `packages/pi/src/tests/`: Pi-specific tests (commands, convert, effort-history, index, stream)
-- `packages/e2e-tests/tests/`: Integration tests (tool prefix, quota header relay, temp directory hygiene, custody mode, mock claustrum)
+- `packages/e2e-tests/tests/`: Process integration tests (tool prefix, quota header relay, temp directory hygiene, scoped custody, and Opus 5.5 structured output with and without the schema tool call)
 
 ## Naming Conventions
 
