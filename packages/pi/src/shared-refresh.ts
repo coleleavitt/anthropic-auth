@@ -9,7 +9,9 @@
  */
 import {
   claimSharedAccountRefresh,
+  getClaustrumMode,
   type LoadedSharedAccountStore,
+  loadAccounts,
   loadSharedAccountStore,
   logger,
   markSharedRefreshTokenDead,
@@ -22,6 +24,7 @@ import {
   updateSharedAccountStore,
 } from '@cortexkit/anthropic-auth-core'
 import type { OAuthCredentials } from '@earendil-works/pi-ai'
+import { getPiAccountStoragePath } from './paths.ts'
 import {
   errorHttpStatus,
   type TraceSpan,
@@ -156,10 +159,26 @@ export interface RefreshAnthropicTokenOptions {
   reason?: RefreshReason
 }
 
+/**
+ * Claustrum custody owns the credential: local login and refresh must never
+ * spend or mint a token while it is active (upstream custody contract).
+ */
+export async function assertLocalAuthentication(): Promise<void> {
+  if (
+    getClaustrumMode(await loadAccounts(getPiAccountStoragePath())) ===
+    'claustrum'
+  ) {
+    throw new Error(
+      'Local Anthropic login and refresh are disabled while Claustrum custody is active',
+    )
+  }
+}
+
 export async function refreshAnthropicToken(
   credentials: OAuthCredentials,
   optionsOrSignal: AbortSignal | RefreshAnthropicTokenOptions = {},
 ): Promise<OAuthCredentials> {
+  await assertLocalAuthentication()
   const options =
     optionsOrSignal instanceof AbortSignal
       ? { signal: optionsOrSignal }

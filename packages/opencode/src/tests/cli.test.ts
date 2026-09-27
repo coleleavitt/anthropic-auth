@@ -5,7 +5,9 @@ import { join } from 'node:path'
 import {
   addAccountPersistent,
   getAccountStatePath,
+  loadAccounts,
   loadSharedAccountStore,
+  saveAccounts,
   saveSharedAccountStore,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -253,6 +255,37 @@ describe('CLI login', () => {
     expect(ids).toContain('person@example.com (org-b)')
   })
 
+  test('refuses before authorization while global Claustrum custody is committed', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [],
+        claustrum: { mode: 'claustrum' },
+      },
+      accountPath,
+    )
+    let authorizeCalls = 0
+
+    await expect(
+      withAccountEnv(accountPath, {}, () =>
+        login('blocked', {
+          authorize: async () => {
+            authorizeCalls += 1
+            throw new Error('authorization should not start')
+          },
+          prompt: async () => {
+            throw new Error('prompt should not run')
+          },
+        }),
+      ),
+    ).rejects.toThrow('Exit Claustrum mode first')
+    expect(authorizeCalls).toBe(0)
+    await expect(loadAccounts(accountPath)).resolves.toMatchObject({
+      accounts: [],
+    })
+  })
+
   test('names the account from the grant email and saves it', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
 
@@ -340,6 +373,27 @@ describe('CLI login', () => {
     expect(
       runtimeState.accounts['signed-in@example.com'].authLineageId,
     ).toMatch(/^[0-9a-f-]{36}$/)
+  })
+
+  test('allows human-readable local OAuth labels without the obsolete manifest label restriction', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+
+    await withAccountEnv(accountPath, {}, () =>
+      login('invalid label', {
+        prompt: async () => 'cli-code',
+        exchange: async () => ({
+          type: 'success' as const,
+          access: 'cli-access',
+          refresh: 'cli-refresh',
+          expires: Date.now() + 3600 * 1000,
+        }),
+      }),
+    )
+    expect((await loadAccounts(accountPath))?.accounts[0]).toMatchObject({
+      id: 'invalid label',
+      label: 'invalid label',
+      access: 'cli-access',
+    })
   })
 
   test('preserves an account committed while the interactive OAuth flow is open', async () => {

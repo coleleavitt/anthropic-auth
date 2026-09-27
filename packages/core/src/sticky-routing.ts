@@ -30,15 +30,24 @@ const MIN_WEIGHT = 0.000_001
 
 export type StickyRouteFamily = 'fable' | 'opus' | 'general'
 
+export type IdentityState =
+  | { kind: 'known'; accountId: string }
+  | { kind: 'unknown' }
+
+export type QuotaState =
+  | { kind: 'known'; quota: OAuthQuotaSnapshot }
+  | { kind: 'unknown' }
+
 export type StickyRouteCandidate = {
   accountId: string
-  quota: OAuthQuotaSnapshot
+  quota: OAuthQuotaSnapshot | QuotaState
   order: number
 }
 
 export type StickyRouteAssignment = {
   accountId: string
   family: StickyRouteFamily
+  affinityModelId?: string
   assignedAt: number
   lastSeenAt: number
   initialInputBytes: number
@@ -180,9 +189,19 @@ function normalizeAssignment(
   ) {
     return
   }
+  if (
+    Object.hasOwn(value, 'affinityModelId') &&
+    typeof value.affinityModelId !== 'string'
+  ) {
+    return
+  }
   return {
     accountId: value.accountId,
     family: value.family as StickyRouteFamily,
+    affinityModelId:
+      typeof value.affinityModelId === 'string'
+        ? value.affinityModelId
+        : undefined,
     assignedAt,
     lastSeenAt,
     initialInputBytes: Math.max(0, initialInputBytes),
@@ -239,6 +258,14 @@ function snapshotCheckedAt(quota: OAuthQuotaSnapshot) {
   )
 }
 
+function knownQuota(
+  quota: OAuthQuotaSnapshot | QuotaState | undefined,
+): OAuthQuotaSnapshot | undefined {
+  if (!quota) return undefined
+  if ('kind' in quota) return quota.kind === 'known' ? quota.quota : undefined
+  return quota
+}
+
 function remainingThreshold(
   storage: AccountStorage | null,
   accountId: string,
@@ -290,14 +317,14 @@ export function stickyRouteCandidateWeight(input: {
 }) {
   const now = input.now ?? Date.now()
   const { candidate, storage } = input
-  if (
-    !stickyQuotaSnapshotIsFresh(candidate.quota, storage, now, input.modelId)
-  ) {
+  const quota = knownQuota(candidate.quota)
+  if (!quota) return 0
+  if (!stickyQuotaSnapshotIsFresh(quota, storage, now, input.modelId)) {
     return 0
   }
   const weights: number[] = []
   for (const key of ['five_hour', 'seven_day'] as const) {
-    const window = candidate.quota[key]
+    const window = quota[key]
     if (!window || !Number.isFinite(window.remainingPercent)) return 0
     weights.push(
       sustainableWindowWeight(
@@ -309,7 +336,7 @@ export function stickyRouteCandidateWeight(input: {
     )
   }
   if (input.family === 'fable') {
-    const window = getScopedQuotaWindowForModel(candidate.quota, input.modelId)
+    const window = getScopedQuotaWindowForModel(quota, input.modelId)
     if (window && Number.isFinite(window.remainingPercent)) {
       weights.push(
         sustainableWindowWeight(
@@ -329,28 +356,25 @@ export function stickyRouteKnownFableExhausted(
   storage: AccountStorage | null,
   now = Date.now(),
 ) {
-  const window = getScopedQuotaWindowForModel(candidate.quota, 'claude-fable-5')
+  const quota = knownQuota(candidate.quota)
+  const window = getScopedQuotaWindowForModel(quota, 'claude-fable-5')
   return Boolean(
     window &&
-      stickyQuotaSnapshotIsFresh(
-        candidate.quota,
-        storage,
-        now,
-        'claude-fable-5',
-      ) &&
+      stickyQuotaSnapshotIsFresh(quota, storage, now, 'claude-fable-5') &&
       Number.isFinite(window.remainingPercent) &&
       window.remainingPercent <= 0,
   )
 }
 
 export function decideStickyQuotaFailure(input: {
-  quota: OAuthQuotaSnapshot | undefined
+  quota: OAuthQuotaSnapshot | QuotaState | undefined
   modelId?: string
   now?: number
 }): StickyQuotaFailureDecision {
   const now = input.now ?? Date.now()
-  if (!input.quota) return { action: 'retain', reason: 'unknown' }
-  const scoped = getScopedQuotaWindowForModel(input.quota, input.modelId)
+  const quota = knownQuota(input.quota)
+  if (!quota) return { action: 'retain', reason: 'unknown' }
+  const scoped = getScopedQuotaWindowForModel(quota, input.modelId)
   if (
     scoped &&
     Number.isFinite(scoped.remainingPercent) &&
@@ -358,7 +382,7 @@ export function decideStickyQuotaFailure(input: {
   ) {
     return { action: 'migrate', reason: 'model-scoped' }
   }
-  const sevenDay = input.quota.seven_day
+  const sevenDay = quota.seven_day
   if (
     sevenDay &&
     Number.isFinite(sevenDay.remainingPercent) &&
@@ -366,7 +390,7 @@ export function decideStickyQuotaFailure(input: {
   ) {
     return { action: 'migrate', reason: 'seven-day' }
   }
-  const fiveHour = input.quota.five_hour
+  const fiveHour = quota.five_hour
   if (
     fiveHour &&
     Number.isFinite(fiveHour.remainingPercent) &&
@@ -568,7 +592,16 @@ export class StickySessionRouter {
       })
       return weight > 0 ? [{ candidate, weight }] : []
     })
-    if (weighted.length === 0) return undefined
+    if (
+      weighted.length === 0 &&
+      candidates.every((candidate) => !knownQuota(candidate.quota))
+    ) {
+      return [...candidates].sort(
+        (left, right) =>
+          left.order - right.order ||
+          left.accountId.localeCompare(right.accountId),
+      )[0]
+    }
 
     const pendingBytes = new Map<string, number>()
     for (const assignment of Object.values(input.state.assignments)) {
@@ -576,7 +609,8 @@ export class StickySessionRouter {
         (entry) => entry.candidate.accountId === assignment.accountId,
       )?.candidate
       if (!candidate) continue
-      if (assignment.quotaCheckedAt !== snapshotCheckedAt(candidate.quota))
+      const quota = knownQuota(candidate.quota)
+      if (quota && assignment.quotaCheckedAt !== snapshotCheckedAt(quota))
         continue
       pendingBytes.set(
         assignment.accountId,
@@ -604,6 +638,7 @@ export class StickySessionRouter {
     sessionId: string
     family: StickyRouteFamily
     modelId?: string
+    affinityModelId?: string
     candidates: readonly StickyRouteCandidate[]
     retainAccountIds: ReadonlySet<string>
     storage: AccountStorage | null
@@ -614,10 +649,16 @@ export class StickySessionRouter {
     if (!input.sessionId) return null
     await this.refreshStateIfChanged()
     const key = sessionKey(input.sessionId)
+    const affinityModelId = input.affinityModelId ?? input.modelId
+    const matchesAffinity = (assignment: StickyRouteAssignment) =>
+      affinityModelId !== undefined
+        ? assignment.affinityModelId === affinityModelId
+        : assignment.family === input.family
     const cached = this.state.assignments[key]
     if (
       cached &&
       this.assignmentIsActive(cached) &&
+      matchesAffinity(cached) &&
       input.retainAccountIds.has(cached.accountId) &&
       !input.excludeAccountIds?.has(cached.accountId)
     ) {
@@ -640,6 +681,7 @@ export class StickySessionRouter {
       const current = state.assignments[key]
       if (
         current &&
+        matchesAffinity(current) &&
         input.retainAccountIds.has(current.accountId) &&
         !input.excludeAccountIds?.has(current.accountId)
       ) {
@@ -652,22 +694,27 @@ export class StickySessionRouter {
           migrated: false,
         }
       }
+      const affinityChanged = Boolean(current && !matchesAffinity(current))
+      if (affinityChanged) {
+        delete state.assignments[key]
+      }
       const candidates = input.candidates.filter(
         (candidate) => !input.excludeAccountIds?.has(candidate.accountId),
       )
-      const preferred = input.preferredAccountId
-        ? candidates.find(
-            (candidate) =>
-              candidate.accountId === input.preferredAccountId &&
-              stickyRouteCandidateWeight({
-                candidate,
-                family: input.family,
-                modelId: input.modelId,
-                storage: input.storage,
-                now: this.now(),
-              }) > 0,
-          )
-        : undefined
+      const preferred =
+        !affinityChanged && input.preferredAccountId
+          ? candidates.find(
+              (candidate) =>
+                candidate.accountId === input.preferredAccountId &&
+                stickyRouteCandidateWeight({
+                  candidate,
+                  family: input.family,
+                  modelId: input.modelId,
+                  storage: input.storage,
+                  now: this.now(),
+                }) > 0,
+            )
+          : undefined
       const selected =
         preferred ?? this.selectCandidate({ ...input, candidates, state })
       if (!selected) {
@@ -678,13 +725,15 @@ export class StickySessionRouter {
         return null
       }
       const now = this.now()
+      const selectedQuota = knownQuota(selected.quota)
       const assignment: StickyRouteAssignment = {
         accountId: selected.accountId,
         family: input.family,
+        affinityModelId,
         assignedAt: now,
         lastSeenAt: now,
         initialInputBytes: Math.max(1, input.inputBytes),
-        quotaCheckedAt: snapshotCheckedAt(selected.quota),
+        quotaCheckedAt: selectedQuota ? snapshotCheckedAt(selectedQuota) : 0,
       }
       state.assignments[key] = assignment
       await this.writeState(state)

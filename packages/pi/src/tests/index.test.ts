@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  saveAccounts,
   saveSharedAccountStore,
   updateSharedAccountStore,
 } from '@cortexkit/anthropic-auth-core'
@@ -44,23 +45,58 @@ async function isolateCatalogState() {
   process.env.ANTHROPIC_MODEL_CATALOG_FILE = join(directory, 'catalog.json')
 }
 
+let tempDir: string | undefined
+
+// Fable 5.1 is the family that carries mid-conversation effort markers, so it
+// is the model that can observe what turn_start collected.
+const fableModel = {
+  id: 'claude-fable-5-1',
+  name: 'Claude Fable 5.1',
+  api: 'cortexkit-anthropic-messages',
+  provider: 'anthropic',
+  baseUrl: 'https://api.anthropic.com',
+  reasoning: true,
+  input: ['text'],
+  cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+  contextWindow: 1_000_000,
+  maxTokens: 128_000,
+}
+const messagesUrl = `${fableModel.baseUrl}/v1/messages`
+
+afterEach(async () => {
+  globalThis.fetch = originalFetch
+  delete process.env.PI_ANTHROPIC_AUTH_FILE
+  if (tempDir) await rm(tempDir, { recursive: true, force: true })
+  tempDir = undefined
+})
+
 function mockPi() {
   const providers = new Map<
     string,
-    { models?: Array<Record<string, unknown>> }
+    {
+      models?: Array<Record<string, unknown>>
+      streamSimple?: (...args: any[]) => unknown
+    }
   >()
+  const events = new Map<string, (...args: any[]) => unknown>()
 
   const pi = {
     registerCommand: () => {},
     registerProvider: (
       name: string,
-      config: { models?: Array<Record<string, unknown>> },
+      config: {
+        models?: Array<Record<string, unknown>>
+        streamSimple?: (...args: any[]) => unknown
+      },
     ) => {
       providers.set(name, config)
     },
+    on: (name: string, handler: (...args: any[]) => unknown) => {
+      events.set(name, handler)
+    },
   } as unknown as ExtensionAPI
 
-  return { pi, providers }
+  return { pi, providers, events }
 }
 
 describe('cortexKitPiAnthropicAuth provider registration', () => {
@@ -204,6 +240,63 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
       access: 'winner-access',
       refresh: 'winner-refresh',
       expires: 9_999_999,
+    })
+  })
+
+  test('exposes Claude Fable and Mythos 5.1 in the Pi Anthropic catalog', async () => {
+    await isolateCatalogState()
+    globalThis.fetch = (() => {
+      throw new Error('offline')
+    }) as unknown as typeof fetch
+    const { pi, providers } = mockPi()
+
+    await cortexKitPiAnthropicAuth(pi)
+
+    const models = providers.get('anthropic')?.models ?? []
+    expect(models).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'claude-fable-5-1',
+          name: 'Claude Fable 5.1',
+          reasoning: true,
+          cost: { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 },
+          contextWindow: 1_000_000,
+          maxTokens: 128_000,
+        }),
+        expect.objectContaining({
+          id: 'claude-mythos-5-1',
+          name: 'Claude Mythos 5.1',
+          reasoning: true,
+          cost: { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 },
+          contextWindow: 1_000_000,
+          maxTokens: 128_000,
+        }),
+      ]),
+    )
+  })
+
+  test('exposes Claude Opus 5.5 in the Pi Anthropic catalog', async () => {
+    await isolateCatalogState()
+    globalThis.fetch = (() => {
+      throw new Error('offline')
+    }) as unknown as typeof fetch
+    const { pi, providers } = mockPi()
+
+    await cortexKitPiAnthropicAuth(pi)
+
+    const opus55 = providers
+      .get('anthropic')
+      ?.models?.find((model) => model.id === 'claude-opus-5-5')
+    expect(opus55).toMatchObject({
+      id: 'claude-opus-5-5',
+      name: 'Claude Opus 5.5',
+      reasoning: true,
+      input: ['text', 'image'],
+      // The catalog uses the 5-minute cache-write rate for every model
+      // (Opus 5: 6.25); Opus 5.5's 5-minute rate is 5 (8 is its 1-hour rate).
+      cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
     })
   })
 
@@ -510,5 +603,129 @@ describe('cold fallback catalog', () => {
       contextWindow: 200_000,
       maxTokens: 64_000,
     })
+  })
+})
+
+// Oh My Pi 18.x dropped SessionManager.buildContextEntries(); calling it threw
+// on every turn, so no effort history was ever collected (issue #200). Only
+// getSessionId/getBranch are assumed here — the accessors both hosts expose.
+describe('cortexKitPiAnthropicAuth turn_start effort history', () => {
+  test('carries transitions from a getBranch-only host into the request', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-turn-start-effort-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+      },
+      storagePath,
+    )
+
+    const { pi, providers, events } = mockPi()
+    await cortexKitPiAnthropicAuth(pi)
+
+    // minimal -> low, then xhigh, with one assistant message between them.
+    const branch = [
+      { id: 't0', type: 'thinking_level_change', thinkingLevel: 'minimal' },
+      { id: 'u1', type: 'message', message: { role: 'user' } },
+      { id: 'a1', type: 'message', message: { role: 'assistant' } },
+      { id: 't1', type: 'thinking_level_change', thinkingLevel: 'xhigh' },
+      { id: 'u2', type: 'message', message: { role: 'user' } },
+    ]
+    const handler = events.get('turn_start')
+    expect(handler).toBeDefined()
+    await handler?.(
+      { type: 'turn_start' },
+      {
+        sessionManager: {
+          getSessionId: () => 'session-omp',
+          getBranch: () => branch,
+          getEntries: () => branch,
+        },
+      },
+    )
+
+    // Only the messages POST may be captured: if the stream path ever adds
+    // another request (relay, quota, retry), this must fail loudly rather than
+    // let the assertions below inspect that body instead.
+    let requestBody: Record<string, unknown> | undefined
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = input.toString()
+        if (url.includes('/api/claude_cli/bootstrap')) {
+          return new Response(
+            JSON.stringify({
+              oauth_account: { account_uuid: 'pi-turn-start-account' },
+            }),
+          )
+        }
+        const method = (init?.method ?? 'GET').toUpperCase()
+        if (method !== 'POST' || !url.startsWith(messagesUrl)) {
+          throw new Error(`unexpected request: ${method} ${url}`)
+        }
+        expect(requestBody).toBeUndefined()
+        requestBody = JSON.parse(String(init?.body))
+        return new Response(
+          [
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join(''),
+          { status: 200 },
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const stream = providers.get('anthropic')?.streamSimple?.(
+      fableModel,
+      {
+        systemPrompt: 'test',
+        tools: [],
+        messages: [
+          { role: 'user', content: 'first', timestamp: 0 },
+          {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'answer' }],
+            timestamp: 0,
+          },
+          { role: 'user', content: 'second', timestamp: 0 },
+        ],
+      },
+      { apiKey: 'sk-ant-oat-turn-start', sessionId: 'session-omp' },
+    )
+    for await (const _event of stream as AsyncIterable<unknown>) {
+      // Drain the provider stream.
+    }
+
+    // The transitions the handler collected, as the request carries them: the
+    // opening effort on the body and the later change as its own marker turn.
+    expect(requestBody).toBeDefined()
+    const sent = requestBody as { output_config: unknown; messages: unknown[] }
+    expect(sent.output_config).toEqual({ effort: 'low' })
+    expect(sent.messages[2]).toEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'xhigh' },
+    })
+  })
+
+  test('degrades to no transitions when the host session shape is unreadable', async () => {
+    const { pi, events } = mockPi()
+    await cortexKitPiAnthropicAuth(pi)
+
+    const handler = events.get('turn_start')
+    expect(handler).toBeDefined()
+    const ctx = {
+      sessionManager: {
+        getSessionId: () => 'session-broken',
+        getBranch: () => {
+          throw new TypeError('getBranch is not a function')
+        },
+      },
+    }
+
+    expect(await handler?.({ type: 'turn_start' }, ctx)).toBeUndefined()
   })
 })

@@ -2,6 +2,106 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+## 2.0.0
+
+### Breaking Changes
+
+- Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. OpenCode and Pi now require enrolled, zero-bind scoped custody; an older Claustrum configuration without a scoped roster refuses serving until `setup` completes. Remove Core's process-shared enrollment-registry export; host path resolution remains available through the Core enrollment module. Local OAuth and API-key routes are unaffected.
+
+### Patch Changes
+
+- Stop sending `speed: "fast"` to Opus 4.7, where it returns 400, and Opus 4.6, where it has no effect. Fast mode now applies only to Opus 4.8, Opus 5, and Opus 5.5 in OpenCode and Pi (#267).
+- Remove Opus 5.5's unsupported forced `tool_choice` for OpenCode structured-output requests while retaining the schema tool. OpenCode still records validated structured output and reports an error if the model does not call it. Keep named `tool_choice` references aligned with prefixed tool definitions on other models (#268).
+- Isolate OpenCode tests from live account files, sidebar state, CacheKeep leases, RPC directories, and Claustrum sockets even when a test clears a feature-specific override. Setup detection now uses the supplied environment for its connection file (#264, #265).
+- Persist scoped main quota under the discovered primary account rather than the local host slot, and let `/claude-quota` poll with a freshly authorized scoped credential. A header-only main quota remains due for its first usage poll; failed polls are spaced by account without treating usage 403 as rate-limit backoff or counting requests that lose the cross-process refresh lock.
+- Load the Pi extension through Oh My Pi's legacy SDK compatibility layer by keeping transcript system-prompt and tool replay in the extension instead of importing helpers absent from the host. Check built Pi imports with a syntax-aware allowlist in CI and release workflows.
+- Add debug diagnostics for scoped 401 retry decisions and delivered failure reports across OpenCode and Pi, recording served and current record versions and a non-secret decision reason without logging bearer material.
+- Update the shared Claustrum client to 0.4.0 (with Subc client 0.16.x) for scoped custody. The client no longer reconnects on a terminal `unknown_module` response from a daemon without the Claustrum module.
+- Show an approved Claustrum enrollment as active in `/claude-account` and the account modal when the main account is vault-served; stop telling already configured users to rerun setup or request a grant. Clarify that `enrollment-reset` only clears terminal state.
+- Fix packed OpenCode CLI startup under Node: keep `jsonc-parser` external so its CommonJS `./impl/*` modules resolve from the installed dependency, and run the packed CLI's `--help` path alongside the TUI smoke gate (#257).
+- Stop unsolicited Claustrum enrollment on OpenCode boot and account-status views: only explicit offline setup proposes and polls, while `/claude-account enrollment-reset` clears terminal state under lock without starting another request. Setup resumes crash-persisted secrets and replaces one daemon-confirmed dead request; all producer-permanent refusal codes stop polling even when older client transports mislabel them retryable. This removes the per-process enrollment poll loop (#255) without changing scoped account-discovery polling.
+- Update OpenCode plugin and SDK test dependencies together to 1.18.31, plus Biome 2.5.14, Lefthook 2.1.14 and the dev-only Anthropic SDK 4.0.58; preserve packed TUI and custom-fetch compatibility checks.
+- Remove Core's unused direct `@cortexkit/subc-client` dependency and declare it where the E2E mock uses it. Synchronize `bun.lock` workspace versions and dependency declarations during version bumps, and fail CI or release preparation when the lock disagrees with package manifests (which Bun's frozen install alone did not detect).
+- Enforce Core/OpenCode/Pi unit-test count floors in CI and releases with one measured test pass, a PR merge-target ratchet and a release ratchet against the previous version tag rather than only the release commit's parent. A reduction requires an explicit from/to marker and reason; release checks reject stale tags or missing floor provenance, with v1.23.0's verified floorless baseline seeded at 290/1672/140. Both workflows check canonical Claustrum fixture provenance and the real Pi host tool-call round-trip.
+- Keep Fable 5.1 effort changes correlated through completed tool-call continuations and consecutive host user records merged onto one wire boundary; log safe refusal metadata and apply the last planned effort on each merged boundary. Retain a bounded, revocable history when compaction overwrites an in-flight request plan. Missing anchors still fail closed rather than treating unprovable marker loss as a valid prefix trim.
+- Pin the vendored Claustrum tombstone to the canonical `cortexkit/claustrum` source: update the fixture to the deployed empty-access shape and verify its exact bytes against a commit reachable from canonical `master`. Remove an obsolete "vault path not implemented" refresh error.
+- Recover in-flight scoped OAuth rotations on replayable model requests, CacheKeep prewarms, Prime fires, and quota/profile queries: reauthorize after a genuine upstream 401 and retry once only when the same account's record version advances. Report only the final rejected send-time version, reauthorize relay-to-direct fallbacks separately, and classify relay-owned 401s without an Anthropic request ID as transport errors rather than account failures.
+- Fix OpenCode main quota polling under scoped custody: resolve the quota account UUID to the `main` route before authorization. This also restores Prime's main-account quota preflight.
+- Restore Pi tool-call name mapping on normalized transcripts: the streaming response uses the exact host tool set resolved for its outgoing request, rather than the missing `context.tools` field on Pi ≥0.86.
+- Prevent background fallback refresh and quota polling from sending retained local OAuth material when a legacy Claustrum configuration is incomplete.
+- Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick so per-request writes no longer clobber a sibling's count with a stale zero.
+
+## 1.23.0
+
+### Minor Changes
+
+- Support Claude Opus 5.5 (`claude-opus-5-5`) across Core, OpenCode, and Pi:
+  - Expose Opus 5.5 model specifications (1,000,000 token context window, 128,000 max output tokens, $4/$20 MTok pricing).
+  - Enforce always-on adaptive thinking with summarized display (`thinking: { type: "adaptive", display: "summarized" }`) per Anthropic's Opus 5.5 specification, automatically rewriting disabled thinking or manual token budgets to adaptive summarized to prevent 400 invalid request errors.
+  - Expose native adaptive `low`, `medium`, `high`, `xhigh`, and `max` effort variants for Opus 5.5 in OpenCode's provider catalog and Pi.
+  - Support Anthropic fast mode (`speed: "fast"` with `fast-mode-2026-02-01` beta header) on Opus 5.5.
+  - Provide refusal recovery and server-side safety fallback parity for Opus 5.5, isolating recovery state between Opus 5 and Opus 5.5.
+- Add unified interactive `opencode-anthropic-auth setup` wizard (`bunx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
+- Add Claustrum vault custody support to Pi with native ambient authentication, per-dispatch scoped credential authorization, atomic roster reconciliation, and version-fenced 401 reporting.
+- Implement zero-bind scoped Claustrum custody across OpenCode and Pi, discovering vaulted Anthropic accounts automatically via `listScoped` under `category:anthropic-native` without manual capability handle minting, manifest files, or process restarts.
+
+- Add the global `/claude-account claustrum|local` custody mode for every OpenCode OAuth account, including main-account tombstone takeover, fail-closed serving, and explicit Pi refusal.
+- Add global Claustrum manifest onboarding, startup legacy-handle migration, and verified local re-login recovery.
+- Add a crash-resumable OpenCode Claustrum enrollment ceremony for the future scoped-discovery cutover, using producer-owned typed wire decoders, one host-global owner-only token, secret-before-propose persistence, process/file-lock sharing, and explicit pending/terminal status without enabling scoped credential spending yet.
+- Add API-key/proxy-only custom headers and model aliases for OpenCode and Pi, preserving versioned proxy base paths while protecting route authentication, protocol headers, and internal correlation state.
+
+### Patch Changes
+
+- Bind sticky-balanced affinity to the user-selected model for OpenCode and Pi, discarding the old assignment and CacheKeep route preference on a real model change while preserving account affinity for transparent Fable/Opus recovery.
+- Enroll newly bound Claustrum OAuth accounts into the OpenCode routing pool at startup or live without a restart, after exact credential-ID and provider-account verification; immediately prime quota for sticky-balanced routing, persist only secret-free tombstone rows, preserve disabled accounts, and recover missed manifest watch events with one process-shared metadata poll.
+- Remove obsolete root-level build output before workspace builds so stale pre-custody CLI artifacts cannot bypass current account and Claustrum safeguards.
+- Give consecutive Desktop fallback notices distinct, pre-registered message IDs before the assistant; defer delivery when safe ordering is unavailable and bound notice tracking across sessions (#230).
+- Publish account UUIDs and credential-lineage provenance in the sanitized quota-header feed while fencing stale lease cleanup.
+- Make Pi effort history compatible with both host context-entry APIs, preserve ordered structured system-prompt blocks, and keep every cache strategy within Anthropic's four-breakpoint limit.
+- Bind persisted main-quota ordering to the account-bound snapshot's embedded `checkedAt` value, preventing a concurrent unbound `mainQuotaCheckedAt` value from making stale state replace a newer in-memory or on-disk observation.
+- Harden global Claustrum takeover as a resumable fail-closed transition: repeated commands accept already tombstoned fallbacks, failed partial commits never restore whole-file snapshots over concurrent account edits, local fallback login is refused before OAuth while custody is active, and main-account Prime uses the resident vault credential for quota checks and sends with version-fenced 401 reporting.
+- Keep OpenCode's request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, and fold effort changes removed by downstream prefix compaction into the retained baseline through a checksum-bound current-boundary anchor. This prevents transient retries and legitimate Magic Context trims from becoming local plan-correlation failures while preserving fail-closed validation for non-prefix loss.
+- Match Claude Code's request billing lineage on OAuth OpenCode turns: pin one `cc_prompt_id` UUID to the causal user message across tool loops and retries, carry genuine direct or relay response request IDs as `cc_prev_req`, exclude background turns, and strip request lineage from reusable prewarm bodies before re-signing. Model-family checks also recognize OpenCode's `[1m]` context qualifier.
+- Isolate loopback RPC servers and notification drains by project/session, serialize concurrent same-directory server replacement, and make plugin disposal release every per-instance background service without stopping a successor or a shared Prime manager still leased by another project.
+- Fence no-reply Desktop fallback notices against newly created user messages before OpenCode publishes its busy status, and coalesce overtaken transition notices to the latest state so rapid turns neither duplicate provider requests nor strand a current notice behind stale text.
+
+## 1.22.0
+
+### Minor Changes
+
+- Add Claude Fable 5.1 and limited-access Mythos 5.1 across the shared model catalogue, OpenCode request/routing/recovery paths, and Pi provider catalogue.
+- Preserve OAuth Fable 5.1 prompt-cache prefixes across mid-conversation effort changes in OpenCode and Pi, and expose explicit `account-default`, `error`, or `drop_block` thinking-prefix mismatch behavior in sidecar config.
+- Add opt-in OpenCode Claustrum custody for fallback OAuth credentials, with vault-owned refresh, cache-only request-path reads, version-fenced 401 reporting, sidecar failover, and custody status in account UI.
+
+### Patch Changes
+
+- Preserve OpenCode Fable 5.1 effort transitions when host lowering collapses tool-heavy or compacted assistant records, and keep marker correlation stable when later message transforms tag or persist the same user parts.
+- Treat DNS lookup failures as transient OAuth refresh failures with a fixed five-minute retry interval—including already-persisted long backoffs—and keep sticky-balanced fallback routes usable while their current access token remains valid.
+- Match Claude Code 2.1.258 request identity and final-body `cch` signing, keep the billing suffix stable through in-process session compaction, and apply configured Fable 5.1 thinking-prefix behavior only when replaying signed or redacted thinking in OpenCode or Pi.
+- Reject provider-bound Claustrum custody tombstones locally before OAuth refresh without persisting a permanent auth failure, and ensure shutdown closes any replacement transport that finishes connecting after the Claustrum client is closed.
+- Redact malformed JSON parser context before account sidecar and request-dump errors reach logs, preventing secrets from being repeated in diagnostic text while retaining path, line, and column metadata.
+- Bind persisted OAuth refresh backoffs to the refresh-token fingerprint in OpenCode and Pi. Rotated credentials immediately escape stale `invalid_grant` latches, cross-process clears are fenced against stale writers, Claustrum outage fallback uses the same lineage check, and `/claude-account reset-backoff` explicitly clears main refresh and matching quota backoffs.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing Fable/Mythos 5.1 support, Claude Code identity compatibility, Claustrum fallback custody and tombstone guards, parser-error redaction, and refresh-latch recovery.
+
+## 1.21.0
+
+### Minor Changes
+
+- Keep quota, profile, refresh-backoff, Prime-lineage, and routing state attached to stable Claude account identities across OAuth token rotation, while treating unknown identity or quota as distinct from an absent account.
+- Add an opt-in OpenCode host-local feed for sanitized response-header quota observations so another local CortexKit process can consume fresh account state without polling Anthropic's rate-limited usage endpoint.
+
+### Patch Changes
+
+- Coalesce main OAuth refreshes across OpenCode project plugin instances and let sticky 401 recovery adopt a concurrently rotated valid credential instead of refreshing it again.
+- Prevent Pi from replaying foreign thinking signatures to Anthropic while preserving visible reasoning as text, and round-trip Anthropic `redacted_thinking` blocks for valid same-model continuation.
+- Keep the OpenCode plugin entrypoint limited to the plugin factory so the host cannot invoke internal request-policy helpers as plugins.
+- Update OpenTUI Core and Solid together to 0.5.7 and `@tsconfig/bun` to 1.0.11.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity and the host-local quota feed.
+
 ## 1.20.0
 
 ### Minor Changes

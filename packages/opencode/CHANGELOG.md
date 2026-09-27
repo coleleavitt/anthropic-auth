@@ -2,6 +2,95 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## Unreleased
+
+## 2.0.0
+
+### Breaking Changes
+
+- Remove legacy capability-handle and manifest-based Claustrum custody. The plugin serves OAuth only via enrolled scoped credentials; old Claustrum configurations without `scopedRoster: true` fail closed until the offline `setup` wizard completes.
+
+### Patch Changes
+
+- Exclude Opus 4.6 and 4.7 from fast mode: only Opus 4.8, Opus 5, and Opus 5.5 receive the `speed` field and beta header (#267).
+- On Opus 5.5, remove unsupported forced tool choice without removing the StructuredOutput tool; OpenCode accepts its validated schema result and fails closed when the model instead completes without it. Prefix named tool-choice references alongside tool definitions for other models (#268).
+- Keep the entire OpenCode unit-test environment under a disposable root, including fallback account/sidebar/cache/RPC paths and a nonexistent Claustrum connection. Setup detection respects its injected environment rather than consulting the operator's daemon (#264, #265).
+- Persist scoped main quotas with the vault's primary account identity, restore `/claude-quota` polling with scoped credentials, and discover model-scoped limits from usage polls even when response headers keep general windows fresh. A failed usage poll is bounded per account, without counting lock-losing contenders.
+- Log scoped OAuth 401 re-authorization decisions and delivered failure reports at debug level with record-version provenance but no bearer tokens.
+- Update scoped Claustrum transport through the shared 0.4.0 client; a daemon that does not serve the Claustrum module now fails without a futile reconnect.
+- Correct approved enrollment status in `/claude-account` and the TUI account dialog when the main account is vault-served; do not prompt configured users to rerun setup, and describe `enrollment-reset` as a state clear rather than an automatic retry.
+- Fix the packed CLI failing before `setup` under Node by externalizing `jsonc-parser` from the split bundle and checking a fresh packed CLI install in the smoke gate (#257).
+- Make Claustrum enrollment explicit: OpenCode boot and `/claude-account` no longer start proposals or per-process polling; status reads local state, and reset only clears terminal state. The setup wizard resumes interrupted enrollment and replaces a daemon-proven dead request at most once. Permanently refused requests now stop even if the client labels them retryable (#255).
+- Preserve authenticated Fable 5.1 effort transitions through tool-result continuations and merged user boundaries, logging refusal metadata without markers; keep bounded, revocable request-plan history after in-flight compaction without accepting missing-anchor marker loss.
+- Align the tombstone golden fixture with canonical Claustrum's empty-access form and verify its pinned commit ancestry and exact bytes rather than trusting a fork-controlled source.
+- Recover in-flight scoped OAuth rotations on replayable model requests, CacheKeep prewarms, Prime fires, and quota/profile queries: retry once only when the same account's record version advances, report only the final rejected send-time version, and reauthorize relay-to-direct fallback separately. A relay-owned 401 without upstream provenance no longer invalidates an account.
+- Fix scoped main quota polling by authorizing the `main` route rather than passing the provider account UUID as a fallback route ID; Prime's main-account preflight now reaches the usage endpoint.
+- Stop background local OAuth refresh or quota probing for incomplete legacy Claustrum configurations, even if old sidecar secrets remain.
+- Fix TUI sidebar `Tracked` session count flickering between instances: scoped roster notifications now fire only when the discovery view actually changes instead of on every 2s poll, background sidebar refreshes rebuild the cross-process CacheKeep aggregate before writing, and each instance refreshes its aggregate view on a 10s background tick (opt-out via `cacheKeepAggregateRefreshIntervalMs: 0`) so per-request writes no longer clobber a sibling's count with a stale zero.
+
+## 1.23.0
+
+### Minor Changes
+
+- Support Claude Opus 5.5 (`claude-opus-5-5`):
+  - Expose Opus 5.5 in OpenCode's provider catalog with native adaptive `low` through `max` effort variants.
+  - Enforce always-on adaptive summarized thinking per model specification, avoiding 400 errors from disabled thinking or manual token budgets.
+  - Support Anthropic fast mode on Opus 5.5.
+  - Support refusal recovery and server-side safety fallback for Opus 5.5 with isolated recovery state.
+- Add unified interactive `opencode-anthropic-auth setup` wizard (`bunx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
+- Implement zero-bind scoped Claustrum custody in OpenCode, discovering vaulted Anthropic accounts automatically via `listScoped` under `category:anthropic-native` without manual capability handle minting, manifest files, or process restarts.
+
+- Add API-key/proxy-only custom headers and model aliases while preserving versioned proxy base paths and protecting route authentication, protocol headers, body framing, and internal correlation state.
+- Add a crash-resumable Claustrum enrollment ceremony for the future scoped-discovery cutover, sharing one owner-only `anthropic-auth-opencode` identity across project processes and projecting approval status without changing the existing handle-based serving path.
+
+### Patch Changes
+
+- Bind sticky-balanced affinity to the user-selected model, discarding the old assignment and CacheKeep route preference on a real model change while preserving account affinity for transparent Fable/Opus recovery.
+- Enroll newly bound Claustrum OAuth accounts into the routing pool at startup or live without a restart, after exact credential-ID and provider-account verification; immediately prime quota for sticky-balanced routing, persist only secret-free tombstone rows, preserve disabled accounts, and recover missed manifest watch events with one process-shared metadata poll.
+- Give consecutive Desktop fallback notices distinct, pre-registered message IDs before the assistant; defer delivery when safe ordering is unavailable and bound notice tracking across sessions (#230).
+
+- Publish account UUIDs and credential-lineage provenance in the sanitized quota-header feed while fencing stale lease cleanup.
+- Bind persisted main-quota ordering to the account-bound snapshot's embedded `checkedAt` value, preventing a concurrent unbound `mainQuotaCheckedAt` value from making stale state replace a newer in-memory or on-disk observation.
+- Harden global Claustrum takeover as a resumable fail-closed transition: repeated commands accept already tombstoned fallbacks, failed partial commits never restore whole-file snapshots over concurrent account edits, local fallback login is refused before OAuth while custody is active, and main-account Prime uses the resident vault credential for quota checks and sends with version-fenced 401 reporting.
+- Keep the request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, and fold effort changes removed by downstream prefix compaction into the retained baseline through a checksum-bound current-boundary anchor. This prevents transient retries and legitimate Magic Context trims from becoming local plan-correlation failures while preserving fail-closed validation for non-prefix loss.
+- Match Claude Code's request billing lineage on OAuth turns: pin one `cc_prompt_id` UUID to the causal user message across tool loops and retries, carry genuine direct or relay response request IDs as `cc_prev_req`, exclude background turns, and strip request lineage from reusable prewarm bodies before re-signing. Model-family checks also recognize OpenCode's `[1m]` context qualifier.
+- Isolate loopback RPC servers and notification drains by project/session, serialize concurrent same-directory server replacement, and make plugin disposal release every per-instance background service without stopping a successor or a shared Prime manager still leased by another project.
+- Fence no-reply Desktop fallback notices against newly created user messages before OpenCode publishes its busy status, and coalesce overtaken transition notices to the latest state so rapid turns neither duplicate provider requests nor strand a current notice behind stale text.
+
+## 1.22.0
+
+### Minor Changes
+
+- Add Claude Fable 5.1 and limited-access Mythos 5.1 to the model catalogue and extend quota routing, server fallback, deterministic recovery, cache warming, and sidebar naming to Fable 5.1.
+- Preserve OAuth Fable 5.1 prompt-cache prefixes across per-turn effort changes, expose native effort variants, and add explicit `account-default`, `error`, or `drop_block` thinking-prefix behavior in sidecar config.
+- Add opt-in Claustrum custody for fallback OAuth credentials, with vault-owned refresh, cache-only request-path reads, version-fenced 401 reporting, sidecar failover, and custody status in account UI.
+
+### Patch Changes
+
+- Preserve Fable 5.1 effort transitions when OpenCode host lowering collapses tool-heavy or compacted assistant records, and keep marker correlation stable when later message transforms tag or persist the same user parts.
+- Treat DNS lookup failures as transient OAuth refresh failures with a fixed five-minute retry interval—including already-persisted long backoffs—and keep sticky-balanced fallback routes usable while their current access token remains valid.
+- Match Claude Code 2.1.258 request identity and final-body `cch` signing, keep the billing suffix stable through in-process session compaction, and apply configured Fable 5.1 thinking-prefix behavior only when replaying signed or redacted thinking.
+- Reject provider-bound Claustrum custody tombstones locally before OAuth refresh without persisting a permanent auth failure, and ensure shutdown closes any replacement transport that finishes connecting after the Claustrum client is closed.
+- Redact malformed JSON parser context before account sidecar and request-dump errors reach logs, preventing secrets from being repeated in diagnostic text while retaining path, line, and column metadata.
+- Bind persisted main and fallback OAuth refresh backoffs to the refresh-token fingerprint. Rotated credentials immediately escape stale `invalid_grant` latches, cross-process clears are fenced against stale writers, Claustrum outage fallback uses the same lineage check, and `/claude-account reset-backoff` explicitly clears main refresh and matching quota backoffs.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing Fable/Mythos 5.1 support, Claude Code identity compatibility, Claustrum fallback custody and tombstone guards, parser-error redaction, and refresh-latch recovery.
+
+## 1.21.0
+
+### Minor Changes
+
+- Keep quota, profile, refresh-backoff, Prime-lineage, and routing state attached to stable Claude account identities across OAuth token rotation, while treating unknown identity or quota as distinct from an absent account.
+- Add an opt-in host-local feed for sanitized response-header quota observations so another local CortexKit process can consume fresh account state without polling Anthropic's rate-limited usage endpoint.
+
+### Patch Changes
+
+- Coalesce main OAuth refreshes across project plugin instances and let sticky 401 recovery adopt a concurrently rotated valid credential instead of refreshing it again.
+- Keep the plugin entrypoint limited to the plugin factory so OpenCode cannot invoke internal request-policy helpers as plugins.
+- Update OpenTUI Core and Solid together to 0.5.7.
+
+Thanks to [@iceteaSA](https://github.com/iceteaSA) for contributing stable account identity and the host-local quota feed.
+
 ## 1.20.0
 
 ### Minor Changes

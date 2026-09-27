@@ -1,22 +1,29 @@
 import {
   applyClaudeCodeMetadata,
+  applyMidConversationOutputConfig,
+  applyThinkingBindingControls,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
+  ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
   clampEffortForModel,
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
+  isClaudeOpus55Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
+  type MidConversationEffortTransition,
   orderClaudeCodeBody,
   resolveThinkingShape,
   signRequestBody,
+  type ThinkingPrefixMismatchBehavior,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   Context,
@@ -28,11 +35,22 @@ import type {
   Tool,
   ToolResultMessage,
 } from '@earendil-works/pi-ai'
+import {
+  collapseSystemMessages,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  normalizeContext,
+} from './transcript.ts'
 
 // Anchor identifying Pi's documentation paragraph — the only part of the prompt
 // that Anthropic currently rejects in system[]. Unknown prompt shapes take the
 // service-preserving fallback below instead of returning the full prompt there.
 const PI_DOCS_ANCHOR = 'Pi documentation'
+const firstUserTextTracker = new ClaudeCodeFirstUserTextTracker()
+const ANTHROPIC_REPLAY_APIS = new Set([
+  'anthropic-messages',
+  'cortexkit-anthropic-messages',
+])
 
 const CLAUDE_CODE_TOOLS = new Map(
   [
@@ -67,7 +85,7 @@ export type AnthropicRequestBody = {
     | { type: 'enabled'; budget_tokens: number }
     | { type: 'adaptive'; display: 'summarized' }
   output_config?: { effort: string }
-  cache_control?: { type: 'ephemeral' }
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' }
   fallbacks?: 'default'
   speed?: 'fast'
 }
@@ -188,6 +206,7 @@ function convertTextAndImages(
 
 function convertMessages(
   messages: Message[],
+  targetModelId: string,
 ): AnthropicRequestBody['messages'] {
   const result: AnthropicRequestBody['messages'] = []
 
@@ -227,18 +246,64 @@ function convertMessages(
       for (const block of message.content) {
         if (block.type === 'text' && block.text.trim()) {
           blocks.push({ type: 'text', text: sanitize(block.text) })
-        } else if (block.type === 'thinking' && block.thinking.trim()) {
+        } else if (block.type === 'thinking') {
           const thinking = block as ThinkingContent
-          if (isOpenAIReasoningSignature(thinking.thinkingSignature)) {
-            // OpenAI reasoningEncryptedContent is also opaque encrypted state,
-            // but it is not an Anthropic thinking signature. Sending it as
-            // `thinking.signature` makes Anthropic reject the request.
+          const signature = thinking.thinkingSignature
+          const hasSignature =
+            typeof signature === 'string' && signature.trim().length > 0
+          const signatureBelongsToTarget =
+            message.provider === 'anthropic' &&
+            ANTHROPIC_REPLAY_APIS.has(message.api) &&
+            message.model === targetModelId &&
+            !isOpenAIReasoningSignature(signature)
+
+          // Match Pi's built-in origin check: only replay signatures from the
+          // same Anthropic API/model. Preserve visible foreign reasoning as
+          // ordinary text, but drop opaque redacted/OpenAI encrypted state.
+          if (hasSignature && !signatureBelongsToTarget) {
+            if (
+              !thinking.redacted &&
+              !isOpenAIReasoningSignature(signature) &&
+              thinking.thinking.trim()
+            ) {
+              blocks.push({ type: 'text', text: sanitize(thinking.thinking) })
+            }
             continue
           }
-          if (
-            thinking.thinkingSignature &&
-            !hasLoneSurrogate(thinking.thinking)
-          ) {
+
+          if (thinking.redacted) {
+            if (hasSignature) {
+              blocks.push({
+                type: 'redacted_thinking',
+                data: signature,
+              })
+            }
+            continue
+          }
+
+          if (!hasSignature) {
+            // Anthropic rejects unsigned thinking blocks. Preserve readable
+            // output from interrupted streams as ordinary assistant text.
+            if (thinking.thinking.trim()) {
+              blocks.push({
+                type: 'text',
+                text: sanitize(thinking.thinking),
+              })
+            }
+            continue
+          }
+
+          if (hasLoneSurrogate(thinking.thinking)) {
+            // Signature authenticates the thinking bytes exactly. Sanitizing the
+            // text would invalidate it, so downgrade malformed signed thinking
+            // to plain text and omit the signature instead.
+            if (thinking.thinking.trim()) {
+              blocks.push({
+                type: 'text',
+                text: sanitize(thinking.thinking),
+              })
+            }
+          } else {
             // Signed thinking blocks are sent back verbatim. A live test on
             // 2026-09-23 (haiku-4-5, opus-4-8, opus-5-5) showed that Anthropic
             // accepts edited or emptied text on a signed block, both in the
@@ -250,14 +315,8 @@ function convertMessages(
             blocks.push({
               type: 'thinking',
               thinking: thinking.thinking,
-              signature: thinking.thinkingSignature,
+              signature,
             })
-          } else {
-            // Either unsigned, or signed-but-contains a lone surrogate. In the
-            // latter case we cannot keep the signature: sanitizing breaks it and
-            // sending the raw lone surrogate is an invalid-UTF8 400. Drop the
-            // signature and downgrade to sanitized text.
-            blocks.push({ type: 'text', text: sanitize(thinking.thinking) })
           }
         } else if (block.type === 'toolCall') {
           blocks.push({
@@ -369,6 +428,49 @@ function addEphemeralCacheControl(body: AnthropicRequestBody): void {
   }
 }
 
+/**
+ * Flatten a host system prompt to text.
+ *
+ * Pi types `Context.systemPrompt` as `string`, but Oh My Pi 18.x types it as
+ * `string[]` — "ordered system prompt blocks" — and hands that array to the
+ * provider unflattened, where `.trim()` is not a function and no request was
+ * ever built (issue #201).
+ *
+ * Blocks join on a blank line, which is how the host's own providers flatten
+ * them (`normalizeSystemPrompts(prompt).join('\n\n')`), so the paragraph split
+ * below classifies the same text on either host. The host asks providers to
+ * preserve its entries as distinct blocks, and that is deliberately not done
+ * here: an unrecognized prompt shape is carried in messages[] precisely because
+ * placing the host prompt in top-level system[] is the request shape Anthropic
+ * rejects with 400 "You're out of extra usage" (see splitPiSystemPrompt).
+ * Joining loses no text and no paragraph boundary; re-emitting the entries as
+ * system[] blocks would reintroduce that rejection.
+ *
+ * Only a `{ type: 'text', text }` block is read. The host declares strings, so
+ * that branch is for the next drift in this same field: returning '' there
+ * would silently ship requests with no host prompt at all, which is worse than
+ * the crash this replaces. `type` is checked rather than reading any object's
+ * `text` field, so a tool, image, or other structured block never has its
+ * metadata flattened into the prompt.
+ */
+function systemPromptText(prompt: unknown): string {
+  if (typeof prompt === 'string') return prompt
+  if (!Array.isArray(prompt)) return ''
+
+  const parts: string[] = []
+  for (const block of prompt) {
+    if (typeof block === 'string') {
+      parts.push(block)
+      continue
+    }
+    const record = block as { type?: unknown; text?: unknown } | null
+    if (record?.type === 'text' && typeof record.text === 'string') {
+      parts.push(record.text)
+    }
+  }
+  return parts.join('\n\n')
+}
+
 function splitPiSystemPrompt(prompt: string): {
   systemText?: string
   messageText: string
@@ -414,33 +516,73 @@ function prependCachedPromptBlock(
   }
 }
 
+/**
+ * Visit every object that can legitimately hold an Anthropic cache breakpoint:
+ * the request root, each `system[]` block, each tool, and each message with its
+ * content blocks — exactly where addEphemeralCacheControl and
+ * prependCachedPromptBlock place them.
+ *
+ * Deliberately not a deep walk. A tool's `input_schema` and a replayed
+ * `tool_use.input` are arbitrary caller data, so a nested field named
+ * `cache_control` there is a tool parameter or argument, not a breakpoint:
+ * deleting it or writing `ttl` into it would corrupt the tool contract.
+ */
+function walkCacheControlHolders(
+  body: AnthropicRequestBody,
+  visit: (holder: Record<string, unknown>) => void,
+): void {
+  const holders: unknown[] = [body]
+  if (body.system) holders.push(...body.system)
+  if (body.tools) holders.push(...body.tools)
+  for (const message of body.messages) {
+    holders.push(message)
+    if (Array.isArray(message.content)) holders.push(...message.content)
+  }
+
+  for (const holder of holders) {
+    if (!holder || typeof holder !== 'object') continue
+    const record = holder as Record<string, unknown>
+    const cacheControl = record.cache_control
+    if (cacheControl && typeof cacheControl === 'object') visit(record)
+  }
+}
+
+/**
+ * Anthropic accepts at most four cache breakpoints per request. This provider
+ * composes its own body and has already placed exactly four
+ * (addEphemeralCacheControl's last tool, last system block and last user block,
+ * plus the cached prompt block on the first user message), so the top-level
+ * control this used to add on top of them made five cache_control sites in one
+ * body — the shape behind "A maximum of 4 blocks with cache_control may be
+ * provided. Found 5." on a request that never reached the model (issue #201).
+ *
+ * Each mode now places its own breakpoints and nothing else, as the OpenCode
+ * rewrite path does (`applyAutomaticCache1h` / `applyHybridCache1h` both clear
+ * every breakpoint first):
+ * - `automatic`: the top-level control alone, at 1h.
+ * - `hybrid`: the four block breakpoints extended to 1h, no top-level control.
+ *   That is the placement OpenCode's hybrid anchors reconstruct by hand and
+ *   this converter emits natively.
+ * - `explicit`: the same four breakpoints, TTL only.
+ */
 function applyCacheMode(
   body: AnthropicRequestBody,
   enabled: boolean,
   mode: Cache1hMode,
 ): void {
   if (!enabled) return
+
   if (mode === 'automatic') {
-    body.cache_control = { type: 'ephemeral' }
+    walkCacheControlHolders(body, (holder) => {
+      delete holder.cache_control
+    })
+    body.cache_control = { type: 'ephemeral', ttl: '1h' }
     return
   }
 
-  const addTtl = (value: unknown): void => {
-    if (!value || typeof value !== 'object') return
-    if (Array.isArray(value)) {
-      for (const item of value) addTtl(item)
-      return
-    }
-    const record = value as Record<string, unknown>
-    const cacheControl = record.cache_control
-    if (cacheControl && typeof cacheControl === 'object') {
-      ;(cacheControl as Record<string, unknown>).ttl = '1h'
-    }
-    for (const child of Object.values(record)) addTtl(child)
-  }
-
-  if (mode === 'hybrid') body.cache_control = { type: 'ephemeral' }
-  addTtl(body)
+  walkCacheControlHolders(body, (holder) => {
+    ;(holder.cache_control as Record<string, unknown>).ttl = '1h'
+  })
 }
 
 export async function buildAnthropicRequest(
@@ -450,8 +592,31 @@ export async function buildAnthropicRequest(
   cache: { enabled: boolean; mode: Cache1hMode },
   fastModeEnabled = false,
   identity?: ClaudeCodeIdentity,
-): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
-  const messages = convertMessages(context.messages)
+  controls: {
+    effortTransitions?: readonly MidConversationEffortTransition[]
+    thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
+  } = {},
+): Promise<{
+  body: AnthropicRequestBody
+  bodyText: string
+  hostTools: Tool[]
+}> {
+  // Pi 0.86 passes a normalized transcript to providers, and later system
+  // messages can change the prompt, its named sections and the tool set. Resolve
+  // them through the local replay port; raw host prompts (including ordered OMP
+  // blocks) still enter through normalization.
+  const transcript = collapseSystemMessages(
+    normalizeContext({
+      ...context,
+      systemPrompt: systemPromptText(context.systemPrompt),
+    }),
+  )
+  context = {
+    messages: transcript.messages,
+    systemPrompt: getCurrentSystemPrompt(transcript.messages),
+    tools: getCurrentTools(transcript.messages),
+  }
+  const messages = convertMessages(context.messages, modelId)
   // Strip trailing assistant messages — Anthropic rejects prefill on some models
   while (
     messages.length &&
@@ -466,11 +631,15 @@ export async function buildAnthropicRequest(
         messages,
         undefined,
         CLAUDE_CODE_ENTRYPOINT,
+        options?.sessionId
+          ? firstUserTextTracker.resolve(options.sessionId, messages)
+          : undefined,
       ),
     },
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
-  if (context.systemPrompt?.trim()) {
+  const systemPrompt = systemPromptText(context.systemPrompt)
+  if (systemPrompt.trim()) {
     // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
     // its documentation paragraph (the docs/*.md enumeration and the "follow .md
     // cross-references" instruction) are each independently sufficient to make
@@ -495,7 +664,7 @@ export async function buildAnthropicRequest(
     // cache_control is set explicitly because addEphemeralCacheControl's
     // message-level breakpoint only fires for array content on the *last* user
     // message, which is not this one after the first turn.
-    const prompt = splitPiSystemPrompt(context.systemPrompt)
+    const prompt = splitPiSystemPrompt(systemPrompt)
     if (prompt.systemText) {
       system.push({ type: 'text', text: prompt.systemText })
     }
@@ -520,6 +689,7 @@ export async function buildAnthropicRequest(
   const isFableOrMythos5 = isClaudeFableOrMythos5Model(modelId)
   const isSonnet5 = isClaudeSonnet5Model(modelId)
   const isOpus5 = isClaudeOpus5Model(modelId)
+  const isOpus55 = isClaudeOpus55Model(modelId)
   // Adaptive thinking is the default shape for every current first-party model
   // except the older families (Opus 4.5 and earlier, Sonnet 4.5 and earlier,
   // Haiku 4.5, Claude 3.x). Opus 4.6/4.7/4.8 and Sonnet 4.6 are adaptive too, so
@@ -542,6 +712,8 @@ export async function buildAnthropicRequest(
     body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
   } else if (isSonnet5) {
     body.thinking = { ...CLAUDE_SONNET_5_ADAPTIVE_THINKING }
+  } else if (isOpus55) {
+    body.thinking = { ...CLAUDE_OPUS_5_5_ADAPTIVE_THINKING }
   } else if (isOpus5) {
     body.thinking = { ...CLAUDE_OPUS_5_ADAPTIVE_THINKING }
   }
@@ -553,12 +725,18 @@ export async function buildAnthropicRequest(
   // on by default there, so the injection above only opts `display` back in.
 
   if (options?.reasoning) {
-    if (isAdaptiveThinking) {
+    if (
+      isAdaptiveThinking ||
+      isFableOrMythos5 ||
+      isSonnet5 ||
+      isOpus5 ||
+      isOpus55
+    ) {
       // Adaptive non-5 models have thinking OFF unless a thinking field is sent,
       // so an explicit `reasoning` request must turn it on. `display:"summarized"`
       // keeps reasoning text visible on the models that default it to "omitted".
       // The 5-series already got its per-family constant above; don't overwrite it.
-      if (!isFableOrMythos5 && !isSonnet5 && !isOpus5) {
+      if (!isFableOrMythos5 && !isSonnet5 && !isOpus5 && !isOpus55) {
         body.thinking = { type: 'adaptive', display: 'summarized' }
       }
       // Pi's `minimal` is not in Anthropic's effort enum (low/medium/high/xhigh/max) — 400s if passed through.
@@ -606,11 +784,21 @@ export async function buildAnthropicRequest(
     }
   }
 
+  applyMidConversationOutputConfig(body, controls.effortTransitions ?? [])
   addEphemeralCacheControl(body)
   applyCacheMode(body, cache.enabled, cache.mode)
-  if (identity) applyClaudeCodeMetadata(body, identity)
+  if (identity) {
+    applyThinkingBindingControls(
+      body,
+      controls.thinkingPrefixMismatchBehavior ?? 'account-default',
+    )
+    applyClaudeCodeMetadata(body, identity)
+  }
 
   const unsigned = JSON.stringify(orderClaudeCodeBody(body))
   const bodyText = await signRequestBody(unsigned)
-  return { body, bodyText }
+  // The stream decoder must use the exact tool set that produced this body.
+  // Pi 0.86's transcript has no top-level context.tools, and normalizing it
+  // again after dispatch would duplicate work and risk a different mapping.
+  return { body, bodyText, hostTools: context.tools ?? [] }
 }

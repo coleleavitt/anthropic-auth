@@ -15,6 +15,7 @@ export const CODE_CALLBACK_URL =
 
 export const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 export const REVOKE_URL = `${TOKEN_URL}/revoke`
+export const CUSTODY_HANDLE_PATTERN = /^ckh_[A-Za-z0-9_-]{43}$/
 
 export const AXIOS_USER_AGENT = 'axios/1.15.2'
 
@@ -92,10 +93,7 @@ export function mergeAnthropicBetas(
 export function isFastModeSupportedModel(model: unknown) {
   return (
     typeof model === 'string' &&
-    (model.startsWith('claude-opus-4-6') ||
-      model.startsWith('claude-opus-4-7') ||
-      model.startsWith('claude-opus-4-8') ||
-      model.startsWith('claude-opus-5'))
+    (model.startsWith('claude-opus-4-8') || model.startsWith('claude-opus-5'))
   )
 }
 
@@ -126,7 +124,7 @@ export const CLAUDE_CODE_ENTRYPOINT = 'cli'
 export const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION = '0.112.1'
 export const CLAUDE_CODE_STAINLESS_RUNTIME_VERSION = 'v26.3.0'
 
-export const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`
+export const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, ${CLAUDE_CODE_ENTRYPOINT})`
 
 export const CACHE_1H_MODES = ['explicit', 'automatic', 'hybrid'] as const
 export type Cache1hMode = (typeof CACHE_1H_MODES)[number]

@@ -13,7 +13,7 @@ anthropic-auth/
 │   │   ├── src/
 │   │   │   ├── rpc/            # Loopback RPC server/client for TUI IPC
 │   │   │   ├── tests/          # Comprehensive test suite per module
-│   │   │   │   ├── fixtures/   # Test fixtures (realistic system prompts)
+│   │   │   │   ├── fixtures/   # Test fixtures (claustrum-golden, realistic prompts)
 │   │   │   │   └── __snapshots__/
 │   │   │   └── tui/            # Command modal dialog components
 │   │   ├── scripts/            # Build and smoke-testing scripts for the TUI
@@ -35,36 +35,40 @@ anthropic-auth/
 ## Directory Purposes
 
 **`packages/core/src/`:**
-- Purpose: Reusable OAuth/WIF lifecycle, native/secure credential discovery, account management, device/trusted/Cowork protocols, quota, cache, relay, signing, routing, and command execution logic
+- Purpose: All reusable OAuth/WIF lifecycle, native/secure credential discovery, account management, device/trusted/Cowork protocols, optional Claustrum custody, model metadata, quota, host-local quota feeds, cache, relay, dump, signing, thinking-binding, routing, content filtering/refusal mitigation, and command execution logic
 - Contains: TypeScript modules, each focused on one concern, plus core unit tests in `tests/`
-- Key files: `index.ts` (re-exports all public API), `shared-account-store.ts` (Rust-compatible canonical Anthropic credential store), `shared-account-adapter.ts` (canonical-store/sidecar conversion), `accounts.ts` (sidecar storage + types + quota API + prime opt-in and runtime counters), `auth.ts` (OAuth authorization/exchange/refresh/revocation), `oauth-loopback.ts` (automatic localhost completion), `oauth-profile.ts` (OAuth profile fetch + rate limit tier formatting), `quota-headers.ts` (passive quota header extraction and normalization), `token-fingerprint.ts` (SHA-256 token fingerprinting), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cachekeep-registry.ts` (cross-process tracked-session lease registry), `prime.ts` (opt-in five-hour quota priming and cross-process scheduler), `start.ts` (explicit lane-start command parsing and text), `cch.ts` (2.1.260 literal billing CCH plus legacy canonical-preimage diagnostics), `claude-code.ts` + `device-identity.ts` (persistent Claude identity), `wif.ts` (Workload Identity Federation), `native-claude-credentials.ts` + `secure-secret-store.ts` (native import/storage), `trusted-device.ts` + `attestation.ts` + `cowork-binding.ts` (Remote Control/Cowork security), `provider.ts` (provider HTTP error classification), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture and size-capped background sweeping), `models.ts` (Claude model specs and Haiku prime pricing), `logger.ts` (structured logger), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants)
+- Key files: `index.ts` (re-exports all public API), `shared-account-store.ts` (Rust-compatible canonical Anthropic credential store), `shared-account-adapter.ts` (canonical-store/sidecar conversion), `accounts.ts` (sidecar storage + types + quota API + prime opt-in, Claustrum gates, and runtime counters), `auth.ts` (OAuth authorization/exchange/refresh/revocation), `oauth-loopback.ts` (automatic localhost completion), `claustrum.ts` (connection discovery and custody tombstone guards), `claustrum-scoped-runtime.ts` (scoped credential discovery and per-send authorization), `claustrum-scoped-roster.ts` (locked secret-free routing projection), `oauth-profile.ts` (OAuth profile fetch + rate limit tier formatting), `quota-headers.ts` (passive quota header extraction and normalization), `quota-header-feed.ts` (sanitized host-local quota observation leases with per-field provenance), `token-fingerprint.ts` (SHA-256 token fingerprinting for legacy migration and credential lineage), `relay.ts` (Cloudflare Worker relay protocol), `quota-manager.ts` (centralized quota cache), `cachekeep.ts` (hybrid cache pre-warming), `cachekeep-registry.ts` (cross-process tracked-session lease registry), `prime.ts` (opt-in five-hour quota priming and cross-process scheduler), `start.ts` (explicit lane-start command parsing and text), `cch.ts` (body signing, bounded process-local Claude Code version-suffix pinning, request lineage formatting, and lineage stripping for reusable bodies), `claude-code.ts` (Claude Code identity + billing headers), `device-identity.ts` (persistent Claude identity), `wif.ts` (Workload Identity Federation), `native-claude-credentials.ts` + `secure-secret-store.ts` (native import/storage), `trusted-device.ts` + `attestation.ts` + `cowork-binding.ts` (Remote Control/Cowork security), `thinking-binding.ts` (configurable Fable 5.1 thinking-prefix controls), `mid-conversation-output-config.ts` (cache-stable Fable 5.1 effort changes), `provider.ts` (provider HTTP error classification), `retry-policy.ts` (provider retry policy), `content-filter.ts` + `content-filter-terms.ts` + `context-sanitizer.ts` (pre-flight classifier-mitigation content filter), `refusal-surrogate.ts` + `refusal-surrogate-model.ts` + `refusal-guard.ts` + `refusal-suggestions.ts` + `refusal-logger.ts` (surrogate-guided refusal mitigation and logging), `session-heat.ts` + `split.ts` (session heat tracking and session split), `low-priority.ts` (low-priority mode), `request-logger.ts` (usage logging), `logging.ts` (logging level commands), `commands/account.ts` (account command execution), `cache1h.ts` (1h prompt cache configuration), `fast.ts` (fast mode configuration), `dump.ts` (request/response dump capture and size-capped background sweeping), `models.ts` (Claude model specs, Haiku prime pricing, and context-window qualifier normalization), `logger.ts` (structured logger), `json.ts` (redacted JSON parser diagnostics for secret-bearing files and bodies), `network-errors.ts` (transient network and DNS error classification), `pkce.ts` (PKCE helpers), `routing.ts` (routing mode commands), `sticky-routing.ts` (persistent quota-balanced session affinity), `killswitch.ts` (hard-block and model-scoped thresholds), `quotas.ts` (quota calculation), `constants.ts` (global constants), `custom-headers.ts` (proxy-only custom header parsing), `model-remap.ts` (proxy route model aliases)
 
 **`packages/opencode/src/`:**
 - Purpose: OpenCode plugin implementation — fetch interception, request rewriting, CLI, TUI sidebar, command dialogs
 - Contains: Plugin entry point, transform pipeline, cache diagnostics, CLI, TUI widget (SolidJS), precompiled TUI loader/output, RPC server for TUI IPC, preferences management
-- Key files: `index.ts` (plugin factory — auth loader, command registration, background services), `transform.ts` (request body rewriting + SSE stream stripping), `cache-diagnostics.ts` (cache diagnosis beta opt-in, message ID tracking, and schema v:2 record formatting), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, outcome detection, and completed-tool refusal continuation), `fable-fallback.ts` (session-and-source-family 10-response Opus 4.8 backstop/legacy recovery and standby cache-anchor state), `prime-manager-registry.ts` (process-wide PrimeManager registry keyed by account-storage identity), `lane-start.ts` (synthetic prompt injection and request correlation), `cli.ts` (localhost OAuth, native import, confirmed revocation, API routes, and relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (comment-preserving JSONC preferences with directory-watch and independent polling reload paths), `sidebar-state.ts` (quota/routing, prime status, and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver), `shared-auth.ts` (canonical shared-store resolution and OpenCode credential reconciliation)
+- Key files: `index.ts` (single exported plugin factory — auth loader, command registration, background services), `request-policy.ts` (internal killswitch request classification and messaging), `transform.ts` (request body rewriting + SSE stream stripping), `custody-mode.ts` (fail-closed scoped startup admission), `custody-dimensions.ts` (route custody classification), `cache-diagnostics.ts` (cache diagnosis beta opt-in, message ID tracking, and schema v:2 record formatting), `server-fallback.ts` (Anthropic server-side safety fallback opt-in, fallback-boundary preservation, outcome detection, and completed-tool refusal continuation), `fable-fallback.ts` (session-and-source-family 10-response Opus 4.8 backstop/legacy recovery and standby cache-anchor state), `prime-manager-registry.ts` (process-wide PrimeManager registry keyed by account-storage identity), `lane-start.ts` (synthetic prompt injection and request correlation), `cli.ts` (localhost OAuth, native import, confirmed revocation, API routes, and relay setup), `tui.tsx` (sidebar source), `tui/entry.mjs` (host-runtime-aware compiled/raw loader), `tui/command-dialogs.tsx` (command modal dialog components), `tui-compiled/` (generated build output, shipped but git-ignored), `tui-preferences.ts` (comment-preserving JSONC preferences with directory-watch and independent polling reload paths), `sidebar-state.ts` (quota/routing, prime status, and session-keyed recovery state for TUI sidebar IPC), `sanitize-memo.ts` (system prompt sanitization memoization), `prompt-context.ts` (prompt context resolver), `effort-history.ts` (request-scoped Fable 5.1 effort timeline), `billing-lineage.ts` (user-turn prompt UUID and previous Anthropic request ID tracking across tool loops, internal correlation headers, and session invalidation), `shared-auth.ts` (canonical shared-store resolution and OpenCode credential reconciliation)
+
+**`packages/opencode/src/setup/`:**
+- Purpose: Interactive setup wizard and environment detection for OpenCode, Pi, and Claustrum custody
+- Contains: `command.ts` (wizard orchestration), `detect.ts` (OpenCode, Pi, and Claustrum detection), `process-fence.ts` (host quiescence verification), `opencode-config.ts` (comment-preserving `opencode.jsonc` and `tui.jsonc` plugin updates), `pi.ts` (Pi extension installation and local OAuth conflict resolution), `activation.ts` (fenced OpenCode auth tombstone installation), `claustrum.ts` (consumer enrollment, grant, discovery, and scoped roster commitment), `command-runner.ts` (safe child execution), `paths.ts` (host path resolution), `jsonc.ts` (safe JSONC editing), `types.ts`
 
 **`packages/opencode/src/rpc/`:**
-- Purpose: Loopback HTTP RPC between OpenCode server and TUI process
-- Contains: `rpc-server.ts`, `rpc-client.ts`, `rpc-dir.ts`, `port-file.ts`, `protocol.ts`, `notifications.ts`
+- Purpose: Project-isolated loopback HTTP RPC between OpenCode server and TUI process, with session-scoped notification delivery, serialized same-directory replacement, and identity-fenced server disposal
+- Contains: `rpc-server.ts`, `server-registry.ts`, `rpc-client.ts`, `rpc-dir.ts`, `port-file.ts`, `protocol.ts`, `notifications.ts`
 
 **`packages/opencode/scripts/`:**
-- Purpose: Build and smoke-testing scripts for the precompiled TUI
-- Contains: SolidJS build transformation and package installation validation
-- Key files: `build-tui.ts` (compiles the SolidJS/OpenTUI files to `src/tui-compiled/` with virtual modules), `smoke-tui-pack-install.ts` (validates TUI installation and dependency resolution)
+- Purpose: Build, smoke-testing, and bundle validation scripts for the OpenCode plugin and precompiled TUI
+- Contains: SolidJS build transformation, package installation validation, and bundle artifact registry verification
+- Key files: `build-tui.ts` (compiles the SolidJS/OpenTUI files to `src/tui-compiled/` with virtual modules), `smoke-tui-pack-install.ts` (verifies packed Node CLI startup and compiled TUI dependency resolution from a fresh install), `check-bundle-globals.ts` (validates bundle artifact size and RPC server registry globals)
 
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
 - Contains: Extension entry point, command registration, host credential seeding, request building, streaming provider
-- Key files: `index.ts` (provider and model-catalog registration), `adopt-host-credential.ts` (cold-start seeding of Pi's own `auth.json` from the canonical shared store), `stream.ts` (streaming request handling), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, Pi documentation-prompt relocation, and cache breakpoint placement), `paths.ts` (Pi-specific path resolution)
+- Key files: `index.ts` (provider and model-catalog registration), `adopt-host-credential.ts` (cold-start seeding of Pi's own `auth.json` from the canonical shared store), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, bounded process-local billing-suffix pinning, origin-aware thinking-signature filtering, configurable Fable 5.1 prefix behavior, mid-conversation effort markers, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `transcript.ts` (host-independent system-prompt and tool replay for Pi and Oh My Pi), `effort-history.ts` (compaction-aware Pi thinking-level timeline), `paths.ts` (Pi-specific path resolution)
 
 **`packages/e2e-tests/`:**
-- Purpose: Integration tests with mock Anthropic and relay servers
-- Contains: Test harness, mock server implementations, process runner with temp dir hygiene, end-to-end integration tests (tool prefix, quota header relay, temp directory hygiene)
+- Purpose: Integration tests with mock Anthropic, relay, and Claustrum servers
+- Contains: Test harness, mock server implementations, process runner with temp dir hygiene, end-to-end integration tests (tool prefix, quota header relay, temp directory hygiene, custody mode, mock claustrum)
 
 **`scripts/`:**
 - Purpose: Development, release, and analysis utilities
-- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` (cross-package version alignment)
+- Contains: `dev.ts` / `dev-clean.ts` (local dev workflow with symlinks), `release.sh` / `wait-release.sh` (tag-driven npm release), `analyze-cache-usage.mjs` (OpenCode SQLite cache analyzer), `check-claustrum-golden.ts` (pins canonical Claustrum tombstone ancestry and exact fixture bytes), `check-pi-tool-mapping.ts` (runs an isolated real Pi host tool round-trip against deterministic SSE), `check-pi-dist-imports.ts` (AST-validates emitted Pi host-SDK imports, rejecting unsupported or unverifiable dynamic imports in CI and release), `check-test-count-floors.ts` (runs unit suites once; compares floors against the merge target in PR CI and the previous version tag at release), `extract-system-prompt.ts` (prompt capture extraction), `capture-with-mitmproxy.sh` (HTTPS capture setup), `version-sync.mjs` / `workspace-lock.mjs` (cross-package versions, surgical Bun lockfile synchronization, and manifest-to-lock validation)
 
 ## Key File Locations
 
@@ -77,7 +81,7 @@ anthropic-auth/
 
 **Configuration:**
 - `package.json` (root): Bun workspace root — workspace config, shared dev dependencies, root scripts
-- `packages/core/package.json`: Core package — depends only on `xxhash-wasm`
+- `packages/core/package.json`: Core package — depends on `xxhash-wasm` and `@cortexkit/claustrum-client`; only the E2E mock declares `@cortexkit/subc-client` directly
 - `packages/opencode/package.json`: OpenCode package — depends on core + OpenCode SDK + SolidJS + OpenTUI
 - `packages/pi/package.json`: Pi package — depends on core + Pi SDKs (peer dependencies)
 - `biome.json`: Biome linter and formatter config
@@ -86,23 +90,30 @@ anthropic-auth/
 - `tsconfig.*.json`: TypeScript configs (root + per-package build configs)
 
 **Core Logic:**
-- `packages/core/src/auth.ts`: OAuth authorize → PKCE challenge → token exchange → expiry-aware refresh → revocation
+- `packages/core/src/auth.ts`: OAuth authorize → PKCE challenge → token exchange → expiry-aware refresh → revocation, with provider-bound custody tombstones rejected before network access
 - `packages/core/src/oauth-loopback.ts`: Bounded one-shot localhost callback with manual fallback
 - `packages/core/src/wif.ts`: Service-account WIF environment resolution, assertion exchange, and single-flight cache
 - `packages/core/src/native-claude-credentials.ts`: Native keychain/plaintext discovery and explicit shared-store import
 - `packages/core/src/secure-secret-store.ts`: Bounded shell-free command reader and atomic private file secrets
 - `packages/core/src/device-identity.ts`: Persistent installation-wide 32-byte identity
 - `packages/core/src/trusted-device.ts`, `attestation.ts`, `cowork-binding.ts`: Trusted enrollment, fail-closed Remote Control status filtering, and P-256 Cowork binding
+- `packages/core/src/claustrum.ts`: Claustrum connection-file discovery and provider-scoped tombstone recognition/refusal
+- `packages/core/src/claustrum-scoped.ts`: Per-dispatch credential retrieval and send-time record-version 401 reporting through enrolled scoped access
+- `packages/core/src/claustrum-scoped-runtime.ts`: Shared client lifecycle, discovery polling, and quota/profile authorization
+- `packages/core/src/claustrum-scoped-roster.ts`: Locked projection of verified inventory into secret-free OAuth routing rows
+- `packages/core/src/claustrum-enrollment.ts`: Host-specific enrollment paths and crash-resumable, setup-only Claustrum ceremony — owner-only bounded state, secret-before-propose persistence, idempotent crash replay, one-shot token persistence ordering, producer-permanent refusal classification, cross-process locking, terminal reset guards, and read-only status projection
 - `packages/core/src/oauth-profile.ts`: OAuth profile metadata fetch, tier formatting (`Max 5x`, `Team · Max 5x`), and 7-day TTL validation
 - `packages/core/src/quota-headers.ts`: Normalization of `anthropic-ratelimit-unified-*` headers from direct fetch and relay transports into shared quota snapshots
-- `packages/core/src/token-fingerprint.ts`: Non-reversible SHA-256 token fingerprinting for profile-to-token binding
+- `packages/core/src/quota-header-feed.ts`: Schema-versioned, owner-only per-process lease files containing an explicit allowlist of fresh quota observations for host-local consumers
+- `packages/core/src/token-fingerprint.ts`: Non-reversible SHA-256 token fingerprinting retained for legacy state migration, refresh-token lineage, and other credential-bound guards
 - `packages/core/src/shared-account-store.ts`: Canonical `~/.anthropic-accounts/accounts.json` schema, path resolution, account selection, atomic writes, permissions, and safety checks compatible with the Rust `anthropic` crate
 - `packages/core/src/shared-account-adapter.ts`: Converts canonical OAuth/API-key accounts to and from legacy sidecar fallback entries
-- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, refresh-token-hash-bound error/backoff state, in-process write serialization, cross-process configuration file locking and account merging (with `ENOENT`/`EINVAL` eviction race handling), prime opt-in, auth-lineage bindings, and per-account runtime usage counters
-- `packages/core/src/quota-manager.ts`: Unified quota cache with backoff, staleness, and fresh-result metadata for quota priming
+- `packages/core/src/accounts.ts`: Sidecar file read/write, account CRUD, quota API fetch, stable main-account slot identity, account-identity-bound quota/profile state, observation-fenced quota-error clears, refresh-token-hash-bound error/backoff state, global Claustrum mode and scoped inventory state, in-process write serialization, cross-process configuration file locking and account merging (with `ENOENT`/`EINVAL` eviction race handling), prime opt-in, auth-lineage bindings, and per-account runtime usage counters
+- `packages/core/src/quota-manager.ts`: Stable-account-identity-keyed quota cache with backoff, replacement generations, staleness, and fresh-result metadata for quota priming
 - `packages/core/src/relay.ts`: Cloudflare Worker HTTP/WebSocket relay protocol
-- `packages/core/src/cch.ts`: Claude 2.1.260 literal billing `cch=00000` normalization plus legacy xxHash64 diagnostic helpers
-- `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager with local-window and process-lifetime `always` schedules
+- `packages/core/src/cch.ts`: XXH64-based final-body signing plus Claude Code 2.1.280 billing suffix extraction, bounded per-session pinning, request lineage formatting (`cc_prev_req`, `cc_prompt_id`), and lineage stripping for reusable bodies
+- `packages/core/src/claude-code.ts`: Claude Code identity system instructions and billing headers
+- `packages/core/src/cachekeep.ts`: Hybrid cache pre-warming manager with local-window and process-lifetime `always` schedules, stripping request-scoped billing lineage from pre-warm bodies
 - `packages/core/src/cachekeep-registry.ts`: Temporary lease registry for cross-process tracked-session status
 - `packages/core/src/prime.ts`: Opt-in five-hour quota priming command, eligibility gates, minimal Haiku request body, and cross-process marker-claim scheduler
 - `packages/core/src/start.ts`: Shared parsing and user-facing text for the explicit OpenCode lane-start command
@@ -115,32 +126,48 @@ anthropic-auth/
 - `packages/core/src/cache1h.ts`: 1h prompt cache configuration and commands
 - `packages/core/src/fast.ts`: Fast mode configuration and commands
 - `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, same-session on-disk byte-diff baseline recovery after restart, CacheKeep/Prime prewarm tagging, and commands
-- `packages/core/src/models.ts`: Supported Claude models and specs, including the Haiku 4.5 prime model and pricing constants
+- `packages/core/src/models.ts`: Supported Claude models and specs, including Fable/Mythos 5.1 release metadata and pricing, context-window qualifier normalization (`[1m]`) for model-family checks, and the Haiku 4.5 prime model
+- `packages/core/src/thinking-binding.ts`: Shared replay detection and configurable `account-default`/`error`/`drop_block` controls for Fable 5.1 signed/redacted thinking
+- `packages/core/src/mid-conversation-output-config.ts`: Shared Fable 5.1 effort normalization and empty-system-marker insertion while keeping the cached top-level effort stable
 - `packages/core/src/logger.ts`: Shared structured logger
+- `packages/core/src/json.ts`: Shared JSON parsing helpers that redact parser source context while preserving path, line, and column diagnostics
+- `packages/core/src/network-errors.ts`: Shared transient DNS and transport error classification for OAuth refresh and quota recovery
+- `packages/core/src/custom-headers.ts`: Bounded, redacted parsing for API-key/proxy-only custom headers with protected authentication, protocol, framing, and internal-correlation names
+- `packages/core/src/model-remap.ts`: Proxy-only generic and family-specific model alias resolution with strict family boundaries
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
 - `packages/core/src/quotas.ts`: Quota calculation and formatting helpers
 - `packages/core/src/constants.ts`: Global application constants
-- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping and cache diagnostics opt-in), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
+- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping, Fable/Mythos 5.1 adaptive-thinking normalization, conditional Fable 5.1 binding controls, Claude Code 2.1.280 billing suffix pinning and request lineage, cache diagnostics opt-in, API-route model aliases, and version-aware proxy base-path composition), source-cache prewarm lineage stripping, system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
 - `packages/opencode/src/cache-diagnostics.ts`: Cache diagnosis beta request opt-in (`diagnostics.previous_message_id`), session message ID tracking, schema v:2 record construction with TTL token breakdown, and beta header hash deduplication
-- `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, streamed handoff/sticky/restoration classification, and terminal-refusal rewriting after completed tool calls
-- `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 backstop state, source-model prewarming, and standby cache-anchor identity; used after unabsorbed server-policy refusals or exclusively under `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
-- `packages/opencode/src/prime-manager-registry.ts`: Process-wide registry that shares PrimeManager instances by account-storage identity and releases managers when project slots move
+- `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/5.1 and Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, streamed handoff/sticky/restoration classification, and terminal-refusal rewriting after completed tool calls
+- `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 backstop state (recognizing context-window-qualified models like `[1m]`), source-model prewarming, and standby cache-anchor identity; used after unabsorbed server-policy refusals or exclusively under `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`
+- `packages/opencode/src/prime-manager-registry.ts`: Process-wide registry that shares PrimeManager instances by account-storage identity and returns generation-fenced project-slot leases, preventing late predecessor disposal from releasing a reloaded successor
+- `packages/opencode/src/request-policy.ts`: Internal killswitch block classification and user-facing request-policy messages kept outside the plugin entrypoint so OpenCode invokes only `AnthropicAuthPlugin`
 - `packages/opencode/src/lane-start.ts`: Resolves the current prompt context, injects the exact synthetic lane-start marker, and correlates its message ID to one request through a bounded session-scoped tracker
 - `packages/opencode/src/sidebar-state.ts`: Shared quota/routing, prime status, and session-keyed server/legacy safety fallback state file for TUI sidebar IPC, using cross-process `mkdir` directory locks, read-before-write routing preservation, and pre/post-rename ownership fences
 - `packages/opencode/src/sanitize-memo.ts`: System prompt sanitization memoization LRU cache
 - `packages/opencode/src/prompt-context.ts`: Resolves context (agent, model, variant, and latest message IDs for assistant/user) for synthetic OpenCode user messages to preserve model state and support message ordering
 - `packages/opencode/src/shared-auth.ts`: Resolves canonical shared credentials, adopts legacy OpenCode auth/fallbacks, preserves API-key versus OAuth header semantics, and synchronizes token rotations
+- `packages/opencode/src/effort-history.ts`: Carries bounded Fable 5.1 effort transitions across OpenCode host lowering with stable checksum-bound user-boundary markers, a plan-bound current-user anchor, and a fixed-size request-plan header retained across same-message provider retries; accepts correlated tool-result continuations and ordered transitions merged onto one wire user boundary, retains bounded and revocable history for overwritten in-flight plans, folds exact-suffix-trimmed changes into the baseline only with an authenticated surviving anchor, strips internal state before dispatch, and fails locally on unprovable total marker loss or non-prefix correlation loss
+- `packages/opencode/src/billing-lineage.ts`: Correlates user message prompt UUIDs and upstream Anthropic request IDs across tool turns via internal headers, excludes background and synthetic turns, tracks session sequence/generations, and commits valid `req_*` responses to feed `previousRequestId` into the billing header
+- `packages/opencode/src/custody-mode.ts`: Scoped-only startup verdict and fail-closed mismatch classification
+- `packages/opencode/src/custody-dimensions.ts`: Classification of scoped roster, main tombstone, and OAuth fallback dimensions
 - `packages/opencode/src/tui-preferences.ts`: Comment-preserving JSONC preference reads/writes plus live reload through content-checked directory events and an independent polling fallback for missed events or `fs.watch` construction failures
 - `packages/opencode/src/tui/command-dialogs.tsx`: Command modal dialog presentation and input formatting
 - `packages/pi/src/adopt-host-credential.ts`: Seeds Pi's own `auth.json` from the canonical shared account store when Pi holds no Anthropic entry, so Pi's pre-flight `hasConfiguredAuth` gate cannot refuse a machine whose shared store is already authenticated; never overwrites an existing host entry and never throws
-- `packages/pi/src/stream.ts`: Pi provider streaming implementation, including server-side fallback opt-in/boundary preservation and structured terminal-refusal diagnostics
+- `packages/pi/src/commands.ts`: Pi slash command registration (`/claude-*`) and persistent setting handlers
+- `packages/pi/src/paths.ts`: Pi-specific storage and config path resolution
+- `packages/pi/src/convert.ts`: Pi-to-Anthropic request conversion, including ordered system prompt block flattening, session-stable Claude Code billing suffixes, same-origin thinking-signature replay, configurable Fable 5.1 compaction behavior, mid-conversation effort markers, redacted_thinking mapping, Pi documentation-prompt relocation, and four-slot cache breakpoint placement
+- `packages/pi/src/transcript.ts`: Locally replays host system messages and tool changes rather than importing helpers absent from Oh My Pi's legacy SDK shim
+- `packages/pi/src/effort-history.ts`: Rebuilds Fable 5.1 effort transitions from Pi's active branch and compaction-aware context entries (locally derived when buildContextEntries is absent)
+- `packages/pi/src/stream.ts`: Pi provider streaming implementation, including preservation of Anthropic redacted-thinking blocks for later replay, request-resolved host tool names for SSE tool-call mapping, API-key route versioned URL composition, and safe custom header application, plus server-side fallback opt-in/boundary preservation and structured terminal-refusal diagnostics
 - `packages/core/src/relay.ts`: Shared HTTP/WebSocket relay implementation; persistent WebSocket sends propagate caller cancellation and close fail-closed after a dispatched request is aborted because binary response frames are not request-tagged
 
 **Tests:**
-- `packages/core/src/tests/`: Core-only unit tests (dump, killswitch, models, prime, quota surfaces)
-- `packages/opencode/src/tests/`: One test file per module (30+ test files covering core + opencode)
-- `packages/pi/src/tests/`: Pi-specific tests (convert, stream, index)
-- `packages/e2e-tests/tests/`: Integration tests
+- `packages/core/src/tests/`: Core-only unit tests (dump, killswitch, models, prime, quota surfaces, accounts persistence, custom headers, model remap, claustrum)
+- `packages/opencode/src/tests/`: OpenCode unit and integration tests, including scoped Claustrum custody, billing lineage, a fail-closed network guard, and test-host filesystem/daemon isolation. `preload-sandbox.ts` initializes a disposable sandbox before `setup.ts` imports Core (whose logger/dump defaults are fixed at module load), then `setup.ts` restores account, sidebar, cache, RPC, dump, and daemon paths before/after tests so clearing a feature override cannot reach live state.
+- `packages/pi/src/tests/`: Pi-specific tests (commands, convert, effort-history, index, stream)
+- `packages/e2e-tests/tests/`: Process integration tests (tool prefix, quota header relay, temp directory hygiene, scoped custody, and Opus 5.5 structured output with and without the schema tool call)
 
 ## Naming Conventions
 
@@ -164,7 +191,7 @@ anthropic-auth/
 
 **New test:** Add `*.test.ts` under the owning package's test directory — `packages/core/src/tests/` for core-only tests, `packages/opencode/src/tests/` for OpenCode and shared-core integration tests, `packages/pi/src/tests/` for Pi-specific tests, and `packages/e2e-tests/tests/` for process-level integration tests.
 
-**New script:** `scripts/` (for global analysis/development tools) or `packages/opencode/scripts/` (for TUI build/packaging validations) — use TypeScript (run with `bun`) or plain JavaScript. Reference `tsconfig.scripts.json` or `packages/opencode/tsconfig.scripts.json` for TypeScript compilation options.
+**New script:** `scripts/` (for global analysis/development tools) or `packages/opencode/scripts/` (for TUI build/packaging validations and bundle checks) — use TypeScript (run with `bun`) or plain JavaScript. Reference `tsconfig.scripts.json` or `packages/opencode/tsconfig.scripts.json` for TypeScript compilation options.
 
 **New CLI command:** `packages/opencode/src/cli.ts` — add the subcommand handler following the `login`/`list`/`api add`/`relay setup` pattern.
 

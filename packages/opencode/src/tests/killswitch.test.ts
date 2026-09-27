@@ -22,7 +22,7 @@ import {
 import {
   formatKillswitchBlockMessage,
   resolveScopedDrivenBlock,
-} from '../index.ts'
+} from '../request-policy.ts'
 
 let tempDir: string
 let accountPath: string
@@ -230,6 +230,15 @@ describe('killswitchPassesPolicy', () => {
       main: { five_hour: 5, seven_day: 10 },
     }
     expect(killswitchPassesPolicy(undefined, storage)).toBe(false)
+  })
+
+  test('empty quota snapshot remains killswitch-unknown under fail-closed policy', () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10 },
+    }
+    expect(killswitchPassesPolicy({}, storage)).toBe(false)
   })
 
   test('missing quota without failClosedOnUnknownQuota returns true', () => {

@@ -11,11 +11,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import {
   __setLogTestSink,
-  type AccountStorage,
   type LogTestRecord,
-  type OAuthAccount,
-  type OAuthQuotaSnapshot,
-  type PrimeUsageCounters,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 // Source-side logger import — installed as a second sink so PrimeManager logs
@@ -23,6 +19,16 @@ import {
 // relative `./logger.ts` path) reach the test capture array. The dist logger
 // instance is the package-alias target used by other tests; both must be
 // wired to keep sink assertions consistent across runs.
+import {
+  type AccountStorage,
+  getOrCreateMainAccountId,
+  getOrCreatePrimeAuthLineageId,
+  loadAccounts,
+  type OAuthAccount,
+  type OAuthQuotaSnapshot,
+  type PrimeUsageCounters,
+  saveAccountState,
+} from '../accounts.ts'
 import {
   __setLogTestSink as __setLogTestSinkSource,
   getLogLevel,
@@ -191,7 +197,7 @@ describe('buildPrimeStatusSummary', () => {
       {
         id: 'main',
         label: 'main',
-        nextDueAt: null,
+        nextDueAt: undefined,
         usage: {
           count: 12,
           inputTokens: 240,
@@ -225,7 +231,7 @@ describe('executePrimeCommand', () => {
     {
       id: 'main',
       label: 'main',
-      nextDueAt: null,
+      nextDueAt: undefined,
       usage: { count: 0, inputTokens: 0, outputTokens: 0, since: 1 },
       estimatedCostUsd: 0,
     },
@@ -366,6 +372,8 @@ async function makeHarness(opts: {
   recordSuccessReturn?: PrimeUsageCounters
   refreshError?: Error
   storagePath?: string
+  setTimeoutImpl?: typeof globalThis.setTimeout
+  clearTimeoutImpl?: typeof globalThis.clearTimeout
 }): Promise<Harness> {
   const sendCalls: SendCall[] = []
   const refreshCalls: string[] = []
@@ -409,6 +417,8 @@ async function makeHarness(opts: {
     },
     now: () => opts.now,
     markerDir: opts.markerDir,
+    setTimeoutImpl: opts.setTimeoutImpl,
+    clearTimeoutImpl: opts.clearTimeoutImpl,
   })
 
   return {
@@ -447,6 +457,55 @@ afterEach(async () => {
   if (markerRoot) {
     await rm(markerRoot, { recursive: true, force: true }).catch(() => {})
   }
+})
+
+describe('Prime main identity lineage', () => {
+  test('main identity stays stable across refresh token rotation', async () => {
+    const storagePath = join(markerRoot, 'accounts.json')
+    const mainAccountId = await getOrCreateMainAccountId(
+      storagePath,
+      () => 'main-stable-identity',
+    )
+
+    await saveAccountState(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+        mainAccountId,
+        prime: {
+          mainAuthLineageRefreshTokenFingerprint: 'refresh-before-rotation',
+        },
+      },
+      storagePath,
+      { mainPrime: true },
+    )
+
+    const beforeRotation = await getOrCreatePrimeAuthLineageId(
+      'main',
+      storagePath,
+    )
+
+    const persisted = await loadAccounts(storagePath)
+    expect(persisted?.prime?.mainAuthLineageId).toBe(beforeRotation)
+    await saveAccountState(
+      {
+        ...persisted!,
+        prime: {
+          ...persisted?.prime,
+          mainAuthLineageRefreshTokenFingerprint: 'refresh-after-rotation',
+        },
+      },
+      storagePath,
+      { mainPrime: true },
+    )
+
+    expect(mainAccountId).toBe('main-stable-identity')
+    expect(beforeRotation).toBe('main-stable-identity')
+    expect(await getOrCreatePrimeAuthLineageId('main', storagePath)).toBe(
+      beforeRotation,
+    )
+  })
 })
 
 describe('PrimeManager — due boundary', () => {
@@ -1484,6 +1543,47 @@ describe('PrimeManager — send failure', () => {
     expect(h.sendCalls).toEqual([])
     await h.cleanup()
   })
+
+  test('cold vault prime is recorded as a skipped attempt, not an error', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+      send: () => ({
+        ok: false,
+        reason: 'vault-cold',
+        error: 'vault credential is unavailable',
+      }),
+    })
+
+    await h.manager.tick()
+
+    const stats = h.manager.stats()
+    expect(stats[0]?.lastResult).toBe('skipped')
+    const summary = buildPrimeStatusSummary({ enabled: true, accounts: stats })
+    expect(summary).toContain('skipped')
+    expect(summary).not.toContain('err')
+    await h.cleanup()
+  })
 })
 
 describe('PrimeManager — recordSuccess', () => {
@@ -1545,16 +1645,14 @@ describe('PrimeManager — recordSuccess', () => {
       },
     })
     const now = 500 + 120_000
-    const originalSetTimeout = globalThis.setTimeout
-    const originalClearTimeout = globalThis.clearTimeout
     let scheduled: (() => void) | undefined
     let scheduledDelay: number | undefined
-    globalThis.setTimeout = ((handler: () => void, delay?: number) => {
+    const setTimeoutImpl = ((handler: () => void, delay?: number) => {
       scheduled = handler
       scheduledDelay = delay
       return 42
     }) as unknown as typeof setTimeout
-    globalThis.clearTimeout = (() => {}) as typeof clearTimeout
+    const clearTimeoutImpl = (() => {}) as typeof clearTimeout
     const h = await makeHarness({
       storage: fixture.storage,
       markerDir: markerRoot,
@@ -1567,22 +1665,19 @@ describe('PrimeManager — recordSuccess', () => {
           checkedAt: 2,
         },
       },
+      setTimeoutImpl,
+      clearTimeoutImpl,
     })
 
-    try {
-      await h.manager.tick()
-      expect(h.refreshCalls).toEqual(['main'])
-      expect(scheduledDelay).toBe(PRIME_POST_FIRE_REFRESH_MS)
+    await h.manager.tick()
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(scheduledDelay).toBe(PRIME_POST_FIRE_REFRESH_MS)
 
-      scheduled?.()
-      await Promise.resolve()
+    scheduled?.()
+    await Promise.resolve()
 
-      expect(h.refreshCalls).toEqual(['main', 'main'])
-      await h.cleanup()
-    } finally {
-      globalThis.setTimeout = originalSetTimeout
-      globalThis.clearTimeout = originalClearTimeout
-    }
+    expect(h.refreshCalls).toEqual(['main', 'main'])
+    await h.cleanup()
   })
 
   test('post-fire refresh skips when another process disables prime', async () => {
@@ -1597,14 +1692,12 @@ describe('PrimeManager — recordSuccess', () => {
       },
     })
     const now = 500 + 120_000
-    const originalSetTimeout = globalThis.setTimeout
-    const originalClearTimeout = globalThis.clearTimeout
     let scheduled: (() => void) | undefined
-    globalThis.setTimeout = ((handler: () => void) => {
+    const setTimeoutImpl = ((handler: () => void) => {
       scheduled = handler
       return 42
     }) as unknown as typeof setTimeout
-    globalThis.clearTimeout = (() => {}) as typeof clearTimeout
+    const clearTimeoutImpl = (() => {}) as typeof clearTimeout
     const h = await makeHarness({
       storage: fixture.storage,
       markerDir: markerRoot,
@@ -1617,23 +1710,20 @@ describe('PrimeManager — recordSuccess', () => {
           checkedAt: 2,
         },
       },
+      setTimeoutImpl,
+      clearTimeoutImpl,
     })
 
-    try {
-      await h.manager.tick()
-      expect(h.refreshCalls).toEqual(['main'])
-      fixture.storage.prime = { enabled: false }
+    await h.manager.tick()
+    expect(h.refreshCalls).toEqual(['main'])
+    fixture.storage.prime = { enabled: false }
 
-      scheduled?.()
-      await Promise.resolve()
-      await Promise.resolve()
+    scheduled?.()
+    await Promise.resolve()
+    await Promise.resolve()
 
-      expect(h.refreshCalls).toEqual(['main'])
-      await h.cleanup()
-    } finally {
-      globalThis.setTimeout = originalSetTimeout
-      globalThis.clearTimeout = originalClearTimeout
-    }
+    expect(h.refreshCalls).toEqual(['main'])
+    await h.cleanup()
   })
 })
 
@@ -1763,15 +1853,13 @@ describe('PrimeManager — lifecycle', () => {
       },
     })
     const now = 500 + 120_000
-    const originalSetTimeout = globalThis.setTimeout
-    const originalClearTimeout = globalThis.clearTimeout
     let scheduled: (() => void) | undefined
     const cleared: unknown[] = []
-    globalThis.setTimeout = ((handler: () => void) => {
+    const setTimeoutImpl = ((handler: () => void) => {
       scheduled = handler
       return 42
     }) as unknown as typeof setTimeout
-    globalThis.clearTimeout = ((timer: unknown) => {
+    const clearTimeoutImpl = ((timer: unknown) => {
       cleared.push(timer)
     }) as typeof clearTimeout
     const h = await makeHarness({
@@ -1786,21 +1874,18 @@ describe('PrimeManager — lifecycle', () => {
           checkedAt: 2,
         },
       },
+      setTimeoutImpl,
+      clearTimeoutImpl,
     })
 
-    try {
-      await h.manager.tick()
-      h.manager.stop()
-      scheduled?.()
-      await Promise.resolve()
+    await h.manager.tick()
+    h.manager.stop()
+    scheduled?.()
+    await Promise.resolve()
 
-      expect(cleared).toEqual([42])
-      expect(h.refreshCalls).toEqual(['main'])
-    } finally {
-      await h.cleanup()
-      globalThis.setTimeout = originalSetTimeout
-      globalThis.clearTimeout = originalClearTimeout
-    }
+    expect(cleared).toEqual([42])
+    expect(h.refreshCalls).toEqual(['main'])
+    await h.cleanup()
   })
 })
 

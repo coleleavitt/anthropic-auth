@@ -7,7 +7,7 @@ import {
   test,
 } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CacheKeepSessionRegistry } from '@cortexkit/anthropic-auth-core'
@@ -84,6 +84,44 @@ afterAll(() => {
 })
 
 describe('claude-account persistence', () => {
+  test('refuses custody changes without a host controller and preserves Pi config and state', async () => {
+    const initial = {
+      version: 1,
+      claustrum: { accounts: { unrelated: { enabled: true } } },
+      accounts: [
+        {
+          id: 'oauth-work',
+          type: 'oauth',
+          access: 'access',
+          refresh: 'refresh',
+          enabled: true,
+        },
+      ],
+    }
+    await writeFile(accountPath, JSON.stringify(initial), 'utf8')
+    await writeFile(statePath, JSON.stringify({ version: 1 }), 'utf8')
+    const beforeConfig = await readFile(accountPath, 'utf8')
+    const beforeState = await readFile(statePath, 'utf8')
+    const beforeConfigMtime = (await stat(accountPath)).mtimeMs
+    const beforeStateMtime = (await stat(statePath)).mtimeMs
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-account')?.handler
+    const { ctx, notified } = mockNotify()
+
+    await handler!('claustrum', ctx)
+    await handler!('local', ctx)
+
+    expect(notified).toEqual([
+      'Refused: Pi custody controller is unavailable.',
+      'Refused: Pi custody controller is unavailable.',
+    ])
+    expect(await readFile(accountPath, 'utf8')).toBe(beforeConfig)
+    expect(await readFile(statePath, 'utf8')).toBe(beforeState)
+    expect((await stat(accountPath)).mtimeMs).toBe(beforeConfigMtime)
+    expect((await stat(statePath)).mtimeMs).toBe(beforeStateMtime)
+  })
+
   test('disable persists to storage', async () => {
     await writeFile(
       accountPath,
@@ -207,6 +245,49 @@ describe('claude-account persistence', () => {
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.accounts[0].enabled).toBe(true)
+  })
+
+  test('reset-backoff clears and persists main refresh and quota errors', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        version: 1,
+        mainAccountId: 'main-account-id',
+        refresh: {
+          mainLastRefreshError: {
+            message: 'invalid_grant',
+            checkedAt: 1,
+            nextRetryAt: 2,
+            accountIdentity: 'main-account-id',
+            permanent: true,
+          },
+        },
+        quota: {
+          mainLastQuotaApiError: {
+            message: 'quota unavailable',
+            checkedAt: 1,
+            nextRetryAt: 2,
+            accountIdentity: 'main-account-id',
+          },
+        },
+        accounts: [],
+      }),
+      'utf8',
+    )
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-account')?.handler
+    expect(handler).toBeDefined()
+
+    const { ctx, notified } = mockNotify()
+    await handler!('reset-backoff', ctx)
+
+    expect(notified[0]).toContain(
+      'Main OAuth refresh and quota backoff cleared.',
+    )
+    const state = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(state.main.lastRefreshError).toBeUndefined()
+    expect(state.main.lastQuotaApiError).toBeUndefined()
   })
 
   test('status is display-only (no mutation)', async () => {

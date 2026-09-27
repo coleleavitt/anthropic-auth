@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 
+import { assertNotCustodyTombstone } from './claustrum.ts'
 import {
   AUTHORIZE_URLS,
   AXIOS_USER_AGENT,
@@ -11,6 +12,7 @@ import {
   TOKEN_URL,
 } from './constants.ts'
 import { logger } from './logger.ts'
+import { isTransientNetworkError } from './network-errors.ts'
 import { generatePKCE } from './pkce.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -163,18 +165,6 @@ export type ClaudeOAuthRefreshResult = {
   authLineageId?: string
 }
 
-function isTransientNetworkError(error: unknown) {
-  if (!(error instanceof Error)) return false
-  const code = (error as Error & { code?: unknown }).code
-  return (
-    error.message.includes('fetch failed') ||
-    code === 'ECONNRESET' ||
-    code === 'ECONNREFUSED' ||
-    code === 'ETIMEDOUT' ||
-    code === 'UND_ERR_CONNECT_TIMEOUT'
-  )
-}
-
 function abortableWait(
   ms: number,
   signal: AbortSignal,
@@ -208,6 +198,10 @@ export async function refreshClaudeOAuthToken(input: {
   /** Whole-operation deadline. Must remain shorter than a refresh lease. */
   timeoutMs?: number
 }): Promise<ClaudeOAuthRefreshResult> {
+  assertNotCustodyTombstone(input.refreshToken, 'anthropic')
+  if (typeof input.refreshToken !== 'string' || !input.refreshToken.trim()) {
+    throw new Error('Local OAuth refresh credential is unavailable')
+  }
   const fetchImpl = input.fetchImpl ?? fetch
   const maxRetries = input.maxRetries ?? 2
   const baseDelayMs = input.baseDelayMs ?? 500

@@ -20,6 +20,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const REPO_ROOT = resolve(import.meta.dir, '../../..')
 const PLUGIN_ENTRY = join(REPO_ROOT, 'packages/opencode/src/index.ts')
@@ -30,10 +31,12 @@ const activeRunDirs = new Set<string>()
 
 export type IsolatedEnv = {
   tempDir: string
+  homeDir: string
   configDir: string
   dataDir: string
   cacheDir: string
   workdir: string
+  quotaFeedDir: string
 }
 
 function isExpectedE2ETempDir(path: string, root: string) {
@@ -179,16 +182,70 @@ export type SpawnOptions = {
     transport: 'websocket' | 'http'
   }
   port?: number
-  beforeSpawn?: (env: IsolatedEnv) => void
+  beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
+  childEnv?: Record<string, string | undefined>
   childTmpDir?: string
+  quotaFeed?: boolean
 }
 
-async function pickFreePort() {
-  const server = Bun.serve({ port: 0, fetch: () => new Response() })
-  const port = server.port ?? 0
-  server.stop(true)
-  if (!port) throw new Error('could not allocate free port')
-  return port
+export function waitForOpencodeListening(
+  child: ChildProcess,
+  getStdout: () => string,
+  timeoutMs = 60_000,
+): Promise<{ url: string; port: number }> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const cleanup = () => {
+      clearTimeout(timer)
+      child.stdout?.off('data', check)
+      child.off('exit', exited)
+      child.off('error', failed)
+    }
+    const failed = (error: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(error)
+    }
+    const exited = (code: number | null, signal: NodeJS.Signals | null) => {
+      failed(
+        new Error(
+          `opencode exited before announcing its listener (code=${code}, signal=${signal})`,
+        ),
+      )
+    }
+    const check = () => {
+      if (settled) return
+      const match =
+        /^opencode server listening on (http:\/\/127\.0\.0\.1:(\d+))\r?\n/m.exec(
+          getStdout(),
+        )
+      if (!match?.[1]) return
+      const port = Number(match[2])
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        failed(new Error('opencode announced an invalid listener port'))
+        return
+      }
+      settled = true
+      cleanup()
+      resolve({ url: match[1], port })
+    }
+    const timer = setTimeout(
+      () =>
+        failed(
+          new Error(
+            'opencode did not announce a listener before its startup deadline',
+          ),
+        ),
+      Math.max(1, timeoutMs),
+    )
+    child.stdout?.on('data', check)
+    child.once('exit', exited)
+    child.once('error', failed)
+    if (child.exitCode !== null || child.signalCode !== null)
+      exited(child.exitCode, child.signalCode)
+    else check()
+  })
 }
 
 export function createIsolatedEnv(root = tmpdir()): IsolatedEnv {
@@ -198,10 +255,12 @@ export function createIsolatedEnv(root = tmpdir()): IsolatedEnv {
   )
   const env = {
     tempDir: base,
+    homeDir: join(base, 'home'),
     configDir: join(base, 'config'),
     dataDir: join(base, 'data'),
     cacheDir: join(base, 'cache'),
     workdir: join(base, 'work'),
+    quotaFeedDir: join(base, 'quota-header-feed'),
   }
   try {
     for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true })
@@ -243,6 +302,7 @@ function writeConfigs(env: IsolatedEnv, options: SpawnOptions) {
         accounts: [],
         quota: { enabled: false },
         refresh: { enabled: false },
+        ...(options.quotaFeed ? { quotaHeaderFeed: { enabled: true } } : {}),
         ...(options.hybridCache
           ? { claudeCache: { enabled: true, mode: 'hybrid' } }
           : {}),
@@ -267,6 +327,7 @@ function writeConfigs(env: IsolatedEnv, options: SpawnOptions) {
 async function waitForReady(
   url: string,
   getLogs: () => { stdout: string; stderr: string },
+  signal: AbortSignal,
   timeoutMs = 60_000,
 ) {
   const deadline = Date.now() + timeoutMs
@@ -274,6 +335,7 @@ async function waitForReady(
   let readySince = 0
 
   while (Date.now() < deadline) {
+    signal.throwIfAborted()
     const logs = getLogs()
     const combinedLogs = `${logs.stdout}\n${logs.stderr}`
     const migrationStarted = combinedLogs.includes('database migration')
@@ -283,7 +345,7 @@ async function waitForReady(
 
     try {
       const response = await fetch(`${url}/global/health`, {
-        signal: AbortSignal.timeout(2_000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(2_000)]),
       })
       const serverAcceptsRequests = response.ok || response.status === 401
       if (serverAcceptsRequests && (!migrationStarted || migrationDone)) {
@@ -293,12 +355,91 @@ async function waitForReady(
         readySince = 0
       }
     } catch (error) {
+      signal.throwIfAborted()
       readySince = 0
       lastError = error
     }
-    await Bun.sleep(200)
+    await delay(200, undefined, { signal })
   }
   throw new Error(`opencode serve did not become ready: ${String(lastError)}`)
+}
+
+export async function waitForOpencodeReady(
+  child: ChildProcess,
+  url: string,
+  getLogs: () => { stdout: string; stderr: string },
+  timeoutMs = 60_000,
+): Promise<void> {
+  const controller = new AbortController()
+  const exited = (code: number | null, signal: NodeJS.Signals | null) => {
+    controller.abort(
+      new Error(
+        `opencode exited before readiness at ${url} (code=${code}, signal=${signal})`,
+      ),
+    )
+  }
+  const failed = (error: Error) => controller.abort(error)
+  child.once('exit', exited)
+  child.once('error', failed)
+  if (child.exitCode !== null || child.signalCode !== null) {
+    exited(child.exitCode, child.signalCode)
+  }
+  try {
+    await waitForReady(url, getLogs, controller.signal, timeoutMs)
+  } catch (error) {
+    controller.signal.throwIfAborted()
+    throw error
+  } finally {
+    child.off('exit', exited)
+    child.off('error', failed)
+  }
+}
+
+export async function waitForOpencodeProjectReady(
+  child: ChildProcess,
+  url: string,
+  directory: string,
+  timeoutMs = 60_000,
+): Promise<void> {
+  const controller = new AbortController()
+  const exited = (code: number | null, signal: NodeJS.Signals | null) => {
+    controller.abort(
+      new Error(
+        `opencode exited during project bootstrap (code=${code}, signal=${signal})`,
+      ),
+    )
+  }
+  const failed = (error: Error) => controller.abort(error)
+  child.once('exit', exited)
+  child.once('error', failed)
+  if (child.exitCode !== null || child.signalCode !== null)
+    exited(child.exitCode, child.signalCode)
+  try {
+    controller.signal.throwIfAborted()
+    // /global/health confirms only that the listener is up. OpenCode creates
+    // the project and loads its plugins lazily; exercise that real boundary
+    // before a test starts timing session.create or Anthropic dispatch.
+    const response = await fetch(
+      `${url}/config?directory=${encodeURIComponent(directory)}`,
+      {
+        signal: AbortSignal.any([
+          controller.signal,
+          AbortSignal.timeout(Math.max(1, timeoutMs)),
+        ]),
+      },
+    )
+    if (!response.ok)
+      throw new Error(
+        `opencode project bootstrap returned HTTP ${response.status}`,
+      )
+    await response.body?.cancel()
+  } catch (error) {
+    controller.signal.throwIfAborted()
+    throw error
+  } finally {
+    child.off('exit', exited)
+    child.off('error', failed)
+  }
 }
 
 export async function terminateChildProcess(
@@ -374,9 +515,11 @@ export async function spawnOpencode(
   let stdout = ''
   let stderr = ''
   try {
-    options.beforeSpawn?.(env)
-    const port = options.port ?? (await pickFreePort())
+    // The child owns allocation. Never reserve/release a port in the parent
+    // or probe an address before this child has announced its bound listener.
+    const requestedPort = options.port ?? 0
     writeConfigs(env, options)
+    await options.beforeSpawn?.(env)
 
     const childEnv: Record<string, string> = {}
     for (const [key, value] of Object.entries(process.env)) {
@@ -404,17 +547,31 @@ export async function spawnOpencode(
       'sidebar-state.json',
     )
     childEnv.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(env.tempDir, 'rpc')
+    childEnv.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+      env.configDir,
+      'claustrum-enrollment.json',
+    )
     childEnv.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = join(env.tempDir, 'dumps')
     childEnv.OPENCODE_ANTHROPIC_AUTH_LOG_FILE = join(
       env.tempDir,
       'opencode-anthropic-auth.log',
     )
+    if (options.quotaFeed) {
+      childEnv.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = env.quotaFeedDir
+    } else {
+      delete childEnv.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
+    }
     childEnv.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     if (options.fallbackMode) {
       childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
     } else {
       delete childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     }
+    // XDG isolation alone is insufficient: OpenCode also reads ~/.opencode
+    // and ~/.claude/skills during lazy project bootstrap. Keep those reads
+    // inside the test run, away from the operator's live configuration.
+    childEnv.HOME = env.homeDir
+    childEnv.USERPROFILE = env.homeDir
     childEnv.XDG_CONFIG_HOME = env.configDir
     childEnv.XDG_DATA_HOME = env.dataDir
     childEnv.XDG_CACHE_HOME = env.cacheDir
@@ -436,10 +593,14 @@ export async function spawnOpencode(
     })
     childEnv.ANTHROPIC_BASE_URL = options.anthropicBaseURL
     childEnv.ANTHROPIC_API_KEY = 'test-key-not-real'
+    for (const [key, value] of Object.entries(options.childEnv ?? {})) {
+      if (value === undefined) delete childEnv[key]
+      else childEnv[key] = value
+    }
 
     child = spawn(
       'opencode',
-      ['serve', '--port', String(port), '--hostname', '127.0.0.1'],
+      ['serve', '--port', String(requestedPort), '--hostname', '127.0.0.1'],
       { cwd: env.workdir, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] },
     )
     const spawnFailure = new Promise<never>((_, reject) => {
@@ -455,11 +616,28 @@ export async function spawnOpencode(
       stderr += chunk.toString()
     })
 
-    const url = `http://127.0.0.1:${port}`
-    await Promise.race([
-      waitForReady(url, () => ({ stdout, stderr })),
+    const deadline = Date.now() + 60_000
+    const { url, port } = await Promise.race([
+      waitForOpencodeListening(child, () => stdout, deadline - Date.now()),
       spawnFailure,
     ])
+    if (requestedPort !== 0 && requestedPort !== port)
+      throw new Error('opencode announced a different port than requested')
+    await Promise.race([
+      waitForOpencodeReady(
+        child,
+        url,
+        () => ({ stdout, stderr }),
+        deadline - Date.now(),
+      ),
+      spawnFailure,
+    ])
+    await waitForOpencodeProjectReady(
+      child,
+      url,
+      env.workdir,
+      deadline - Date.now(),
+    )
     return {
       url,
       port,
@@ -482,7 +660,7 @@ export async function spawnOpencode(
     })
     if (!child) throw error
     throw new Error(
-      `opencode serve failed to start\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n${String(error)}`,
+      `opencode serve failed to start (${env.tempDir})\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n${String(error)}`,
     )
   }
 }

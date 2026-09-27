@@ -107,6 +107,19 @@ describe('prime display formatters', () => {
         lastResult: 'error',
       }),
     ).toEqual({ text: 'err', hasError: true })
+    const skipped = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          { id: 'cold-vault', label: 'cold-vault', lastResult: 'skipped' },
+        ],
+      },
+    }).prime?.accounts[0]
+    expect(skipped).toBeDefined()
+    expect(formatPrimeAccountValue(skipped!)).toEqual({
+      text: 'skip',
+      hasError: false,
+    })
     expect(formatPrimeAccountValue({ id: 'idle', label: 'idle' })).toEqual({
       text: '\u2014',
       hasError: false,
@@ -369,6 +382,14 @@ describe('formatFallbackModelLabel', () => {
   test('formats Fable 5 ids', () => {
     expect(formatFallbackModelLabel('claude-fable-5')).toBe('Fable 5')
     expect(formatFallbackModelLabel('claude-fable-5-20260608')).toBe('Fable 5')
+    expect(formatFallbackModelLabel('claude-fable-5-1')).toBe('Fable 5.1')
+    expect(formatFallbackModelLabel('claude-fable-5-1-20260701')).toBe(
+      'Fable 5.1',
+    )
+    expect(formatFallbackModelLabel('claude-mythos-5-1')).toBe('Mythos 5.1')
+    expect(formatFallbackModelLabel('claude-mythos-5-1-20260701')).toBe(
+      'Mythos 5.1',
+    )
   })
 
   test('formats Opus 5 ids', () => {

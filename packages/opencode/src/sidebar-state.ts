@@ -34,6 +34,18 @@ export interface SidebarAccountState {
   // True when the account's refresh token is permanently dead (400
   // invalid_grant) and it needs a re-login — distinct from a transient backoff.
   needsReauth: boolean
+  // True when the vault copy needs re-importing while the sidecar remains usable.
+  vaultReauth?: boolean
+  // A gate alone does not prove the sidecar can serve a request.
+  vaultServed?: boolean
+  custodyState?:
+    | 'off'
+    | 'on-vault-served'
+    | 'on-vault-reauth'
+    | 'on-cold'
+    | 'unknown-identity'
+    | 'on-identity-mismatch'
+    | 'on-corrupt-binding'
   tierLabel?: string
 }
 
@@ -57,7 +69,7 @@ export interface PrimeSidebarAccountState {
   label: string
   nextDueAt?: number | null
   lastPrimedAt?: number | null
-  lastResult?: 'ok' | 'error'
+  lastResult?: 'ok' | 'error' | 'skipped'
   usage?: PrimeUsageCounters
   estimatedCostUsd?: number
 }
@@ -189,7 +201,11 @@ function normalizePrimeAccount(
   } else if (isFiniteNumber(value.lastPrimedAt)) {
     account.lastPrimedAt = value.lastPrimedAt
   }
-  if (value.lastResult === 'ok' || value.lastResult === 'error') {
+  if (
+    value.lastResult === 'ok' ||
+    value.lastResult === 'error' ||
+    value.lastResult === 'skipped'
+  ) {
     account.lastResult = value.lastResult
   }
   const usage = normalizePrimeUsage(value.usage)
@@ -346,6 +362,12 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
+          ...(entry.vaultReauth === true && { vaultReauth: true }),
+          ...(entry.vaultServed === true && { vaultServed: true }),
+          ...(typeof entry.custodyState === 'string' && {
+            custodyState:
+              entry.custodyState as SidebarAccountState['custodyState'],
+          }),
           tierLabel:
             typeof entry.tierLabel === 'string' && entry.tierLabel.trim()
               ? entry.tierLabel.trim()
@@ -726,6 +748,8 @@ export async function setSidebarState(
               lastUpdated: Math.max(current.lastUpdated, state.lastUpdated),
             }
           }
+          // The state file is a cross-process artifact; future account fields must fail closed.
+          stateToWrite = normalizeSidebarState(stateToWrite)
           result = await writeSidebarStateAtomic(
             stateFile,
             stateToWrite,
@@ -806,11 +830,21 @@ export function formatScopedQuotaLabel(title: string) {
 }
 
 /**
- * Pretty label for a recoverable-refusal source model (Fable 5 or Opus 5).
+ * Pretty label for a recoverable-refusal source model (Fable 5/5.1 or Opus 5).
  * Falls back to the raw id for unrecognized ids so the sidebar never goes
  * blank on a future model that has not yet been cataloged here.
  */
 export function formatFallbackModelLabel(modelId: string | undefined): string {
+  if (
+    modelId === 'claude-mythos-5-1' ||
+    modelId?.startsWith('claude-mythos-5-1-')
+  )
+    return 'Mythos 5.1'
+  if (
+    modelId === 'claude-fable-5-1' ||
+    modelId?.startsWith('claude-fable-5-1-')
+  )
+    return 'Fable 5.1'
   if (modelId === 'claude-fable-5' || modelId?.startsWith('claude-fable-5-'))
     return 'Fable 5'
   if (modelId === 'claude-opus-5-5' || modelId?.startsWith('claude-opus-5-5-'))
@@ -841,6 +875,9 @@ export function formatPrimeAccountValue(account: PrimeSidebarAccountState): {
 } {
   if (account.lastResult === 'error') {
     return { text: 'err', hasError: true }
+  }
+  if (account.lastResult === 'skipped') {
+    return { text: 'skip', hasError: false }
   }
   if (account.nextDueAt && account.nextDueAt > Date.now()) {
     return { text: formatPrimeTime(account.nextDueAt), hasError: false }

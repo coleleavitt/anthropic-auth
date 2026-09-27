@@ -1,17 +1,93 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
+  __setLogTestSink,
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
+  applyCustomHeaders,
   CLAUDE_CODE_FULL_AGENT_BETAS,
   type ClaudeCodeIdentity,
+  configureClaudeCodeInstallationDeviceId,
   getCachedClaudeCodeVersion,
+  getClaudeCodeIdentity,
   orderClaudeCodeBody,
+  type ProviderAccountUuid,
+  parseCustomHeaders,
   REQUIRED_BETAS,
+  resetClaudeCodeIdentityCachesForTest,
   resolveClaudeCodeIdentity,
   selectClaudeCodeBetas,
 } from '@cortexkit/anthropic-auth-core'
 
+const providerUuid = (value: string) => value as ProviderAccountUuid
+
 describe('Claude Code fingerprint helpers', () => {
+  const originalFetch = globalThis.fetch
+
+  beforeEach(() => {
+    resetClaudeCodeIdentityCachesForTest()
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test('compare-and-clear prevents a negative bootstrap from leaking a slot UUID', async () => {
+    globalThis.fetch = mock((_input: any, init: RequestInit = {}) => {
+      const authorization = new Headers(init.headers).get('authorization')
+      return Promise.resolve(
+        authorization?.includes('sk-ant-oat-isolation-seed')
+          ? Response.json({ oauth_account: { account_uuid: 'uuid-isolation' } })
+          : Response.json({}),
+      )
+    }) as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-isolation-seed',
+      undefined,
+      'isolation-main',
+    )
+    expect(first.accountUuid).toBe(providerUuid('uuid-isolation'))
+
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-isolation-next',
+      undefined,
+      'isolation-main',
+    )
+    // This assertion pins the production compare-and-clear against the seeded UUID.
+    expect(second.accountUuid).toBeUndefined()
+
+    // No reset runs between these resolves, so the slot device identity remains stable.
+    expect(second.deviceId).toBe(first.deviceId)
+  })
+
+  test('explicit identity-cache reset clears a slot device identity', async () => {
+    globalThis.fetch = mock((_input: any, init: RequestInit = {}) => {
+      const authorization = new Headers(init.headers).get('authorization')
+      return Promise.resolve(
+        authorization?.includes('sk-ant-oat-isolation-reset-seed')
+          ? Response.json({ oauth_account: { account_uuid: 'uuid-reset' } })
+          : Response.json({}),
+      )
+    }) as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-isolation-reset-seed',
+      undefined,
+      'isolation-reset-main',
+    )
+    expect(first.accountUuid).toBe(providerUuid('uuid-reset'))
+
+    resetClaudeCodeIdentityCachesForTest()
+
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-isolation-reset-next',
+      undefined,
+      'isolation-reset-main',
+    )
+    // This assertion pins the explicit test reset, not production UUID clearing.
+    expect(second.deviceId).not.toBe(first.deviceId)
+  })
+
   test('selects the live-captured full-agent beta set only for tool-bearing agent requests', () => {
     const body = {
       model: 'claude-sonnet-4-6',
@@ -35,12 +111,14 @@ describe('Claude Code fingerprint helpers', () => {
       'context-1m-2025-08-07',
     ])
     const fullBetas = selectClaudeCodeBetas(body).split(',')
-    expect(fullBetas[0]).toBe('claude-code-20250219')
+    expect(fullBetas[0]).toBe('oauth-2025-04-20')
     expect(fullBetas).toContain('thinking-token-count-2026-05-13')
     expect(fullBetas).not.toContain('redact-thinking-2026-02-12')
     expect(fullBetas).toContain('claude-code-20250219')
     expect(fullBetas).toContain('context-1m-2025-08-07')
     expect(fullBetas).toContain('effort-2025-11-24')
+    expect(fullBetas).toContain('mid-conversation-system-2026-04-07')
+    expect(fullBetas).toContain('fallback-credit-2026-06-01')
   })
 
   test('selects structured-output betas without full-agent private betas', () => {
@@ -55,12 +133,10 @@ describe('Claude Code fingerprint helpers', () => {
 
     expect(betas).toContain('structured-outputs-2025-12-15')
     expect(betas).toContain('thinking-token-count-2026-05-13')
-    expect(betas).not.toContain('redact-thinking-2026-02-12')
-    expect(betas).toContain('claude-code-20250219')
-    expect(betas).toContain('effort-2025-11-24')
+    expect(betas).not.toContain('claude-code-20250219')
     expect(betas).not.toContain('advanced-tool-use-2025-11-20')
     expect(betas).not.toContain('context-1m-2025-08-07')
-    expect(betas).toContain('extended-cache-ttl-2025-04-11')
+    expect(betas).not.toContain('extended-cache-ttl-2025-04-11')
   })
 
   test('does not add full-agent-only betas for tool requests missing captured companion fields', () => {
@@ -72,43 +148,28 @@ describe('Claude Code fingerprint helpers', () => {
       stream: true,
     }).split(',')
 
-    expect(betas).toEqual([
-      'claude-code-20250219',
-      'oauth-2025-04-20',
-      'interleaved-thinking-2025-05-14',
-      'thinking-token-count-2026-05-13',
-      'context-management-2025-06-27',
-      'prompt-caching-scope-2026-01-05',
-      'effort-2025-11-24',
-      'extended-cache-ttl-2025-04-11',
-      'cache-diagnosis-2026-04-07',
-      // sonnet-4-6 is a 1M family, so the beta is derived from the model id.
-      'context-1m-2025-08-07',
-    ])
     expect(betas).toContain('thinking-token-count-2026-05-13')
-    expect(betas).not.toContain('advanced-tool-use-2025-11-20')
+    expect(betas).toContain('advanced-tool-use-2025-11-20')
     expect(betas).toContain('extended-cache-ttl-2025-04-11')
-    expect(betas).toContain('claude-code-20250219')
+    expect(betas).not.toContain('claude-code-20250219')
+    // sonnet-4-6 is a 1M family, so the beta is derived from the model id.
     expect(betas).toContain('context-1m-2025-08-07')
-    expect(betas).toContain('effort-2025-11-24')
-    expect(betas).not.toContain('redact-thinking-2026-02-12')
+    expect(betas).not.toContain('effort-2025-11-24')
   })
 
   test('does not add full-agent betas when request shape is unavailable', () => {
     const betas = selectClaudeCodeBetas(null).split(',')
 
     for (const beta of REQUIRED_BETAS) expect(betas).toContain(beta)
-    expect(betas[0]).toBe('claude-code-20250219')
+    expect(betas[0]).toBe('oauth-2025-04-20')
     expect(betas).toContain('thinking-token-count-2026-05-13')
-    expect(betas).toContain('effort-2025-11-24')
-    expect(betas).not.toContain('redact-thinking-2026-02-12')
-    expect(betas).toContain('claude-code-20250219')
+    expect(betas).not.toContain('claude-code-20250219')
   })
 
   test('applies Claude Code headers and couples session id to metadata', () => {
     const identity: ClaudeCodeIdentity = {
       deviceId: 'a'.repeat(64),
-      accountUuid: '11111111-2222-4333-8444-555555555555',
+      accountUuid: providerUuid('11111111-2222-4333-8444-555555555555'),
       sessionId: '66666666-7777-4888-9999-aaaaaaaaaaaa',
     }
     const body: Record<string, unknown> = {
@@ -223,6 +284,221 @@ describe('Claude Code fingerprint helpers', () => {
     expect(headers.get('x-claude-code-agent-id')).toBe('ses_caf%C3%A9%0A')
   })
 
+  test('shares the no-account identity between resolution and default headers', async () => {
+    const accessToken = 'sk-ant-oat-no-account-identity-split'
+    const fetchMock = mock(async () => new Response('stubbed', { status: 503 }))
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const resolvedIdentity = await resolveClaudeCodeIdentity(
+      accessToken,
+      undefined,
+      undefined,
+    )
+    const headers = applyClaudeCodeHeaders(new Headers(), accessToken)
+    const defaultHeaderIdentity = getClaudeCodeIdentity(accessToken)
+
+    expect(defaultHeaderIdentity.deviceId).toBe(resolvedIdentity.deviceId)
+    expect(defaultHeaderIdentity.sessionId).toBe(resolvedIdentity.sessionId)
+    expect(headers.get('x-claude-code-session-id')).toBe(
+      resolvedIdentity.sessionId,
+    )
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('clears a cached account UUID after negative bootstrap before compatibility fallback', async () => {
+    const successfulToken = 'sk-ant-oat-negative-cache-success'
+    const failedToken = 'sk-ant-oat-negative-cache-failure'
+    globalThis.fetch = mock(async (_input, init?: RequestInit) => {
+      const token = new Headers(init?.headers).get('authorization')
+      if (token?.includes(successfulToken)) {
+        return Response.json({
+          oauth_account: { account_uuid: 'account-a' },
+        })
+      }
+      return new Response('bootstrap unavailable', { status: 503 })
+    }) as unknown as typeof fetch
+
+    const successful = await resolveClaudeCodeIdentity(
+      successfulToken,
+      undefined,
+      'main-slot',
+    )
+    expect(successful.accountUuid).toBe(providerUuid('account-a'))
+
+    const failed = await resolveClaudeCodeIdentity(
+      failedToken,
+      undefined,
+      'main-slot',
+    )
+    expect(failed.accountUuid).toBeUndefined()
+
+    const compatibility = await resolveClaudeCodeIdentity(
+      'compatibility-token-after-failure',
+      undefined,
+      'main-slot',
+    )
+    expect(compatibility.accountUuid).toBeUndefined()
+  })
+
+  test('late negative bootstrap cannot clobber a newer stable-account identity', async () => {
+    const tokenOld = 'sk-ant-oat-late-negative-old'
+    const tokenA = 'sk-ant-oat-late-negative-a'
+    const tokenB = 'sk-ant-oat-late-negative-b'
+    let releaseA!: (response: Response) => void
+    let markAStarted!: () => void
+    const aStarted = new Promise<void>((resolve) => {
+      markAStarted = resolve
+    })
+    globalThis.fetch = mock(async (_input, init?: RequestInit) => {
+      const token = new Headers(init?.headers).get('authorization')
+      if (token?.includes(tokenA)) {
+        markAStarted()
+        return await new Promise<Response>((resolve) => {
+          releaseA = resolve
+        })
+      }
+      if (token?.includes(tokenOld)) {
+        return Response.json({
+          oauth_account: { account_uuid: 'account-a' },
+        })
+      }
+      if (token?.includes(tokenB)) {
+        return Response.json({
+          oauth_account: { account_uuid: 'account-b' },
+        })
+      }
+      return new Response('unexpected bootstrap token', { status: 503 })
+    }) as unknown as typeof fetch
+
+    const initialIdentity = await resolveClaudeCodeIdentity(
+      tokenOld,
+      undefined,
+      'main-slot',
+    )
+    expect(initialIdentity.accountUuid).toBe(providerUuid('account-a'))
+    const pendingA = resolveClaudeCodeIdentity(tokenA, undefined, 'main-slot')
+    await aStarted
+    const identityB = await resolveClaudeCodeIdentity(
+      tokenB,
+      undefined,
+      'main-slot',
+    )
+    expect(identityB.accountUuid).toBe(providerUuid('account-b'))
+
+    releaseA(new Response('bootstrap unavailable', { status: 503 }))
+    const identityA = await pendingA
+    expect(identityA.accountUuid).toBeUndefined()
+
+    const sameCredential = await resolveClaudeCodeIdentity(
+      tokenB,
+      undefined,
+      'main-slot',
+    )
+    expect(sameCredential.accountUuid).toBe(providerUuid('account-b'))
+  })
+
+  test('keeps Claude Code OAuth identity headers unchanged when custom headers are configured', () => {
+    const previous = process.env.ANTHROPIC_CUSTOM_HEADERS
+    const identity: ClaudeCodeIdentity = {
+      deviceId: 'a'.repeat(64),
+      accountUuid: providerUuid('11111111-2222-4333-8444-555555555555'),
+      sessionId: '66666666-7777-4888-9999-aaaaaaaaaaaa',
+    }
+    const body = {
+      model: 'claude-sonnet-4-6',
+      messages: [],
+      system: [],
+      tools: [],
+    }
+    const normalizedHeaders = (headers: Headers) => {
+      const entries = [...headers.entries()]
+        .filter(([key]) => key !== 'x-client-request-id')
+        .sort(([left], [right]) => left.localeCompare(right))
+      return new Headers(entries)
+    }
+
+    delete process.env.ANTHROPIC_CUSTOM_HEADERS
+    const baseline = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test', {
+      body,
+      identity,
+    })
+
+    process.env.ANTHROPIC_CUSTOM_HEADERS = JSON.stringify({
+      authorization: 'Bearer user-controlled',
+      'user-agent': 'Mozilla/5.0',
+      'x-app': 'not-cli',
+      'anthropic-beta': 'not-a-beta',
+      'anthropic-version': '1999-01-01',
+      'x-claude-code-session-id': '00000000-0000-4000-8000-000000000000',
+      'x-api-key': 'user-controlled',
+    })
+    try {
+      const headers = applyClaudeCodeHeaders(new Headers(), 'sk-ant-oat-test', {
+        body,
+        identity,
+      })
+
+      expect([...normalizedHeaders(headers).entries()]).toEqual([
+        ...normalizedHeaders(baseline).entries(),
+      ])
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ANTHROPIC_CUSTOM_HEADERS
+      } else {
+        process.env.ANTHROPIC_CUSTOM_HEADERS = previous
+      }
+    }
+  })
+
+  test('parses custom headers from JSON object values', () => {
+    const headers = parseCustomHeaders(
+      JSON.stringify({
+        'x-string': 'value',
+        'x-number': 123,
+        'x-bool': true,
+        'x-skip': null,
+      }),
+    )
+
+    expect(headers.get('x-string')).toBe('value')
+    expect(headers.get('x-number')).toBe('123')
+    expect(headers.get('x-bool')).toBe('true')
+    expect(headers.get('x-skip')).toBeNull()
+  })
+
+  test('parses custom headers from colon-separated env values', () => {
+    const headers = parseCustomHeaders(
+      'x-one: one,x-two: two\nx-three: value:with:colon',
+    )
+
+    expect(headers.get('x-one')).toBe('one')
+    expect(headers.get('x-two')).toBe('two')
+    expect(headers.get('x-three')).toBe('value:with:colon')
+  })
+
+  test('ignores malformed custom headers after one warning without changing headers', () => {
+    const records: Array<{ level: string; channel: string; message: string }> =
+      []
+    const malformed = '{"x-a":'
+    __setLogTestSink((record) => records.push(record))
+    try {
+      const headers = new Headers({ 'x-existing': 'unchanged' })
+
+      expect(() => applyCustomHeaders(headers, malformed)).not.toThrow()
+      expect(() => applyCustomHeaders(headers, malformed)).not.toThrow()
+      expect(headers).toEqual(new Headers({ 'x-existing': 'unchanged' }))
+      expect(
+        records.filter(
+          (record) =>
+            record.level === 'warn' &&
+            record.channel === 'custom-headers' &&
+            record.message === 'ignoring malformed ANTHROPIC_CUSTOM_HEADERS',
+        ),
+      ).toHaveLength(1)
+    } finally {
+      __setLogTestSink(null)
+    }
+  })
+
   test('orders serialized body fields like captured Claude Code requests', () => {
     const ordered = orderClaudeCodeBody({
       stream: true,
@@ -278,9 +554,12 @@ describe('Claude Code bootstrap identity lookup', () => {
     const identity = await resolveClaudeCodeIdentity(
       'sk-ant-oat-test-bootstrap',
       'claude-sonnet-4-6',
+      'bootstrap-account',
     )
 
-    expect(identity.accountUuid).toBe('11111111-2222-4333-8444-555555555555')
+    expect(identity.accountUuid).toBe(
+      providerUuid('11111111-2222-4333-8444-555555555555'),
+    )
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
@@ -290,6 +569,8 @@ describe('Claude Code bootstrap identity lookup', () => {
 
     const identity = await resolveClaudeCodeIdentity(
       'sk-ant-oat-bootstrap-fails',
+      undefined,
+      'failed-account',
     )
     const body: Record<string, unknown> = {
       metadata: { user_id: 'stale-user-id', other: 'preserved' },
@@ -305,36 +586,110 @@ describe('Claude Code bootstrap identity lookup', () => {
     const fetchMock = mock(async () => new Response('nope', { status: 503 }))
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
-    const first = await resolveClaudeCodeIdentity('sk-ant-oat-negative-cache')
-    const second = await resolveClaudeCodeIdentity('sk-ant-oat-negative-cache')
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-negative-cache',
+      undefined,
+      'negative-account',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-negative-cache-rotated',
+      undefined,
+      'negative-account',
+    )
 
     expect(first.accountUuid).toBeUndefined()
     expect(second.accountUuid).toBeUndefined()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  test('uses one installation device id across distinct accounts while keeping sessions separate', async () => {
-    let calls = 0
+  test('derives stable per-account device ids from the installation secret', async () => {
+    globalThis.fetch = mock(async () =>
+      Response.json({}),
+    ) as unknown as typeof fetch
+    configureClaudeCodeInstallationDeviceId('a'.repeat(64))
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-installation-a',
+      undefined,
+      'installation-account-a',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-installation-b',
+      undefined,
+      'installation-account-b',
+    )
+    // Upstream: distinct account identities never share a device id.
+    expect(second.deviceId).not.toBe(first.deviceId)
+    expect(second.sessionId).not.toBe(first.sessionId)
+    expect(first.deviceId).toMatch(/^[0-9a-f]{64}$/)
+
+    // Fork: the same installation secret re-derives the same device id for the
+    // same identity, so it survives restarts instead of rotating per process.
+    const before = first.deviceId
+    configureClaudeCodeInstallationDeviceId('b'.repeat(64))
+    configureClaudeCodeInstallationDeviceId('a'.repeat(64))
+    const again = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-installation-a2',
+      undefined,
+      'installation-account-a',
+    )
+    expect(again.deviceId).toBe(before)
+  })
+
+  test('does not reuse the previous main-slot account UUID after account replacement', async () => {
     const fetchMock = mock(async () => {
-      calls += 1
-      return Response.json({
-        oauth_account: {
-          account_uuid:
-            calls === 1
-              ? '11111111-2222-4333-8444-555555555555'
-              : 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
-        },
-      })
+      const uuid =
+        fetchMock.mock.calls.length === 1 ? 'main-account-a' : 'main-account-b'
+      return new Response(
+        JSON.stringify({ oauth_account: { account_uuid: uuid } }),
+      )
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
-    const first = await resolveClaudeCodeIdentity('sk-ant-oat-global-device-a')
-    const second = await resolveClaudeCodeIdentity('sk-ant-oat-global-device-b')
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-main-account-a',
+      undefined,
+      'stable-main-slot',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-main-account-b',
+      undefined,
+      'stable-main-slot',
+    )
+
+    expect(first.accountUuid).toBe(providerUuid('main-account-a'))
+    expect(second.accountUuid).toBe(providerUuid('main-account-b'))
     expect(second.deviceId).toBe(first.deviceId)
-    expect(second.sessionId).not.toBe(first.sessionId)
+    expect(second.sessionId).toBe(first.sessionId)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  test('keeps identity stable across rotated access tokens for the same account UUID', async () => {
+  test('drops a bootstrapped UUID when a slot receives a non-oat credential', async () => {
+    const oatToken = 'sk-ant-oat-main-to-non-oat'
+    globalThis.fetch = mock(async () =>
+      Response.json({
+        oauth_account: { account_uuid: 'main-oat-account-uuid' },
+      }),
+    ) as unknown as typeof fetch
+
+    const oatIdentity = await resolveClaudeCodeIdentity(
+      oatToken,
+      undefined,
+      'main-slot',
+    )
+    const nonOatIdentity = await resolveClaudeCodeIdentity(
+      'main-non-oat-token',
+      undefined,
+      'main-slot',
+    )
+
+    expect(oatIdentity.accountUuid).toBe(providerUuid('main-oat-account-uuid'))
+    expect(nonOatIdentity.accountUuid).toBeUndefined()
+    expect(nonOatIdentity.deviceId).toBe(oatIdentity.deviceId)
+    expect(nonOatIdentity.sessionId).toBe(oatIdentity.sessionId)
+  })
+
+  test('keeps device identity stable while refreshing bootstrap UUID per credential', async () => {
     const accountUuid = 'c7b3bc43-f4d8-48c6-a30f-7fd81a8db03f'
     const fetchMock = mock(
       async () =>
@@ -344,13 +699,160 @@ describe('Claude Code bootstrap identity lookup', () => {
     )
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
-    const first = await resolveClaudeCodeIdentity('sk-ant-oat-rotation-a')
-    const second = await resolveClaudeCodeIdentity('sk-ant-oat-rotation-b')
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-rotation-a',
+      undefined,
+      'uuid-account',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-rotation-b',
+      undefined,
+      'uuid-account',
+    )
 
-    expect(first.accountUuid).toBe(accountUuid)
-    expect(second.accountUuid).toBe(accountUuid)
+    expect(first.accountUuid).toBe(providerUuid(accountUuid))
+    expect(second.accountUuid).toBe(providerUuid(accountUuid))
     expect(second.deviceId).toBe(first.deviceId)
     expect(second.sessionId).toBe(first.sessionId)
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('keeps device identity stable across rotated credentials for an explicit account identity', async () => {
+    const fetchMock = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            oauth_account: {
+              account_uuid: 'explicit-account-bootstrap',
+            },
+          }),
+        ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-explicit-rotation-a',
+      undefined,
+      'account-a',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-explicit-rotation-b',
+      undefined,
+      'account-a',
+    )
+
+    expect(second.deviceId).toBe(first.deviceId)
+    expect(second.sessionId).toBe(first.sessionId)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('never shares a device identity between distinct account identities', async () => {
+    const fetchMock = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            oauth_account: { account_uuid: 'shared-bootstrap-uuid' },
+          }),
+        ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-distinct-a',
+      undefined,
+      'distinct-account-a',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-distinct-b',
+      undefined,
+      'distinct-account-b',
+    )
+
+    expect(second.deviceId).not.toBe(first.deviceId)
+    expect(second.sessionId).not.toBe(first.sessionId)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('adopts a legacy cached identity with no account identity', async () => {
+    const legacy = getClaudeCodeIdentity('sk-ant-oat-legacy-token')
+    const fetchMock = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            oauth_account: { account_uuid: 'legacy-bootstrap-uuid' },
+          }),
+        ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const resolved = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-legacy-token',
+      undefined,
+      'legacy-account',
+    )
+
+    expect(resolved.deviceId).toBe(legacy.deviceId)
+    expect(resolved.sessionId).toBe(legacy.sessionId)
+    expect(resolved.accountUuid).toBe(providerUuid('legacy-bootstrap-uuid'))
+  })
+
+  test('does not reuse an in-flight bootstrap from a rotated credential', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const fetchMock = mock(async () => {
+      await gate
+      return new Response(
+        JSON.stringify({
+          oauth_account: { account_uuid: 'in-flight-bootstrap-uuid' },
+        }),
+      )
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const firstPromise = resolveClaudeCodeIdentity(
+      'sk-ant-oat-in-flight-a',
+      undefined,
+      'in-flight-account',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const secondPromise = resolveClaudeCodeIdentity(
+      'sk-ant-oat-in-flight-b',
+      undefined,
+      'in-flight-account',
+    )
+    release()
+    const [first, second] = await Promise.all([firstPromise, secondPromise])
+
+    expect(second.deviceId).toBe(first.deviceId)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('keeps Claude Code metadata.user_id on the wire when account identity is missing', async () => {
+    const accountUuid = 'missing-identity-bootstrap-uuid'
+    const fetchMock = mock(
+      async () =>
+        new Response(
+          JSON.stringify({ oauth_account: { account_uuid: accountUuid } }),
+        ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const identity = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-missing-id-wire',
+      undefined,
+      undefined,
+    )
+    const body: Record<string, unknown> = { metadata: { stale: true } }
+    applyClaudeCodeMetadata(body, identity)
+    const wireBody = JSON.parse(JSON.stringify(body)) as {
+      metadata?: { user_id?: string }
+    }
+
+    expect(identity.accountIdentity).toBeUndefined()
+    expect(typeof wireBody.metadata?.user_id).toBe('string')
+    expect(wireBody.metadata?.user_id).toContain(accountUuid)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

@@ -2,6 +2,7 @@ import {
   type FallbackAccount,
   fallbackAccountToShared,
   findSharedAccountByCredential,
+  isCustodyTombstoneValue,
   isFirstPartyAnthropicApiAccount,
   loadSharedAccountStore,
   materializeSharedFallbackAccounts,
@@ -230,6 +231,19 @@ export async function reconcileAnthropicAuth(input: {
   wifAuth?: WifAuth | null
   options?: SharedAccountStoreOptions
 }): Promise<ReconciledAnthropicAuth> {
+  // Upstream custody: a Claustrum tombstone in the host auth means the vault
+  // owns this credential. It must reach the custody startup gate unchanged and
+  // must never be mirrored into (or overridden by) the shared account store.
+  if (
+    input.openCodeAuth.type === 'oauth' &&
+    (isCustodyTombstoneValue(input.openCodeAuth.refresh) ||
+      isCustodyTombstoneValue(input.openCodeAuth.access))
+  ) {
+    return {
+      auth: resolveOpenCodeAuth(input.openCodeAuth),
+      fallbacks: [...input.legacyAccounts],
+    }
+  }
   const options = input.options ?? {}
   const now = options.now?.() ?? Date.now()
   const loaded = await loadSharedAccountStore(options)
@@ -316,9 +330,19 @@ export async function reconcileAnthropicAuth(input: {
           now,
         )
         if (sharedHost) {
-          const match =
-            findSharedAccountByCredential(next, sharedHost.credential) ??
-            next.accounts.find((account) => account.id === sharedHost.id)
+          const byCredential = findSharedAccountByCredential(
+            next,
+            sharedHost.credential,
+          )
+          const byId = byCredential
+            ? undefined
+            : next.accounts.find((account) => account.id === sharedHost.id)
+          // A concurrent writer may have created the host's slot between our
+          // read and this locked update. The host is the authority on its own
+          // session, so replace that slot's credential instead of silently
+          // serving whatever the other writer stored there.
+          if (byId) byId.credential = sharedHost.credential
+          const match = byCredential ?? byId
           if (!match) next.accounts.unshift(sharedHost)
           next.current = match?.id ?? sharedHost.id
         }

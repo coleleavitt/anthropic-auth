@@ -35,25 +35,38 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Cache keepalive**: use `/claude-cachekeep always` or `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Quota window priming**: opt in with `/claude-prime on` to start each 5-hour quota window about one minute after it resets instead of waiting for the next normal prompt.
 - **Lane start (OpenCode only)**: use `/claude-start` to fire one synthetic, one-token turn through the current session's normal model, agent, variant, quota, routing, cache, and request pipeline.
-- **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
-- **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5, Mythos 5, and Opus 5. OpenCode receives native `low`, `medium`, `high`, `xhigh`, and `max` Opus 5 effort variants rather than legacy manual-thinking budgets.
-- **Fable/Opus 5 safety fallback**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
+- **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models (`claude-opus-4-8`, `claude-opus-5`, and `claude-opus-5-5`).
+- **Adaptive reasoning visibility**: request summarized adaptive thinking for Claude Fable 5/5.1, Mythos 5/5.1, Opus 5, and Opus 5.5. OpenCode exposes native `low`, `medium`, `high`, `xhigh`, and `max` effort variants for Fable 5.1, Opus 5, and Opus 5.5. On Opus 5.5, thinking is always on (adaptive summarized) per the model specification. OAuth Fable 5.1 sessions can change effort between turns without rewriting the cached prefix.
+- **Fable/Opus 5 and 5.5 safety fallback**: eligible OAuth requests try Anthropic's server-side safety fallback first. The plugin preserves Anthropic's fallback conversation boundary across OpenCode history and automatically starts its deterministic 10-response Opus 4.8 recovery if the response still ends in refusal. The TUI sidebar and OpenCode Desktop report the active target model and restoration. Set `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` to bypass the server policy and use client-side recovery exclusively.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
+- **Host-local quota feed**: optionally publish sanitized response-header quota observations so another local CortexKit process can reuse fresh account state without polling Anthropic's rate-limited usage endpoint.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
-- **Claude-compatible request hardening**: final-body billing signing, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
+- **Claude-compatible request hardening**: Claude Code 2.1.258 identity and final-body billing signing, user-turn prompt and request lineage across tool loops, live-session-stable billing suffixes, Fable 5.1 thinking-prefix recovery, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
 
 ## What these integrations do
 
 - Let OpenCode and Pi use Claude Pro/Max OAuth credentials instead of an Anthropic API key.
 - In OpenCode, intercept the final Anthropic request and rewrite it into the Claude-compatible shape expected by Anthropic OAuth access.
 - In Pi, replace Pi's built-in Anthropic provider with a CortexKit provider override that uses the same Claude-compatible request path.
-- Add Claude 2.1.260 billing headers with stable `cc_version` and the native literal `cch=00000` slot.
+- Add Claude billing headers with stable `cc_version`, user-turn `cc_prompt_id`/`cc_prev_req` lineage, and the native `cch=00000` slot patched with the body-derived `cch` signature.
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.
 - Add `/claude-cache`, `/claude-cachekeep`, `/claude-prime`, `/claude-start`, `/claude-fast`, `/claude-quota`, and `/claude-dump` commands.
 - Optionally relay large requests through a Cloudflare Worker owned by the user.
+
+## Setup wizard (recommended)
+
+Run the interactive setup wizard:
+
+```bash
+bunx @cortexkit/opencode-anthropic-auth setup
+```
+
+The wizard detects OpenCode, Pi, and Claustrum, configures plugin entries, and optionally activates Claustrum custody.
+
+---
 
 ## Install
 
@@ -71,7 +84,7 @@ Pinning is strongly recommended for any OpenCode plugin:
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-anthropic-auth@1.0.0"]
+  "plugin": ["@cortexkit/opencode-anthropic-auth@2.0.0"]
 }
 ```
 
@@ -85,7 +98,7 @@ After changing plugin config, restart OpenCode.
 Install the Pi package with Pi's package manager:
 
 ```bash
-pi install npm:@cortexkit/pi-anthropic-auth@1.0.0
+pi install npm:@cortexkit/pi-anthropic-auth@2.0.0
 ```
 
 For an unpinned install:
@@ -197,6 +210,12 @@ Example:
     "failClosedOnUnknownQuota": true,
     "showToasts": false
   },
+  "quotaHeaderFeed": {
+    "enabled": false
+  },
+  "claustrum": {
+    "accounts": {}
+  },
   "killswitch": {
     "enabled": false,
     "main": { "five_hour": 5, "seven_day": 10, "scoped": 0 },
@@ -218,6 +237,9 @@ Example:
   "claudeFast": {
     "enabled": false
   },
+  "thinkingBinding": {
+    "prefixMismatchBehavior": "account-default"
+  },
   "costZeroing": {
     "enabled": true
   },
@@ -234,6 +256,12 @@ Example:
 
 The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-cache`, `cacheKeep` controls `/claude-cachekeep`, and `claudeFast` controls `/claude-fast`. OpenCode zeroes Anthropic OAuth model costs by default because OAuth usage is quota-based; set `costZeroing.enabled` to `false` only if you want OpenCode to display the provider's model pricing instead. Set `quota.showToasts` to `true` to opt into OpenCode quota toast notifications after quota refreshes. The `main` field identifies OpenCode's Anthropic integration; the selected credential itself comes from the shared account store. Pi keeps primary OAuth credentials in Pi's own credential store but uses the same sidecar shape for CortexKit settings and fallback labels.
 
+`thinkingBinding.prefixMismatchBehavior` controls replayed signed/redacted thinking on OAuth Fable 5.1 requests. `account-default` (the default) sends no explicit prefix-mismatch override. Use `error` to make prefix changes fail deterministically during compaction testing, or `drop_block` to ask Anthropic to discard mismatched thinking blocks. The beta header is added only when an explicit behavior is configured and replayable thinking is present.
+
+`quotaHeaderFeed.enabled` is an OpenCode-only, restart-required opt-in. It publishes only allowlisted quota-window values, an opaque account reference, an observation timestamp, and the configured OAuth-account count; it never publishes tokens, raw headers, request bodies, model IDs, or refresh errors. Per-process lease files use owner-only permissions under `$TMPDIR/opencode-anthropic-auth/quota-header-feed`, expire after three minutes, and can be redirected with `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR`.
+
+`claustrum.accounts` remains loadable only so configurations can safely downgrade to older releases; it does not gate custody per account. Capability handles are bearer credentials and must not be copied into the public config file.
+
 Runtime data is stored separately in `anthropic-auth-state.json`: token-refresh backoff, quota snapshots, quota API backoff, custom API-route keys, and a compatibility mirror used by existing routing code. Canonical OAuth and first-party Anthropic API-key credentials live in `~/.anthropic-accounts/accounts.json`. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 
 ## OpenCode lane-start setting
@@ -245,7 +273,7 @@ Fallback accounts are separate Claude OAuth accounts or Anthropic-compatible API
 
 Use `/claude-routing fallback-first` to prefer usable fallback accounts before the main account, `/claude-routing main-first` to restore the default, or `/claude-routing sticky-balanced` to allocate each new session according to spendable 5-hour, 7-day, and matching model-scoped OAuth quota headroom. The command persists `routing.mode` and takes effect on the next request without restarting. `/claude-routing reset` clears only the current session's assignment so its next request is allocated again.
 
-`sticky-balanced` normalizes quota headroom by time until reset and tracks weighted initial-prompt deficit until the next quota refresh. Assignments are persisted by hashed session ID in `anthropic-auth-routing-state.json`, shared safely across OpenCode plugin instances and restarts. Active hybrid CacheKeep sessions seed their current route when the mode is first enabled.
+`sticky-balanced` normalizes quota headroom by time until reset and tracks weighted initial-prompt deficit until the next quota refresh. Assignments are persisted by hashed session ID in `anthropic-auth-routing-state.json`, shared safely across OpenCode plugin instances and restarts. Active hybrid CacheKeep sessions seed their current route when the mode is first enabled. Changing the user-selected model discards the old assignment and its model-specific CacheKeep preference before quota-based reselection; transparent safety-recovery model changes retain the original account.
 
 Affinity survives network/relay failures, 5xx responses, unconfirmed 429s, quota-probe failures, and relative quota changes. Confirmed 7-day or matching model-scoped exhaustion migrates a session. Confirmed 5-hour exhaustion migrates only when more than 15 minutes remain; otherwise the plugin retains the route and returns `Retry-After`. Fable content-filter recovery keeps Fable, Opus 4.8, and Fable prewarms on the same sticky account. Direct Opus sessions first prefer an otherwise usable account whose Fable quota is exhausted.
 
@@ -282,9 +310,17 @@ Fallback retries are only attempted when the request body is safely replayable. 
 
 ### Token refresh
 
-Fallback OAuth tokens refresh in the background. Access and refresh-token expiries persist in the Rust-compatible schema; expired refresh tokens fail locally. Omitted refresh-expiry fields preserve the known absolute expiry, and rotations commit with a locked compare-and-swap so a newer cross-process token cannot be overwritten.
+Fallback OAuth tokens refresh in the background. Access and refresh-token expiries persist in the Rust-compatible schema; expired refresh tokens fail locally. Omitted refresh-expiry fields preserve the known absolute expiry, and rotations commit with a locked compare-and-swap so a newer cross-process token cannot be overwritten. Persisted refresh backoffs are bound to the refresh token that produced them, so replacing a rejected credential immediately clears its stale latch.
 
-If Anthropic reports `invalid_grant`, that fallback account must be logged in again.
+If Anthropic reports `invalid_grant`, that account must be logged in again. `/claude-account reset-backoff` manually clears the main account's refresh backoff and its matching quota backoff.
+
+### Claustrum scoped custody
+
+Run `bunx @cortexkit/opencode-anthropic-auth setup` with OpenCode stopped to enroll `anthropic-auth-opencode`, grant `category:anthropic-native` read access, and install the non-secret main OAuth tombstone. The plugin then discovers active Claude OAuth accounts through `credential.list_scoped`; `ck auth login --provider anthropic` adds new routing rows automatically without manual binding or restart. Newly discovered accounts receive an initial quota fetch. Existing disabled routing preferences are preserved.
+
+Each model send, quota/profile query, CacheKeep prewarm, and Prime fire obtains fresh scoped authorization with a five-minute serving margin. The vault alone refreshes OAuth credentials; the plugin never serves or refreshes a stale local token in Claustrum mode. A 401 report carries the exact record version sent for that attempt. An older Claustrum configuration without `scopedRoster: true` fails closed, even if obsolete local fallback material remains. Account and sidebar projections contain no bearer material.
+
+`/claude-account` displays the roster and reads enrollment status without proposing or polling. Only the offline `setup` command enrolls a host; it resumes crash-persisted requests and replaces a daemon-proven dead request at most once. `/claude-account claustrum` provides setup guidance and `/claude-account local` explains the verified local login requirement; neither switches authority while OpenCode is active. `/claude-account enrollment-reset` clears denied or blocked local state under lock without starting a new proposal; run setup afterward. Approved tokens cannot be reset by that command. API-key routes remain separate.
 
 ## Quota-aware routing
 
@@ -315,7 +351,7 @@ Reset times are rendered as relative durations, such as `resets in 10m` or `rese
 
 ## Safety fallback
 
-Eligible Fable 5 and Opus 5 OAuth requests try Anthropic's server-side safety fallback first. The plugin sends `fallbacks: "default"` with Anthropic's server-side fallback beta, preserves fallback conversation boundaries in OpenCode history, and reports model handoffs and restoration in the TUI sidebar or OpenCode Desktop. Follow-up requests may remain on Anthropic's selected fallback model for approximately one hour.
+Eligible Fable 5/5.1 and Opus 5 OAuth requests try Anthropic's server-side safety fallback first. The plugin sends `fallbacks: "default"` with Anthropic's server-side fallback beta, preserves fallback conversation boundaries in OpenCode history, and reports model handoffs and restoration in the TUI sidebar or OpenCode Desktop. Follow-up requests may remain on Anthropic's selected fallback model for approximately one hour.
 
 If an eligible OAuth response still ends in refusal, CortexKit automatically starts its deterministic 10-successful-response Opus 4.8 recovery, prewarms the selected source model without the server-fallback opt-in, and then restores that model. If the refused response already completed a tool call, the plugin preserves that call and continues with its existing tool result instead of replaying the tool.
 
@@ -327,7 +363,7 @@ To bypass Anthropic's server policy and use deterministic client recovery from t
 OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy opencode
 ```
 
-Legacy mode routes a refused Fable 5 or Opus 5 session through Opus 4.8 for 10 successful responses, prewarms the selected source model's cache, and then restores that model without first opting into Anthropic's server policy. Unset the variable and restart OpenCode to return to the default server-first policy with the same client recovery as a backstop.
+Legacy mode routes a refused Fable 5/5.1 or Opus 5 session through Opus 4.8 for 10 successful responses, prewarms the selected source model's cache, and then restores that model without first opting into Anthropic's server policy. Unset the variable and restart OpenCode to return to the default server-first policy with the same client recovery as a backstop.
 
 ## Killswitch
 
@@ -533,7 +569,7 @@ Both OpenCode and Pi packages can persistently request Anthropic fast mode for s
 /claude-fast off
 ```
 
-When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic currently documents fast mode for `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, and `claude-opus-5-5`; Claude Fable 5 and Mythos 5 are not fast-mode models.
+When enabled, supported requests add `speed: "fast"` to the Anthropic JSON body and include the `fast-mode-2026-02-01` beta header. Unsupported models are left at standard speed. Anthropic supports fast mode for `claude-opus-4-8`, `claude-opus-5`, and `claude-opus-5-5`. Opus 4.7 rejects `speed: "fast"`, while Opus 4.6 runs at standard speed; Claude Fable and Mythos 5/5.1 are not fast-mode models.
 
 Fast and standard speeds do not share prompt-cache prefixes, so switching this setting can cause cache misses.
 
@@ -671,13 +707,24 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `ANTHROPIC_WORKSPACE_ID` | Optional multi-workspace WIF selector. |
 | `CLAUDE_TRUSTED_DEVICE_TOKEN` | Trusted-device override for explicit Remote Control/Cowork calls only. |
 | `CLAUDE_CODE_OAUTH_CLIENT_ID` | Override the public PKCE OAuth client ID, matching Claude Code and the Rust `anthropic` crate. |
+| `ANTHROPIC_CUSTOM_HEADERS` | Add proxy-specific headers on API-key and proxy routes. Authentication, protocol, framing, and internal correlation headers cannot be overridden. Ignored for OAuth requests. |
+| `ANTHROPIC_MODEL` | Default proxy alias for any `claude-*` model. Ignored for OAuth requests. |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Proxy alias for `claude-sonnet-*` models. |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Proxy alias for `claude-opus-*` models. |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Proxy alias for `claude-haiku-*` models. |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | Proxy alias for `claude-fable-*` and `claude-mythos-*` models. |
 | `ANTHROPIC_INSECURE` | Set to `1` or `true` to skip TLS verification when `ANTHROPIC_BASE_URL` is set. |
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
+| `OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE` | Override the owner-only OpenCode Claustrum enrollment-token path. |
 | `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | Set to `legacy` to bypass Anthropic's server policy and use deterministic 10-response client recovery exclusively. The default tries server-side safety fallback first and uses client recovery as a backstop. |
 | `PI_ANTHROPIC_AUTH_FILE` | Override the Pi sidecar config path. |
 | `PI_AGENT_DIR` | Override Pi's agent directory when deriving the default sidecar path. |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @cortexkit/opencode-anthropic-auth relay setup`. Not stored. |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID used by relay setup. |
+
+`ANTHROPIC_CUSTOM_HEADERS` and the model-alias variables apply only to API-key and proxy routes. OAuth requests keep the Claude Code header and model identity unchanged. Custom headers accept either a JSON object or comma/newline-separated `name: value` entries. A configuration containing an invalid or protected header is ignored as a whole with one redacted warning; it cannot replace route authentication, Anthropic protocol headers, body framing, or plugin-internal correlation headers.
+
+An `ANTHROPIC_BASE_URL` path is preserved. For example, `https://proxy.example/anthropic` sends requests to `/anthropic/v1/messages`, while a versioned base such as `https://proxy.example/anthropic/v2` sends to `/anthropic/v2/messages`. Existing version segments are not duplicated, and unrelated paths ending in `/messages` are not rewritten.
 
 ## Request rewriting
 
@@ -689,8 +736,8 @@ For Claude Pro/Max OAuth requests, the plugin works at the final Anthropic wire-
 4. Prepends Claude Code identity and billing-header blocks.
 5. Rewrites cache controls according to `/claude-cache` mode.
 6. Renames MCP tool names into Claude-compatible PascalCase form.
-7. Opts eligible Fable 5 and Opus 5 OAuth requests into Anthropic's server-side safety fallback, restores stored fallback boundaries, and activates replay-safe client recovery if the response still refuses.
-8. Computes Claude 2.1.233 `cch` with seed `0x4d659218e32a3268` over the canonical preimage with every model value emptied and every integer max-token field removed, then patches only the five-character billing slot in the unchanged wire body.
+7. Opts eligible Fable 5/5.1 and Opus 5 OAuth requests into Anthropic's server-side safety fallback, restores stored fallback boundaries, and activates replay-safe client recovery if the response still refuses.
+8. Computes `cch` (xxHash64 seed `0x4d659218e32a3268`) over the serialized request body, then patches only the five-character billing slot in the unchanged wire body.
 
 The sanitizer is anchor-based: it removes paragraphs containing known OpenCode documentation or source anchors, performs a small set of inline replacements, and preserves the rest of the prompt including user/project instructions, tool policy, environment context, and file paths.
 

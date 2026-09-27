@@ -1,7 +1,25 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import xxhashInit from 'xxhash-wasm'
 import { getCachedClaudeCodeVersion } from './claude-version.ts'
 import { CCH_POSITIONS, CCH_SALT } from './constants.ts'
+
+const ANTHROPIC_REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]{8,128}$/
+const PROMPT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const BILLING_LINEAGE_FIELD_PATTERN = / cc_(?:prev_req|prompt_id)=[^;\r\n]*;/g
+
+export interface BillingLineageFields {
+  previousRequestId?: string
+  promptId?: string
+}
+
+export function isValidAnthropicRequestId(value: string): boolean {
+  return ANTHROPIC_REQUEST_ID_PATTERN.test(value)
+}
+
+export function isValidBillingPromptId(value: string): boolean {
+  return PROMPT_ID_PATTERN.test(value)
+}
 
 type Message = {
   role?: string
@@ -9,13 +27,13 @@ type Message = {
   content?: string | Array<{ type?: string; text?: string }>
 }
 
-// Claude Code 2.1.138–2.1.233 seed, independently validated against six
-// controlled native-fetch oracles and four 92 KiB no-egress captures.
 const CCH_SEED = 0x4d659218e32a3268n
 const CCH_PLACEHOLDER = 'cch=00000;'
 export const CCH_PATTERN = /\bcch=([0-9a-f]{5});/
 const BILLING_HEADER_CCH_PATTERN =
   /("system":\[\{"type":"text","text":"x-anthropic-billing-header: cc_version=[^;"]+; cc_entrypoint=[^;"]+; )cch=([0-9a-f]{5});/
+const BILLING_HEADER_CCH_PLACEHOLDER_PATTERN =
+  /("system":\[\{"type":"text","text":"x-anthropic-billing-header: cc_version=[^;"]+; cc_entrypoint=[^;"]+; )cch=00000;/
 
 let xxhashPromise: Promise<void> | null = null
 let xxhash64Raw: ((input: Uint8Array, seed: bigint) => bigint) | null = null
@@ -30,8 +48,8 @@ async function ensureXxhash() {
 }
 
 /**
- * Extract text from the first user message's first text block.
- * Kept for diagnostics/backward-compatible tests; CCH signing no longer uses it.
+ * Extract the visible prompt from the first user message. Claude Code prepends
+ * reminder blocks and derives its version suffix from the final text block.
  */
 export function extractFirstUserMessageText(messages: Message[]): string {
   const userMsg = messages.find(
@@ -43,18 +61,65 @@ export function extractFirstUserMessageText(messages: Message[]): string {
   if (typeof content === 'string') return content
 
   if (Array.isArray(content)) {
-    const textBlock = content.find((block) => block.type === 'text')
-    if (textBlock?.text) return textBlock.text
+    const textBlocks = content.filter(
+      (block): block is { type: 'text'; text?: string } =>
+        block.type === 'text',
+    )
+    const commandBlock = textBlocks.find((block) =>
+      block.text?.includes('<command-name>'),
+    )
+    if (commandBlock?.text) {
+      return commandBlock.text.slice(
+        commandBlock.text.indexOf('<command-name>'),
+      )
+    }
+    const visibleBlock = textBlocks.findLast(
+      (block) => typeof block.text === 'string' && block.text.length > 0,
+    )
+    if (visibleBlock?.text) return visibleBlock.text
   }
 
   return ''
 }
 
+export class ClaudeCodeFirstUserTextTracker {
+  readonly #values = new Map<string, string>()
+
+  constructor(readonly limit = 1_000) {}
+
+  resolve(sessionId: string, messages: Message[], pin = true) {
+    const existing = this.#values.get(sessionId)
+    if (existing !== undefined) {
+      this.#values.delete(sessionId)
+      this.#values.set(sessionId, existing)
+      return existing
+    }
+
+    const value = extractFirstUserMessageText(messages)
+    if (pin) {
+      if (!this.#values.has(sessionId) && this.#values.size >= this.limit) {
+        const oldest = this.#values.keys().next().value
+        if (oldest !== undefined) this.#values.delete(oldest)
+      }
+      this.#values.set(sessionId, value)
+    }
+    return value
+  }
+
+  has(sessionId: string) {
+    return this.#values.has(sessionId)
+  }
+
+  clear() {
+    this.#values.clear()
+  }
+}
+
 /**
- * Compute the legacy CortexKit xxHash64 diagnostic token.
+ * Compute Claude Code's cch token over the final serialized request body.
  *
- * Claude Code 2.1.260 does not place this value in its billing header; normal
- * request dispatch keeps the native literal `cch=00000`.
+ * Real Claude Code signs the full body bytes with xxHash64 using a fixed seed,
+ * masks to 20 bits, and writes that value into the billing-header placeholder.
  */
 export async function computeCCH(bodyBytes: Uint8Array): Promise<string> {
   await ensureXxhash()
@@ -73,10 +138,9 @@ export function resetBillingHeaderCCH(bodyString: string): string {
 }
 
 /**
- * Build the legacy CortexKit diagnostic hash preimage.
- *
- * Retained for dump analysis and compatibility; it is not native 2.1.260 wire
- * signing and must not mutate a normal Messages request.
+ * Build the diagnostic hash preimage (model emptied, max_tokens removed) as a
+ * string transform. `signRequestBody()` performs the canonical equivalent on
+ * the parsed body; this is retained for dump analysis.
  */
 export function buildCCHPreimage(bodyString: string): string {
   return bodyString
@@ -89,75 +153,119 @@ export function extractBillingHeaderCCH(bodyString: string): string | null {
 }
 
 export async function signRequestBody(bodyString: string): Promise<string> {
-  // Claude Code 2.1.260 emits this slot as the literal `cch=00000;`. Keep the
-  // async API for callers while normalizing stale/non-native signed bodies back
-  // to the native placeholder.
-  return resetBillingHeaderCCH(bodyString)
+  if (!BILLING_HEADER_CCH_PATTERN.test(bodyString)) return bodyString
+
+  const unsignedBodyString = resetBillingHeaderCCH(bodyString)
+  const canonicalBody = JSON.parse(unsignedBodyString) as Record<
+    string,
+    unknown
+  >
+  if ('model' in canonicalBody) canonicalBody.model = ''
+  delete canonicalBody.max_tokens
+  const token = await computeCCH(
+    new TextEncoder().encode(JSON.stringify(canonicalBody)),
+  )
+  return unsignedBodyString.replace(
+    BILLING_HEADER_CCH_PLACEHOLDER_PATTERN,
+    `$1cch=${token};`,
+  )
 }
 
-/** Compute Claude Code's message-derived 3-character cc_version suffix. */
-export function computeVersionSuffix(
+/**
+ * Compute Claude Code's 3-character suffix for cc_version.
+ */
+export function computeCcVersionSuffix(
+  firstUserText: string,
   version: string = getCachedClaudeCodeVersion(),
-  firstUserText = '',
 ): string {
-  const sampled = CCH_POSITIONS.map(
-    (position) => firstUserText[position] || '0',
+  const sampledText = CCH_POSITIONS.map(
+    (position) => firstUserText[position] ?? '0',
   ).join('')
   return createHash('sha256')
-    .update(`${CCH_SALT}${sampled}${version}`)
+    .update(`${CCH_SALT}${sampledText}${version}`)
     .digest('hex')
     .slice(0, 3)
 }
 
-const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]{1,36}$/
-const PROMPT_ID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-
-export type BillingHeaderAttribution = {
-  workload?: string
-  isSubagent?: boolean
-  previousRequestId?: string
-  promptId?: string
+/** Fork-compatible argument order for {@link computeCcVersionSuffix}. */
+export function computeVersionSuffix(
+  version: string = getCachedClaudeCodeVersion(),
+  firstUserText = '',
+): string {
+  return computeCcVersionSuffix(firstUserText, version)
 }
 
 /**
- * Build the billing header with Claude Code 2.1.260's literal cch placeholder.
- * `signRequestBody()` normalizes this slot but does not replace it with a hash.
- *
- * Segment order and spacing mirror Claude Code 2.1.260 exactly: each optional
- * segment carries its own leading space, and the cch placeholder is emitted
- * first so the five-character slot keeps a stable wire offset.
+ * Request attribution appended to the billing header. `workload` and
+ * `isSubagent` mirror Claude Code's `cc_workload` / `cc_is_subagent` segments.
+ */
+export type BillingHeaderAttribution = BillingLineageFields & {
+  workload?: string
+  isSubagent?: boolean
+}
+
+/**
+ * Build the billing header with a cch placeholder.
+ * signRequestBody() must run after final request serialization to replace it.
  */
 export function buildBillingHeaderValue(
-  _messages: Message[],
+  messages: Message[],
   version: string = getCachedClaudeCodeVersion(),
   entrypoint: string,
-  _date: Date = new Date(),
-  attribution: BillingHeaderAttribution = {},
+  pinnedFirstUserText?: string,
+  lineage?: BillingHeaderAttribution,
 ): string {
-  const suffix = computeVersionSuffix(
+  const suffix = computeCcVersionSuffix(
+    pinnedFirstUserText ?? extractFirstUserMessageText(messages),
     version,
-    extractFirstUserMessageText(_messages),
   )
 
-  const workload = attribution.workload?.trim()
-  const previousRequestId = attribution.previousRequestId?.trim()
-  const promptId = attribution.promptId?.trim()
-
-  return (
+  let value =
     'x-anthropic-billing-header: ' +
     `cc_version=${version}.${suffix}; ` +
-    `cc_entrypoint=${entrypoint};` +
-    ' cch=00000;' +
-    (workload ? ` cc_workload=${workload};` : '') +
-    (attribution.isSubagent ? ' cc_is_subagent=true;' : '') +
-    (previousRequestId && REQUEST_ID_PATTERN.test(previousRequestId)
-      ? ` cc_prev_req=${previousRequestId};`
-      : '') +
-    (promptId && PROMPT_ID_PATTERN.test(promptId)
-      ? ` cc_prompt_id=${promptId};`
-      : '')
-  )
+    `cc_entrypoint=${entrypoint}; ` +
+    'cch=00000;'
+  const workload = lineage?.workload?.trim()
+  if (workload) value += ` cc_workload=${workload};`
+  if (lineage?.isSubagent) value += ' cc_is_subagent=true;'
+  if (
+    lineage?.previousRequestId &&
+    isValidAnthropicRequestId(lineage.previousRequestId)
+  ) {
+    value += ` cc_prev_req=${lineage.previousRequestId};`
+  }
+  if (lineage?.promptId && isValidBillingPromptId(lineage.promptId)) {
+    value += ` cc_prompt_id=${lineage.promptId};`
+  }
+  return value
+}
+
+/** Remove request-scoped Claude Code lineage from a billing header string. */
+export function stripBillingLineageFields(value: string): string {
+  return value.replace(BILLING_LINEAGE_FIELD_PATTERN, '')
+}
+
+/** Remove request-scoped Claude Code lineage before reusing a request body. */
+export function stripBillingLineageFromBody(body: unknown): number {
+  if (!body || typeof body !== 'object') return 0
+  const system = (body as { system?: unknown }).system
+  if (!Array.isArray(system)) return 0
+  let stripped = 0
+  for (const block of system) {
+    if (!block || typeof block !== 'object') continue
+    const text = (block as { text?: unknown }).text
+    if (
+      typeof text !== 'string' ||
+      !text.startsWith('x-anthropic-billing-header:')
+    ) {
+      continue
+    }
+    const clean = stripBillingLineageFields(text)
+    if (clean === text) continue
+    ;(block as { text: string }).text = clean
+    stripped += 1
+  }
+  return stripped
 }
 
 // ============================================================================
@@ -165,8 +273,8 @@ export function buildBillingHeaderValue(
 // ============================================================================
 //
 // The older implementation used HMAC-SHA256 to attest the request body.
-// This is NOT what Claude Code 2.1.260 does (it sends literal cch=00000).
-// However, some users may want to use this for experimentation.
+// Upstream (2.1.280) signs cch with xxHash64 over the canonical body; the
+// fork's `literal` mode keeps the 2.1.260-era `cch=00000;` placeholder.
 //
 // Enable with: ANTHROPIC_AUTH_CCH_MODE=hmac
 //
@@ -176,15 +284,14 @@ export function buildBillingHeaderValue(
 //   3. Take first 5 hex chars of the digest
 //   4. Replace "cch=00000" with "cch={hash5}" in the serialized string
 
-import { createHmac } from 'node:crypto'
-
-export type CCHMode = 'native' | 'hmac' | 'xxhash'
+export type CCHMode = 'native' | 'hmac' | 'xxhash' | 'literal'
 
 export function getCCHMode(): CCHMode {
   const mode = process.env.ANTHROPIC_AUTH_CCH_MODE?.toLowerCase().trim()
   if (mode === 'hmac') return 'hmac'
   if (mode === 'xxhash') return 'xxhash'
-  return 'native' // Default: literal cch=00000 like Claude Code 2.1.260
+  if (mode === 'literal') return 'literal'
+  return 'native' // Default: canonical xxHash64 signing (signRequestBody)
 }
 
 /**
@@ -219,7 +326,8 @@ export async function computeXxhashBodyAttestation(
  * Sign the request body according to the configured CCH mode.
  *
  * Modes:
- *   - native (default): Keep cch=00000 literal (matches Claude Code 2.1.260)
+ *   - native (default): canonical xxHash64 signing (upstream 2.1.280)
+ *   - literal: keep cch=00000 (Claude Code 2.1.260-era placeholder)
  *   - hmac: HMAC-SHA256 body attestation
  *   - xxhash: xxHash64 body attestation
  */
@@ -232,7 +340,9 @@ export async function signRequestBodyWithMode(
       return computeHmacBodyAttestation(bodyString)
     case 'xxhash':
       return computeXxhashBodyAttestation(bodyString)
-    default:
+    case 'literal':
       return resetBillingHeaderCCH(bodyString)
+    default:
+      return signRequestBody(bodyString)
   }
 }

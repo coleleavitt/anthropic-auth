@@ -2,39 +2,57 @@ import { createHash } from 'node:crypto'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
+  applyThinkingBindingControls,
+  assertNotCustodyTombstone,
+  type BillingLineageFields,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
+  ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
   type ContentFilterSummary,
   FAST_MODE_BETA,
   filterRequestBodyGuarded,
+  hasThinkingBindingControls,
   isClaudeFableOrMythos5Model,
+  isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
+  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   mergeAnthropicBetas,
   modelRejectsDisabledThinking,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
+  remapRequestBodyModel,
   selectClaudeCodeBetas,
   signRequestBody,
+  stripBillingLineageFromBody,
   TEXT_REPLACEMENTS,
+  THINKING_BINDING_CONTROLS_BETA,
+  type ThinkingPrefixMismatchBehavior,
   TOOL_PREFIX,
+  usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
   applyCacheDiagnosticsOptIn,
   CACHE_DIAGNOSTICS_BETA,
 } from './cache-diagnostics'
+import {
+  applyOpenCodeEffortMarkers,
+  EffortMarkerCorrelationError,
+  type OpenCodeEffortMarkerPlan,
+} from './effort-history'
 import { makeByteBoundedMemo } from './sanitize-memo'
 import {
   applyServerSideFallbackToBody,
@@ -44,7 +62,6 @@ import {
 } from './server-fallback'
 
 export const NON_STREAMING_DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
-
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
  * Claude Code uses PascalCase tool names (e.g. mcp_Bash, mcp_Read);
@@ -163,12 +180,21 @@ export function setOAuthHeaders(
     parentAgentId?: string
   } = {},
 ): Headers {
+  // This is the shared boundary where an access value becomes a bearer header.
+  assertNotCustodyTombstone(accessToken, 'anthropic')
   return applyClaudeCodeHeaders(headers, accessToken, {
     ...options,
-    extraBetas:
-      options.body?.fallbacks === 'default'
+    extraBetas: [
+      ...(options.body?.fallbacks === 'default'
         ? SERVER_SIDE_FALLBACK_BETAS
-        : undefined,
+        : []),
+      ...(options.body && hasThinkingBindingControls(options.body)
+        ? [THINKING_BINDING_CONTROLS_BETA]
+        : []),
+      ...(options.body && usesMidConversationOutputConfig(options.body)
+        ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
+        : []),
+    ],
   })
 }
 
@@ -184,6 +210,15 @@ export function prefixToolNames(parsed: Record<string, unknown>): string {
         name: tool.name ? prefixName(tool.name) : tool.name,
       }),
     )
+  }
+
+  const toolChoice = parsed.tool_choice
+  if (
+    isRecord(toolChoice) &&
+    toolChoice.type === 'tool' &&
+    typeof toolChoice.name === 'string'
+  ) {
+    parsed.tool_choice = { ...toolChoice, name: prefixName(toolChoice.name) }
   }
 
   if (parsed.messages && Array.isArray(parsed.messages)) {
@@ -328,10 +363,31 @@ export function rewriteUrl(
     ? parseBaseUrl(options.baseURL)
     : resolveBaseUrl()
   if (baseUrl) {
+    const basePath = baseUrl.pathname.replace(/\/$/, '')
+    const inputPath = requestUrl.pathname
     requestUrl.protocol = baseUrl.protocol
     requestUrl.host = baseUrl.host
-    if (options.baseURL) {
-      requestUrl.pathname = `${baseUrl.pathname.replace(/\/$/, '')}${requestUrl.pathname}`
+
+    const alreadyUnderBase =
+      inputPath === basePath ||
+      (basePath !== '' && inputPath.startsWith(`${basePath}/`))
+    if (!alreadyUnderBase) {
+      const baseEndsInVersion = /\/v\d[^/]*$/.test(basePath)
+      if (inputPath === '/messages') {
+        requestUrl.pathname = baseEndsInVersion
+          ? `${basePath}/messages`
+          : `${basePath}/v1/messages`
+      } else if (inputPath === '/v1/messages' && baseEndsInVersion) {
+        requestUrl.pathname = `${basePath}/messages`
+      } else {
+        requestUrl.pathname = `${basePath}${inputPath}`
+      }
+    } else if (inputPath === `${basePath}/messages`) {
+      // Repair only the exact SDK form under a non-versioned base. Do not
+      // rewrite sibling resources or explicit /v2 (and later) proxy paths.
+      if (!/\/v\d[^/]*$/.test(basePath)) {
+        requestUrl.pathname = `${basePath}/v1/messages`
+      }
     }
   }
 
@@ -962,12 +1018,25 @@ function stripNonAnthropicThinkingBlocks(parsed: Record<string, unknown>) {
   return removed
 }
 
+function removeUnsupportedForcedToolChoice(parsed: Record<string, unknown>) {
+  const toolChoice = parsed.tool_choice
+  if (
+    isRecord(toolChoice) &&
+    (toolChoice.type === 'any' || toolChoice.type === 'tool')
+  ) {
+    delete parsed.tool_choice
+  }
+}
+
 function normalizeFableMythosRequest(
   parsed: Record<string, unknown>,
 ): { replacedExisting: boolean } | null {
   if (!isClaudeFableOrMythos5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   parsed.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  if (isClaudeFableOrMythos51Model(parsed.model)) {
+    removeUnsupportedForcedToolChoice(parsed)
+  }
   return { replacedExisting: hadThinking }
 }
 
@@ -1010,6 +1079,16 @@ function normalizeSonnet5Request(
 function normalizeOpus5Request(
   parsed: Record<string, unknown>,
 ): { replacedExisting: boolean; display: 'summarized' | 'disabled' } | null {
+  if (isClaudeOpus55Model(parsed.model)) {
+    // Opus 5.5 rejects forced tool choice, including OpenCode's
+    // `required` setting for its StructuredOutput tool.
+    removeUnsupportedForcedToolChoice(parsed)
+    // Opus 5.5 has adaptive thinking ALWAYS ON: setting `type: "disabled"` or manual
+    // `budget_tokens` returns a 400 invalid_request_error. Rewrite to adaptive summarized.
+    const hadThinking = Object.hasOwn(parsed, 'thinking')
+    parsed.thinking = { ...CLAUDE_OPUS_5_5_ADAPTIVE_THINKING }
+    return { replacedExisting: hadThinking, display: 'summarized' }
+  }
   if (!isClaudeOpus5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   const thinking = parsed.thinking
@@ -1047,6 +1126,7 @@ export function prepareFableCacheWarmSource(
     // The prewarm must reach the source model (not be fallback-routed),
     // so strip any server-side fallback opt-in inherited from the captured body.
     delete body.fallbacks
+    stripBillingLineageFromBody(body)
     normalizeFableMythosRequest(body)
     normalizeOpus5Request(body)
     return { ok: true, bodyText: JSON.stringify(body) }
@@ -1151,6 +1231,27 @@ type RewritePerfCallback = (
   data?: Record<string, unknown>,
 ) => void
 
+export const CC_VERSION_SUFFIX_SESSION_LIMIT = 1_000
+const firstUserTextTracker = new ClaudeCodeFirstUserTextTracker(
+  CC_VERSION_SUFFIX_SESSION_LIMIT,
+)
+
+export function resetPinnedFirstUserTextsForTest() {
+  firstUserTextTracker.clear()
+}
+
+export function hasPinnedFirstUserTextForTest(sessionId: string) {
+  return firstUserTextTracker.has(sessionId)
+}
+
+function firstUserTextForSession(
+  sessionId: string,
+  messages: Parameters<typeof buildBillingHeaderValue>[0],
+  laneStart: boolean,
+): string {
+  return firstUserTextTracker.resolve(sessionId, messages, !laneStart)
+}
+
 function rewriteNowMs() {
   return performance.now()
 }
@@ -1196,11 +1297,18 @@ export async function rewriteRequestBody(
     cache1hMode?: Cache1hMode
     fastModeEnabled?: boolean
     identity?: ClaudeCodeIdentity
+    sessionId?: string
+    thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
+    midConversationEffortEnabled?: boolean
+    midConversationEffortPlan?: string
+    midConversationEffortResolvedPlan?: OpenCodeEffortMarkerPlan
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
     isSubagent?: boolean
+    modelRemapEnabled?: boolean
     laneStart?: boolean
+    billingLineage?: BillingLineageFields
     cacheDiagnosticsPreviousMessageId?: string | null
     /** Receives the content-filter summary for outcome telemetry. */
     onContentFilterSummary?: (summary: ContentFilterSummary) => void
@@ -1289,6 +1397,17 @@ export async function rewriteRequestBody(
       delete parsed.thinking
     }
 
+    applyOpenCodeEffortMarkers(
+      parsed,
+      options.midConversationEffortEnabled === true,
+      options.midConversationEffortPlan,
+      options.midConversationEffortResolvedPlan,
+    )
+    applyThinkingBindingControls(
+      parsed,
+      options.thinkingPrefixMismatchBehavior ?? 'account-default',
+    )
+
     const billingStart = rewriteNowMs()
     const billingHeader =
       Array.isArray(parsed.messages) &&
@@ -1299,8 +1418,16 @@ export async function rewriteRequestBody(
             parsed.messages,
             undefined,
             CLAUDE_CODE_ENTRYPOINT,
-            undefined,
-            { isSubagent: options.isSubagent === true },
+            options.sessionId
+              ? firstUserTextForSession(
+                  options.sessionId,
+                  parsed.messages,
+                  options.laneStart === true,
+                )
+              : undefined,
+            options.isSubagent === true
+              ? { ...options.billingLineage, isSubagent: true }
+              : options.billingLineage,
           )
         : null
     options.perf?.('billing_header', {
@@ -1360,6 +1487,7 @@ export async function rewriteRequestBody(
     })
 
     const prefixStart = rewriteNowMs()
+    if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     const prefixed = prefixToolNames(parsed)
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),
@@ -1375,7 +1503,8 @@ export async function rewriteRequestBody(
     })
 
     return signed
-  } catch {
+  } catch (error) {
+    if (error instanceof EffortMarkerCorrelationError) throw error
     return body
   }
 }
@@ -1397,6 +1526,7 @@ type SseEventSummary = {
   signatureDeltaBytes?: number
   redactedThinkingBytes?: number
   message?: Record<string, unknown>
+  usage?: Record<string, unknown>
 }
 
 type SseDiagnosticState = {
@@ -1548,6 +1678,7 @@ function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
     )
   }
   if (usage) {
+    summary.usage = usage
     summary.stopReason ??= stringField(message, 'stop_reason')
   }
   if (summary.type === 'message_start' && message) summary.message = message
@@ -1844,10 +1975,47 @@ function retryableAnthropicStreamErrorFromRawEvent(
   return retryableAnthropicStreamError(errorType, message)
 }
 
+type RelayUpstreamStatus = {
+  status: number
+  source: 'relay_status_field' | 'relay_message_parse'
+}
+
+function relayUpstreamStatusFromRawEvent(
+  rawEvent: string,
+): RelayUpstreamStatus | undefined {
+  if (!rawEvent.includes('relay_upstream_error')) return undefined
+
+  const dataLines: string[] = []
+  for (const line of rawEvent.split(/\r?\n/)) {
+    if (line.startsWith('data:')) {
+      const value = line.slice('data:'.length)
+      dataLines.push(value.startsWith(' ') ? value.slice(1) : value)
+    }
+  }
+  if (!dataLines.length) return undefined
+
+  try {
+    const data = asDiagnosticRecord(JSON.parse(dataLines.join('\n')))
+    const error = asDiagnosticRecord(data?.error)
+    if (stringField(error, 'type') !== 'relay_upstream_error') return undefined
+    const status = error?.status
+    if (typeof status === 'number' && Number.isInteger(status))
+      return { status, source: 'relay_status_field' }
+    const message = stringField(error, 'message')
+    const match = message?.match(/HTTP\s+(\d{3})\b/i)
+    return match
+      ? { status: Number(match[1]), source: 'relay_message_parse' }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function updateSseErrorState(
   state: SseErrorState,
   text: string,
   maxPendingBytes: number,
+  onRelayUpstreamError?: (status: RelayUpstreamStatus) => void,
 ): RetryableAnthropicStreamError | null {
   if (!text) return null
   if (state.disabled) {
@@ -1871,6 +2039,8 @@ function updateSseErrorState(
 
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
+    const relayStatus = relayUpstreamStatusFromRawEvent(rawEvent)
+    if (relayStatus !== undefined) onRelayUpstreamError?.(relayStatus)
     const error = retryableAnthropicStreamErrorFromRawEvent(rawEvent)
     retryable ??= error
   }
@@ -1921,7 +2091,12 @@ export function createStrippedStream(
     serverSideFallbackModel?: string
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
     onMessageStart?: (message: Record<string, unknown>) => void
+    onMessageDelta?: (delta: {
+      usage?: Record<string, unknown>
+      stopReason?: string
+    }) => void
     onMessageResponse?: (message: Record<string, unknown>) => void
+    onRelayUpstreamError?: (status: RelayUpstreamStatus) => void
     onStreamEnd?: () => void | Promise<void>
     responseMode?: 'json'
     laneStart?: boolean
@@ -1945,7 +2120,7 @@ export function createStrippedStream(
   let lastProgressAt = rewriteNowMs()
   const streamStart = rewriteNowMs()
   const sseDiagnostics =
-    options.perf || options.onMessageStart
+    options.perf || options.onMessageStart || options.onMessageDelta
       ? createSseDiagnosticState()
       : undefined
   let responseText = ''
@@ -2089,6 +2264,18 @@ export function createStrippedStream(
                   const message = summary.message
                   if (summary.type === 'message_start' && message)
                     observe(() => options.onMessageStart?.(message))
+                  if (
+                    summary.type === 'message_delta' &&
+                    (summary.usage || summary.stopReason)
+                  )
+                    observe(() =>
+                      options.onMessageDelta?.({
+                        ...(summary.usage ? { usage: summary.usage } : {}),
+                        ...(summary.stopReason
+                          ? { stopReason: summary.stopReason }
+                          : {}),
+                      }),
+                    )
                 },
               )
             if (jsonMode) {
@@ -2129,6 +2316,7 @@ export function createStrippedStream(
                   sseErrors,
                   finalDecoded,
                   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                  options.onRelayUpstreamError,
                 ) ?? updateFinish(laneStartRewritten))
             if (retryableStreamError) {
               logProgress('stream_tool_prefix_retryable_error', {
@@ -2183,6 +2371,18 @@ export function createStrippedStream(
                 const message = summary.message
                 if (summary.type === 'message_start' && message)
                   observe(() => options.onMessageStart?.(message))
+                if (
+                  summary.type === 'message_delta' &&
+                  (summary.usage || summary.stopReason)
+                )
+                  observe(() =>
+                    options.onMessageDelta?.({
+                      ...(summary.usage ? { usage: summary.usage } : {}),
+                      ...(summary.stopReason
+                        ? { stopReason: summary.stopReason }
+                        : {}),
+                    }),
+                  )
               },
             )
           const rewriteStart = rewriteNowMs()
@@ -2196,6 +2396,7 @@ export function createStrippedStream(
                 sseErrors,
                 decoded,
                 NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+                options.onRelayUpstreamError,
               ) ?? updateFinish(laneStartRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {

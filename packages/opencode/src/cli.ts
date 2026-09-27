@@ -13,6 +13,7 @@ import {
   fetchOAuthAccountIdentity,
   generateRelayToken,
   getAccountStoragePath,
+  getClaustrumMode,
   importNativeClaudeAccount,
   isOAuthAccount,
   isValidApiBaseURL,
@@ -55,6 +56,7 @@ function defaultStorage(): AccountStorage {
 
 function usage() {
   console.log(`Usage:
+  opencode-anthropic-auth setup [--yes] [--dry-run]
   opencode-anthropic-auth login [label]
   opencode-anthropic-auth api add [label]
   opencode-anthropic-auth import-native [label]
@@ -317,6 +319,9 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   const ask = deps.prompt ?? prompt
   const authorizeImpl = deps.authorize ?? authorize
   const exchangeImpl = deps.exchange ?? exchange
+  if (getClaustrumMode(await loadAccounts()) === 'claustrum') {
+    throw new Error('Exit Claustrum mode first: /claude-account local')
+  }
   // No label prompt: the token grant reports the signed-in account's email, so
   // asking the user to retype it only invites a mismatch between the label and
   // the account they actually authenticated as.
@@ -610,6 +615,10 @@ async function listAccounts() {
   }
 }
 
+import { runSetupCommand } from './setup/command.ts'
+
+export { runSetupCommand }
+
 async function main() {
   const [command, subcommandOrLabel, maybeLabel] = process.argv.slice(2)
   if (
@@ -619,6 +628,12 @@ async function main() {
     command === '-h'
   ) {
     usage()
+    return
+  }
+
+  if (command === 'setup') {
+    const code = await runSetupCommand(process.argv.slice(3))
+    if (code !== 0) process.exitCode = code
     return
   }
 

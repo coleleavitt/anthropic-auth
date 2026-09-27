@@ -12,6 +12,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { syncVersionLock, workspaceLockErrors } from './workspace-lock.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+[\w.]+)?$/
@@ -26,18 +27,29 @@ function parseArgs(argv) {
   let version = null
   let fromTag = false
   let dryRun = false
+  let checkLock = false
 
   for (const arg of args) {
     if (arg === '--from-tag') {
       fromTag = true
     } else if (arg === '--dry-run') {
       dryRun = true
+    } else if (arg === '--check-lock') {
+      checkLock = true
     } else if (!version && !arg.startsWith('-')) {
       version = arg
     } else {
       console.error(`Unknown argument: ${arg}`)
       process.exit(1)
     }
+  }
+
+  if (checkLock) {
+    if (fromTag || dryRun || version) {
+      console.error('--check-lock does not accept a version or other flags')
+      process.exit(1)
+    }
+    return { checkLock, version: null, dryRun: false }
   }
 
   if (fromTag) {
@@ -62,60 +74,83 @@ function parseArgs(argv) {
     process.exit(1)
   }
 
-  return { version, dryRun }
+  return { version, dryRun, checkLock: false }
 }
 
-const { version, dryRun } = parseArgs(process.argv)
+const { version, dryRun, checkLock } = parseArgs(process.argv)
 
-console.log(
-  `${dryRun ? '[DRY RUN] ' : ''}Syncing publishable package versions to ${version}\n`,
-)
-
-for (const pkgPath of packageJsonPaths) {
-  if (!existsSync(pkgPath)) {
-    console.error(`Package file not found: ${pkgPath}`)
-    process.exit(1)
-  }
-
-  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'))
-  const relativePath = pkgPath.slice(root.length + 1)
-
-  let changed = false
-
-  if (pkg.version === version) {
-    console.log(`${relativePath}: version already at target`)
+if (checkLock) {
+  const issues = workspaceLockErrors(root)
+  if (issues.length) {
+    console.error(`Workspace lockfile is stale:\n${issues.join('\n')}`)
+    process.exitCode = 1
   } else {
-    console.log(`${relativePath}: version ${pkg.version} → ${version}`)
-    pkg.version = version
-    changed = true
+    console.log('Workspace lockfile matches package manifests.')
   }
+} else {
+  console.log(
+    `${dryRun ? '[DRY RUN] ' : ''}Syncing publishable package versions to ${version}\n`,
+  )
 
-  if (
-    pkg.name === '@cortexkit/opencode-anthropic-auth' ||
-    pkg.name === '@cortexkit/pi-anthropic-auth'
-  ) {
-    const currentCoreVersion =
-      pkg.dependencies?.['@cortexkit/anthropic-auth-core']
-    if (currentCoreVersion !== version) {
-      console.log(
-        `${relativePath}: @cortexkit/anthropic-auth-core ${currentCoreVersion ?? '(missing)'} → ${version}`,
-      )
-      pkg.dependencies = {
-        ...pkg.dependencies,
-        '@cortexkit/anthropic-auth-core': version,
-      }
+  for (const pkgPath of packageJsonPaths) {
+    if (!existsSync(pkgPath)) {
+      console.error(`Package file not found: ${pkgPath}`)
+      process.exit(1)
+    }
+
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'))
+    const relativePath = pkgPath.slice(root.length + 1)
+
+    let changed = false
+
+    if (pkg.version === version) {
+      console.log(`${relativePath}: version already at target`)
+    } else {
+      console.log(`${relativePath}: version ${pkg.version} → ${version}`)
+      pkg.version = version
       changed = true
+    }
+
+    if (
+      pkg.name === '@cortexkit/opencode-anthropic-auth' ||
+      pkg.name === '@cortexkit/pi-anthropic-auth'
+    ) {
+      const currentCoreVersion =
+        pkg.dependencies?.['@cortexkit/anthropic-auth-core']
+      if (currentCoreVersion !== version) {
+        console.log(
+          `${relativePath}: @cortexkit/anthropic-auth-core ${currentCoreVersion ?? '(missing)'} → ${version}`,
+        )
+        pkg.dependencies = {
+          ...pkg.dependencies,
+          '@cortexkit/anthropic-auth-core': version,
+        }
+        changed = true
+      }
+    }
+
+    if (!changed) {
+      console.log(`${relativePath}: (already synced)`)
+      continue
+    }
+
+    if (!dryRun) {
+      writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8')
     }
   }
 
-  if (!changed) {
-    console.log(`${relativePath}: (already synced)`)
-    continue
+  const lockChanges = syncVersionLock(root, version, { dryRun })
+  for (const change of lockChanges) {
+    console.log(`${dryRun ? '[DRY RUN] ' : ''}bun.lock: ${change}`)
   }
-
   if (!dryRun) {
-    writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8')
+    const issues = workspaceLockErrors(root)
+    if (issues.length) {
+      throw new Error(
+        `Workspace lockfile is stale after version sync:\n${issues.join('\n')}`,
+      )
+    }
   }
-}
 
-console.log(`\n${dryRun ? '[DRY RUN] ' : ''}Done.`)
+  console.log(`\n${dryRun ? '[DRY RUN] ' : ''}Done.`)
+}

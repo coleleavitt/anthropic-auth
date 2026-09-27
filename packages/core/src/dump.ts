@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
+import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
 
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
@@ -542,7 +543,7 @@ function diffSummary(previousBodyText: string | undefined, bodyText: string) {
 
 function parseBody(bodyText: string): Record<string, unknown> | null {
   try {
-    const parsed = JSON.parse(bodyText)
+    const parsed = parseJsonRedacted(bodyText) as Record<string, unknown> | null
     return parsed != null &&
       typeof parsed === 'object' &&
       !Array.isArray(parsed)
@@ -777,7 +778,7 @@ export async function dumpRelayRequest(input: {
 
 export async function dumpResponseArtifact(
   handle: DumpHandle | null,
-  input: { status: number; message: unknown },
+  input: { status: number; message: unknown; complete?: boolean },
 ): Promise<void> {
   if (!handle) return
   const message =
@@ -786,7 +787,10 @@ export async function dumpResponseArtifact(
     !Array.isArray(input.message)
       ? (input.message as Record<string, unknown>)
       : {}
-  const artifact: Record<string, unknown> = { status: input.status }
+  const artifact: Record<string, unknown> = {
+    status: input.status,
+    stream_complete: input.complete ?? true,
+  }
   if (typeof message.id === 'string' && message.id.length > 0)
     artifact.message_id = message.id
   if (typeof message.model === 'string' && message.model.length > 0)
@@ -794,6 +798,8 @@ export async function dumpResponseArtifact(
   if (Object.hasOwn(message, 'usage')) artifact.usage = message.usage
   if (Object.hasOwn(message, 'diagnostics'))
     artifact.diagnostics = message.diagnostics
+  if (typeof message.stop_reason === 'string' && message.stop_reason.length > 0)
+    artifact.stop_reason = message.stop_reason
   try {
     await writeDumpFile(
       handle.responsePath,

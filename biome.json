@@ -1,5 +1,5 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.5.10/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
   "formatter": {
     "indentStyle": "space",
     "indentWidth": 2
@@ -19,6 +19,7 @@
     "ignoreUnknown": true,
     "includes": [
       "packages/*/src/**",
+      "!packages/opencode/src/tests/fixtures/claustrum-golden",
       "!packages/opencode/src/tui-compiled",
       "packages/*/*.json",
       "packages/*/scripts/**",

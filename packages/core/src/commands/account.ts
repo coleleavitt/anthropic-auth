@@ -1,10 +1,18 @@
-import type { AccountStorage, FallbackAccount } from '../accounts.ts'
+import type {
+  AccountStorage,
+  ClaustrumMode,
+  FallbackAccount,
+} from '../accounts.ts'
+import { getClaustrumMode, isOAuthAccount } from '../accounts.ts'
+import type { ClaustrumDetection } from '../claustrum.ts'
+import type { ClaustrumEnrollmentStatus } from '../claustrum-enrollment.ts'
 import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
 export const CLAUDE_ACCOUNT_COMMAND_NAME = 'claude-account'
 
 export type AccountCommandAction =
   | { type: 'status' }
+  | { type: 'claustrum-mode'; mode: ClaustrumMode }
   | { type: 'enable'; id: string }
   | { type: 'disable'; id: string }
   | { type: 'remove'; id: string }
@@ -12,6 +20,8 @@ export type AccountCommandAction =
   | { type: 'import-native'; label?: string; confirmed: boolean }
   | { type: 'move-up'; id: string }
   | { type: 'move-down'; id: string }
+  | { type: 'reset-backoff' }
+  | { type: 'enrollment-reset' }
   | {
       type: 'add-apikey'
       apiKey: string
@@ -22,6 +32,21 @@ export type AccountCommandAction =
   | { type: 'add-oauth-start' }
   | { type: 'add-oauth-finish'; code?: string; label?: string }
   | { type: 'usage' }
+
+export type AccountCommandResult = {
+  text: string
+  updated?: {
+    id: string
+    action: 'enable' | 'disable' | 'remove' | 'reorder' | 'reset-backoff'
+    enabled?: boolean
+    previousOrder?: string[]
+    newOrder?: string[]
+  }
+}
+
+export type ClaustrumModeTransition = (
+  mode: ClaustrumMode,
+) => Promise<AccountCommandResult>
 
 export function parseAccountCommandAction(
   argumentsText: string,
@@ -51,7 +76,15 @@ export function parseAccountCommandAction(
   }
   if (action === 'move-up' && rest) return { type: 'move-up', id: rest }
   if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
-
+  if (action === 'reset-backoff' && !rest) return { type: 'reset-backoff' }
+  if (action === 'enrollment-reset' && !rest)
+    return { type: 'enrollment-reset' }
+  if (action === 'claustrum' && !rest) {
+    return { type: 'claustrum-mode', mode: 'claustrum' }
+  }
+  if (action === 'local' && !rest) {
+    return { type: 'claustrum-mode', mode: 'local' }
+  }
   if (action === 'add-apikey' && rest) {
     let remaining = rest
     let baseURL: string | undefined
@@ -139,6 +172,93 @@ export interface AccountListItem {
   tierLabel?: string
 }
 
+export type CustodyStatusState =
+  | 'na'
+  | 'off'
+  | 'on-vault-served'
+  | 'on-vault-reauth'
+  | 'on-cold'
+  | 'unknown-identity'
+  | 'on-identity-mismatch'
+  | 'on-corrupt-binding'
+
+export function custodyStatusLabel(state: CustodyStatusState): string {
+  switch (state) {
+    case 'na':
+      return 'n/a (OpenCode-managed)'
+    case 'off':
+      return 'not enrolled'
+    case 'on-vault-served':
+      return 'vault-served'
+    case 'on-vault-reauth':
+      return 'vault reauth'
+    case 'on-cold':
+      return 'vault cold'
+    case 'unknown-identity':
+      return 'unknown identity'
+    case 'on-identity-mismatch':
+      return 'identity mismatch'
+    case 'on-corrupt-binding':
+      return 'corrupt binding'
+  }
+}
+
+export function formatEnrollmentStatus(
+  status: ClaustrumEnrollmentStatus,
+  scopedServing = false,
+): string[] {
+  const setup =
+    '- Next: Quit the host and run `bunx @cortexkit/opencode-anthropic-auth setup`'
+  switch (status.state) {
+    case 'idle':
+      return ['- Enrollment: not enrolled']
+    case 'busy':
+      return ['- Enrollment: setup is busy']
+    case 'unavailable':
+      return ['- Enrollment: temporarily unavailable']
+    case 'pending':
+      return status.requestId && /^[A-Za-z0-9_-]{1,128}$/.test(status.requestId)
+        ? [`- Enrollment: pending approval (${status.requestId})`, setup]
+        : [
+            status.requestId
+              ? '- Enrollment: pending approval'
+              : '- Enrollment: request not sent',
+            setup,
+          ]
+    case 'approved': {
+      const name = status.approvedName ?? status.proposedName
+      return /^[A-Za-z0-9_-]{1,128}$/.test(name)
+        ? [
+            `- Enrollment: approved as enrolled:${name} (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
+            ...(scopedServing ? [] : [setup]),
+          ]
+        : [
+            `- Enrollment: approved (generation ${status.tokenGeneration}${scopedServing ? '' : '; scoped serving not active yet'})`,
+            ...(scopedServing ? [] : [setup]),
+          ]
+    }
+    case 'denied':
+      return ['- Enrollment: denied by operator']
+    case 'blocked':
+      return [`- Enrollment: blocked (${status.code})`]
+  }
+}
+
+export type AccountCommandStatusProjection = {
+  claustrumDetection: string
+  claustrumEnrollment?: ClaustrumEnrollmentStatus
+  custodyMode?: 'local' | 'claustrum'
+  custodyModeKnown?: boolean
+  accounts: Array<
+    AccountListItem & {
+      claustrumGate: 'on' | 'off' | 'na'
+      vaultServed: boolean
+      vaultReauth: boolean
+      custodyState: CustodyStatusState
+    }
+  >
+}
+
 export function buildAccountList(storage: AccountStorage): AccountListItem[] {
   const list: AccountListItem[] = []
 
@@ -182,39 +302,75 @@ const USAGE_TEXT = [
   '  /claude-account remove <id>           Remove a fallback account locally',
   '  /claude-account revoke <id> --confirm Remote-revoke and disable OAuth',
   '  /claude-account import-native [label] --confirm  Import native Claude OAuth',
+  '  /claude-account claustrum             Enable Claustrum mode',
+  '  /claude-account local                 Enable local mode',
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
+  '  /claude-account reset-backoff          Clear main OAuth refresh and quota backoff',
+  '  /claude-account enrollment-reset       Clear denied/blocked state; rerun setup',
   '  /claude-account add-apikey <key>      Add an API key fallback account',
   '  /claude-account add-oauth-start       Start browser OAuth login',
   '  /claude-account add-oauth-finish [code]  Complete captured/manual OAuth flow',
 ].join('\n')
 
-export function executeAccountCommand(input: {
+export async function executeAccountCommand(input: {
   argumentsText: string
   storage: AccountStorage
-}): {
-  text: string
-  updated?: {
-    id: string
-    action: 'enable' | 'disable' | 'remove' | 'reorder'
-    enabled?: boolean
-    previousOrder?: string[]
-    newOrder?: string[]
-  }
-} {
+  claustrum?: ClaustrumDetection
+  statusProjection?: AccountCommandStatusProjection
+  path?: string
+  transition?: ClaustrumModeTransition
+  resetEnrollment?: () => Promise<AccountCommandResult>
+}): Promise<AccountCommandResult> {
   const action = parseAccountCommandAction(input.argumentsText)
   const accounts = input.storage.accounts
   const mainId = 'main'
 
   if (action.type === 'status') {
-    const list = buildAccountList(input.storage)
-    const lines = ['## Claude Accounts', '']
+    const list =
+      input.statusProjection?.accounts ?? buildAccountList(input.storage)
+    const detection =
+      input.statusProjection?.claustrumDetection ??
+      input.claustrum?.status ??
+      'unknown'
+    const lines = [
+      '## Claude Accounts',
+      '',
+      `- Custody mode: ${getClaustrumMode(input.storage)}`,
+      `- Claustrum: ${detection}`,
+      ...(input.statusProjection?.claustrumEnrollment
+        ? formatEnrollmentStatus(
+            input.statusProjection.claustrumEnrollment,
+            input.statusProjection.accounts.some(
+              (account) => account.role === 'main' && account.vaultServed,
+            ),
+          )
+        : []),
+      '',
+    ]
     for (const a of list) {
       const pct =
         a.quotaPercent != null ? ` ${Math.round(a.quotaPercent)}%` : ''
       const status = !a.enabled ? ' (disabled)' : ''
       const tier = a.tierLabel ? ` · ${a.tierLabel}` : ''
-      lines.push(`- **${a.label}** [${a.role}]${tier}${status}${pct}`)
+      const projected = input.statusProjection?.accounts.find(
+        (account) => account.id === a.id,
+      )
+      const storedAccount = input.storage.accounts.find(
+        (account) => account.id === a.id,
+      )
+      const custody = projected
+        ? custodyStatusLabel(projected.custodyState)
+        : a.id !== mainId &&
+            storedAccount &&
+            getClaustrumMode(input.storage) === 'claustrum' &&
+            isOAuthAccount(storedAccount) &&
+            storedAccount.claustrumScopedCredentialId
+          ? custodyStatusLabel('on-cold')
+          : 'local'
+      lines.push(
+        `- **${a.label}** [${a.role}]${tier}${status}${pct} · ${custody}`,
+      )
     }
     lines.push('', USAGE_TEXT)
     return { text: lines.join('\n') }
@@ -222,6 +378,24 @@ export function executeAccountCommand(input: {
 
   if (action.type === 'usage') {
     return { text: USAGE_TEXT }
+  }
+
+  if (action.type === 'claustrum-mode') {
+    if (!input.transition) {
+      return { text: 'Claustrum mode transition is unavailable.' }
+    }
+    return input.transition(action.mode)
+  }
+  if (action.type === 'enrollment-reset') {
+    if (getClaustrumMode(input.storage) !== 'claustrum') {
+      return {
+        text: 'Claustrum enrollment is available only in Claustrum mode.',
+      }
+    }
+    if (!input.resetEnrollment) {
+      return { text: 'Claustrum enrollment reset is unavailable.' }
+    }
+    return input.resetEnrollment()
   }
 
   if (action.type === 'add-apikey') {
@@ -245,6 +419,12 @@ export function executeAccountCommand(input: {
       text: action.confirmed
         ? 'import-native'
         : 'Importing may copy a keychain-protected credential into the project-neutral store. Re-run with --confirm.',
+    }
+  }
+  if (action.type === 'reset-backoff') {
+    return {
+      text: 'Main OAuth refresh and quota backoff cleared.',
+      updated: { id: 'main', action: 'reset-backoff' },
     }
   }
 
@@ -274,6 +454,15 @@ export function executeAccountCommand(input: {
     const target = accounts.find((a) => a.id === id)
     if (!target) {
       return { text: `Account "${id}" not found.` }
+    }
+    if (
+      getClaustrumMode(input.storage) === 'claustrum' &&
+      isOAuthAccount(target) &&
+      target.claustrumScopedCredentialId
+    ) {
+      return {
+        text: `Account "${target.label ?? id}" is managed by Claustrum. Disable it to stop routing, or remove it from the vault.`,
+      }
     }
     return {
       text: `Account "${target.label ?? id}" removed.`,

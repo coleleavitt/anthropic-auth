@@ -1,10 +1,16 @@
 import { describe, expect, test } from 'bun:test'
-import type { Message } from '@earendil-works/pi-ai'
+import {
+  CLAUDE_CODE_VERSION,
+  computeCcVersionSuffix,
+  type ProviderAccountUuid,
+} from '@cortexkit/anthropic-auth-core'
+import { type Context, type Message, Type } from '@earendil-works/pi-ai'
 import {
   buildAnthropicRequest,
   fromClaudeCodeToolName,
   toClaudeCodeToolName,
 } from '../convert'
+import { normalizeContext } from '../transcript.ts'
 
 function userMsg(text: string): Message {
   return { role: 'user', content: text, timestamp: 0 }
@@ -26,10 +32,14 @@ function assistantMsg(text: string): Message {
   } as Message
 }
 
-function toolCallMsg(id: string, name: string): Message {
+function toolCallMsg(
+  id: string,
+  name: string,
+  args: Record<string, unknown> = {},
+): Message {
   return {
     role: 'assistant',
-    content: [{ type: 'toolCall', id, name, arguments: {} }],
+    content: [{ type: 'toolCall', id, name, arguments: args }],
     timestamp: 0,
   } as Message
 }
@@ -44,6 +54,7 @@ function toolResultMsg(toolCallId: string, text: string): Message {
 }
 
 const defaultCache = { enabled: false, mode: 'hybrid' as const }
+const TEST_MODEL_ID = 'claude-sonnet-4-20250514'
 
 // Mirrors the shape of Pi's real prompt: instruction paragraphs followed by the
 // documentation paragraph, which is the only part Anthropic rejects in system[].
@@ -57,20 +68,43 @@ const PI_PROMPT = [
 // system[] and the first user message, so tests that assert raw conversion output
 // pass no prompt and observe messages unchanged. The split itself is covered by
 // the "Claude Code system[] shape" block below.
-async function buildMessages(messages: Message[], systemPrompt?: string) {
+async function buildMessages(
+  messages: Message[],
+  systemPrompt?: string,
+  modelId = TEST_MODEL_ID,
+) {
   const context = {
     messages,
     systemPrompt,
     tools: [],
   }
   const { body } = await buildAnthropicRequest(
-    'claude-sonnet-4-20250514',
+    modelId,
     context as any,
     undefined,
     defaultCache,
   )
   return body.messages
 }
+
+describe('fast mode model eligibility', () => {
+  test.each([
+    ['claude-opus-4-6', false],
+    ['claude-opus-4-7', false],
+    ['claude-opus-4-8', true],
+    ['claude-opus-5', true],
+    ['claude-opus-5-5', true],
+  ])('Pi sends speed only for eligible %s', async (model, enabled) => {
+    const { body } = await buildAnthropicRequest(
+      model,
+      { messages: [userMsg('hello')], tools: [] } as Context,
+      undefined,
+      defaultCache,
+      true,
+    )
+    expect(body.speed).toBe(enabled ? 'fast' : undefined)
+  })
+})
 
 describe('buildAnthropicRequest — prefill stripping', () => {
   test('strips single trailing assistant message', async () => {
@@ -530,6 +564,50 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
     expect(body.system).toHaveLength(2)
     expect(body.messages[0]).toEqual(cachedUserText('hello'))
   })
+
+  test('pins the Claude Code suffix by Pi session across compacted history', async () => {
+    const buildForSession = async (text: string, sessionId: string) =>
+      (
+        await buildAnthropicRequest(
+          TEST_MODEL_ID,
+          { messages: [userMsg(text)], systemPrompt: '', tools: [] } as any,
+          { sessionId } as any,
+          defaultCache,
+        )
+      ).body
+
+    const first = await buildForSession('messCage', 'pi-suffix-session')
+    const compacted = await buildForSession(
+      'replacement compaction summary',
+      'pi-suffix-session',
+    )
+    const other = await buildForSession(
+      'replacement compaction summary',
+      'pi-suffix-other-session',
+    )
+
+    const firstHeader = String(first.system?.[0]?.text)
+    expect(String(compacted.system?.[0]?.text)).toContain(
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messCage', CLAUDE_CODE_VERSION)};`,
+    )
+    expect(String(compacted.system?.[0]?.text)).toBe(firstHeader)
+    expect(String(other.system?.[0]?.text)).not.toBe(firstHeader)
+  })
+
+  test('recomputes the Claude Code suffix from changing first-user text without a session id', async () => {
+    const first = await buildBody([userMsg('messCage')])
+    const changed = await buildBody([userMsg('messDage')])
+    const firstHeader = String(first.system?.[0]?.text)
+    const changedHeader = String(changed.system?.[0]?.text)
+
+    expect(firstHeader).toContain(
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messCage', CLAUDE_CODE_VERSION)};`,
+    )
+    expect(changedHeader).toContain(
+      `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix('messDage', CLAUDE_CODE_VERSION)};`,
+    )
+    expect(changedHeader).not.toBe(firstHeader)
+  })
 })
 
 describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
@@ -555,6 +633,115 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
 
     expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
     expect(body.output_config).toBeUndefined()
+  })
+
+  test('adds Fable 5.1 binding controls when compacted history replays signed thinking', async () => {
+    const identity = {
+      deviceId: 'd'.repeat(64),
+      accountIdentity: 'main',
+      accountUuid: 'account-uuid' as ProviderAccountUuid,
+      sessionId: 'identity-session',
+    }
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      {
+        messages: [
+          userMsg('compaction summary'),
+          thinkingToolMsg('reason', 'signature', 'tool_1', {
+            model: 'claude-fable-5-1',
+          }),
+          toolResultMsg('tool_1', 'result'),
+          userMsg('continue'),
+        ],
+        systemPrompt: 'test',
+        tools: [],
+      } as any,
+      { sessionId: 'pi-fable-5-1-binding' } as any,
+      defaultCache,
+      false,
+      identity,
+      { thinkingPrefixMismatchBehavior: 'drop_block' },
+    )
+
+    expect(body.thinking as Record<string, unknown>).toEqual({
+      type: 'adaptive',
+      display: 'summarized',
+      block_binding: { prefix_mismatch_behavior: 'drop_block' },
+    })
+  })
+
+  test('injects Pi effort changes before their user turns', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      {
+        messages: [
+          userMsg('first'),
+          assistantMsg('first answer'),
+          userMsg('second'),
+        ],
+        systemPrompt: 'test',
+        tools: [],
+      } as any,
+      { sessionId: 'pi-fable-5-1-effort', reasoning: 'high' } as any,
+      defaultCache,
+      false,
+      undefined,
+      {
+        effortTransitions: [
+          { afterAssistantMessages: 0, effort: 'low' },
+          { afterAssistantMessages: 1, effort: 'high' },
+        ],
+      },
+    )
+
+    expect(body.output_config).toEqual({ effort: 'low' })
+    expect(body.messages[2]).toEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'high' },
+    })
+  })
+
+  test('does not add Fable 5.1 binding controls to an API-key request', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      {
+        messages: [
+          userMsg('compaction summary'),
+          thinkingToolMsg('reason', 'signature', 'tool_1', {
+            model: 'claude-fable-5-1',
+          }),
+          toolResultMsg('tool_1', 'result'),
+          userMsg('continue'),
+        ],
+        systemPrompt: 'test',
+        tools: [],
+      } as any,
+      { sessionId: 'pi-fable-5-1-api-route' } as any,
+      defaultCache,
+    )
+
+    expect(
+      (body.thinking as Record<string, unknown>).block_binding,
+    ).toBeUndefined()
+  })
+
+  test('does not add Fable 5.1 binding controls on a first turn', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { sessionId: 'pi-fable-5-1-first-turn' } as any,
+      defaultCache,
+      false,
+      {
+        deviceId: 'd'.repeat(64),
+        accountIdentity: 'main',
+        accountUuid: 'account-uuid' as ProviderAccountUuid,
+        sessionId: 'identity-session',
+      },
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
   })
 
   test('uses adaptive thinking + effort for adaptive non-5 models (Opus 4.8)', async () => {
@@ -844,11 +1031,25 @@ function thinkingToolMsg(
   thinking: string,
   signature: string,
   toolId: string,
+  options: {
+    provider?: string
+    api?: string
+    model?: string
+    redacted?: boolean
+  } = {},
 ): Message {
   return {
     role: 'assistant',
+    provider: options.provider ?? 'anthropic',
+    api: options.api ?? 'cortexkit-anthropic-messages',
+    model: options.model ?? TEST_MODEL_ID,
     content: [
-      { type: 'thinking', thinking, thinkingSignature: signature },
+      {
+        type: 'thinking',
+        thinking,
+        thinkingSignature: signature,
+        redacted: options.redacted,
+      },
       { type: 'toolCall', id: toolId, name: 'Bash', arguments: {} },
     ],
     timestamp: 0,
@@ -888,6 +1089,7 @@ describe('convertMessages — signed thinking blocks', () => {
           summary: [{ type: 'summary_text', text: 'gpt reasoning summary' }],
         }),
         'tool_1',
+        { provider: 'openai-codex', model: 'gpt-5.6-sol' },
       ),
       toolResultMsg('tool_1', 'out1'),
     ])
@@ -901,6 +1103,137 @@ describe('convertMessages — signed thinking blocks', () => {
     })
     expect(JSON.stringify(messages)).not.toContain('gAAAAABqKqht')
     expect(JSON.stringify(messages)).not.toContain('gpt reasoning summary')
+  })
+
+  test('drops another provider signature but preserves its visible reasoning as text', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('deepseek reasoning', 'reasoning_content', 'tool_1', {
+        provider: 'opencode-go',
+        model: 'deepseek-v4-flash',
+      }),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block).toEqual([
+      { type: 'text', text: 'deepseek reasoning' },
+      {
+        type: 'tool_use',
+        id: 'tool_1',
+        name: 'Bash',
+        input: {},
+      },
+    ])
+  })
+
+  test('drops a different Anthropic model signature but preserves visible reasoning', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('old model reasoning', 'sig-old', 'tool_1', {
+        model: 'claude-opus-4-8',
+      }),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block).toEqual([
+      { type: 'text', text: 'old model reasoning' },
+      {
+        type: 'tool_use',
+        id: 'tool_1',
+        name: 'Bash',
+        input: {},
+      },
+    ])
+  })
+
+  test('drops a different API signature even when provider and model match', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('Bedrock reasoning', 'sig-bedrock', 'tool_1', {
+        api: 'bedrock-converse-stream',
+      }),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({ type: 'text', text: 'Bedrock reasoning' })
+    expect(block[1]?.type).toBe('tool_use')
+  })
+
+  test('accepts same-model signatures from Pi native Anthropic history', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('native reasoning', 'sig-native', 'tool_1', {
+        api: 'anthropic-messages',
+      }),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({
+      type: 'thinking',
+      thinking: 'native reasoning',
+      signature: 'sig-native',
+    })
+  })
+
+  test('drops foreign redacted thinking because its payload is opaque', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg(
+        '[Reasoning redacted]',
+        'foreign-redacted-data',
+        'tool_1',
+        { model: 'claude-opus-4-8', redacted: true },
+      ),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block).toEqual([
+      {
+        type: 'tool_use',
+        id: 'tool_1',
+        name: 'Bash',
+        input: {},
+      },
+    ])
+  })
+
+  test('round-trips same-model redacted thinking as an opaque redacted block', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg(
+        '[Reasoning redacted]',
+        'encrypted-redacted-data',
+        'tool_1',
+        { redacted: true },
+      ),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({
+      type: 'redacted_thinking',
+      data: 'encrypted-redacted-data',
+    })
+  })
+
+  test('preserves same-model omitted thinking when only its signature is visible', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('', 'sig-omitted', 'tool_1'),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({
+      type: 'thinking',
+      thinking: '',
+      signature: 'sig-omitted',
+    })
   })
 
   test('downgrades a signed thinking block with a lone surrogate to sanitized text', async () => {
@@ -947,5 +1280,308 @@ describe('convertMessages — signed thinking blocks', () => {
       thinking: 'clean reason',
       signature: 'sig-B',
     })
+  })
+})
+
+describe('buildAnthropicRequest — host system prompt shapes', () => {
+  // Oh My Pi types Context.systemPrompt as ordered prompt blocks and hands the
+  // array straight to the provider, where `.trim()` threw and no request was
+  // ever built (issue #201). Blocks must classify exactly like the joined text.
+  // The cast is the point of these cases: the host contradicts the `string`
+  // declaration in Pi's Context type at runtime.
+  async function buildBody(systemPrompt: unknown) {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        messages: [userMsg('hello')],
+        systemPrompt,
+        tools: [],
+      } as unknown as Context,
+      undefined,
+      defaultCache,
+    )
+    return body
+  }
+
+  test('splits an ordered block array exactly like the joined prompt', async () => {
+    const blocks = PI_PROMPT.split('\n\n')
+    expect(blocks).toHaveLength(3)
+
+    const fromBlocks = await buildBody(blocks)
+    const fromString = await buildBody(PI_PROMPT)
+
+    expect(fromBlocks.system).toEqual(fromString.system)
+    expect(fromBlocks.messages).toEqual(fromString.messages)
+    expect(String(fromBlocks.system?.[2]?.text)).toContain('KEEP TWO')
+    const content = fromBlocks.messages[0]?.content as Array<
+      Record<string, unknown>
+    >
+    expect(String(content[0]?.text)).toContain('MOVE THIS')
+  })
+
+  test('reads structured text blocks for their text', async () => {
+    const body = await buildBody(
+      PI_PROMPT.split('\n\n').map((text) => ({ type: 'text', text })),
+    )
+    expect(String(body.system?.[2]?.text)).toContain('KEEP ONE')
+    const content = body.messages[0]?.content as Array<Record<string, unknown>>
+    expect(String(content[0]?.text)).toContain('MOVE THIS')
+  })
+
+  test('drops non-text blocks instead of flattening their metadata', async () => {
+    const paragraphs = PI_PROMPT.split('\n\n')
+    const body = await buildBody([
+      { type: 'text', text: paragraphs[0] },
+      { type: 'image', text: 'IMAGE METADATA' },
+      { type: 'tool_use', name: 'read', text: 'TOOL METADATA' },
+      paragraphs[1],
+      { type: 'text', text: paragraphs[2] },
+    ])
+
+    const sent = JSON.stringify(body)
+    expect(sent).toContain('KEEP ONE')
+    expect(sent).toContain('KEEP TWO')
+    expect(sent).toContain('MOVE THIS')
+    expect(sent).not.toContain('IMAGE METADATA')
+    expect(sent).not.toContain('TOOL METADATA')
+  })
+
+  test('treats an empty block list as no prompt', async () => {
+    const body = await buildBody([])
+    expect(body.system).toHaveLength(2)
+    // Fork (f6f8a23): a plain-text final user turn carries the cache breakpoint.
+    expect(body.messages[0]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } },
+      ],
+    })
+  })
+})
+
+describe('buildAnthropicRequest — cache breakpoint budget', () => {
+  // Anthropic accepts at most four cache breakpoints per request, and this
+  // converter places four itself: the last tool, the last system block, the
+  // cached prompt block on the first user message, and the last user block.
+  // Adding the top-level control on top of them made five and Anthropic
+  // rejected the request before it reached the model (issue #201).
+  async function buildBody(cache: {
+    enabled: boolean
+    mode: 'explicit' | 'automatic' | 'hybrid'
+  }) {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        messages: [userMsg('hello')],
+        systemPrompt: PI_PROMPT,
+        tools: [
+          {
+            name: 'read',
+            description: 'read a file',
+            parameters: { properties: {}, required: [] },
+          },
+        ],
+      } satisfies Context,
+      undefined,
+      cache,
+    )
+    return body
+  }
+
+  const countBreakpoints = (body: unknown) =>
+    JSON.stringify(body).split('"cache_control"').length - 1
+
+  test('places four breakpoints and no top-level control by default', async () => {
+    const body = await buildBody({ enabled: false, mode: 'hybrid' })
+    expect(countBreakpoints(body)).toBe(4)
+    expect(body.cache_control).toBeUndefined()
+  })
+
+  test('keeps hybrid within the budget by extending those four to 1h', async () => {
+    const body = await buildBody({ enabled: true, mode: 'hybrid' })
+    expect(countBreakpoints(body)).toBe(4)
+    expect(body.cache_control).toBeUndefined()
+    expect(body.system?.at(-1)?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(body.tools?.at(-1)?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+  })
+
+  test('spends the whole budget on the top-level control in automatic', async () => {
+    const body = await buildBody({ enabled: true, mode: 'automatic' })
+    expect(countBreakpoints(body)).toBe(1)
+    expect(body.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+    expect(body.system?.at(-1)?.cache_control).toBeUndefined()
+    expect(body.tools?.at(-1)?.cache_control).toBeUndefined()
+  })
+
+  // A tool parameter or tool argument that happens to be named cache_control is
+  // caller data, not a breakpoint. A deep walk would delete it in automatic and
+  // write ttl into it in hybrid/explicit, silently corrupting the tool contract.
+  test.each(['explicit', 'automatic', 'hybrid'] as const)(
+    'leaves a tool parameter named cache_control untouched in %s',
+    async (mode) => {
+      const { body } = await buildAnthropicRequest(
+        TEST_MODEL_ID,
+        {
+          messages: [
+            userMsg('hello'),
+            toolCallMsg('tool_1', 'store', {
+              cache_control: { type: 'ephemeral' },
+            }),
+            toolResultMsg('tool_1', 'stored'),
+          ],
+          systemPrompt: PI_PROMPT,
+          tools: [
+            {
+              name: 'store',
+              description: 'store a value',
+              parameters: {
+                properties: {
+                  cache_control: { type: 'string', description: 'a header' },
+                },
+                required: [],
+              },
+            },
+          ],
+        } satisfies Context,
+        undefined,
+        { enabled: true, mode },
+      )
+
+      const schema = body.tools?.[0]?.input_schema as {
+        properties: Record<string, unknown>
+      }
+      expect(schema.properties.cache_control).toEqual({
+        type: 'string',
+        description: 'a header',
+      })
+
+      const assistant = body.messages[1] as {
+        content: Array<Record<string, unknown>>
+      }
+      expect(assistant.content[0]?.input).toEqual({
+        cache_control: { type: 'ephemeral' },
+      })
+    },
+  )
+})
+
+describe('Pi normalized transcripts', () => {
+  test('preserves the same prompt, tools and cache boundaries as raw host context', async () => {
+    const raw: Context = {
+      systemPrompt: 'PRESERVE_SYSTEM_INSTRUCTION_8642',
+      tools: [
+        {
+          name: 'preserve_tool',
+          description: 'Keep this tool',
+          parameters: Type.Object({}),
+        },
+      ],
+      messages: [userMsg('Hello')],
+    }
+    const cache = { enabled: false, mode: 'explicit' as const }
+    const direct = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      raw,
+      undefined,
+      cache,
+    )
+    const normalized = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      normalizeContext(raw),
+      undefined,
+      cache,
+    )
+    expect(normalized.bodyText).toContain('PRESERVE_SYSTEM_INSTRUCTION_8642')
+    expect(normalized.body.tools?.map((tool) => tool.name)).toEqual([
+      'preserve_tool',
+    ])
+    expect(normalized.body.messages).toEqual(direct.body.messages)
+    expect(normalized.body.tools).toEqual(direct.body.tools)
+    expect(normalized.body.system).toEqual(direct.body.system)
+  })
+
+  test('replays named prompt replacements and tool additions/removals without losing instructions', async () => {
+    const transcript = normalizeContext({
+      messages: [
+        {
+          role: 'system',
+          content: 'BASE_INSTRUCTION',
+          sections: { rules: 'RETIRED_SECTION_8642', stable: 'STABLE_SECTION' },
+          toolsAdded: [
+            {
+              name: 'old_tool',
+              description: 'Old',
+              parameters: Type.Object({}),
+            },
+          ],
+          timestamp: 0,
+        },
+        userMsg('Hello'),
+        {
+          role: 'system',
+          content: 'LATER_INSTRUCTION',
+          sections: { rules: 'REPLACED_SECTION_8642' },
+          toolsRemoved: [{ name: 'old_tool' }],
+          toolsAdded: [
+            {
+              name: 'new_tool',
+              description: 'New',
+              parameters: Type.Object({}),
+            },
+          ],
+          timestamp: 1,
+        },
+      ],
+    })
+    const result = await buildAnthropicRequest(
+      'claude-fable-5-1',
+      transcript,
+      undefined,
+      { enabled: false, mode: 'explicit' },
+    )
+    for (const instruction of [
+      'BASE_INSTRUCTION',
+      'STABLE_SECTION',
+      'LATER_INSTRUCTION',
+      'REPLACED_SECTION_8642',
+    ])
+      expect(result.bodyText).toContain(instruction)
+    expect(result.bodyText).not.toContain('RETIRED_SECTION_8642')
+    expect(result.body.tools?.map((tool) => tool.name)).toEqual(['new_tool'])
+    expect(
+      result.body.messages.every((message) => message.role !== 'system'),
+    ).toBe(true)
+  })
+})
+
+describe('buildAnthropicRequest — Opus 5.5 thinking', () => {
+  test('requests summarized adaptive thinking for Opus 5.5 without reasoning', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toBeUndefined()
+  })
+
+  test('maps reasoning to output_config effort for Opus 5.5', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'medium' } as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'medium' })
   })
 })

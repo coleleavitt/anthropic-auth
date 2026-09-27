@@ -1,6 +1,7 @@
 import {
   authorize,
   type CatalogModel,
+  CLAUDE_FABLE_MYTHOS_5_1_PRICING,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
@@ -8,10 +9,15 @@ import {
   CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
   CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
   CLAUDE_OPUS_5_5_MODEL_ID,
+  type ClaustrumScopedClient,
   exchange,
   findSharedAccountByCredential,
   getClaudeCodeVersion,
+  getClaustrumMode,
+  isClaudeFableOrMythos51Model,
+  loadAccounts,
   loadSharedAccountStore,
+  type MidConversationEffortTransition,
   resolveAnthropicModelCatalog,
   resolveModelCost,
   startOAuthLoopbackSession,
@@ -20,23 +26,40 @@ import {
 import type {
   OAuthCredentials,
   OAuthLoginCallbacks,
+  Provider,
+  SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import type {
+  ExtensionAPI,
+  ProviderConfig,
+} from '@earendil-works/pi-coding-agent'
 
 import { adoptSharedCredentialIntoHostAuth } from './adopt-host-credential.ts'
 import { registerCommands } from './commands.ts'
+import { createPiCustodyCommands, requirePiEnrollment } from './custody.ts'
 import {
+  collectPiEffortHistory,
+  deriveContextEntries,
+} from './effort-history.ts'
+import { getPiAccountStoragePath } from './paths.ts'
+import {
+  assertLocalAuthentication,
   currentSharedAccount,
   forgetDeadRefreshTokens,
   refreshAnthropicToken,
   sharedCredentialIsLive,
 } from './shared-refresh.ts'
-import { streamCortexKitAnthropic } from './stream.ts'
+import {
+  closePiScopedRuntime,
+  getPiScopedRuntime,
+  streamCortexKitAnthropic,
+} from './stream.ts'
 import { errorHttpStatus, withAuthSpan } from './trace-bridge.ts'
 
 export async function loginAnthropic(
   callbacks: OAuthLoginCallbacks,
 ): Promise<OAuthCredentials> {
+  await assertLocalAuthentication()
   let loopback: Awaited<ReturnType<typeof startOAuthLoopbackSession>> | null =
     null
   let auth: Awaited<ReturnType<typeof authorize>>
@@ -84,6 +107,7 @@ export async function loginAnthropic(
   if (result.type !== 'success') {
     throw new Error('Anthropic OAuth exchange failed')
   }
+  await assertLocalAuthentication()
   const now = Date.now()
   await updateSharedAccountStore((store) => {
     const credential = {
@@ -162,21 +186,26 @@ function fallbackModel(
 // Reached only when the live catalog and its cache both fail. Deliberately not
 // synced with the live registry — it is the shipped floor, not a mirror.
 export const FALLBACK_MODEL_CATALOG: CatalogModel[] = [
-  ...Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((model) => ({
-    ...fallbackModel(
-      model.id,
-      model.name,
-      CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
-      CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
-      model.limited,
-    ),
-    cost: {
-      input: CLAUDE_FABLE_MYTHOS_5_PRICING.input,
-      output: CLAUDE_FABLE_MYTHOS_5_PRICING.output,
-      cacheRead: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheRead,
-      cacheWrite: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheWrite5m,
-    },
-  })),
+  ...Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((model) => {
+    const pricing = isClaudeFableOrMythos51Model(model.id)
+      ? CLAUDE_FABLE_MYTHOS_5_1_PRICING
+      : CLAUDE_FABLE_MYTHOS_5_PRICING
+    return {
+      ...fallbackModel(
+        model.id,
+        model.name,
+        CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
+        CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
+        model.limited,
+      ),
+      cost: {
+        input: pricing.input,
+        output: pricing.output,
+        cacheRead: pricing.cacheRead,
+        cacheWrite: pricing.cacheWrite5m,
+      },
+    }
+  }),
   fallbackModel(
     CLAUDE_OPUS_5_5_MODEL_ID,
     'Claude Opus 5.5',
@@ -227,14 +256,69 @@ export async function resolvePiModelCatalog(): Promise<CatalogModel[]> {
   })
 }
 
-export default async function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
-  registerCommands(pi)
+export default async function cortexKitPiAnthropicAuth(
+  pi: ExtensionAPI,
+  options: {
+    connectScoped?: () => Promise<ClaustrumScopedClient>
+    pollIntervalMs?: number
+  } = {},
+) {
+  const storagePath = getPiAccountStoragePath()
+  registerCommands(
+    pi,
+    createPiCustodyCommands({
+      storagePath,
+      reconfigure: configureProvider,
+      connect: options.connectScoped,
+    }),
+  )
+  const effortHistoryBySession = new Map<
+    string,
+    MidConversationEffortTransition[]
+  >()
+  pi.on('turn_start', async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (!sessionId) return
+    // This hook only adds mid-conversation effort markers to Fable/Mythos 5.1
+    // requests. A host whose session entries do not match what this reads must
+    // cost the session its transitions and nothing else: the handler runs
+    // before every turn, and an exception here surfaced as a per-turn extension
+    // error while collecting no effort history at all (issue #200).
+    //
+    // The catch stays quiet: `ExtensionAPI` carries no log surface on either
+    // host, and writing to stdout from a per-turn hook corrupts the host's
+    // rendering — which is the same per-turn noise this fix removes. The
+    // degraded state is observable in the request: no effort markers.
+    let transitions: MidConversationEffortTransition[]
+    try {
+      const branch = ctx.sessionManager.getBranch()
+      transitions = collectPiEffortHistory(deriveContextEntries(branch), branch)
+    } catch {
+      transitions = []
+    }
+    effortHistoryBySession.delete(sessionId)
+    effortHistoryBySession.set(sessionId, transitions)
+    while (effortHistoryBySession.size > 128) {
+      const oldest = effortHistoryBySession.keys().next().value
+      if (oldest) effortHistoryBySession.delete(oldest)
+      else break
+    }
+  })
+  pi.on('session_shutdown', async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (sessionId) effortHistoryBySession.delete(sessionId)
+    closePiScopedRuntime(storagePath)
+  })
 
   // Pi's pre-flight gate (`hasConfiguredAuth`) reads only Pi's own auth file,
   // while our request path reads the shared store, so a cold `auth.json` would
   // refuse a machine that is fully authenticated. Seed it before the provider
   // is registered, and never let a failure here block registration.
-  await adoptSharedCredentialIntoHostAuth().catch(() => undefined)
+  // Under Claustrum custody Pi must hold no local OAuth credential, so the
+  // host auth file is left alone.
+  if (getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum') {
+    await adoptSharedCredentialIntoHostAuth().catch(() => undefined)
+  }
 
   // Warm the live Claude Code version so request fingerprints track the
   // published CLI instead of the compiled floor; Anthropic hard-rejects
@@ -243,7 +327,7 @@ export default async function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
 
   const catalog = await resolvePiModelCatalog()
 
-  pi.registerProvider('anthropic', {
+  const configuration: ProviderConfig = {
     name: 'Anthropic (CortexKit OAuth)',
     baseUrl: 'https://api.anthropic.com',
     api: 'cortexkit-anthropic-messages',
@@ -262,8 +346,73 @@ export default async function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
       refreshToken: refreshAnthropicToken,
       getApiKey: (credentials) => credentials.access,
     },
-    streamSimple: streamCortexKitAnthropic,
-  })
+    streamSimple: (model, context, options) =>
+      streamCortexKitAnthropic(
+        model,
+        context,
+        options,
+        options?.sessionId
+          ? effortHistoryBySession.get(options.sessionId)
+          : undefined,
+      ),
+  }
+
+  async function configureProvider() {
+    if (getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum') {
+      closePiScopedRuntime(storagePath)
+      pi.registerProvider('anthropic', configuration)
+      return
+    }
+    const streamSimple = configuration.streamSimple
+    if (!streamSimple)
+      throw new Error('Anthropic stream implementation is unavailable')
+    const configured = async () => {
+      if (getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum')
+        return false
+      await requirePiEnrollment()
+      return true
+    }
+    const provider: Provider = {
+      id: 'anthropic',
+      name: 'Anthropic (Claustrum)',
+      baseUrl: 'https://api.anthropic.com',
+      auth: {
+        // Native ambient auth avoids fake keys and local OAuth refresh. Pi refuses
+        // a leftover stored OAuth credential because this provider has no OAuth
+        // handler; setup must obtain consent before removing that local entry.
+        apiKey: {
+          name: 'Claustrum',
+          check: async () =>
+            (await configured())
+              ? { type: 'api_key', source: 'Claustrum' }
+              : undefined,
+          resolve: async () =>
+            (await configured())
+              ? { auth: {}, source: 'Claustrum' }
+              : undefined,
+        },
+      },
+      getModels: () =>
+        (configuration.models ?? []).map((model) => ({
+          ...model,
+          provider: 'anthropic',
+          api: model.api ?? 'cortexkit-anthropic-messages',
+          baseUrl: model.baseUrl ?? 'https://api.anthropic.com',
+        })),
+      // Preserve the legacy provider's simplified option surface for raw calls.
+      stream: (model, context, options) =>
+        streamSimple(model, context, options as SimpleStreamOptions),
+      streamSimple,
+    }
+    pi.registerProvider(provider)
+    getPiScopedRuntime(storagePath, {
+      ...(options.connectScoped && { connect: options.connectScoped }),
+      ...(options.pollIntervalMs !== undefined && {
+        pollIntervalMs: options.pollIntervalMs,
+      }),
+    }).start()
+  }
+  await configureProvider()
 }
 
 export { forgetDeadRefreshTokens, refreshAnthropicToken }

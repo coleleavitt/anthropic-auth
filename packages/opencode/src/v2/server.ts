@@ -570,10 +570,11 @@ export async function setup(context: V2Context) {
           lastReceivedId?: number
           sessionId?: string
         }) => ({
-          messages: drainNotifications(
-            input.lastReceivedId ?? 0,
-            input.sessionId,
-          ),
+          // Upstream scopes the shared notification queue to sessions; an
+          // unscoped drain could expose another project's pending dialog.
+          messages: input.sessionId
+            ? drainNotifications(input.lastReceivedId ?? 0, input.sessionId)
+            : [],
         }),
         apply: async (input: Parameters<typeof local.apply>[0]) =>
           local.apply(input),

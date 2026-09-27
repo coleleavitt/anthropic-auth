@@ -1,10 +1,9 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import {
   getCachedClaudeCodeVersion,
   getClaudeCodeUserAgent,
 } from './claude-version.ts'
 import {
-  CLAUDE_CODE_BUILD_HASH,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_STAINLESS_PACKAGE_VERSION,
   CLAUDE_CODE_STAINLESS_RUNTIME_VERSION,
@@ -18,9 +17,14 @@ import {
   getOrCreateDeviceId,
 } from './device-identity.ts'
 
+export type ProviderAccountUuid = string & {
+  readonly __providerAccountUuid: unique symbol
+}
+
 export type ClaudeCodeIdentity = {
   deviceId: string
-  accountUuid?: string
+  accountIdentity?: string
+  accountUuid?: ProviderAccountUuid
   sessionId: string
 }
 
@@ -28,6 +32,19 @@ const IDENTITY_CACHE_LIMIT = 1_000
 const identityCache = new Map<string, ClaudeCodeIdentity>()
 let installationDeviceId = randomBytes(32).toString('hex')
 let installationDeviceIdPromise: Promise<string> | null = null
+const identitySeeds = new WeakMap<ClaudeCodeIdentity, string>()
+
+/**
+ * Per-identity device id. Upstream never shares a device id between distinct
+ * account identities; the fork keeps it stable across restarts by deriving it
+ * from the persistent installation secret (device-identity.ts) and the
+ * identity's cache key instead of minting a random one per process.
+ */
+function deriveDeviceId(seed: string) {
+  return createHash('sha256')
+    .update(`${installationDeviceId}\0${seed}`)
+    .digest('hex')
+}
 
 export function setBounded<K, V>(
   map: Map<K, V>,
@@ -49,7 +66,10 @@ export function configureClaudeCodeInstallationDeviceId(deviceId: string) {
     )
   }
   installationDeviceId = deviceId
-  for (const identity of identityCache.values()) identity.deviceId = deviceId
+  for (const identity of identityCache.values()) {
+    const seed = identitySeeds.get(identity)
+    if (seed !== undefined) identity.deviceId = deriveDeviceId(seed)
+  }
 }
 
 /** Load the project-neutral persistent device identity exactly once per process. */
@@ -68,28 +88,112 @@ export async function loadClaudeCodeInstallationDeviceId(
   return installationDeviceIdPromise
 }
 
+function clearCachedAccountUuid(
+  key: string,
+  identity: ClaudeCodeIdentity,
+): ClaudeCodeIdentity {
+  if (!identity.accountUuid) return identity
+  if (identityCache.get(key) !== identity) {
+    return { ...identity, accountUuid: undefined }
+  }
+  const cleared = { ...identity, accountUuid: undefined }
+  setBounded(identityCache, key, cleared)
+  return cleared
+}
+
 export function getClaudeCodeIdentity(seed: string): ClaudeCodeIdentity {
   const cacheKey = seed || 'anonymous'
   const cached = identityCache.get(cacheKey)
   if (cached) return cached
 
   const identity: ClaudeCodeIdentity = {
-    deviceId: installationDeviceId,
+    deviceId: deriveDeviceId(cacheKey),
     sessionId: randomUUID(),
   }
+  identitySeeds.set(identity, cacheKey)
   setBounded(identityCache, cacheKey, identity)
   return identity
 }
 
 const BOOTSTRAP_IDENTITY_CACHE_TTL_MS = 24 * 60 * 60_000
 const BOOTSTRAP_IDENTITY_NEGATIVE_TTL_MS = 5 * 60_000
-const bootstrapFetches = new Map<string, Promise<string | null>>()
+const bootstrapFetches = new Map<string, Promise<ProviderAccountUuid | null>>()
 const bootstrapResults = new Map<
   string,
-  { accountUuid: string | null; expiresAt: number }
+  { accountUuid: ProviderAccountUuid | null; expiresAt: number }
 >()
 
-async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
+export function resetClaudeCodeIdentityCachesForTest() {
+  // Also rotate the installation secret (without reloading it from disk) so a
+  // reset slot cannot inherit the previous test's device id.
+  installationDeviceId = randomBytes(32).toString('hex')
+  installationDeviceIdPromise = Promise.resolve(installationDeviceId)
+  identityCache.clear()
+  bootstrapFetches.clear()
+  bootstrapResults.clear()
+}
+
+function compatibilityCacheKey(accessToken: string) {
+  return `compat:${accessToken || 'anonymous'}`
+}
+
+function explicitCacheKey(accountIdentity: string) {
+  return `identity:${accountIdentity}`
+}
+
+function accountCacheKey(accountUuid: string, accountIdentity: string) {
+  return `account:${accountUuid}:${accountIdentity}`
+}
+
+function adoptCachedIdentity(
+  cached: ClaudeCodeIdentity | undefined,
+  accountIdentity: string,
+  accountUuid?: ProviderAccountUuid,
+) {
+  if (!cached) return undefined
+  if (
+    cached.accountIdentity !== undefined &&
+    cached.accountIdentity !== accountIdentity
+  ) {
+    return undefined
+  }
+  if (
+    accountUuid !== undefined &&
+    cached.accountUuid !== undefined &&
+    cached.accountUuid !== accountUuid
+  ) {
+    return undefined
+  }
+  if (
+    cached.accountIdentity === accountIdentity &&
+    (accountUuid === undefined || cached.accountUuid === accountUuid)
+  ) {
+    return cached
+  }
+  return {
+    ...cached,
+    accountIdentity,
+    ...(accountUuid !== undefined && { accountUuid }),
+  }
+}
+
+function cacheAccountIdentity(
+  identity: ClaudeCodeIdentity,
+  accountIdentity: string,
+  accountUuid: ProviderAccountUuid,
+) {
+  setBounded(identityCache, explicitCacheKey(accountIdentity), identity)
+  setBounded(
+    identityCache,
+    accountCacheKey(accountUuid, accountIdentity),
+    identity,
+  )
+}
+
+async function fetchClaudeCodeAccountUuid(
+  accessToken: string,
+  model?: string,
+): Promise<ProviderAccountUuid | null> {
   if (!accessToken.startsWith('sk-ant-oat')) return null
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 5_000)
@@ -114,7 +218,9 @@ async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
       oauth_account?: { account_uuid?: unknown }
     } | null
     const accountUuid = data?.oauth_account?.account_uuid
-    return typeof accountUuid === 'string' && accountUuid ? accountUuid : null
+    return typeof accountUuid === 'string' && accountUuid
+      ? (accountUuid as ProviderAccountUuid)
+      : null
   } catch {
     return null
   } finally {
@@ -122,37 +228,114 @@ async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
   }
 }
 
+/** Use the identity already verified by the credential custodian, without an
+ * additional bootstrap request carrying a previously authorized token. */
+export function getClaudeCodeIdentityForVerifiedAccount(
+  accountIdentity: string,
+  accountUuid: ProviderAccountUuid,
+): ClaudeCodeIdentity {
+  if (!accountIdentity.trim() || !accountUuid.trim()) {
+    throw new Error('A verified provider account identity is required')
+  }
+  const base =
+    identityCache.get(accountCacheKey(accountUuid, accountIdentity)) ??
+    getClaudeCodeIdentity(explicitCacheKey(accountIdentity))
+  const identity = { ...base, accountIdentity, accountUuid }
+  cacheAccountIdentity(identity, accountIdentity, accountUuid)
+  return identity
+}
+
 export async function resolveClaudeCodeIdentity(
   accessToken: string,
-  model?: string,
+  model: string | undefined,
+  accountIdentity: string | undefined,
   deviceIdentityOptions: DeviceIdentityOptions = {},
 ): Promise<ClaudeCodeIdentity> {
   await loadClaudeCodeInstallationDeviceId(deviceIdentityOptions)
-  const identity = getClaudeCodeIdentity(accessToken)
-  if (!accessToken.startsWith('sk-ant-oat')) return identity
-
-  const now = Date.now()
-  const cachedResult = bootstrapResults.get(accessToken)
-  if (cachedResult && cachedResult.expiresAt > now) {
-    if (!cachedResult.accountUuid) return identity
-    const accountCacheKey = `account:${cachedResult.accountUuid}`
-    const accountIdentity = identityCache.get(accountCacheKey)
-    if (accountIdentity) {
-      setBounded(identityCache, accessToken, accountIdentity)
-      return accountIdentity
-    }
+  const stableAccountIdentity = accountIdentity?.trim() || undefined
+  const cacheKey = stableAccountIdentity
+    ? explicitCacheKey(stableAccountIdentity)
+    : compatibilityCacheKey(accessToken)
+  let identity: ClaudeCodeIdentity
+  if (stableAccountIdentity) {
+    const cachedIdentity = adoptCachedIdentity(
+      identityCache.get(cacheKey) ?? identityCache.get(accessToken),
+      stableAccountIdentity,
+    )
+    identity = cachedIdentity ?? getClaudeCodeIdentity(cacheKey)
+    identity = adoptCachedIdentity(identity, stableAccountIdentity) ?? identity
+    setBounded(identityCache, cacheKey, identity)
+  } else {
+    identity =
+      identityCache.get(cacheKey) ??
+      identityCache.get(accessToken) ??
+      getClaudeCodeIdentity(cacheKey)
+    setBounded(identityCache, cacheKey, identity)
+    setBounded(identityCache, accessToken, identity)
   }
 
-  let fetchPromise = bootstrapFetches.get(accessToken)
+  if (!accessToken.startsWith('sk-ant-oat')) {
+    return clearCachedAccountUuid(cacheKey, identity)
+  }
+
+  const now = Date.now()
+  // A slot-stable identity survives account replacement; bootstrap is the
+  // account lookup that must be repeated for each credential presented to it.
+  const bootstrapKey = `${cacheKey}:${accessToken}`
+  const cachedResult = bootstrapResults.get(bootstrapKey)
+  if (cachedResult && cachedResult.expiresAt > now) {
+    if (!cachedResult.accountUuid) {
+      identity = clearCachedAccountUuid(cacheKey, identity)
+      return identity
+    }
+    if (!stableAccountIdentity) {
+      if (identity.accountUuid === cachedResult.accountUuid) return identity
+      identity = { ...identity, accountUuid: cachedResult.accountUuid }
+      setBounded(identityCache, bootstrapKey, identity)
+      return identity
+    }
+    const cachedAccountIdentity = adoptCachedIdentity(
+      identityCache.get(
+        accountCacheKey(cachedResult.accountUuid, stableAccountIdentity),
+      ) ?? identityCache.get(`account:${cachedResult.accountUuid}`),
+      stableAccountIdentity,
+      cachedResult.accountUuid,
+    )
+    if (cachedAccountIdentity) {
+      identity = cachedAccountIdentity
+      cacheAccountIdentity(
+        identity,
+        stableAccountIdentity,
+        cachedResult.accountUuid,
+      )
+      return identity
+    }
+    if (identity.accountUuid === cachedResult.accountUuid) return identity
+    identity = {
+      ...identity,
+      accountIdentity: stableAccountIdentity,
+      accountUuid: cachedResult.accountUuid,
+    }
+    cacheAccountIdentity(
+      identity,
+      stableAccountIdentity,
+      cachedResult.accountUuid,
+    )
+    return identity
+  }
+
+  let fetchPromise = bootstrapFetches.get(bootstrapKey)
   if (!fetchPromise) {
     fetchPromise = fetchClaudeCodeAccountUuid(accessToken, model)
-    bootstrapFetches.set(accessToken, fetchPromise)
+    setBounded(bootstrapFetches, bootstrapKey, fetchPromise)
   }
 
   const accountUuid = await fetchPromise.finally(() => {
-    bootstrapFetches.delete(accessToken)
+    if (bootstrapFetches.get(bootstrapKey) === fetchPromise) {
+      bootstrapFetches.delete(bootstrapKey)
+    }
   })
-  setBounded(bootstrapResults, accessToken, {
+  setBounded(bootstrapResults, bootstrapKey, {
     accountUuid,
     expiresAt:
       now +
@@ -160,17 +343,34 @@ export async function resolveClaudeCodeIdentity(
         ? BOOTSTRAP_IDENTITY_CACHE_TTL_MS
         : BOOTSTRAP_IDENTITY_NEGATIVE_TTL_MS),
   })
-  if (!accountUuid) return identity
-
-  const accountCacheKey = `account:${accountUuid}`
-  const accountIdentity = identityCache.get(accountCacheKey)
-  if (accountIdentity) {
-    setBounded(identityCache, accessToken, accountIdentity)
-    return accountIdentity
+  if (!accountUuid) {
+    identity = clearCachedAccountUuid(cacheKey, identity)
+    return identity
+  }
+  if (!stableAccountIdentity) {
+    identity = { ...identity, accountUuid }
+    setBounded(identityCache, bootstrapKey, identity)
+    return identity
   }
 
-  identity.accountUuid = accountUuid
-  setBounded(identityCache, accountCacheKey, identity)
+  const cachedAccountIdentity = adoptCachedIdentity(
+    identityCache.get(accountCacheKey(accountUuid, stableAccountIdentity)) ??
+      identityCache.get(`account:${accountUuid}`),
+    stableAccountIdentity,
+    accountUuid,
+  )
+  if (cachedAccountIdentity) {
+    identity = cachedAccountIdentity
+    cacheAccountIdentity(identity, stableAccountIdentity, accountUuid)
+    return identity
+  }
+
+  identity = {
+    ...identity,
+    accountIdentity: stableAccountIdentity,
+    accountUuid,
+  }
+  cacheAccountIdentity(identity, stableAccountIdentity, accountUuid)
   return identity
 }
 
@@ -205,27 +405,45 @@ export function applyClaudeCodeMetadata(
   return true
 }
 
-const CLAUDE_CODE_BASE_BETAS = [
-  'claude-code-20250219',
+// Claude Code 2.1.258 sends redact-thinking-2026-02-12, but it suppresses
+// thinking-block content that OpenCode displays; deliberately omitted after A/B proof on 2026-09-01.
+export const CLAUDE_CODE_FULL_AGENT_BETAS = [
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
   'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  EFFORT_BETA,
+  'claude-code-20250219',
+  'advisor-tool-2026-03-01',
+  'advanced-tool-use-2025-11-20',
+  'mid-conversation-system-2026-04-07',
+  'effort-2025-11-24',
+  'fallback-credit-2026-06-01',
   'extended-cache-ttl-2025-04-11',
   'cache-diagnosis-2026-04-07',
 ] as const
 
-export const CLAUDE_CODE_FULL_AGENT_BETAS = [
-  ...CLAUDE_CODE_BASE_BETAS,
+const CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS = [
+  'oauth-2025-04-20',
+  'interleaved-thinking-2025-05-14',
+  'thinking-token-count-2026-05-13',
+  'context-management-2025-06-27',
+  'prompt-caching-scope-2026-01-05',
   'advisor-tool-2026-03-01',
-  'advanced-tool-use-2025-11-20',
+  'structured-outputs-2025-12-15',
+  'cache-diagnosis-2026-04-07',
 ] as const
 
-const CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS = [
-  ...CLAUDE_CODE_BASE_BETAS,
-  'structured-outputs-2025-12-15',
+const CLAUDE_CODE_BASE_BETAS = [
+  'oauth-2025-04-20',
+  'interleaved-thinking-2025-05-14',
+  'thinking-token-count-2026-05-13',
+  'context-management-2025-06-27',
+  'prompt-caching-scope-2026-01-05',
+  'advisor-tool-2026-03-01',
+  'advanced-tool-use-2025-11-20',
+  'extended-cache-ttl-2025-04-11',
+  'cache-diagnosis-2026-04-07',
 ] as const
 
 function hasStructuredOutput(body: Record<string, unknown>) {
@@ -260,6 +478,12 @@ export function selectClaudeCodeBetas(
     : [...CLAUDE_CODE_BASE_BETAS]
 
   if (body?.speed === 'fast') selected.push(FAST_MODE_BETA)
+  // Fork: any request carrying output_config.effort needs the effort beta,
+  // even when it does not have the full-agent shape (upstream lists it only
+  // in the full-agent tuple).
+  const outputConfig = body?.output_config
+  if (isRecord(outputConfig) && outputConfig.effort !== undefined)
+    selected.push(EFFORT_BETA)
   // A 1M-capable model without this beta uses the standard context window.
   // `suppressContext1m` mirrors Claude Code's account-local fallback after the
   // server specifically reports that usage credits are required for long
@@ -429,10 +653,6 @@ export function orderClaudeCodeBody<T extends Record<string, unknown>>(
     if (!Object.hasOwn(ordered, key)) ordered[key] = value
   }
   return ordered as T
-}
-
-export function claudeCodeBuildHash() {
-  return CLAUDE_CODE_BUILD_HASH
 }
 
 export function claudeCodeEntrypoint() {

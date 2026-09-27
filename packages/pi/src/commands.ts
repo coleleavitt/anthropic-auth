@@ -7,6 +7,7 @@ import {
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   createEmptyStorage,
+  detectClaustrumConnection,
   executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
@@ -15,8 +16,10 @@ import {
   executeLoggingCommand,
   executePrimeCommand,
   executeRoutingCommand,
+  formatEnrollmentStatus,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getClaustrumMode,
   getPersistedLogLevel,
   getRoutingMode,
   isCache1hPersistentlyEnabled,
@@ -27,6 +30,9 @@ import {
   isFastModePersistentlyEnabled,
   isPrimePersistentlyEnabled,
   loadAccounts,
+  mergeMainQuotaErrorClearedAt,
+  mergeMainRefreshErrorClearedAt,
+  parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
@@ -35,6 +41,7 @@ import {
   parseRoutingCommandAction,
   removeAccountPersistent,
   reorderAccountsPersistent,
+  saveAccountState,
   setAccountEnabledPersistent,
   setCache1hPersistentEnabled,
   setCache1hPersistentMode,
@@ -52,7 +59,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from '@earendil-works/pi-coding-agent'
-
+import type { PiCustodyCommands } from './custody.ts'
 import { getPiAccountStoragePath } from './paths.ts'
 import {
   clearPiStickyRoutingSession,
@@ -69,7 +76,10 @@ function notify(
   ctx.ui.notify(message, kind)
 }
 
-export function registerCommands(pi: ExtensionAPI) {
+export function registerCommands(
+  pi: ExtensionAPI,
+  custody?: PiCustodyCommands,
+) {
   pi.registerCommand('claude-cache', {
     description: 'Show or configure Claude 1-hour prompt cache mode',
     handler: async (args, ctx) => {
@@ -264,13 +274,36 @@ export function registerCommands(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const path = getPiAccountStoragePath()
       const storage = await loadAccounts(path)
-      const result = executeAccountCommand({
+      const action = parseAccountCommandAction(args ?? '')
+      const result = await executeAccountCommand({
         argumentsText: args ?? '',
         storage: storage ?? createEmptyStorage(),
+        path,
+        transition:
+          custody?.transition ??
+          (async () => ({
+            text: 'Refused: Pi custody controller is unavailable.',
+          })),
+        resetEnrollment: custody?.reset,
+        claustrum:
+          action.type === 'status'
+            ? await detectClaustrumConnection()
+            : undefined,
       })
 
+      if (action.type === 'status' && custody) {
+        try {
+          result.text += `\n${formatEnrollmentStatus(await custody.status(), getClaustrumMode(storage) === 'claustrum').join('\n')}`
+        } catch {
+          result.text += '\n- Enrollment: unavailable'
+        }
+      }
       if (!result.updated) {
-        notify(ctx, result.text)
+        notify(
+          ctx,
+          result.text,
+          result.text.startsWith('Refused:') ? 'error' : 'info',
+        )
         return
       }
 
@@ -292,6 +325,40 @@ export function registerCommands(pi: ExtensionAPI) {
         if (newOrder) {
           await reorderAccountsPersistent(newOrder, path)
         }
+      } else if (mutationAction === 'reset-backoff') {
+        const nextStorage = storage ?? createEmptyStorage()
+        nextStorage.refresh = nextStorage.refresh ?? {}
+        nextStorage.refresh.mainLastRefreshError = undefined
+        nextStorage.refresh.mainRefreshErrorClearedAt =
+          mergeMainRefreshErrorClearedAt(
+            nextStorage.refresh.mainRefreshErrorClearedAt,
+            Date.now(),
+          )
+        const mainIdentity = nextStorage.mainAccountId
+        const quotaError = nextStorage.quota?.mainLastQuotaApiError
+        if (
+          !quotaError?.accountIdentity ||
+          !mainIdentity ||
+          quotaError.accountIdentity === mainIdentity
+        ) {
+          nextStorage.quota = nextStorage.quota ?? {}
+          nextStorage.quota.mainLastQuotaApiError = undefined
+          const nextQuotaErrorGeneration =
+            (nextStorage.quota.mainQuotaErrorGeneration ?? 0) + 1
+          nextStorage.quota.mainQuotaErrorGeneration = Math.max(
+            nextStorage.quota.mainQuotaErrorGeneration ?? 0,
+            nextQuotaErrorGeneration,
+          )
+          nextStorage.quota.mainQuotaErrorClearedAt =
+            mergeMainQuotaErrorClearedAt(
+              nextStorage.quota.mainQuotaErrorClearedAt,
+              Date.now(),
+            )
+        }
+        await saveAccountState(nextStorage, path, {
+          mainRefresh: true,
+          mainQuota: true,
+        })
       }
 
       notify(ctx, result.text)

@@ -1,3 +1,5 @@
+import type { ClaustrumEnrollmentStatus } from '@cortexkit/anthropic-auth-core'
+
 export const COMMAND_MODAL_NAMES = [
   'claude-account',
   'claude-cache',
@@ -16,6 +18,38 @@ export const COMMAND_MODAL_NAMES = [
 
 export type CommandModalName = (typeof COMMAND_MODAL_NAMES)[number]
 
+export interface AccountDialogAccount {
+  id: string
+  label: string
+  role: 'main' | 'fallback'
+  enabled: boolean
+  quotaPercent: number | null
+  tierLabel?: string
+  authType?: 'oauth' | 'api'
+  claustrumGate: 'on' | 'off' | 'na'
+  vaultServed: boolean
+  vaultReauth: boolean
+  custodyState:
+    | 'na'
+    | 'off'
+    | 'on-vault-served'
+    | 'on-vault-reauth'
+    | 'on-cold'
+    | 'unknown-identity'
+    | 'on-identity-mismatch'
+    | 'on-corrupt-binding'
+}
+
+export interface AccountDialogKnobs {
+  accounts: AccountDialogAccount[]
+  claustrumDetection: string
+  custodyMode?: 'local' | 'claustrum'
+  custodyModeKnown?: boolean
+  enrollmentStatus?: string
+  claustrumEnrollment?: ClaustrumEnrollmentStatus
+  [key: string]: unknown
+}
+
 export interface OpenDialogPayload {
   command: CommandModalName
   text: string
@@ -26,7 +60,7 @@ export interface RpcNotification {
   id: number
   type: 'open-dialog'
   payload: OpenDialogPayload
-  sessionId?: string
+  sessionId: string
 }
 
 export interface ApplyRequest {

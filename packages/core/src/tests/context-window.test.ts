@@ -69,7 +69,7 @@ describe('selectClaudeCodeBetas — 1M context', () => {
     const betas = selectClaudeCodeBetas({ model: 'claude-sonnet-5' }, [], {
       suppressContext1m: true,
     })
-    expect(betas).toContain('claude-code-20250219')
     expect(betas).toContain('oauth-2025-04-20')
+    expect(betas).toContain('prompt-caching-scope-2026-01-05')
   })
 })

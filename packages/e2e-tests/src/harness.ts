@@ -1,7 +1,11 @@
 import { join } from 'node:path'
 import { MockAnthropicServer, type MockResponse } from './mock-anthropic.ts'
 import { MockRelayServer } from './mock-relay.ts'
-import { type SpawnedOpencode, spawnOpencode } from './opencode-runner.ts'
+import {
+  type IsolatedEnv,
+  type SpawnedOpencode,
+  spawnOpencode,
+} from './opencode-runner.ts'
 
 type SdkClient = {
   session: {
@@ -14,8 +18,22 @@ type SdkClient = {
       body: {
         model: { providerID: string; modelID: string }
         parts: Array<{ type: 'text'; text: string }>
+        variant?: string
+        format?: { type: 'json_schema'; schema: Record<string, unknown> }
       }
     }) => Promise<{ data?: unknown }>
+    promptAsync: (options: {
+      path: { id: string }
+      body: {
+        model: { providerID: string; modelID: string }
+        parts: Array<{ type: 'text'; text: string }>
+        variant?: string
+      }
+    }) => Promise<{ data?: unknown }>
+    abort: (options: { path: { id: string } }) => Promise<{ data?: unknown }>
+    status: () => Promise<{
+      data?: Record<string, { type?: string }>
+    }>
     messages: (options: {
       path: { id: string }
     }) => Promise<{ data?: unknown[] }>
@@ -23,10 +41,14 @@ type SdkClient = {
 }
 
 export type E2EHarnessOptions = {
-  relay?: 'websocket'
+  relay?: 'websocket' | 'http'
+  quotaFeed?: boolean
+  relayResponseStartDelayMs?: number
   hybridCache?: boolean
   fallbackMode?: 'server' | 'legacy'
   childTmpDir?: string
+  childEnv?: Record<string, string | undefined>
+  beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
 }
 
 export class E2EHarness {
@@ -52,15 +74,18 @@ export class E2EHarness {
     const { baseURL } = await anthropic.start()
     let relay: MockRelayServer | null = null
     let relayConfig:
-      | { url: string; token: string; transport: 'websocket' }
+      | { url: string; token: string; transport: 'websocket' | 'http' }
       | undefined
-    if (options.relay === 'websocket') {
+    if (options.relay) {
       relay = new MockRelayServer()
-      const started = await relay.start({ token: 'relay-token' })
+      const started = await relay.start({
+        token: 'relay-token',
+        responseStartDelayMs: options.relayResponseStartDelayMs,
+      })
       relayConfig = {
         url: started.url,
         token: 'relay-token',
-        transport: 'websocket',
+        transport: options.relay,
       }
     }
 
@@ -70,6 +95,9 @@ export class E2EHarness {
       hybridCache: options.hybridCache,
       fallbackMode: options.fallbackMode,
       childTmpDir: options.childTmpDir,
+      quotaFeed: options.quotaFeed,
+      childEnv: options.childEnv,
+      beforeSpawn: options.beforeSpawn,
     })
     const sdk = await import('@opencode-ai/sdk')
     const client = sdk.createOpencodeClient({
@@ -108,6 +136,8 @@ export class E2EHarness {
     text: string,
     timeoutMs = 45_000,
     modelID = 'claude-sonnet-4-5',
+    variant?: string,
+    format?: { type: 'json_schema'; schema: Record<string, unknown> },
   ) {
     const result = await this.withTimeout(
       this.client.session.prompt({
@@ -115,12 +145,51 @@ export class E2EHarness {
         body: {
           model: { providerID: 'anthropic', modelID },
           parts: [{ type: 'text', text }],
+          variant,
+          ...(format ? { format } : {}),
         },
       }),
       timeoutMs,
       'session.prompt',
     )
     return result
+  }
+
+  async startPrompt(
+    sessionId: string,
+    text: string,
+    modelID = 'claude-sonnet-4-5',
+    variant?: string,
+  ) {
+    return this.client.session.promptAsync({
+      path: { id: sessionId },
+      body: {
+        model: { providerID: 'anthropic', modelID },
+        parts: [{ type: 'text', text }],
+        variant,
+      },
+    })
+  }
+
+  async abortSession(sessionId: string) {
+    return this.client.session.abort({ path: { id: sessionId } })
+  }
+
+  async waitForSessionStatusType(
+    sessionId: string,
+    type: string,
+    timeoutMs = 15_000,
+  ) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const response = await this.client.session.status()
+      const status = response.data?.[sessionId]
+      if (status?.type === type) return status
+      await Bun.sleep(50)
+    }
+    throw new Error(
+      `session did not reach ${type}: ${sessionId}\n--- stdout ---\n${this.opencode.stdout()}\n--- stderr ---\n${this.opencode.stderr()}`,
+    )
   }
 
   async waitForSessionText(
@@ -167,14 +236,19 @@ export class E2EHarness {
   }
 
   async waitFor<T>(
-    predicate: () => T | false | null | undefined,
+    predicate: () =>
+      | T
+      | false
+      | null
+      | undefined
+      | Promise<T | false | null | undefined>,
     options: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
   ): Promise<T> {
     const timeoutMs = options.timeoutMs ?? 10_000
     const intervalMs = options.intervalMs ?? 100
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
-      const value = predicate()
+      const value = await predicate()
       if (value) return value
       await Bun.sleep(intervalMs)
     }

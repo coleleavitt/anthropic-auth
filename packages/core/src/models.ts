@@ -1,5 +1,7 @@
 export const CLAUDE_FABLE_5_MODEL_ID = 'claude-fable-5'
 export const CLAUDE_MYTHOS_5_MODEL_ID = 'claude-mythos-5'
+export const CLAUDE_FABLE_5_1_MODEL_ID = 'claude-fable-5-1'
+export const CLAUDE_MYTHOS_5_1_MODEL_ID = 'claude-mythos-5-1'
 
 /**
  * Haiku 4.5 model identifier used by `/claude-prime` to start each OAuth
@@ -8,6 +10,11 @@ export const CLAUDE_MYTHOS_5_MODEL_ID = 'claude-mythos-5'
  * above so per-million-token cost estimation does not conflate families.
  */
 export const CLAUDE_HAIKU_4_5_MODEL_ID = 'claude-haiku-4-5'
+
+/** Remove OpenCode's context-window qualifier before model-family checks. */
+export function normalizeAnthropicModelId(model: string): string {
+  return model.endsWith('[1m]') ? model.slice(0, -4) : model
+}
 
 /**
  * Per-million-token USD pricing for Haiku 4.5. Used to project the cumulative
@@ -19,9 +26,15 @@ export const CLAUDE_HAIKU_4_5_PRICING = {
   output: 5,
 } as const
 
+export const CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS = [
+  CLAUDE_FABLE_5_1_MODEL_ID,
+  CLAUDE_MYTHOS_5_1_MODEL_ID,
+] as const
+
 export const CLAUDE_FABLE_MYTHOS_5_MODEL_IDS = [
   CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_MYTHOS_5_MODEL_ID,
+  ...CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS,
 ] as const
 
 export type ClaudeFableMythos5ModelId =
@@ -59,10 +72,7 @@ export const CLAUDE_FABLE_MYTHOS_5_1_PRICING = {
  */
 export function isClaudeFableOrMythos5PointOneModel(model: unknown): boolean {
   if (typeof model !== 'string') return false
-  const canonical = model.trim().toLowerCase()
-  return CLAUDE_FABLE_MYTHOS_5_MODEL_IDS.some(
-    (id) => canonical === `${id}-1` || canonical.startsWith(`${id}-1-`),
-  )
+  return isClaudeFableOrMythos51Model(model.trim().toLowerCase())
 }
 
 /**
@@ -78,6 +88,7 @@ export function resolveClaudeFableMythos5Pricing(model: unknown) {
 export const CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW = 1_000_000
 export const CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS = 128_000
 export const CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE = '2026-06-09'
+export const CLAUDE_FABLE_MYTHOS_5_1_RELEASE_DATE = '2026-09-01'
 
 export const CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS: Record<
   ClaudeFableMythos5ModelId,
@@ -92,7 +103,26 @@ export const CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS: Record<
     name: 'Claude Mythos 5',
     limited: true,
   },
+  [CLAUDE_FABLE_5_1_MODEL_ID]: {
+    id: CLAUDE_FABLE_5_1_MODEL_ID,
+    name: 'Claude Fable 5.1',
+  },
+  [CLAUDE_MYTHOS_5_1_MODEL_ID]: {
+    id: CLAUDE_MYTHOS_5_1_MODEL_ID,
+    name: 'Claude Mythos 5.1',
+    limited: true,
+  },
 }
+
+export const CLAUDE_FABLE_MYTHOS_5_1_MODEL_SPECS = {
+  [CLAUDE_FABLE_5_1_MODEL_ID]:
+    CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS[CLAUDE_FABLE_5_1_MODEL_ID],
+  [CLAUDE_MYTHOS_5_1_MODEL_ID]:
+    CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS[CLAUDE_MYTHOS_5_1_MODEL_ID],
+} satisfies Record<
+  (typeof CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS)[number],
+  { id: string; name: string; limited?: boolean }
+>
 
 /**
  * NOTE ON `claude-mythos-5`: its entry in Claude Code's baked model catalog ships
@@ -105,12 +135,34 @@ export const CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS: Record<
  * `{type:"disabled"}`, so treating it as adaptive here is correct.
  */
 export function isClaudeFableOrMythos5Model(model: unknown) {
-  return (
-    typeof model === 'string' &&
-    CLAUDE_FABLE_MYTHOS_5_MODEL_IDS.some(
-      (id) => model === id || model.startsWith(`${id}-`),
-    )
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return CLAUDE_FABLE_MYTHOS_5_MODEL_IDS.some(
+    (id) => normalized === id || normalized.startsWith(`${id}-`),
   )
+}
+
+export function isClaudeFableOrMythos51Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS.some(
+    (id) => normalized === id || normalized.startsWith(`${id}-`),
+  )
+}
+
+export function isClaudeFable51Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return (
+    normalized === CLAUDE_FABLE_5_1_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_FABLE_5_1_MODEL_ID}-`)
+  )
+}
+
+export function getClaudeFableMythos5ReleaseDate(model: unknown) {
+  return isClaudeFableOrMythos51Model(model)
+    ? CLAUDE_FABLE_MYTHOS_5_1_RELEASE_DATE
+    : CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE
 }
 
 export const CLAUDE_SONNET_5_MODEL_ID = 'claude-sonnet-5'
@@ -125,10 +177,11 @@ export const CLAUDE_SONNET_5_ADAPTIVE_THINKING =
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
 
 export function isClaudeSonnet5Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
   return (
-    typeof model === 'string' &&
-    (model === CLAUDE_SONNET_5_MODEL_ID ||
-      model.startsWith(`${CLAUDE_SONNET_5_MODEL_ID}-`))
+    normalized === CLAUDE_SONNET_5_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_SONNET_5_MODEL_ID}-`)
   )
 }
 
@@ -146,53 +199,26 @@ export const CLAUDE_OPUS_5_ADAPTIVE_THINKING =
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
 
 /**
- * True for every member of the Opus 5 series, including the 5.5 point release
- * (`claude-opus-5-5`) and dated snapshots. Call sites use this as the FAMILY
- * predicate — adaptive thinking injection, server-side fallback eligibility,
- * refusal recovery, effort variants — because those behaviors are shared.
- * Anything that differs between 5.0 and 5.5 (pricing, disabled-thinking
- * support, display label) must additionally consult
- * {@link isClaudeOpus55Model}.
+ * True for Opus 5 (and its dated snapshots) but NOT the 5.5 point release.
+ * Use {@link isClaudeOpus5FamilyModel} for behavior shared across 5.0 and 5.5
+ * (adaptive thinking injection, server-side fallback eligibility, refusal
+ * recovery, effort variants).
  */
 export function isClaudeOpus5Model(model: unknown) {
-  return (
-    typeof model === 'string' &&
-    (model === CLAUDE_OPUS_5_MODEL_ID ||
-      model.startsWith(`${CLAUDE_OPUS_5_MODEL_ID}-`))
-  )
-}
-
-/**
- * Opus 5.5 — a separate catalog entry in Claude Code 2.1.280, not a snapshot of
- * Opus 5. It differs from Opus 5 in three ways that change the wire request or
- * the numbers we report:
- *
- *  - pricing: `tier_4_20_cache_read_0_20` ($4 in / $20 out / $0.20 cache read)
- *    against Opus 5's `tier_5_25` ($5 / $25 / $0.50)
- *  - thinking: capability `rejects_disabled_thinking` — `{type:"disabled"}` is a
- *    400 ("\"thinking.type.disabled\" is not supported for this model"), while
- *    Opus 5 accepts it under `thinking_disabled_effort_cap`
- *  - default effort: `medium` against Opus 5's `high`
- *
- * Matched on the exact id plus dated snapshots, never on Opus 5's prefix.
- */
-export const CLAUDE_OPUS_5_5_MODEL_ID = 'claude-opus-5-5'
-
-export function isClaudeOpus55Model(model: unknown) {
   if (typeof model !== 'string') return false
-  const normalized = model.trim().toLowerCase()
+  const normalized = normalizeAnthropicModelId(model)
   return (
-    normalized === CLAUDE_OPUS_5_5_MODEL_ID ||
-    normalized.startsWith(`${CLAUDE_OPUS_5_5_MODEL_ID}-`)
+    !isClaudeOpus55Model(normalized) &&
+    (normalized === CLAUDE_OPUS_5_MODEL_ID ||
+      normalized.startsWith(`${CLAUDE_OPUS_5_MODEL_ID}-`))
   )
 }
 
-/**
- * Per-million-token USD pricing for Opus 5.5, mirroring Claude Code 2.1.280's
- * `tier_4_20_cache_read_0_20`. Opus 5.5 is CHEAPER than Opus 5 on every axis,
- * so reusing the Opus 5 prefix price overstates cost by 25% on tokens and 2.5x
- * on cache reads.
- */
+export const CLAUDE_OPUS_5_5_MODEL_ID = 'claude-opus-5-5'
+export const CLAUDE_OPUS_5_5_RELEASE_DATE = '2026-09-18'
+export const CLAUDE_OPUS_5_5_CONTEXT_WINDOW = 1_000_000
+export const CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS = 128_000
+
 export const CLAUDE_OPUS_5_5_PRICING = {
   input: 4,
   output: 20,
@@ -201,8 +227,21 @@ export const CLAUDE_OPUS_5_5_PRICING = {
   cacheWrite1h: 8,
 } as const
 
-export const CLAUDE_OPUS_5_5_CONTEXT_WINDOW = 1_000_000
-export const CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS = 128_000
+export const CLAUDE_OPUS_5_5_ADAPTIVE_THINKING =
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
+
+export function isClaudeOpus55Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return (
+    normalized === CLAUDE_OPUS_5_5_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_OPUS_5_5_MODEL_ID}-`)
+  )
+}
+
+export function isClaudeOpus5FamilyModel(model: unknown) {
+  return isClaudeOpus5Model(model) || isClaudeOpus55Model(model)
+}
 
 /**
  * Models that reject `thinking: {type:"disabled"}` outright (HTTP 400,
