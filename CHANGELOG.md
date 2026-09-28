@@ -4,6 +4,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+### Features
+
+- Add Claude Sonnet 5.5 (`claude-sonnet-5-5`) to Core, OpenCode, and Pi with its 1M context, 128K output, and official pricing. OpenCode and Pi request readable adaptive thinking. OpenCode maps explicit thinking opt-outs to Sonnet 5.5's `between_tools` mode, removes unsupported forced tool choice, and offers native `low` through `max` effort variants. Extend explicit thinking-prefix controls to adaptive Sonnet 5.5 and Opus 5.5 continuations; the account-default behavior stays unchanged.
+
 ## 2.0.0
 
 ### Breaking Changes
