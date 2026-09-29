@@ -679,6 +679,9 @@ export async function buildAnthropicRequest(
   }
 
   if (options?.reasoning) {
+    if (isSonnet55 && options.reasoning === 'minimal') {
+      throw new Error('Claude Sonnet 5.5 does not support minimal effort')
+    }
     if (isFableOrMythos5 || isSonnet5 || isSonnet55 || isOpus5 || isOpus55) {
       body.output_config = { effort: options.reasoning }
     } else {

@@ -233,6 +233,12 @@ export default async function cortexKitPiAnthropicAuth(
         id: CLAUDE_SONNET_5_5_MODEL_ID,
         name: 'Claude Sonnet 5.5',
         reasoning: true,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          xhigh: 'xhigh',
+          max: 'max',
+        },
         input: textImageInput(),
         cost: {
           input: CLAUDE_SONNET_5_5_PRICING.input,

@@ -712,6 +712,17 @@ describe('buildAnthropicRequest — Sonnet 5.5 thinking', () => {
     expect(body.speed).toBeUndefined()
   })
 
+  test('refuses unsupported minimal effort rather than sending an invalid Sonnet 5.5 request', async () => {
+    await expect(
+      buildAnthropicRequest(
+        'claude-sonnet-5-5',
+        { messages: [userMsg('hello')], tools: [] } as Context,
+        { reasoning: 'minimal' },
+        defaultCache,
+      ),
+    ).rejects.toThrow('Claude Sonnet 5.5 does not support minimal effort')
+  })
+
   test('honors explicit prefix-mismatch behavior on a signed Sonnet 5.5 continuation', async () => {
     const identity = {
       deviceId: 'd'.repeat(64),

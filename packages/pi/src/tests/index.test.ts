@@ -96,6 +96,12 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
       id: 'claude-sonnet-5-5',
       name: 'Claude Sonnet 5.5',
       reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        xhigh: 'xhigh',
+        max: 'max',
+      },
       input: ['text', 'image'],
       cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
       contextWindow: 1_000_000,
