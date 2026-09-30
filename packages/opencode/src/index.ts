@@ -1,15 +1,14 @@
 import { randomUUID } from 'node:crypto'
 import {
+  type AccountOperationError,
   type AccountStorage,
   type ApiKeyAccount,
-  acquireRefreshFileLock,
   addAccountPersistent,
   authorize,
   buildAccountList,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
   buildPrimeRequestBody,
-  buildRefreshOperationError,
   CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
@@ -35,10 +34,8 @@ import {
   CLAUDE_START_COMMAND_NAME,
   CLAUDE_USAGE_COMMAND_NAME,
   type ContentFilterSummary,
-  claimSharedAccountRefresh,
   classifyProviderBlock,
   computeXxhash64Hex,
-  continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
   createStickyNoRouteResponse,
   createWifAuth,
@@ -64,7 +61,6 @@ import {
   fetchOAuthAccountProfile,
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
-  formatRefreshBackoffMessage,
   getAccountStoragePath,
   getCache1hMode,
   getCache1hPersistentMode,
@@ -82,10 +78,11 @@ import {
   getRelayConfig,
   getRoutingMode,
   getScopedQuotaWindowForModel,
+  getSharedAccessToken,
   getStickyRoutingStatePath,
-  hashRefreshToken,
   importNativeClaudeAccount,
   incrementPrimeUsagePersistent,
+  isAnthropicAuthError,
   isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -111,8 +108,7 @@ import {
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
-  loadAccounts,
-  loadSharedAccountStore,
+  loadAccounts as loadHostAccounts,
   log,
   logContentFilterOutcome,
   logger,
@@ -147,10 +143,8 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   recordResponseUsage,
-  refreshBackoffActive,
   refreshClaudeCodeVersion,
-  refreshClaudeOAuthToken,
-  releaseSharedAccountRefresh,
+  refreshErrorFromSharedAccount,
   removeAccountPersistent,
   removeSharedAccount,
   reorderAccountsPersistent,
@@ -158,8 +152,10 @@ import {
   requiredClaudeCodeVersion,
   resolveClaudeCodeIdentity,
   resolveClaudeFableMythos5Pricing,
-  revokeClaudeOAuthToken,
+  type SharedAnthropicAccount,
+  type SharedLogin,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
+  STORE_MANAGED_REFRESH_PLACEHOLDER,
   type StickyRouteCandidate,
   StickySessionRouter,
   saveAccountState,
@@ -187,14 +183,14 @@ import {
   setRoutingMode,
   setSharedAccountEnabled,
   shouldFallbackStatus,
-  startOAuthLoopbackSession,
+  startSharedLogin,
+  startSharedLoginWithLoopback,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
+  storeCredentialIdentity,
   stripEncryptedServerToolContent,
-  syncRefreshedFallbackAccountInSharedStore,
   TrustedDeviceToken,
   tokenFingerprint,
-  upsertFallbackAccountInSharedStore,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import {
@@ -251,10 +247,9 @@ import {
 import {
   getSharedAnthropicAuthType,
   type OpenCodeAnthropicAuth,
-  persistConnectedAnthropicAuth,
-  persistRefreshedSharedOAuth,
   type ResolvedMainAnthropicAuth,
   reconcileAnthropicAuth,
+  storeAccess,
 } from './shared-auth.ts'
 import {
   getInitialSidebarRoutingTestHooks,
@@ -275,6 +270,20 @@ import {
   setOAuthHeaders,
 } from './transform.ts'
 
+/** The host-config projection of an account (what saveAccounts persists). */
+function persistedAccountShape(account: OAuthAccount | ApiKeyAccount) {
+  return {
+    id: account.id,
+    label: account.label,
+    type: account.type,
+    enabled: account.enabled,
+    addedAt: account.addedAt,
+    ...(account.type === 'api'
+      ? { baseURL: account.baseURL, authHeader: account.authHeader }
+      : {}),
+  }
+}
+
 /** Persisted account JSON may carry an `email` field outside the typed schema. */
 function accountEmail(account: object | undefined): string | undefined {
   const email = (account as { email?: unknown } | undefined)?.email
@@ -287,13 +296,6 @@ const HTTP_COOKIES_TYPE_ID = '~effect/http/Cookies'
 const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
 const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
 const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
-const MAIN_AUTH_REFRESH_TICK_MS = 60_000
-const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
-const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
-const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 200
-const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
-const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
-  MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const SIDEBAR_ROUTING_FRESH_MS = 10 * 60 * 1000
 
 function stripOAuthBetaHeader(headers: Headers) {
@@ -399,7 +401,7 @@ async function resolveInitialSidebarRouting(
   await getInitialSidebarRoutingTestHooks()?.beforeStorageLoad?.()
   let freshStorage: AccountStorage | null
   try {
-    freshStorage = await loadAccounts(accountStoragePath)
+    freshStorage = await loadHostAccounts(accountStoragePath)
   } catch {
     return { activeId: 'main', route: 'main', freshStorage: null }
   } finally {
@@ -526,10 +528,6 @@ function nowMs() {
 
 function roundMs(value: number) {
   return Math.round(value * 10) / 10
-}
-
-function jitterMs(maxMs: number) {
-  return Math.floor(Math.random() * Math.max(0, maxMs))
 }
 
 function fetchInputUrl(input: string | URL | Request) {
@@ -979,11 +977,57 @@ const anthropicAuthPlugin = async (
   const workloadIdentity = createWifAuth()
   let latestResolvedAuth: ResolvedMainAnthropicAuth | null = null
 
+  // -- Store-derived account state ----------------------------------------
+  // The host files carry no credential state any more. The store's refresh
+  // verdicts and enabled flags are layered over them on every load, from a
+  // short-lived snapshot of the (non-secret) store rows.
+  let sharedAccountsCache: SharedAnthropicAccount[] | undefined
+  let sharedAccountsCachedAt = 0
+  let latestMainRefreshError: AccountOperationError | undefined
+  const SHARED_ACCOUNTS_CACHE_MS = 2_000
+
+  async function sharedAccountsSnapshot() {
+    if (
+      sharedAccountsCache &&
+      Date.now() - sharedAccountsCachedAt < SHARED_ACCOUNTS_CACHE_MS
+    ) {
+      return sharedAccountsCache
+    }
+    sharedAccountsCache = await storeAccess()
+      .listAccounts()
+      .catch(() => sharedAccountsCache ?? [])
+    sharedAccountsCachedAt = Date.now()
+    return sharedAccountsCache
+  }
+
+  async function loadAccounts(path: string = accountStoragePath) {
+    const storage = await loadHostAccounts(path)
+    if (!storage) return storage
+    const rows = new Map(
+      (await sharedAccountsSnapshot()).map((row) => [row.id, row] as const),
+    )
+    for (const account of storage.accounts) {
+      if (!isOAuthAccount(account)) continue
+      const row = rows.get(account.id)
+      if (!row) continue
+      account.enabled = row.enabled
+      account.refreshExpires = row.refreshExpiresAt
+      account.lastRefreshedAt = row.lastRefreshedAt
+      account.lastRefreshError ??= refreshErrorFromSharedAccount(row)
+    }
+    if (latestMainRefreshError) {
+      storage.refresh = {
+        ...storage.refresh,
+        mainLastRefreshError: latestMainRefreshError,
+      }
+    }
+    return storage
+  }
+
   // -- OAuth add-flow pending state (Add account modal) --------------------
   interface OAuthPendingEntry {
-    state: string
-    verifier: string
-    redirectUri: string
+    /** Store login in progress (PKCE verifier and state live in Rust). */
+    login: SharedLogin
     createdAt: number
     loopback?: OAuthLoopbackSession
     capturedCallback?: string
@@ -1208,6 +1252,23 @@ const anthropicAuthPlugin = async (
     return next
   }
 
+  /**
+   * The account with its bearer, when the store holds a live one. Display
+   * paths use this: they never make the store refresh an idle account.
+   */
+  async function withLiveStoreAccess(
+    account: OAuthAccount,
+  ): Promise<OAuthAccount> {
+    if (account.access) return account
+    const row = (await sharedAccountsSnapshot()).find(
+      (candidate) => candidate.id === account.id,
+    )
+    if (!row?.accessLive || (row.expiresAt ?? 0) - Date.now() < 60_000) {
+      return account
+    }
+    return fallbackManager.ensureAccessToken(account).catch(() => account)
+  }
+
   async function ensureProfilesForQuotaDisplay(
     storage: AccountStorage,
     mainAccessToken?: string,
@@ -1245,9 +1306,11 @@ const anthropicAuthPlugin = async (
       }
     }
 
-    for (const account of storage.accounts) {
+    for (const stored of storage.accounts) {
       if (signal?.aborted) break
-      if (!isOAuthAccount(account) || !account.access) continue
+      if (!isOAuthAccount(stored)) continue
+      const account = await withLiveStoreAccess(stored)
+      if (!account.access) continue
       const accessToken = account.access
       if (
         account.profile &&
@@ -1301,11 +1364,13 @@ const anthropicAuthPlugin = async (
     }
     const account = storage.accounts.find(
       (candidate): candidate is OAuthAccount =>
-        candidate.id === served.accountId &&
-        isOAuthAccount(candidate) &&
-        candidate.access === served.accessToken,
+        candidate.id === served.accountId && isOAuthAccount(candidate),
     )
     if (!account) return
+    // The host files carry no bearer. The served token came from the store
+    // for this id; only a bearer this process already holds can prove it
+    // stale.
+    if (account.access && account.access !== served.accessToken) return
     account.quota = entry.quota
     await saveAccountState(storage, accountStoragePath, {
       accounts: [served.accountId],
@@ -1364,20 +1429,16 @@ const anthropicAuthPlugin = async (
 
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
-    onFallbackCredentialChanged: async (account, expectedRefresh) => {
-      const synced = await syncRefreshedFallbackAccountInSharedStore(
-        account,
-        expectedRefresh,
-      )
-      return synced.result
-    },
+    store: storeAccess(),
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
     onFallbackStorageChanged: () => {
       void refreshSidebarQuota().catch(() => {})
     },
   })
-  fallbackManager.startBackgroundRefresh()
+  // The store keep-alive (one owner per machine) replaces the old background
+  // refresh that rotated every idle fallback account.
+  fallbackManager.startKeepAlive()
   void getClaudeCodeVersion().catch(() => {})
   const cacheDiagnosticsTracker = new CacheDiagnosticsTracker()
   const cacheDiagnosticsBetaTracker = new CacheDiagnosticsBetaTracker()
@@ -1643,7 +1704,7 @@ const anthropicAuthPlugin = async (
         }
         let current = account
         try {
-          current = await fallbackManager.refreshAccount(account, storage)
+          current = await fallbackManager.ensureAccessToken(account)
         } catch (error) {
           logger.warn('cachekeep', 'fallback token refresh failed', {
             accountId,
@@ -1762,8 +1823,11 @@ const anthropicAuthPlugin = async (
     // state file (M1 persist requirement) and is the SINGLE usage-API
     // call per tick for fallback fresh-checks. The redundant
     // `quotaManager.refreshFallback` call was collapsed (R2).
+    // Prime is a deliberate use of the account: its bearer comes from the
+    // store (which refreshes it if it has expired).
+    const hydrated = await fallbackManager.ensureAccessToken(account)
     const refreshed = await fallbackManager.refreshAccountQuota(
-      account,
+      hydrated,
       storage,
     )
     await fallbackManager.save(storage, [accountId])
@@ -1823,8 +1887,16 @@ const anthropicAuthPlugin = async (
           // call and persisted the result; the fire path reuses the
           // in-memory quota via the headers / URL contract. This keeps
           // the cycle at exactly one quota API call per account.
-          current = await fallbackManager.refreshAccount(account, storage)
+          current = await fallbackManager.ensureAccessToken(account)
         } catch (error) {
+          // The store no longer has this account: it was removed, not a
+          // token failure.
+          if ((error as { code?: unknown }).code === 'auth_required') {
+            return {
+              ok: false,
+              error: `prime: OAuth account ${accountId} is unavailable`,
+            }
+          }
           return {
             ok: false,
             reason: 'token-refresh',
@@ -1910,17 +1982,23 @@ const anthropicAuthPlugin = async (
     storagePath: accountStoragePath,
     loadStorage: () => loadAccounts(accountStoragePath),
     getAccountFingerprint: async (accountId) => {
-      let mainRefreshToken: string | undefined
+      // Main lineage identity: the store row serving as main (stable across
+      // refreshes, which happen in the store), or the static bearer itself.
+      let mainCredentialIdentity: string | undefined
       if (accountId === 'main') {
         try {
           const auth = await latestGetAuth?.()
-          if (auth?.type === 'oauth') mainRefreshToken = auth.refresh
+          if (auth?.type === 'oauth') {
+            mainCredentialIdentity = auth.sharedAccountId
+              ? storeCredentialIdentity(auth.sharedAccountId)
+              : auth.access || undefined
+          }
         } catch {}
       }
       const authLineageId = await getOrCreatePrimeAuthLineageId(
         accountId,
         accountStoragePath,
-        mainRefreshToken,
+        mainCredentialIdentity,
       )
       return authLineageId ? tokenFingerprint(authLineageId) : undefined
     },
@@ -2073,7 +2151,6 @@ const anthropicAuthPlugin = async (
     activeId?: string
     route: string
     mainAccessToken?: string
-    mainRefreshToken?: string
     routingAuthoritative?: boolean
     useHydratedProfiles?: boolean
     /** Current session ID for heat tracking */
@@ -2096,9 +2173,13 @@ const anthropicAuthPlugin = async (
           !isOAuthAccount(account) ||
           !hydratedAccount ||
           !isOAuthAccount(hydratedAccount) ||
-          !account.access ||
-          hydratedAccount.access !== account.access
+          !hydratedAccount.profile
         ) {
+          return account
+        }
+        // Host files carry no bearer; when the reloaded account has one it
+        // must be the token the profile was fetched with.
+        if (account.access && hydratedAccount.access !== account.access) {
           return account
         }
         return { ...account, profile: hydratedAccount.profile }
@@ -2138,13 +2219,11 @@ const anthropicAuthPlugin = async (
         tierLabel: formatOAuthAccountTier(storage?.main?.profile),
         quotaBackedOff: quotaManager.isBackedOff(),
         quotaBackoffUntil: lastApiError?.nextRetryAt,
-        refreshBackedOff: mainRefreshError
-          ? refreshBackoffActive(
-              mainRefreshError,
-              options.mainRefreshToken,
-              Date.now(),
-            )
-          : false,
+        refreshBackedOff: Boolean(
+          mainRefreshError &&
+            (isPermanentRefreshError(mainRefreshError) ||
+              (mainRefreshError.nextRetryAt ?? 0) > Date.now()),
+        ),
         refreshBackoffUntil: mainRefreshError?.nextRetryAt,
       },
       fallbacks: (storage?.accounts ?? [])
@@ -2159,22 +2238,14 @@ const anthropicAuthPlugin = async (
           // Token-aware read: if a fallback account was re-logged with the same
           // id/label, an old in-memory quota snapshot must not be shown as the
           // new account's quota.
-          quota: account.access
-            ? (quotaManager.getFallback(account.id, account.access)?.quota ??
-              null)
-            : null,
+          // Token-bound when the bearer is hydrated; host files carry none.
+          quota:
+            quotaManager.getFallback(account.id, account.access)?.quota ?? null,
           // A fallback with a permanently-dead refresh token (400 invalid_grant)
           // is dropped by getUsableFallbackAccounts and silently degrades to
           // main — surface it as "needs re-login". Only flag truly-dead tokens
           // whose backoff is still active, not transient (429/5xx) backoff.
-          needsReauth:
-            account.lastRefreshError != null &&
-            refreshBackoffActive(
-              account.lastRefreshError,
-              account.refresh,
-              Date.now(),
-            ) &&
-            isPermanentRefreshError(account.lastRefreshError),
+          needsReauth: isPermanentRefreshError(account.lastRefreshError),
           enabled: account.enabled !== false,
         })),
       activeId: options.activeId,
@@ -2274,12 +2345,10 @@ const anthropicAuthPlugin = async (
   async function refreshSidebarQuota() {
     const storage = await loadAccounts(accountStoragePath)
     let access: string | undefined
-    let refresh: string | undefined
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
         access = auth.access
-        refresh = auth.refresh
       } catch {
         // best-effort
       }
@@ -2288,7 +2357,6 @@ const anthropicAuthPlugin = async (
       activeId: lastSidebarRouting.activeId,
       route: lastSidebarRouting.route,
       mainAccessToken: access,
-      mainRefreshToken: refresh,
       routingAuthoritative: false,
     })
   }
@@ -2314,71 +2382,9 @@ const anthropicAuthPlugin = async (
 
   let latestGetAuth: (() => Promise<ResolvedMainAnthropicAuth>) | null = null
   let sidebarMainQuotaRefreshInFlight = false
-  let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
-  /**
-   * The background main-refresh tick, exposed for tests.
-   *
-   * Tests used to reach it as `intervalHandlers.at(-1)`, which silently broke
-   * as soon as anything registered an interval afterwards — the call then hit
-   * an unrelated timer and the refresh never ran. Naming it removes the
-   * dependency on registration order.
-   */
-  let mainBackgroundRefreshTick: (() => Promise<void>) | null = null
   // Per-process counter of replayable model requests. Drives the every-N
   // quota refresh cadence (quota.refreshEveryNRequests) for the active route.
   let sessionRequestCount = 0
-
-  function mainRefreshBeforeExpiryMs(
-    storage: Awaited<ReturnType<typeof loadAccounts>>,
-  ) {
-    const minutes =
-      storage?.refresh?.refreshBeforeExpiryMinutes ??
-      DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
-    return Math.max(MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES, minutes) * 60_000
-  }
-
-  function mainRefreshEnabled(
-    storage: Awaited<ReturnType<typeof loadAccounts>>,
-  ) {
-    return storage?.refresh?.enabled !== false
-  }
-
-  async function clearStaleMainRefreshError(refreshToken?: string) {
-    if (!refreshToken) return
-    const storage = await loadAccounts(accountStoragePath)
-    const error = storage?.refresh?.mainLastRefreshError
-    if (!storage?.refresh || !error?.tokenHash) return
-    const tokenHash = hashRefreshToken(refreshToken)
-    if (error.tokenHash === tokenHash) return
-    // Shared/transient backoffs can remain valid after another process rotates
-    // the token. A permanent invalid_grant is bound to the old refresh token,
-    // however: successful re-login must immediately make the new token usable.
-    if (
-      !isPermanentRefreshError(error) &&
-      error.nextRetryAt &&
-      error.nextRetryAt > Date.now()
-    ) {
-      log(
-        '[refresh] opencode main oauth keeping backoff despite token rotation',
-        {
-          nextRetryAt: error.nextRetryAt,
-          retryCount: error.retryCount,
-          remainingMs: error.nextRetryAt - Date.now(),
-        },
-      )
-      return
-    }
-    storage.refresh.mainLastRefreshError = undefined
-    await saveAccountState(storage, accountStoragePath, { mainRefresh: true })
-    log(
-      '[refresh] opencode main oauth cleared stale backoff after token rotation',
-      {
-        previousCheckedAt: error.checkedAt,
-        previousNextRetryAt: error.nextRetryAt,
-        previousRetryCount: error.retryCount,
-      },
-    )
-  }
 
   async function buildQuotaCommandSummary() {
     const accounts: QuotaAccountSummary[] = []
@@ -2458,7 +2464,6 @@ const anthropicAuthPlugin = async (
           activeId: lastSidebarRouting.activeId,
           route: lastSidebarRouting.route,
           mainAccessToken: auth.access,
-          mainRefreshToken: auth.refresh,
           routingAuthoritative: false,
         })
       } catch {
@@ -2489,7 +2494,6 @@ const anthropicAuthPlugin = async (
       activeId: lastSidebarRouting.activeId,
       route: lastSidebarRouting.route,
       mainAccessToken: auth.access,
-      mainRefreshToken: auth.refresh,
       routingAuthoritative: false,
     })
 
@@ -2725,7 +2729,6 @@ const anthropicAuthPlugin = async (
       activeId: lastSidebarRouting.activeId,
       route: lastSidebarRouting.route,
       mainAccessToken: auth.access,
-      mainRefreshToken: auth.refresh,
       routingAuthoritative: false,
     })
   }
@@ -2928,7 +2931,6 @@ const anthropicAuthPlugin = async (
             activeId: lastSidebarRouting.activeId,
             route: lastSidebarRouting.route,
             mainAccessToken: cmdAuth?.access,
-            mainRefreshToken: cmdAuth?.refresh,
             routingAuthoritative: false,
           })
         } catch (error) {
@@ -2945,6 +2947,14 @@ const anthropicAuthPlugin = async (
       enabled,
       accounts: primeManager.stats(storage),
     }).text
+  }
+
+  /** Store operations apply only to accounts the store holds (OAuth rows). */
+  async function storeHasAccount(id: string) {
+    const rows = await storeAccess()
+      .listAccounts()
+      .catch(() => [])
+    return rows.some((row) => row.id === id)
   }
 
   async function executePersistentAccountCommand(
@@ -2993,45 +3003,13 @@ const anthropicAuthPlugin = async (
 
     // -- remote revoke -----------------------------------------------------
     if (action.type === 'revoke') {
-      const storage =
-        (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
-      if (!action.confirmed) {
-        return {
-          text: 'Remote revocation cannot be undone. Re-run with --confirm.',
-          accounts: buildAccountList(storage),
-        }
-      }
-      const shared = await loadSharedAccountStore()
-      const account = shared.store.accounts.find(
-        (entry) => entry.id === action.id,
-      )
-      if (!account) {
-        return {
-          text: `Account "${action.id}" not found.`,
-          accounts: buildAccountList(storage),
-        }
-      }
-      if (account.credential.type !== 'oauth') {
-        return {
-          text: 'Only OAuth accounts can be remotely revoked.',
-          accounts: buildAccountList(storage),
-        }
-      }
-      const outcome = await revokeClaudeOAuthToken({
-        refreshToken: account.credential.refresh,
-      })
-      // Disable canonical state before sidecar cleanup. A crash cannot make the
-      // revoked token routable or let stale OpenCode auth silently re-adopt it.
-      await setSharedAccountEnabled(account.id, false)
-      await removeAccountPersistent(account.id, accountStoragePath).catch(
-        () => {},
-      )
-      const updatedStorage =
-        (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
-      await refreshSidebarAfterMutation(updatedStorage)
+      // Remote revocation needs the refresh token, which lives only in the
+      // Rust store; the binding exposes no revoke call.
       return {
-        text: `OAuth token ${outcome === 'already-inactive' ? 'was already inactive' : 'was revoked'}; account "${account.label ?? account.id}" is disabled locally.`,
-        accounts: buildAccountList(updatedStorage),
+        text: 'Remote revocation is unavailable: the refresh token lives only in the account store and the store binding has no revoke. Use disable or remove to stop using the account locally.',
+        accounts: buildAccountList(
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
+        ),
       }
     }
 
@@ -3089,25 +3067,13 @@ const anthropicAuthPlugin = async (
 
     // -- add-oauth-start ---------------------------------------------------
     if (action.type === 'add-oauth-start') {
-      let loopback: OAuthLoopbackSession | undefined
-      let authResult: Awaited<ReturnType<typeof authorize>>
-      try {
-        loopback = await startOAuthLoopbackSession()
-        authResult = await authorize('max', {
-          redirectUri: loopback.redirectUri,
-          state: loopback.state,
-        })
-      } catch {
-        await loopback?.close().catch(() => {})
-        loopback = undefined
-        authResult = await authorize('max')
-      }
+      const { login, loopback } = await startSharedLoginWithLoopback({
+        mode: 'max',
+      })
       const entry: OAuthPendingEntry = {
-        state: authResult.state,
-        verifier: authResult.verifier,
-        redirectUri: authResult.redirectUri,
+        login,
         createdAt: Date.now(),
-        loopback,
+        loopback: loopback ?? undefined,
       }
       if (loopback) {
         void loopback
@@ -3120,8 +3086,8 @@ const anthropicAuthPlugin = async (
       const key = sessionId ?? 'default'
       storeOAuthPending(key, entry)
       return {
-        text: `Open this URL in your browser:\n${authResult.url}\n\nThe localhost callback completes automatically; manual paste remains available.`,
-        knobs: { oauthUrl: authResult.url },
+        text: `Open this URL in your browser:\n${login.url}\n\nThe localhost callback completes automatically; manual paste remains available.`,
+        knobs: { oauthUrl: login.url },
         accounts: buildAccountList(
           (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         ),
@@ -3154,42 +3120,23 @@ const anthropicAuthPlugin = async (
       if (action.code) pending.loopback?.cancel()
 
       try {
-        const result = await exchange(
-          callbackInput,
-          pending.verifier,
-          pending.redirectUri,
-          pending.state,
-        )
-
-        if (result.type === 'failed') {
-          const accounts = buildAccountList(
-            (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
-          )
-          return {
-            text: 'OAuth authentication failed. Please check the code and try again.',
-            accounts,
-          }
-        }
-
+        // The code exchange and the token write happen in Rust; only the
+        // non-secret row comes back.
+        const added = await pending.login.complete({
+          callback: callbackInput,
+          label: action.label || undefined,
+          setCurrent: false,
+        })
         const now = Date.now()
-        // OAuth accounts have no natural key, so the id stays a UUID even when a
-        // label is given (label collisions must not collide ids). The label is
-        // optional — a blank one keeps the UUID-name fallback in the UI.
         const account: OAuthAccount = {
-          id: randomUUID(),
+          id: added.id,
           type: 'oauth' as const,
           authLineageId: randomUUID(),
-          label: action.label || undefined,
-          access: result.access,
-          refresh: result.refresh,
-          expires: result.expires,
-          refreshExpires: result.refreshTokenExpiresAt,
+          label: added.label ?? (action.label || undefined),
           enabled: true,
           addedAt: now,
           lastUsed: now,
-          lastRefreshedAt: now,
         }
-        await upsertFallbackAccountInSharedStore(account)
         await addAccountPersistent(account, accountStoragePath)
         logger.info('commands', 'account added', {
           id: account.id,
@@ -3203,12 +3150,18 @@ const anthropicAuthPlugin = async (
           updatedStorage ?? createEmptyStorage(),
         )
         return { text: `OAuth account added.`, accounts }
-      } catch {
+      } catch (error) {
         const accounts = buildAccountList(
           (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
+        if (isAnthropicAuthError(error, 'transient')) {
+          return {
+            text: 'OAuth exchange failed due to a network error. Please try again.',
+            accounts,
+          }
+        }
         return {
-          text: 'OAuth exchange failed due to a network error. Please try again.',
+          text: 'OAuth authentication failed. Please check the code and try again.',
           accounts,
         }
       } finally {
@@ -3244,7 +3197,9 @@ const anthropicAuthPlugin = async (
         result.updated.action === 'disable'
       ) {
         const enabled = result.updated.action === 'enable'
-        await setSharedAccountEnabled(result.updated.id, enabled)
+        if (await storeHasAccount(result.updated.id)) {
+          await setSharedAccountEnabled(result.updated.id, enabled)
+        }
         await setAccountEnabledPersistent(
           result.updated.id,
           enabled,
@@ -3258,7 +3213,9 @@ const anthropicAuthPlugin = async (
           enabled,
         })
       } else if (result.updated.action === 'remove') {
-        await removeSharedAccount(result.updated.id)
+        if (await storeHasAccount(result.updated.id)) {
+          await removeSharedAccount(result.updated.id)
+        }
         await removeAccountPersistent(result.updated.id, accountStoragePath)
         const updatedId = result.updated.id
         const account = storage?.accounts.find((a) => a.id === updatedId)
@@ -3269,7 +3226,15 @@ const anthropicAuthPlugin = async (
       } else if (result.updated.action === 'reorder') {
         const orderedIds =
           result.updated.newOrder ?? result.updated.previousOrder ?? []
-        await reorderSharedAccounts(orderedIds)
+        const storeIds = new Set(
+          (
+            await storeAccess()
+              .listAccounts()
+              .catch(() => [])
+          ).map((row) => row.id),
+        )
+        const storeOrder = orderedIds.filter((id) => storeIds.has(id))
+        if (storeOrder.length) await reorderSharedAccounts(storeOrder)
         await reorderAccountsPersistent(orderedIds, accountStoragePath)
         const updatedId = result.updated.id
         const account = storage?.accounts.find((a) => a.id === updatedId)
@@ -3287,7 +3252,6 @@ const anthropicAuthPlugin = async (
             activeId: lastSidebarRouting.activeId,
             route: lastSidebarRouting.route,
             mainAccessToken: auth.access,
-            mainRefreshToken: auth.refresh,
             routingAuthoritative: false,
           })
         } catch {
@@ -3785,7 +3749,6 @@ const anthropicAuthPlugin = async (
           activeId: lastSidebarRouting.activeId,
           route: lastSidebarRouting.route,
           mainAccessToken: cmdAuth?.access,
-          mainRefreshToken: cmdAuth?.refresh,
           routingAuthoritative: false,
         })
       }
@@ -3805,15 +3768,33 @@ const anthropicAuthPlugin = async (
         const resolveAuth = async () => {
           const openCodeAuth = await getOpenCodeAuth()
           const sidecar =
-            (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+            (await loadHostAccounts(accountStoragePath)) ?? createEmptyStorage()
           const reconciled = await reconcileAnthropicAuth({
             openCodeAuth,
             legacyAccounts: sidecar.accounts,
             wifAuth: workloadIdentity,
+            // After the one-time import, OpenCode's auth.json keeps only the
+            // access token and a placeholder refresh token.
+            setOpenCodeAuth: async (hostAuth) => {
+              // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
+              await (client as any).auth.set({
+                path: { id: 'anthropic' },
+                body: hostAuth,
+              })
+            },
           })
+          sharedAccountsCache = reconciled.accounts
+          sharedAccountsCachedAt = Date.now()
+          latestMainRefreshError =
+            reconciled.auth?.type === 'oauth'
+              ? (reconciled.auth.refreshError ??
+                (reconciled.sharedMain
+                  ? refreshErrorFromSharedAccount(reconciled.sharedMain)
+                  : undefined))
+              : undefined
           if (
-            JSON.stringify(sidecar.accounts) !==
-            JSON.stringify(reconciled.fallbacks)
+            JSON.stringify(sidecar.accounts.map(persistedAccountShape)) !==
+            JSON.stringify(reconciled.fallbacks.map(persistedAccountShape))
           ) {
             const fallbackIds = new Set(
               reconciled.fallbacks.map((account) => account.id),
@@ -3866,487 +3847,67 @@ const anthropicAuthPlugin = async (
           }
         }
         if (auth.type === 'oauth') {
-          // Shared inflight refresh promise — prevents concurrent token refreshes
-          // from racing against each other (and causing 401 cascades with token rotation)
+          // One in-flight re-read per rejected/expired bearer, so concurrent
+          // requests share a single store round trip (and, when the store has
+          // to refresh, a single claimed refresh).
           let refreshPromise: Promise<string> | null = null
 
-          async function refreshMainAccessToken() {
+          /**
+           * A live main bearer from the store. The Rust binding refreshes
+           * (claimed, compare-and-swap, fail-closed) only when the stored
+           * token has expired; with `rejectedAccess` (an upstream 401) it
+           * performs one claimed refresh of that exact bearer. A static
+           * (non-store) credential cannot be refreshed here.
+           */
+          async function refreshMainAccessToken(
+            options: { rejectedAccess?: string } = {},
+          ): Promise<string> {
             if (!refreshPromise) {
               refreshPromise = (async () => {
-                const maxRetries = 2
-                const baseDelayMs = 500
-                let leaseId: string | null = null
-                let leaseTokenHash: string | null = null
-                let releaseFileLock: (() => Promise<void>) | null = null
-                // The machine-wide claim, released alongside the sidecar lease.
-                let sharedMainLeaseId: string | undefined
-                let sharedMainLeaseAccountId: string | undefined
-
-                async function updateMainRefreshState(
-                  update: (storage: AccountStorage) => void,
+                const current = await getAuth()
+                if (current.type !== 'oauth') {
+                  throw new Error('Anthropic main credential is not OAuth')
+                }
+                if (
+                  options.rejectedAccess &&
+                  current.sharedAccountId &&
+                  current.access === options.rejectedAccess
                 ) {
-                  const storage: AccountStorage =
-                    (await loadAccounts(accountStoragePath)) ??
-                    createEmptyStorage()
-                  storage.refresh = storage.refresh ?? {}
-                  update(storage)
-                  await saveAccountState(storage, accountStoragePath, {
-                    mainRefresh: true,
+                  const recovery = await storeAccess().handleUnauthorized(
+                    options.rejectedAccess,
+                  )
+                  log('[refresh] opencode main oauth 401 recovery', {
+                    retry: recovery.retry,
+                    reason: recovery.reason,
+                    failureCode: recovery.failureCode,
                   })
-                }
-
-                async function waitForConcurrentMainRefresh(previous: {
-                  access?: string
-                  refresh?: string
-                  expires?: number
-                }) {
-                  const deadline = Date.now() + CONCURRENT_MAIN_REFRESH_WAIT_MS
-                  while (Date.now() < deadline) {
-                    await new Promise((resolve) =>
-                      runtimeTimers.setTimeout(
-                        resolve,
-                        CONCURRENT_MAIN_REFRESH_POLL_BASE_MS +
-                          jitterMs(CONCURRENT_MAIN_REFRESH_POLL_BASE_MS),
-                      ),
-                    )
-                    const latest = await getAuth()
-                    if (latest.type !== 'oauth' || !latest.access) continue
-                    const changed =
-                      latest.access !== previous.access ||
-                      latest.refresh !== previous.refresh ||
-                      (latest.expires ?? 0) > (previous.expires ?? 0) + 60_000
-                    if (
-                      changed &&
-                      (!latest.expires || latest.expires > Date.now())
-                    ) {
-                      if (previous.refresh && latest.refresh) {
-                        await continueMainPrimeAuthLineageAfterRefresh(
-                          {
-                            previousRefreshToken: previous.refresh,
-                            currentRefreshToken: latest.refresh,
-                          },
-                          accountStoragePath,
-                        )
-                      }
-                      log(
-                        '[refresh] opencode main oauth joined concurrent refresh',
-                        {
-                          expiresInMs: latest.expires
-                            ? latest.expires - Date.now()
-                            : undefined,
-                        },
-                      )
-                      return latest.access
-                    }
+                  if (recovery.retry && recovery.token) {
+                    return recovery.token.accessToken
                   }
-                  return null
+                  throw Object.assign(
+                    new Error(
+                      `Claude OAuth access was rejected and the store could not re-authorize (${recovery.reason})`,
+                    ),
+                    { code: recovery.failureCode ?? 'transient' },
+                  )
                 }
-
-                for (let attempt = 0; attempt <= maxRetries; attempt++) {
-                  let freshAuth: Awaited<ReturnType<typeof getAuth>> | null =
-                    null
-                  try {
-                    if (attempt > 0) {
-                      const delay = baseDelayMs * 2 ** (attempt - 1)
-                      await new Promise((resolve) =>
-                        runtimeTimers.setTimeout(resolve, delay),
-                      )
-                    }
-
-                    // Re-read auth to get the latest refresh token.
-                    // The outer `auth` snapshot may be stale if tokens
-                    // were rotated since the fetch() call was made.
-                    freshAuth = await getAuth()
-
-                    if (!freshAuth.refresh) {
-                      throw new Error(
-                        'Token refresh failed: missing refresh token',
-                      )
-                    }
-
-                    const storage = await loadAccounts(accountStoragePath)
-                    const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
-                    const mainError = storage?.refresh?.mainLastRefreshError
-                    log('[refresh] opencode main oauth refresh check', {
-                      attempt,
-                      expiresInMs: freshAuth.expires
-                        ? freshAuth.expires - Date.now()
-                        : undefined,
-                      hasBackoff: Boolean(mainError),
-                      backoffActive: mainError
-                        ? refreshBackoffActive(
-                            mainError,
-                            freshAuth.refresh,
-                            Date.now(),
-                          )
-                        : false,
-                      retryCount: mainError?.retryCount,
-                      nextRetryAt: mainError?.nextRetryAt,
-                    })
-                    if (
-                      mainError &&
-                      refreshBackoffActive(
-                        mainError,
-                        freshAuth.refresh,
-                        Date.now(),
-                      )
-                    ) {
-                      log(
-                        '[refresh] opencode main oauth refresh skipped backoff',
-                        {
-                          nextRetryAt: mainError.nextRetryAt,
-                          retryCount: mainError.retryCount,
-                        },
-                      )
-                      throw new Error(
-                        formatRefreshBackoffMessage(mainError, Date.now()),
-                      )
-                    }
-                    if (
-                      storage?.refresh?.mainRefreshLeaseUntil &&
-                      storage.refresh.mainRefreshLeaseUntil > Date.now() &&
-                      storage.refresh.mainRefreshLeaseTokenHash ===
-                        refreshTokenHash
-                    ) {
-                      log(
-                        '[refresh] opencode main oauth refresh skipped lease',
-                        {
-                          leaseUntil: storage.refresh.mainRefreshLeaseUntil,
-                        },
-                      )
-                      const concurrentAccess =
-                        await waitForConcurrentMainRefresh(freshAuth)
-                      if (concurrentAccess) return concurrentAccess
-                      throw new Error(
-                        'Claude OAuth refresh is already in progress',
-                      )
-                    }
-
-                    const fileLock = await acquireRefreshFileLock({
-                      name: 'opencode-main-oauth-refresh',
-                      ttlMs: 2 * 60_000,
-                      renew: true,
-                    })
-                    if (!fileLock) {
-                      log(
-                        '[refresh] opencode main oauth refresh skipped file lock',
-                      )
-                      const concurrentAccess =
-                        await waitForConcurrentMainRefresh(freshAuth)
-                      if (concurrentAccess) return concurrentAccess
-                      throw new Error(
-                        'Claude OAuth refresh is already in progress',
-                      )
-                    }
-                    releaseFileLock = fileLock.release
-
-                    leaseId = randomUUID()
-                    leaseTokenHash = refreshTokenHash
-                    await updateMainRefreshState((nextStorage) => {
-                      nextStorage.refresh = nextStorage.refresh ?? {}
-                      nextStorage.refresh.mainRefreshLeaseId =
-                        leaseId ?? undefined
-                      nextStorage.refresh.mainRefreshLeaseUntil =
-                        Date.now() + 2 * 60_000
-                      nextStorage.refresh.mainRefreshLeaseTokenHash =
-                        refreshTokenHash
-                    })
-                    const latestLease = await loadAccounts(accountStoragePath)
-                    log(
-                      '[refresh] opencode main oauth refresh lease acquired',
-                      {
-                        attempt,
-                        leaseUntil: Date.now() + 2 * 60_000,
-                      },
-                    )
-                    if (
-                      latestLease?.refresh?.mainRefreshLeaseId !== leaseId ||
-                      latestLease.refresh.mainRefreshLeaseTokenHash !==
-                        refreshTokenHash
-                    ) {
-                      throw new Error(
-                        'Claude OAuth refresh is already in progress',
-                      )
-                    }
-
-                    // The lease above is the sidecar's, scoped to this app's
-                    // config path — but the credential is machine-wide. Pi and
-                    // OpenCode each hold their own, so both can present the
-                    // same refresh token, and Anthropic revokes the whole
-                    // family when it sees one twice. Claim it in the store the
-                    // credential actually lives in.
-                    if (freshAuth.sharedAccountId) {
-                      const sharedClaim = await claimSharedAccountRefresh(
-                        freshAuth.sharedAccountId,
-                        freshAuth.refresh,
-                        {},
-                      ).catch(() => undefined)
-                      logger.info('refresh', 'shared refresh claim', {
-                        accountId: freshAuth.sharedAccountId,
-                        status: sharedClaim?.status ?? 'errored',
-                        refreshFp: hashRefreshToken(freshAuth.refresh).slice(
-                          0,
-                          8,
-                        ),
-                      })
-                      if (sharedClaim?.status === 'already-refreshed') {
-                        // A peer spent this token first; presenting it now
-                        // would revoke the family.
-                        return sharedClaim.credential.access
-                      }
-                      sharedMainLeaseId =
-                        sharedClaim?.status === 'claimed'
-                          ? sharedClaim.leaseId
-                          : undefined
-                      sharedMainLeaseAccountId = freshAuth.sharedAccountId
-                    }
-
-                    log('[refresh] opencode main oauth refresh request start', {
-                      attempt,
-                    })
-                    const refreshed = await refreshClaudeOAuthToken({
-                      refreshToken: freshAuth.refresh,
-                      refreshTokenExpiresAt: freshAuth.refreshTokenExpiresAt,
-                      // Main OpenCode OAuth already has request-path retry,
-                      // persisted backoff, and cross-process serialization here.
-                      // Keep the shared helper single-shot in this path so the
-                      // two retry layers cannot multiply endpoint pressure.
-                      maxRetries: 0,
-                    })
-
-                    if (freshAuth.sharedAccountId) {
-                      const persisted = await persistRefreshedSharedOAuth({
-                        accountId: freshAuth.sharedAccountId,
-                        expectedRefresh: freshAuth.refresh,
-                        access: refreshed.access,
-                        refresh: refreshed.refresh,
-                        expires: refreshed.expires,
-                        refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt,
-                      })
-                      if (!persisted) {
-                        throw new Error(
-                          'Claude OAuth refresh was superseded by another process',
-                        )
-                      }
-                    }
-
-                    await continueMainPrimeAuthLineageAfterRefresh(
-                      {
-                        previousRefreshToken: freshAuth.refresh,
-                        currentRefreshToken: refreshed.refresh,
-                      },
-                      accountStoragePath,
-                    )
-
-                    try {
-                      // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                      await (client as any).auth.set({
-                        path: {
-                          id: 'anthropic',
-                        },
-                        body: {
-                          type: 'oauth',
-                          refresh: refreshed.refresh,
-                          access: refreshed.access,
-                          expires: refreshed.expires,
-                        },
-                      })
-                    } catch (error) {
-                      await continueMainPrimeAuthLineageAfterRefresh(
-                        {
-                          previousRefreshToken: refreshed.refresh,
-                          currentRefreshToken: freshAuth.refresh,
-                        },
-                        accountStoragePath,
-                      )
-                      throw error
-                    }
-
-                    await updateMainRefreshState((storage) => {
-                      if (!storage?.refresh) return
-                      storage.refresh.mainLastRefreshError = undefined
-                      if (storage.refresh.mainRefreshLeaseId === leaseId) {
-                        storage.refresh.mainRefreshLeaseId = undefined
-                        storage.refresh.mainRefreshLeaseUntil = undefined
-                        storage.refresh.mainRefreshLeaseTokenHash = undefined
-                      }
-                    })
-
-                    log('[refresh] opencode main oauth refresh succeeded', {
-                      attempt,
-                      expiresInMs: refreshed.expires - Date.now(),
-                    })
-                    return refreshed.access
-                  } catch (error) {
-                    const isNetworkError =
-                      error instanceof Error &&
-                      (error.message.includes('fetch failed') ||
-                        ('code' in error &&
-                          (error.code === 'ECONNRESET' ||
-                            error.code === 'ECONNREFUSED' ||
-                            error.code === 'ETIMEDOUT' ||
-                            error.code === 'UND_ERR_CONNECT_TIMEOUT')))
-
-                    if (
-                      attempt < maxRetries &&
-                      (isNetworkError ||
-                        (() => {
-                          const s = (error as { status?: number }).status
-                          return typeof s === 'number' && s >= 500
-                        })())
-                    ) {
-                      continue
-                    }
-
-                    log(
-                      '[refresh] opencode main oauth refresh attempt failed',
-                      {
-                        attempt,
-                        error:
-                          error instanceof Error
-                            ? error.message
-                            : String(error),
-                        transient: isNetworkError,
-                      },
-                    )
-
-                    const failedRefreshToken = freshAuth?.refresh
-                    if (
-                      failedRefreshToken &&
-                      (error as { isRefreshError?: boolean }).isRefreshError
-                    ) {
-                      await updateMainRefreshState((storage) => {
-                        storage.refresh = storage.refresh ?? {}
-                        storage.refresh.mainLastRefreshError =
-                          buildRefreshOperationError({
-                            error,
-                            now: Date.now(),
-                            refreshToken: failedRefreshToken,
-                            previous: storage.refresh.mainLastRefreshError,
-                          })
-                      })
-                    }
-
-                    throw error
-                  } finally {
-                    if (leaseId) {
-                      await updateMainRefreshState((storage) => {
-                        if (!storage?.refresh) return
-                        if (
-                          storage.refresh.mainRefreshLeaseId === leaseId &&
-                          storage.refresh.mainRefreshLeaseTokenHash ===
-                            leaseTokenHash
-                        ) {
-                          storage.refresh.mainRefreshLeaseId = undefined
-                          storage.refresh.mainRefreshLeaseUntil = undefined
-                          storage.refresh.mainRefreshLeaseTokenHash = undefined
-                        }
-                      }).catch(() => {})
-                    }
-                    if (sharedMainLeaseId && sharedMainLeaseAccountId) {
-                      await releaseSharedAccountRefresh(
-                        sharedMainLeaseAccountId,
-                        sharedMainLeaseId,
-                      ).catch(() => {})
-                      sharedMainLeaseId = undefined
-                    }
-                    await releaseFileLock?.().catch(() => {})
-                  }
+                if (current.access && current.expires > Date.now()) {
+                  return current.access
                 }
-                // Unreachable — each iteration either returns or throws.
-                // Kept as a TypeScript exhaustiveness guard.
-                throw new Error('Token refresh exhausted all retries')
+                throw new Error(
+                  current.refreshError?.message ??
+                    (current.sharedAccountId
+                      ? 'Claude OAuth access token is unavailable from the account store'
+                      : 'Claude OAuth access token has expired; log in again'),
+                )
               })().finally(() => {
                 refreshPromise = null
               })
             }
-
             return refreshPromise
           }
 
-          latestRefreshMainAccessToken = refreshMainAccessToken
-
-          function startMainBackgroundRefresh() {
-            if (mainBackgroundRefreshTimer) {
-              runtimeTimers.clearInterval(mainBackgroundRefreshTimer)
-              mainBackgroundRefreshTimer = null
-            }
-
-            const run = async () => {
-              try {
-                const storage = await loadAccounts(accountStoragePath)
-                if (!mainRefreshEnabled(storage)) {
-                  return
-                }
-                const latestAuth = await getAuth()
-                if (latestAuth.type !== 'oauth') return
-                await clearStaleMainRefreshError(latestAuth.refresh)
-                if (!latestAuth.expires) return
-                const expiresInMs = latestAuth.expires - Date.now()
-                const refreshBeforeMs = mainRefreshBeforeExpiryMs(storage)
-                if (expiresInMs > refreshBeforeMs) {
-                  return
-                }
-                log('[refresh] opencode main oauth background due', {
-                  expiresInMs,
-                  refreshBeforeMs,
-                })
-                if (
-                  latestAuth.refresh &&
-                  refreshBackoffActive(
-                    storage?.refresh?.mainLastRefreshError,
-                    latestAuth.refresh,
-                    Date.now(),
-                  )
-                ) {
-                  log(
-                    '[refresh] opencode main oauth background skipped backoff',
-                    {
-                      nextRetryAt:
-                        storage?.refresh?.mainLastRefreshError?.nextRetryAt,
-                      retryCount:
-                        storage?.refresh?.mainLastRefreshError?.retryCount,
-                      expiresInMs,
-                    },
-                  )
-                  return
-                }
-                if (
-                  latestAuth.refresh &&
-                  storage?.refresh?.mainRefreshLeaseUntil &&
-                  storage.refresh.mainRefreshLeaseUntil > Date.now() &&
-                  storage.refresh.mainRefreshLeaseTokenHash ===
-                    hashRefreshToken(latestAuth.refresh)
-                ) {
-                  return
-                }
-
-                await refreshMainAccessToken()
-                const refreshedAuth = await getAuth()
-                log('[refresh] opencode main oauth refreshed in background', {
-                  newExpiresInMs: refreshedAuth.expires
-                    ? refreshedAuth.expires - Date.now()
-                    : undefined,
-                })
-              } catch (error) {
-                logger.warn('refresh', 'opencode main oauth refresh failed', {
-                  message:
-                    error instanceof Error ? error.message : String(error),
-                })
-              }
-            }
-
-            mainBackgroundRefreshTick = run
-            mainBackgroundRefreshTimer = runtimeTimers.setInterval(() => {
-              void run()
-            }, MAIN_AUTH_REFRESH_TICK_MS +
-              jitterMs(MAIN_AUTH_REFRESH_TICK_JITTER_MS))
-            if ('unref' in mainBackgroundRefreshTimer) {
-              mainBackgroundRefreshTimer.unref()
-            }
-          }
-
-          startMainBackgroundRefresh()
+          latestRefreshMainAccessToken = () => refreshMainAccessToken()
           quotaManager.seedFallbacksFromAccounts(
             (initialStorage?.accounts ?? []).filter(isOAuthAccount),
           )
@@ -4356,7 +3917,6 @@ const anthropicAuthPlugin = async (
             activeId: initialSidebarRouting.activeId,
             route: initialSidebarRouting.route,
             mainAccessToken: auth.access,
-            mainRefreshToken: auth.refresh,
             routingAuthoritative: false,
           })
           if (
@@ -4372,7 +3932,6 @@ const anthropicAuthPlugin = async (
                   activeId: 'main',
                   route: 'main',
                   mainAccessToken: auth.access,
-                  mainRefreshToken: auth.refresh,
                   routingAuthoritative: false,
                   useHydratedProfiles: true,
                 })
@@ -5315,7 +4874,17 @@ const anthropicAuthPlugin = async (
               latestStorage?.accounts ?? []
             ).entries()) {
               if (stored.enabled === false || !isOAuthAccount(stored)) continue
-              const account = usableById.get(stored.id) ?? stored
+              let account = usableById.get(stored.id) ?? stored
+              if (
+                !account.access &&
+                !isPermanentRefreshError(account.lastRefreshError)
+              ) {
+                // Host files carry no tokens; a quota-excluded account still
+                // needs its (store) bearer to report its quota as a route.
+                account = await fallbackManager
+                  .ensureAccessToken(account)
+                  .catch(() => account)
+              }
               if (
                 !account.access ||
                 isPermanentRefreshError(account.lastRefreshError)
@@ -5947,7 +5516,6 @@ const anthropicAuthPlugin = async (
                 trace.done('api_key_passthrough', { status: response.status })
                 return response
               }
-              await clearStaleMainRefreshError(auth.refresh)
               const loadStart = nowMs()
               const storage = await loadAccounts()
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
@@ -5990,7 +5558,6 @@ const anthropicAuthPlugin = async (
                   activeId,
                   route,
                   mainAccessToken: auth.access,
-                  mainRefreshToken: auth.refresh,
                 })
               let preselectedFallbackAccounts:
                 | Array<OAuthAccount | ApiKeyAccount>
@@ -6000,7 +5567,10 @@ const anthropicAuthPlugin = async (
                 replayableRequest &&
                 sessionId &&
                 getRoutingMode(storage) === 'sticky-balanced' &&
-                auth.access
+                // A main the store cannot serve (dead or failing refresh)
+                // still routes: sticky routing excludes it and picks a
+                // fallback, or reports that main needs a re-login.
+                (auth.access || auth.refreshError)
               ) {
                 const routingModelId =
                   fablePlan?.effectiveModel ?? requestModelId
@@ -6194,13 +5764,14 @@ const anthropicAuthPlugin = async (
                       const authRouteId = route.id
                       try {
                         if (authRouteId === STICKY_ROUTING_MAIN_ACCOUNT_ID) {
-                          auth.access = await refreshMainAccessToken()
+                          auth.access = await refreshMainAccessToken({
+                            rejectedAccess: route.access,
+                          })
                           route = { ...route, access: auth.access }
                         } else if (route.account && stickyRoutes.storage) {
                           const refreshed =
-                            await fallbackManager.refreshAccount(
+                            await fallbackManager.ensureAccessToken(
                               route.account,
-                              stickyRoutes.storage,
                               { force: true },
                             )
                           if (refreshed.access) {
@@ -6413,38 +5984,13 @@ const anthropicAuthPlugin = async (
               }
 
               if (!auth.access || !auth.expires || auth.expires < Date.now()) {
-                // Check backoff before attempting refresh — avoids noisy
-                // per-request retries during prolonged rate limits
-                const refreshStorage = await loadAccounts()
-                const mainRefreshError =
-                  refreshStorage?.refresh?.mainLastRefreshError
-                if (
-                  auth.refresh &&
-                  mainRefreshError &&
-                  refreshBackoffActive(
-                    mainRefreshError,
-                    auth.refresh,
-                    Date.now(),
-                  )
-                ) {
-                  log('[refresh] opencode main oauth request skipped backoff', {
-                    nextRetryAt: mainRefreshError.nextRetryAt,
-                    retryCount: mainRefreshError.retryCount,
-                    expiresInMs: auth.expires
-                      ? auth.expires - Date.now()
-                      : undefined,
-                  })
-                  throw new Error(
-                    formatRefreshBackoffMessage(mainRefreshError, Date.now()),
-                  )
-                }
+                // The store refreshes an expired main on the next read; a
+                // failure here carries the store's verdict (dead token,
+                // transient, re-login needed).
                 log(
-                  '[refresh] opencode main oauth refresh required for request',
+                  '[refresh] opencode main oauth token required for request',
                   {
                     hasAccess: Boolean(auth.access),
-                    expiresInMs: auth.expires
-                      ? auth.expires - Date.now()
-                      : undefined,
                     expiredAgoMs:
                       auth.expires && auth.expires < Date.now()
                         ? Date.now() - auth.expires
@@ -6554,7 +6100,6 @@ const anthropicAuthPlugin = async (
                     activeId: 'main',
                     route: 'main',
                     mainAccessToken: auth.access,
-                    mainRefreshToken: auth.refresh,
                   })
                   const routingQuotaPasses =
                     quotaSnapshotPassesPolicy(routingQuota, storage) &&
@@ -6799,7 +6344,7 @@ const anthropicAuthPlugin = async (
                 )
               }
 
-              const mainResponse = await sendWithAccessToken(
+              let mainResponse = await sendWithAccessToken(
                 input,
                 init,
                 auth.access,
@@ -6810,6 +6355,39 @@ const anthropicAuthPlugin = async (
                 fableRequest,
                 laneStartRequest,
               )
+              // A 401 on a store-backed main: one claimed refresh of that
+              // exact bearer in the store, then one re-send on the new one.
+              if (
+                mainResponse.status === 401 &&
+                replayableRequest &&
+                auth.sharedAccountId
+              ) {
+                const rejected = auth.access
+                try {
+                  auth.access = await refreshMainAccessToken({
+                    rejectedAccess: rejected,
+                  })
+                  trace.mark('main_unauthorized_recovered')
+                  await mainResponse.body?.cancel().catch(() => {})
+                  mainResponse = await sendWithAccessToken(
+                    input,
+                    init,
+                    auth.access,
+                    trace,
+                    'main_retry',
+                    storage,
+                    'main',
+                    fableRequest,
+                    laneStartRequest,
+                  )
+                } catch (error) {
+                  auth.access = rejected
+                  trace.mark('main_unauthorized_unrecovered', {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  })
+                }
+              }
               let fallbackServed = false
               const response = await tryFallbackAccounts(
                 input,
@@ -6845,32 +6423,34 @@ const anthropicAuthPlugin = async (
           label: 'Claude Pro/Max',
           type: 'oauth',
           authorize: async () => {
-            const result = await authorize('max')
+            // The PKCE verifier, the code exchange and the refresh token stay
+            // in the Rust store. OpenCode gets the access token and a
+            // placeholder refresh token for its own auth.json.
+            const login = startSharedLogin({ mode: 'max' })
             return {
-              url: result.url,
+              url: login.url,
               instructions: 'Paste the authorization code here:',
               method: 'code',
               callback: async (code: string) => {
-                const credentials = await exchange(
-                  code,
-                  result.verifier,
-                  result.redirectUri,
-                  result.state,
-                )
-                if (credentials.type === 'success') {
-                  await persistConnectedAnthropicAuth({
-                    type: 'oauth',
-                    refresh: credentials.refresh,
-                    access: credentials.access,
-                    expires: credentials.expires,
-                    refreshTokenExpiresAt: credentials.refreshTokenExpiresAt,
-                    scopes: credentials.scopes,
-                    accountId: credentials.accountId,
-                    email: credentials.email,
-                    organizationId: credentials.organizationId,
+                try {
+                  const added = await login.complete({
+                    callback: code,
+                    setCurrent: true,
                   })
+                  const token = await getSharedAccessToken(added.id)
+                  return {
+                    type: 'success' as const,
+                    access: token.accessToken,
+                    refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+                    expires: token.expiresAt,
+                  }
+                } catch (error) {
+                  logger.warn('auth', 'claude login failed', {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  })
+                  return { type: 'failed' as const }
                 }
-                return credentials
               },
             }
           },
@@ -6902,10 +6482,8 @@ const anthropicAuthPlugin = async (
                     },
                   },
                 ).then((r) => r.json() as Promise<{ raw_key: string }>)
-                await persistConnectedAnthropicAuth({
-                  type: 'api',
-                  key: apiKey.raw_key,
-                })
+                // OpenCode stores the key in its own auth.json; the store
+                // binding cannot hold API keys (binding gap).
                 return { type: 'success' as const, key: apiKey.raw_key }
               },
             }
@@ -6920,7 +6498,6 @@ const anthropicAuthPlugin = async (
     },
     __primeManager: primeManager,
     __quotaManager: quotaManager,
-    __mainBackgroundRefreshTick: () => mainBackgroundRefreshTick?.(),
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }

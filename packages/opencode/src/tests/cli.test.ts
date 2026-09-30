@@ -5,11 +5,24 @@ import { join } from 'node:path'
 import {
   addAccountPersistent,
   getAccountStatePath,
-  loadSharedAccountStore,
-  saveSharedAccountStore,
+  listSharedAccounts,
+  startSharedLoginWithLoopback,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  type MockTokenServer,
+  seedStoreAccount,
+  startMockTokenServer,
+  type TempStore,
+  useTempStore,
+} from '../../../core/src/tests/support/store-fixture.ts'
 
-import { addApiRoute, login, relaySetup, revokeAccount } from '../cli'
+import {
+  addApiRoute,
+  type LoginDeps,
+  login,
+  relaySetup,
+  revokeAccount,
+} from '../cli'
 
 let tempDir: string
 
@@ -89,12 +102,8 @@ describe('CLI api add', () => {
     )
     expect(runtimeState.accounts['kie-opus'].apiKey).toBe('kie-key')
 
-    const shared = await loadSharedAccountStore({
-      path: join(tempDir, 'shared-anthropic-accounts.json'),
-      legacyPaths: [],
-    })
-    expect(shared.source).toEqual({ type: 'empty' })
-    expect(shared.store.accounts).toEqual([])
+    // API routes stay host-owned: nothing reaches the shared store.
+    expect(await listSharedAccounts()).toEqual([])
   })
 
   test('rejects invalid API base URL before saving route state', async () => {
@@ -123,205 +132,112 @@ describe('CLI api add', () => {
 })
 
 describe('CLI login', () => {
-  test('names the account from the profile endpoint with no label given', async () => {
-    // The whole point of the profile lookup: `login` with no argument names
-    // itself after whoever actually signed in, so the caller never has to
-    // retype an address the API already knows.
-    const accountPath = join(tempDir, 'anthropic-auth.json')
-    const prompt = async () =>
-      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
-    const exchange = async (): Promise<{
-      type: 'success'
-      access: string
-      refresh: string
-      expires: number
-    }> => ({
-      type: 'success',
-      access: 'cli-access',
-      refresh: 'cli-refresh',
-      expires: Date.now() + 3600 * 1000,
+  // The code exchange runs in Rust against a mock token endpoint; the manual
+  // (paste) path is used so no loopback listener is involved.
+  let tokenServer: MockTokenServer
+  let store: TempStore
+  beforeEach(() => {
+    store = useTempStore()
+    tokenServer = startMockTokenServer()
+  })
+  afterEach(() => {
+    tokenServer.stop()
+    store.dispose()
+  })
+  const manualLogin: LoginDeps['startLogin'] = (options) =>
+    startSharedLoginWithLoopback({ ...options, loopback: false })
+
+  function loginCode(code: string, email: string, org = 'a') {
+    tokenServer.codes.set(code, {
+      email,
+      accountUuid: `acct-${email}`,
+      tag: `${code}${org}`.replace(/[^A-Za-z0-9]/g, ''),
     })
+    return code
+  }
 
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      const url = typeof input === 'string' ? input : input.toString()
-      if (url.includes('/api/oauth/profile')) {
-        return new Response(
-          JSON.stringify({
-            account: { uuid: 'acct-uuid', email: 'from-profile@example.com' },
-            organization: { uuid: 'org-uuid' },
-          }),
-          { status: 200 },
-        )
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof fetch
-
+  async function quietly<T>(fn: () => Promise<T>) {
     const logs: string[] = []
     const origLog = console.log
     console.log = (...args: unknown[]) => {
       logs.push(args.map(String).join(' '))
     }
     try {
-      await withAccountEnv(accountPath, {}, () =>
-        // No label argument at all.
-        login(undefined, { prompt, exchange }),
-      )
+      return { result: await fn(), stdout: logs.join('\n') }
     } finally {
       console.log = origLog
-      globalThis.fetch = originalFetch
     }
+  }
 
-    expect(logs.join('\n')).toContain(
-      'Saved fallback account "from-profile@example.com"',
+  test('names the account after the signed-in email with no label given', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const code = loginCode('cli-code', 'from-grant@example.com')
+    const { stdout } = await quietly(() =>
+      withAccountEnv(accountPath, {}, () =>
+        login(undefined, { prompt: async () => code, startLogin: manualLogin }),
+      ),
     )
+    expect(stdout).toContain('Saved fallback account "from-grant@example.com"')
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.accounts[0]).toMatchObject({
-      id: 'from-profile@example.com',
+      id: 'from-grant@example.com',
       enabled: true,
     })
+    expect(tokenServer.codeExchanges.map((entry) => entry.code)).toEqual([code])
   })
 
   test('a second organization for the same person gets its own account', async () => {
-    // An email is not unique on its own: one person can hold a grant in
-    // several organizations, and those are separate routable credentials.
-    // Naming both after the bare email would make the second overwrite the
-    // first and silently drop a working login.
+    // One person can hold a grant in several organizations, and those are
+    // separate routable credentials; the store keeps both.
     const accountPath = join(tempDir, 'anthropic-auth.json')
-    const prompt = async () =>
-      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
-
-    const originalFetch = globalThis.fetch
-    // The suite already isolates the shared store; capture wherever it resolves
-    // rather than assuming, so this stays correct if that isolation changes.
-    let sharedPath = ''
-
-    let currentOrg = 'org-a'
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      const url = typeof input === 'string' ? input : input.toString()
-      if (url.includes('/api/oauth/profile')) {
-        return new Response(
-          JSON.stringify({
-            account: { uuid: 'shared-uuid', email: 'person@example.com' },
-            organization: { uuid: currentOrg, name: currentOrg },
-          }),
-          { status: 200 },
-        )
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof fetch
-
-    const exchangeFor =
-      (suffix: string) =>
-      async (): Promise<{
-        type: 'success'
-        access: string
-        refresh: string
-        expires: number
-      }> => ({
-        type: 'success',
-        access: `access-${suffix}`,
-        refresh: `refresh-${suffix}`,
-        expires: Date.now() + 3600 * 1000,
-      })
-
-    const origLog = console.log
-    console.log = () => {}
-    try {
-      await withAccountEnv(accountPath, {}, async () => {
-        const { getSharedAccountStorePath } = await import(
-          '@cortexkit/anthropic-auth-core'
-        )
-        sharedPath = getSharedAccountStorePath()
-        return login(undefined, { prompt, exchange: exchangeFor('a') })
-      })
-      currentOrg = 'org-b'
+    const first = loginCode('code-org-a', 'person@example.com', 'a')
+    const second = loginCode('code-org-b', 'person@example.com', 'b')
+    await quietly(async () => {
       await withAccountEnv(accountPath, {}, () =>
-        login(undefined, { prompt, exchange: exchangeFor('b') }),
+        login(undefined, {
+          prompt: async () => first,
+          startLogin: manualLogin,
+        }),
       )
-    } finally {
-      console.log = origLog
-      globalThis.fetch = originalFetch
-    }
-
-    const shared = JSON.parse(await readFile(sharedPath, 'utf8')) as {
-      accounts: Array<{ id: string }>
-    }
-
-    const ids = shared.accounts.map((account) => account.id)
-    expect(ids).toContain('person@example.com')
-    expect(ids).toContain('person@example.com (org-b)')
+      await withAccountEnv(accountPath, {}, () =>
+        login(undefined, {
+          prompt: async () => second,
+          startLogin: manualLogin,
+        }),
+      )
+    })
+    const rows = await listSharedAccounts()
+    expect(rows).toHaveLength(2)
+    expect(new Set(rows.map((row) => row.id)).size).toBe(2)
+    const orgs = new Set(rows.map((row) => row.organizationUuid))
+    expect(orgs.size).toBe(2)
+    expect(rows.every((row) => row.email === 'person@example.com')).toBe(true)
   })
 
-  test('names the account from the grant email and saves it', async () => {
+  test('saves the login in the store and only a tokenless entry in the host files', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
-
-    // Real authorize() (exercises PKCE + state + the printed URL); exchange()
-    // is the network boundary, stubbed to return canned tokens. The only
-    // prompt is the pasted callback code: the grant reports who signed in, so
-    // asking the user to retype it would only invite a mismatch.
     const asked: string[] = []
-    const promptAnswers = [
-      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
-    ]
-    let askIndex = 0
+    const code = loginCode('cli-code-2', 'signed-in@example.com')
     const prompt = async (message: string) => {
       asked.push(message)
-      return promptAnswers[askIndex++] ?? ''
+      return code
     }
+    const { stdout } = await quietly(() =>
+      withAccountEnv(accountPath, {}, () =>
+        login(undefined, { prompt, startLogin: manualLogin }),
+      ),
+    )
 
-    let exchangeArgs: { input: string; verifier: string } | undefined
-    const exchange = async (
-      input: string,
-      verifier: string,
-    ): Promise<{
-      type: 'success'
-      access: string
-      refresh: string
-      expires: number
-      email: string
-    }> => {
-      exchangeArgs = { input, verifier }
-      return {
-        type: 'success',
-        access: 'cli-access',
-        refresh: 'cli-refresh',
-        expires: Date.now() + 3600 * 1000,
-        email: 'signed-in@example.com',
-      }
-    }
-
-    const logs: string[] = []
-    const origLog = console.log
-    console.log = (...args: unknown[]) => {
-      logs.push(args.map(String).join(' '))
-    }
-    try {
-      await withAccountEnv(accountPath, {}, () =>
-        login(undefined, { prompt, exchange }),
-      )
-    } finally {
-      console.log = origLog
-    }
-
-    const stdout = logs.join('\n')
-    // The real authorize() URL was printed and carries a generated state.
-    expect(stdout).toMatch(/[?&]state=[A-Za-z0-9_-]{43}/)
+    // The binding's authorize URL was printed and carries a state.
+    expect(stdout).toMatch(/[?&]state=[A-Za-z0-9_-]{16,}/)
     // Only the callback-code prompt fired; no label was asked for.
     expect(asked).toEqual([
       'Paste the full callback URL or authorization code here: ',
     ])
-    // exchange received the real authorize() verifier and the pasted code.
-    expect(exchangeArgs?.input).toBe(
-      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
-    )
-    expect(exchangeArgs?.verifier).toBeString()
     expect(stdout).toContain('Saved fallback account "signed-in@example.com"')
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.accounts).toHaveLength(1)
-    // The id is the signed-in email, so a later re-login updates this account
-    // in place instead of stacking a second copy under a fresh random id.
     expect(storage.accounts[0]).toMatchObject({
       id: 'signed-in@example.com',
       label: 'signed-in@example.com',
@@ -333,51 +249,44 @@ describe('CLI login', () => {
     const runtimeState = JSON.parse(
       await readFile(getAccountStatePath(accountPath), 'utf8'),
     )
-    expect(runtimeState.accounts['signed-in@example.com']).toMatchObject({
-      access: 'cli-access',
-      refresh: 'cli-refresh',
-    })
+    const entry = runtimeState.accounts['signed-in@example.com']
+    expect(entry.access).toBeUndefined()
+    expect(entry.refresh).toBeUndefined()
+    expect(entry.authLineageId).toMatch(/^[0-9a-f-]{36}$/)
+    // The raw state file carries no token at all.
     expect(
-      runtimeState.accounts['signed-in@example.com'].authLineageId,
-    ).toMatch(/^[0-9a-f-]{36}$/)
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    ).not.toContain('sk-ant-')
+
+    const rows = await listSharedAccounts()
+    expect(rows.map((row) => row.id)).toEqual(['signed-in@example.com'])
+    expect(rows[0]?.accessLive).toBe(true)
   })
 
   test('preserves an account committed while the interactive OAuth flow is open', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
     const now = Date.now()
-    const exchange = async (): Promise<{
-      type: 'success'
-      access: string
-      refresh: string
-      expires: number
-    }> => {
+    const code = loginCode('cli-code-3', 'yiyi@example.com')
+    const prompt = async () => {
       await addAccountPersistent(
         {
           id: 'umut',
           label: 'umut',
-          type: 'oauth',
-          access: 'umut-access',
-          refresh: 'umut-refresh',
-          expires: now + 3600 * 1000,
+          type: 'api',
+          apiKey: 'umut-key',
+          baseURL: 'https://api.example.com',
           enabled: true,
           addedAt: now,
         },
         accountPath,
       )
-      return {
-        type: 'success',
-        access: 'yiyi-access',
-        refresh: 'yiyi-refresh',
-        expires: now + 3600 * 1000,
-      }
+      return code
     }
 
-    await withAccountEnv(accountPath, {}, () =>
-      login('yiyi', {
-        prompt: async () =>
-          'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
-        exchange,
-      }),
+    await quietly(() =>
+      withAccountEnv(accountPath, {}, () =>
+        login('yiyi', { prompt, startLogin: manualLogin }),
+      ),
     )
 
     const config = JSON.parse(await readFile(accountPath, 'utf8'))
@@ -388,12 +297,13 @@ describe('CLI login', () => {
       await readFile(getAccountStatePath(accountPath), 'utf8'),
     )
     expect(Object.keys(runtimeState.accounts)).toEqual(['umut', 'yiyi'])
-    expect(runtimeState.accounts.umut.refresh).toBe('umut-refresh')
-    expect(runtimeState.accounts.yiyi.refresh).toBe('yiyi-refresh')
+    expect(runtimeState.accounts.yiyi.refresh).toBeUndefined()
   })
 
-  test('re-login with same label clears stale errors and quota', async () => {
+  test('re-login with the same label keeps the entry and drops legacy host tokens', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
+    const statePath = getAccountStatePath(accountPath)
+    const oldRefreshedAt = Date.now() - 60_000
 
     await writeFile(
       accountPath,
@@ -405,55 +315,44 @@ describe('CLI login', () => {
             id: 'cli-label',
             label: 'cli-label',
             type: 'oauth',
-            access: 'old-access',
-            refresh: 'old-refresh',
-            expires: 1,
             enabled: true,
             addedAt: 123,
-            quota: {
-              five_hour: {
-                usedPercent: 99,
-                remainingPercent: 1,
-                checkedAt: 123,
-              },
-            },
-            lastRefreshedAt: 123,
-            lastRefreshError: { message: 'old refresh failed', checkedAt: 123 },
-            lastQuotaRefreshError: {
-              message: 'old quota failed',
-              checkedAt: 123,
-            },
           },
         ],
       }),
       'utf8',
     )
-
-    // Label is passed as the arg, so the only prompt is the callback code.
-    const asked: string[] = []
-    const prompt = async (message: string) => {
-      asked.push(message)
-      return 'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
-    }
-    const exchange = async (): Promise<{
-      type: 'success'
-      access: string
-      refresh: string
-      expires: number
-    }> => ({
-      type: 'success',
-      access: 'new-access',
-      refresh: 'new-refresh',
-      expires: Date.now() + 3600 * 1000,
-    })
-
-    await withAccountEnv(accountPath, {}, () =>
-      login('cli-label', { prompt, exchange }),
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          'cli-label': {
+            access: 'old-access',
+            refresh: 'old-refresh',
+            expires: 1,
+            lastRefreshedAt: oldRefreshedAt,
+            lastRefreshError: {
+              message: 'old invalid_grant',
+              checkedAt: oldRefreshedAt,
+              nextRetryAt: Date.now() + 3_600_000,
+              permanent: true,
+            },
+          },
+        },
+      }),
+      'utf8',
     )
 
-    expect(asked).toEqual([
-      'Paste the full callback URL or authorization code here: ',
-    ])
+    const code = loginCode('cli-code-4', 'relogin@example.com')
+    await quietly(() =>
+      withAccountEnv(accountPath, {}, () =>
+        login('cli-label', {
+          prompt: async () => code,
+          startLogin: manualLogin,
+        }),
+      ),
+    )
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage.accounts).toHaveLength(1)
@@ -463,172 +362,46 @@ describe('CLI login', () => {
       enabled: true,
       addedAt: 123,
     })
-    expect(storage.accounts[0].access).toBeUndefined()
-    expect(storage.accounts[0].refresh).toBeUndefined()
-    expect(storage.accounts[0].quota).toBeUndefined()
-    expect(storage.accounts[0].lastRefreshedAt).toBeUndefined()
-    expect(storage.accounts[0].lastRefreshError).toBeUndefined()
-    expect(storage.accounts[0].lastQuotaRefreshError).toBeUndefined()
-
-    const runtimeState = JSON.parse(
-      await readFile(getAccountStatePath(accountPath), 'utf8'),
-    )
-    expect(runtimeState.accounts['cli-label']).toMatchObject({
-      access: 'new-access',
-      refresh: 'new-refresh',
-    })
-    expect(runtimeState.accounts['cli-label'].quota).toBeUndefined()
-    expect(runtimeState.accounts['cli-label'].lastRefreshedAt).toBeNumber()
-    expect(runtimeState.accounts['cli-label'].lastRefreshError).toBeUndefined()
-    expect(
-      runtimeState.accounts['cli-label'].lastQuotaRefreshError,
-    ).toBeUndefined()
+    const runtimeState = JSON.parse(await readFile(statePath, 'utf8'))
+    const entry = runtimeState.accounts['cli-label']
+    // No token, and no refresh verdict: those belong to the store now.
+    expect(entry.access).toBeUndefined()
+    expect(entry.refresh).toBeUndefined()
+    expect(entry.lastRefreshError).toBeUndefined()
+    expect(entry.lastRefreshedAt).toBeUndefined()
+    const rows = await listSharedAccounts()
+    expect(rows.find((row) => row.id === 'cli-label')?.refreshDead).toBe(false)
   })
 
-  test('re-login with same label replaces split runtime state and clears stale reauth', async () => {
+  test('a failed code exchange reports authentication failure and saves nothing', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
-    const statePath = getAccountStatePath(accountPath)
-    const oldRefreshedAt = Date.now() - 60_000
-
-    await writeFile(
-      accountPath,
-      JSON.stringify(
-        {
-          version: 1,
-          main: { type: 'opencode', provider: 'anthropic' },
-          accounts: [
-            {
-              id: 'cli-label',
-              label: 'cli-label',
-              type: 'oauth',
-              enabled: true,
-              addedAt: 123,
-            },
-          ],
-        },
-        null,
-        2,
+    await expect(
+      quietly(() =>
+        withAccountEnv(accountPath, {}, () =>
+          login('nobody', {
+            prompt: async () => 'unknown-code',
+            startLogin: manualLogin,
+          }),
+        ),
       ),
-      'utf8',
-    )
-    await writeFile(
-      statePath,
-      JSON.stringify(
-        {
-          version: 1,
-          accounts: {
-            'cli-label': {
-              access: 'old-access',
-              refresh: 'old-refresh',
-              expires: 1,
-              lastRefreshedAt: oldRefreshedAt,
-              quota: {
-                five_hour: {
-                  usedPercent: 99,
-                  remainingPercent: 1,
-                  checkedAt: Date.now(),
-                },
-              },
-              lastRefreshError: {
-                message: 'old invalid_grant',
-                checkedAt: oldRefreshedAt,
-                nextRetryAt: Date.now() + 3_600_000,
-                permanent: true,
-              },
-              lastQuotaRefreshError: {
-                message: 'old quota error',
-                checkedAt: oldRefreshedAt,
-              },
-            },
-          },
-        },
-        null,
-        2,
-      ),
-      'utf8',
-    )
-
-    const prompt = async () =>
-      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
-    const exchange = async (): Promise<{
-      type: 'success'
-      access: string
-      refresh: string
-      expires: number
-    }> => ({
-      type: 'success',
-      access: 'new-access',
-      refresh: 'new-refresh',
-      expires: Date.now() + 3600 * 1000,
-    })
-
-    await withAccountEnv(accountPath, {}, () =>
-      login('cli-label', { prompt, exchange }),
-    )
-
-    const runtimeState = JSON.parse(await readFile(statePath, 'utf8'))
-    expect(runtimeState.accounts['cli-label']).toMatchObject({
-      access: 'new-access',
-      refresh: 'new-refresh',
-    })
-    expect(runtimeState.accounts['cli-label'].lastRefreshedAt).toBeGreaterThan(
-      oldRefreshedAt,
-    )
-    expect(runtimeState.accounts['cli-label'].quota).toBeUndefined()
-    expect(runtimeState.accounts['cli-label'].lastRefreshError).toBeUndefined()
-    expect(
-      runtimeState.accounts['cli-label'].lastQuotaRefreshError,
-    ).toBeUndefined()
+    ).rejects.toThrow('Authentication failed')
+    expect(await listSharedAccounts()).toEqual([])
   })
 })
 
 describe('CLI OAuth revocation', () => {
-  test('requires confirmation, revokes remotely, removes sidecar, and disables canonical auth', async () => {
-    const accountPath = join(tempDir, 'anthropic-auth.json')
-    await withAccountEnv(accountPath, {}, async () => {
-      const now = Date.now()
-      await saveSharedAccountStore({
-        version: 1,
-        current: 'revoked-account',
-        accounts: [
-          {
-            id: 'revoked-account',
-            label: 'Revoked Account',
-            credential: {
-              type: 'oauth',
-              access: 'sk-ant-oat01-abcdefghijklmnopqrstuvwxyz012345',
-              refresh: 'sk-ant-ort01-abcdefghijklmnopqrstuvwxyz012345',
-              expires_at: now + 60_000,
-            },
-            enabled: true,
-            created_at: new Date(now).toISOString(),
-          },
-        ],
-      })
-      await addAccountPersistent({
-        id: 'revoked-account',
-        label: 'Revoked Account',
-        type: 'oauth',
-        access: 'sk-ant-oat01-abcdefghijklmnopqrstuvwxyz012345',
-        refresh: 'sk-ant-ort01-abcdefghijklmnopqrstuvwxyz012345',
-        expires: now + 60_000,
-        enabled: true,
-      })
-      const calls: string[] = []
-      await revokeAccount('revoked-account', {
-        prompt: async () => 'revoke',
-        revoke: async ({ refreshToken }) => {
-          calls.push(refreshToken)
-          return 'revoked'
-        },
-      })
-      expect(calls).toEqual(['sk-ant-ort01-abcdefghijklmnopqrstuvwxyz012345'])
-      const shared = await loadSharedAccountStore()
-      expect(shared.store.accounts[0]?.enabled).toBe(false)
-      expect(shared.store.current).toBeUndefined()
-      const sidecar = JSON.parse(await readFile(accountPath, 'utf8'))
-      expect(sidecar.accounts).toEqual([])
-    })
+  test('refuses remote revocation (no refresh token in TS) and changes nothing', async () => {
+    const store = useTempStore()
+    try {
+      const seeded = await seedStoreAccount({ label: 'revoked-account' })
+      await expect(revokeAccount(seeded.id)).rejects.toThrow(
+        /Remote revocation .* is unavailable/,
+      )
+      const rows = await listSharedAccounts()
+      expect(rows.find((row) => row.id === seeded.id)?.enabled).toBe(true)
+    } finally {
+      store.dispose()
+    }
   })
 })
 
@@ -661,7 +434,6 @@ describe('CLI relay setup', () => {
             id: 'added-during-relay',
             label: 'added-during-relay',
             type: 'oauth',
-            refresh: 'relay-race-refresh',
           },
           accountPath,
         )

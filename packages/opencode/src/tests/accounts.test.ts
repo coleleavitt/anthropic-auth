@@ -16,8 +16,6 @@ import {
   acquireRefreshFileLock,
   addAccountPersistent,
   buildQuotaOperationError,
-  buildRefreshOperationError,
-  ClaudeOAuthRefreshError,
   FallbackAccountManager,
   fetchOAuthAccountProfile,
   fetchOAuthQuotaSnapshot,
@@ -48,10 +46,12 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  refreshErrorFromSharedAccount,
   removeAccount,
   removeAccountPersistent,
   reorderAccounts,
   reorderAccountsPersistent,
+  type SharedAccountAccess,
   saveAccountState,
   saveAccounts,
   saveOAuthProfileState,
@@ -71,8 +71,64 @@ import {
   tokenFingerprint,
   upsertAccount,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  type MockTokenServer,
+  seedStoreAccount,
+  startMockTokenServer,
+  type TempStore,
+  useTempStore,
+} from '../../../core/src/tests/support/store-fixture.ts'
 
 let tempDir: string
+// Every test gets a temp account store and a mock token endpoint, so nothing
+// the Rust store does can reach a real one.
+let store: TempStore
+let tokenServer: MockTokenServer
+
+/**
+ * A stand-in store that serves the access tokens the test fixture itself
+ * carries (read at call time, so later fixture edits are seen). Quota and
+ * routing tests use it; the store integration is exercised against the real
+ * binding in the tests that seed it.
+ */
+function storeFrom(storage: AccountStorage): Partial<SharedAccountAccess> {
+  const oauth = () =>
+    storage.accounts.filter(
+      (account): account is OAuthAccount => account.type === 'oauth',
+    )
+  return {
+    getAccessToken: async (accountId) => {
+      const account = oauth().find((candidate) => candidate.id === accountId)
+      if (!account?.access) {
+        throw Object.assign(
+          new Error(`auth_required: no account ${accountId}`),
+          {
+            code: 'auth_required',
+          },
+        )
+      }
+      return {
+        accessToken: account.access,
+        accountId,
+        expiresAt: account.expires ?? Number.MAX_SAFE_INTEGER,
+        source: 'store',
+      }
+    },
+    listAccounts: async () =>
+      oauth().map((account) => ({
+        id: account.id,
+        kind: 'oauth' as const,
+        enabled: account.enabled !== false,
+        current: false,
+        available: true,
+        accessLive: Boolean(account.access),
+        expiresAt: account.expires ?? Number.MAX_SAFE_INTEGER,
+        refreshDead: false,
+        scopes: [],
+      })),
+    markUsed: async () => true,
+  }
+}
 let accountPath: string
 
 function expectOAuthAccount(
@@ -154,9 +210,13 @@ beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-test-'))
   accountPath = join(tempDir, 'anthropic-auth.json')
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
+  store = useTempStore()
+  tokenServer = startMockTokenServer()
 })
 
 afterEach(async () => {
+  tokenServer.stop()
+  store.dispose()
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   await rm(tempDir, { recursive: true, force: true })
   mock.restore()
@@ -254,7 +314,6 @@ describe('OAuth account profiles', () => {
     storage.accounts.push({
       id: 'work',
       type: 'oauth',
-      refresh: 'refresh',
       profile: fallbackProfile,
     })
 
@@ -277,7 +336,6 @@ describe('OAuth account profiles', () => {
     storage.accounts.push({
       id: 'work',
       type: 'oauth',
-      refresh: 'refresh',
       profile: { tier: 'tier', orgType: 'org', checkedAt: 100 },
     })
 
@@ -293,44 +351,12 @@ describe('OAuth account profiles', () => {
     storage.accounts.push({
       id: 'work',
       type: 'oauth',
-      refresh: 'old',
       profile: { tier: 'old', orgType: 'old', checkedAt: 100 },
     })
 
-    upsertAccount(storage, { id: 'work', type: 'oauth', refresh: 'new' })
+    upsertAccount(storage, { id: 'work', type: 'oauth' })
 
     expect(expectOAuthAccount(storage.accounts[0]).profile).toBeUndefined()
-  })
-
-  test('runtime merge clears a fallback profile when OAuth credentials rotate', async () => {
-    const initial = baseStorage()
-    initial.accounts.push({
-      id: 'work',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      profile: {
-        tier: 'old-tier',
-        orgType: 'claude_team',
-        checkedAt: 100,
-        tokenFingerprint: tokenFingerprint('old-access'),
-      },
-    })
-    await saveAccounts(initial, accountPath)
-
-    const rotated = baseStorage()
-    rotated.accounts.push({
-      id: 'work',
-      type: 'oauth',
-      access: 'new-access',
-      refresh: 'new-refresh',
-    })
-    await saveAccounts(rotated, accountPath)
-
-    expect(
-      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0])
-        .profile,
-    ).toBeUndefined()
   })
 
   test('runtime merge keeps a fallback profile when OAuth credentials match', async () => {
@@ -345,7 +371,6 @@ describe('OAuth account profiles', () => {
       id: 'work',
       type: 'oauth',
       access: 'same-access',
-      refresh: 'same-refresh',
       profile,
     })
     await saveAccounts(initial, accountPath)
@@ -355,7 +380,6 @@ describe('OAuth account profiles', () => {
       id: 'work',
       type: 'oauth',
       access: 'same-access',
-      refresh: 'same-refresh',
     })
     await saveAccounts(sameCredentials, accountPath)
 
@@ -442,7 +466,6 @@ describe('OAuth account profiles', () => {
       id: 'work',
       type: 'oauth',
       access: accessToken,
-      refresh: 'refresh',
       profile: staleProfile,
     })
     await saveAccounts(storage, accountPath)
@@ -520,7 +543,6 @@ describe('account storage', () => {
       id: 'fallback-1',
       type: 'oauth',
       access: 'access',
-      refresh: 'refresh',
       expires: 123,
     })
 
@@ -532,10 +554,14 @@ describe('account storage', () => {
     expect(rawConfig.accounts[0].refresh).toBeUndefined()
 
     const rawState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
-    expect(rawState.accounts['fallback-1'].access).toBe('access')
-    expect(rawState.accounts['fallback-1'].refresh).toBe('refresh')
+    // The runtime access token and expiry stay in memory; the store owns them.
+    expect(rawState.accounts['fallback-1'].access).toBeUndefined()
+    expect(rawState.accounts['fallback-1'].expires).toBeUndefined()
 
-    await expect(loadAccounts()).resolves.toEqual(storage)
+    await expect(loadAccounts()).resolves.toEqual({
+      ...storage,
+      accounts: [{ id: 'fallback-1', type: 'oauth' }],
+    })
   })
 
   test('stores API fallback route secret in runtime state and endpoint in config', async () => {
@@ -565,127 +591,6 @@ describe('account storage', () => {
     expect(rawState.accounts['kie-opus'].apiKey).toBe('kie-key')
 
     await expect(loadAccounts()).resolves.toEqual(storage)
-  })
-
-  test('prefers newer legacy config OAuth credentials over stale runtime state', async () => {
-    await writeFile(
-      accountPath,
-      JSON.stringify({
-        version: 1,
-        main: { type: 'opencode', provider: 'anthropic' },
-        accounts: [
-          {
-            id: 'umut',
-            label: 'umut',
-            type: 'oauth',
-            enabled: true,
-            addedAt: 1,
-            lastUsed: 2_000,
-            access: 'new-access',
-            refresh: 'new-refresh',
-            expires: 3_000,
-          },
-        ],
-      }),
-      'utf8',
-    )
-    await writeFile(
-      getAccountStatePath(),
-      JSON.stringify({
-        version: 1,
-        accounts: {
-          umut: {
-            access: 'old-access',
-            refresh: 'old-refresh',
-            expires: 1_000,
-            lastRefreshedAt: 1_000,
-            lastRefreshError: {
-              message: 'Claude OAuth refresh failed: 400 invalid_grant',
-              checkedAt: 1_500,
-              nextRetryAt: 99_999,
-              status: 400,
-              permanent: true,
-            },
-            lastQuotaRefreshError: {
-              message: 'refresh backed off',
-              checkedAt: 1_500,
-            },
-            quota: {
-              five_hour: {
-                usedPercent: 100,
-                remainingPercent: 0,
-                checkedAt: 1_500,
-              },
-            },
-          },
-        },
-      }),
-      'utf8',
-    )
-
-    const loaded = await loadAccounts()
-    const account = loaded?.accounts[0]
-    expect(account?.type).toBe('oauth')
-    if (account?.type !== 'oauth') throw new Error('expected oauth account')
-    expect(account).toMatchObject({
-      id: 'umut',
-      access: 'new-access',
-      refresh: 'new-refresh',
-      expires: 3_000,
-      lastUsed: 2_000,
-      lastRefreshedAt: 2_000,
-    })
-    expect(account.lastRefreshError).toBeUndefined()
-    expect(account.lastQuotaRefreshError).toBeUndefined()
-    expect(account.quota).toBeUndefined()
-  })
-
-  test('keeps newer runtime OAuth credentials over older legacy config credentials', async () => {
-    await writeFile(
-      accountPath,
-      JSON.stringify({
-        version: 1,
-        main: { type: 'opencode', provider: 'anthropic' },
-        accounts: [
-          {
-            id: 'umut',
-            label: 'umut',
-            type: 'oauth',
-            enabled: true,
-            addedAt: 1,
-            lastUsed: 500,
-            access: 'old-config-access',
-            refresh: 'old-config-refresh',
-            expires: 500,
-          },
-        ],
-      }),
-      'utf8',
-    )
-    await writeFile(
-      getAccountStatePath(),
-      JSON.stringify({
-        version: 1,
-        accounts: {
-          umut: {
-            access: 'new-state-access',
-            refresh: 'new-state-refresh',
-            expires: 2_000,
-            lastRefreshedAt: 2_000,
-          },
-        },
-      }),
-      'utf8',
-    )
-
-    const loaded = await loadAccounts()
-    expect(loaded?.accounts[0]).toMatchObject({
-      id: 'umut',
-      access: 'new-state-access',
-      refresh: 'new-state-refresh',
-      expires: 2_000,
-      lastRefreshedAt: 2_000,
-    })
   })
 
   test('drops API fallback routes with invalid base URLs on load', async () => {
@@ -808,7 +713,6 @@ describe('account storage', () => {
       id: 'fallback-1',
       type: 'oauth',
       access: 'access-newer',
-      refresh: 'refresh-newer',
       expires: 999,
       quota: {
         five_hour: {
@@ -837,7 +741,6 @@ describe('account storage', () => {
     ;(staleRuntimeView as AccountStorage).accounts[0] = {
       ...((staleRuntimeView as AccountStorage).accounts[0] as OAuthAccount),
       access: 'access-older',
-      refresh: 'refresh-older',
       quota: {
         five_hour: {
           usedPercent: 99,
@@ -862,8 +765,8 @@ describe('account storage', () => {
     expect(loaded?.quota?.mainQuotaToken).toBe('token-newer')
     expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(11)
     const account = expectOAuthAccount(loaded?.accounts[0])
-    expect(account.access).toBe('access-newer')
-    expect(account.refresh).toBe('refresh-newer')
+    // Access tokens are never persisted by the host.
+    expect(account.access).toBeUndefined()
     expect(account.quota?.five_hour?.usedPercent).toBe(20)
     expect(account.lastQuotaRefreshError).toBeUndefined()
   })
@@ -874,7 +777,6 @@ describe('account storage', () => {
       id: 'fallback-1',
       type: 'oauth',
       access: 'access',
-      refresh: 'refresh',
       expires: 999,
       quota: {
         five_hour: {
@@ -921,7 +823,6 @@ describe('account storage', () => {
       id: 'fallback-1',
       type: 'oauth',
       access: 'access',
-      refresh: 'refresh',
       expires: 999,
       quota: {
         five_hour: {
@@ -972,7 +873,6 @@ describe('account storage', () => {
       id: 'fallback-1',
       type: 'oauth',
       access: 'access',
-      refresh: 'refresh',
       expires: 999,
       quota: {
         five_hour: {
@@ -1074,7 +974,6 @@ describe('account storage', () => {
       id: 'fallback-1',
       type: 'oauth',
       access: 'access',
-      refresh: 'refresh',
       expires: 999,
       quota: {
         five_hour: {
@@ -1199,109 +1098,6 @@ describe('account storage', () => {
     expect(loaded?.quota?.mainQuota?.scoped?.[0]?.id).toBe('weekly-fable')
     expect(loaded?.quota?.mainQuota?.extraUsage?.used.amountMinor).toBe(500)
     expect(loaded?.quota?.mainQuota?.bindingWindow).toBe('weekly-fable')
-  })
-
-  test('fallback token rotation never rebinds the previous token quota', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'fallback-1',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 1_000,
-      lastRefreshedAt: 100,
-      quota: {
-        five_hour: {
-          usedPercent: 80,
-          remainingPercent: 20,
-          checkedAt: 500,
-        },
-        source: 'poll',
-        checkedAt: 500,
-      },
-    })
-    await saveAccounts(storage)
-    const rotatedView = await loadAccounts()
-    const rotated = expectOAuthAccount(rotatedView?.accounts[0])
-    rotated.access = 'new-access'
-    rotated.refresh = 'new-refresh'
-    rotated.lastRefreshedAt = 600
-    rotated.quota = {
-      five_hour: {
-        usedPercent: 5,
-        remainingPercent: 95,
-        checkedAt: 100,
-      },
-      source: 'headers',
-      checkedAt: 100,
-    }
-    expect(rotated.access).not.toBe('old-access')
-
-    await saveAccountState(rotatedView as AccountStorage, accountPath, {
-      accounts: ['fallback-1'],
-    })
-
-    const loaded = await loadAccounts()
-    const account = expectOAuthAccount(loaded?.accounts[0])
-    expect(account.access).toBe('new-access')
-    expect(account.quota?.five_hour?.usedPercent).toBe(5)
-    expect(account.quota?.source).toBe('headers')
-  })
-
-  test('runtime token updates drop source-less quota passthrough', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'fallback-1',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 1_000,
-      lastRefreshedAt: 100,
-      quota: {
-        five_hour: {
-          usedPercent: 20,
-          remainingPercent: 80,
-          checkedAt: 500,
-        },
-      },
-    })
-    await saveAccounts(storage)
-
-    const refreshedRuntimeView = await loadAccounts()
-    expect(refreshedRuntimeView).not.toBeNull()
-    ;(refreshedRuntimeView as AccountStorage).accounts[0] = {
-      ...((refreshedRuntimeView as AccountStorage).accounts[0] as OAuthAccount),
-      access: 'new-access',
-      refresh: 'new-refresh',
-      expires: 2_000,
-      lastRefreshedAt: 600,
-      quota: {
-        five_hour: {
-          usedPercent: 99,
-          remainingPercent: 1,
-          checkedAt: 100,
-        },
-      },
-    }
-    expect(
-      expectOAuthAccount((refreshedRuntimeView as AccountStorage).accounts[0])
-        .access,
-    ).not.toBe('old-access')
-
-    await saveAccountState(
-      refreshedRuntimeView as AccountStorage,
-      accountPath,
-      {
-        accounts: true,
-      },
-    )
-
-    const loaded = await loadAccounts()
-    const account = expectOAuthAccount(loaded?.accounts[0])
-    expect(account.access).toBe('new-access')
-    expect(account.refresh).toBe('new-refresh')
-    expect(account.lastRefreshedAt).toBe(600)
-    expect(account.quota).toBeUndefined()
   })
 
   test('malformed config file throws a clear error', async () => {
@@ -1595,7 +1391,6 @@ describe('account storage', () => {
       id: 'fallback-1',
       type: 'oauth',
       access: 'access',
-      refresh: 'refresh',
       expires: 123,
     })
 
@@ -1752,91 +1547,36 @@ describe('account storage', () => {
     const loaded = await loadAccounts()
     expect(loaded).not.toBeNull()
     expect(loaded?.accounts).toEqual([])
-    expect(loaded?.refresh?.mainRefreshLeaseId).toBe('lease-abc')
-    expect(loaded?.refresh?.mainRefreshLeaseUntil).toBe(9_999_999_999_999)
-    expect(loaded?.refresh?.mainRefreshLeaseTokenHash).toBe('hash-xyz')
     expect(loaded?.quota?.mainQuotaToken).toBe('token-state-only')
     expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(33)
-  })
-
-  test('lease written via saveAccountState is visible to loadAccounts without a config file', async () => {
-    const storage: AccountStorage = {
-      version: 1,
-      main: { type: 'opencode', provider: 'anthropic' },
-      accounts: [],
-      refresh: {
-        mainRefreshLeaseId: 'lease-from-save',
-        mainRefreshLeaseUntil: 9_999_999_999_999,
-        mainRefreshLeaseTokenHash: 'token-hash-from-save',
-      },
-    }
-    await saveAccountState(storage, accountPath, { mainRefresh: true })
-
-    // saveAccountState must not have created the config file.
-    await expect(stat(accountPath)).rejects.toThrow()
-
-    const loaded = await loadAccounts()
-    expect(loaded?.refresh?.mainRefreshLeaseId).toBe('lease-from-save')
-    expect(loaded?.refresh?.mainRefreshLeaseTokenHash).toBe(
-      'token-hash-from-save',
-    )
   })
 })
 
 describe('FallbackAccountManager', () => {
-  test('refreshes expired fallback tokens and persists rotation', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'fallback-1',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 100,
-      quota: {
-        five_hour: { usedPercent: 1, remainingPercent: 99, checkedAt: 900 },
-        seven_day: { usedPercent: 2, remainingPercent: 98, checkedAt: 900 },
-      },
+  test('an expired fallback is refreshed by the store and no token reaches the host files', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'expired-fallback',
+      expiresAt: Date.now() - 1_000,
     })
+    const storage = baseStorage()
+    storage.quota = { enabled: false }
+    storage.accounts.push({ id: seeded.id, type: 'oauth' })
     await saveAccounts(storage)
 
-    const fetchImpl = mock(
-      (_input: string | URL | Request, init?: RequestInit) => {
-        const body = JSON.parse(String(init?.body))
-        expect(body.refresh_token).toBe('old-refresh')
-        expect(new Headers(init?.headers).get('content-type')).toBe(
-          'application/json',
-        )
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              access_token: 'new-access',
-              refresh_token: 'new-refresh',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      },
-    ) as unknown as typeof fetch
-
-    let synchronizedAccess: string | undefined
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 1_000,
-      onFallbackCredentialChanged: (account) => {
-        synchronizedAccess = account.access
-        return { status: 'applied' }
-      },
-    })
-
+    const manager = new FallbackAccountManager()
     const accounts = await manager.getUsableFallbackAccounts()
-    expect(accounts[0]?.access).toBe('new-access')
-    expect(synchronizedAccess).toBe('new-access')
+    expect(accounts.map((account) => account.id)).toEqual([seeded.id])
+    expect(accounts[0]?.access).toBe(tokenServer.rotatedAccess(1))
+    expect(tokenServer.presented).toEqual([seeded.refresh])
 
-    const saved = await loadAccounts()
-    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
-    expect(expectOAuthAccount(saved?.accounts[0]).expires).toBe(3_601_000)
-    expect(expectOAuthAccount(saved?.accounts[0]).lastRefreshedAt).toBe(1_000)
+    const raw = `${await readFile(accountPath, 'utf8')}${await readFile(
+      getAccountStatePath(accountPath),
+      'utf8',
+    )}`
+    expect(raw).not.toContain('sk-ant-')
+    expect(expectOAuthAccount((await loadAccounts())?.accounts[0]).access).toBe(
+      undefined,
+    )
   })
 
   test('filters fallback accounts with exhausted matching scoped model quota', async () => {
@@ -1846,7 +1586,6 @@ describe('FallbackAccountManager', () => {
         id: 'fable-empty',
         type: 'oauth',
         access: 'empty-access',
-        refresh: 'empty-refresh',
         expires: Date.now() + 5 * 60 * 60 * 1000,
         quota: {
           five_hour: {
@@ -1875,7 +1614,6 @@ describe('FallbackAccountManager', () => {
         id: 'fable-ok',
         type: 'oauth',
         access: 'ok-access',
-        refresh: 'ok-refresh',
         expires: Date.now() + 5 * 60 * 60 * 1000,
         quota: {
           five_hour: {
@@ -1903,7 +1641,10 @@ describe('FallbackAccountManager', () => {
     )
     await saveAccounts(storage)
 
-    const manager = new FallbackAccountManager({ now: () => 1_000 })
+    const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
+      now: () => 1_000,
+    })
 
     expect(
       (
@@ -1927,7 +1668,6 @@ describe('FallbackAccountManager', () => {
       id: 'empty-scoped-only',
       type: 'oauth',
       access: 'a',
-      refresh: 'r',
       expires: Date.now() + 60 * 60 * 1000,
       quota: { scoped: [] },
     })
@@ -1946,7 +1686,6 @@ describe('FallbackAccountManager', () => {
       id: 'empty-scoped-with-five-hour',
       type: 'oauth',
       access: 'a',
-      refresh: 'r',
       expires: Date.now() + 60 * 60 * 1000,
       quota: {
         five_hour: {
@@ -2001,7 +1740,6 @@ describe('FallbackAccountManager', () => {
       id: accountId,
       type: 'oauth',
       access: 'a',
-      refresh: 'r',
       expires: Date.now() + 60 * 60 * 1000,
       quota: {
         five_hour: {
@@ -2033,7 +1771,6 @@ describe('FallbackAccountManager', () => {
       id: accountId,
       type: 'oauth',
       access: 'a',
-      refresh: 'r',
       expires: Date.now() + 60 * 60 * 1000,
       quota: { scoped: [], checkedAt: T2 },
     })
@@ -2059,7 +1796,6 @@ describe('FallbackAccountManager', () => {
       id: accountId,
       type: 'oauth',
       access: 'a',
-      refresh: 'r',
       expires: Date.now() + 60 * 60 * 1000,
       quota: {
         five_hour: {
@@ -2091,7 +1827,6 @@ describe('FallbackAccountManager', () => {
       id: accountId,
       type: 'oauth',
       access: 'a',
-      refresh: 'r',
       expires: Date.now() + 60 * 60 * 1000,
       quota: {
         five_hour: {
@@ -2124,7 +1859,6 @@ describe('FallbackAccountManager', () => {
       id: 'with-checked-at',
       type: 'oauth',
       access: 'a',
-      refresh: 'r',
       expires: Date.now() + 60 * 60 * 1000,
       quota: {
         five_hour: {
@@ -2144,353 +1878,134 @@ describe('FallbackAccountManager', () => {
     expect(account.quota?.checkedAt).toBe(stampedAt)
   })
 
-  test('refreshes fallback tokens within the four-hour minimum window', async () => {
-    const storage = baseStorage()
-    storage.refresh = {
-      enabled: true,
-      intervalMinutes: 10,
-      refreshBeforeExpiryMinutes: 30,
-    }
-    const now = Date.now()
-    storage.accounts.push({
-      id: 'fallback-early',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: now + 3 * 60 * 60_000,
+  test('backs off a transient store failure instead of retrying every pass', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'flaky-fallback',
+      expiresAt: Date.now() - 1_000,
     })
+    tokenServer.unavailable.add(seeded.refresh)
+    const storage = baseStorage()
+    storage.quota = { enabled: false }
+    storage.accounts.push({ id: seeded.id, type: 'oauth' })
     await saveAccounts(storage)
 
-    const fetchImpl = mock((input: any) => {
-      const url = input instanceof Request ? input.url : String(input)
-      if (url.includes('/v1/oauth/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              access_token: 'new-access',
-              refresh_token: 'new-refresh',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
+    const manager = new FallbackAccountManager()
+    await expect(manager.getUsableFallbackAccounts()).resolves.toEqual([])
+    await expect(manager.getUsableFallbackAccounts()).resolves.toEqual([])
+    // One attempt; the second pass is inside the backoff window.
+    expect(tokenServer.presented).toEqual([seeded.refresh])
+    const [account] = (await manager.load())?.accounts ?? []
+    expect(account?.id).toBe(seeded.id)
+  })
+
+  test('concurrent managers spend an expired refresh token once (store claim)', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'contended-fallback',
+      expiresAt: Date.now() - 1_000,
+    })
+    const storage = baseStorage()
+    storage.quota = { enabled: false }
+    storage.accounts.push({ id: seeded.id, type: 'oauth' })
+    await saveAccounts(storage)
+
+    const first = new FallbackAccountManager()
+    const second = new FallbackAccountManager()
+    const [a, b] = await Promise.all([
+      first.getUsableFallbackAccounts(),
+      second.getUsableFallbackAccounts(),
+    ])
+    expect(a[0]?.access).toBe(tokenServer.rotatedAccess(1))
+    expect(b[0]?.access).toBe(tokenServer.rotatedAccess(1))
+    expect(tokenServer.presented).toEqual([seeded.refresh])
+  })
+
+  test('a dead refresh token is a permanent verdict and is never presented again', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'dead-fallback',
+      expiresAt: Date.now() - 1_000,
+    })
+    tokenServer.dead.add(seeded.refresh)
+    const storage = baseStorage()
+    storage.quota = { enabled: false }
+    storage.accounts.push({ id: seeded.id, type: 'oauth' })
+    await saveAccounts(storage)
+
+    const manager = new FallbackAccountManager()
+    const loaded = await manager.load()
+    await expect(manager.getUsableFallbackAccounts(loaded)).resolves.toEqual([])
+    const account = expectOAuthAccount(loaded?.accounts[0])
+    expect(isPermanentRefreshError(account.lastRefreshError)).toBe(true)
+
+    // A fresh manager (another process) is refused by the store without a
+    // second POST of the dead token.
+    const other = new FallbackAccountManager()
+    await expect(other.getUsableFallbackAccounts()).resolves.toEqual([])
+    expect(tokenServer.presented).toEqual([seeded.refresh])
+  })
+
+  test('the keep-alive tick runs the store keep-alive and never refreshes an idle expired fallback', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'idle-fallback',
+      expiresAt: Date.now() - 1_000,
+      refreshExpiresAt: Date.now() + 25 * 24 * 60 * 60_000,
+    })
+    const storage = baseStorage()
+    storage.accounts.push({ id: seeded.id, type: 'oauth' })
+    await saveAccounts(storage)
+
+    const quotaFetch = mock(() => {
+      throw new Error('an idle account must not be polled for quota')
     }) as unknown as typeof fetch
-
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => now,
-    })
-
-    await manager.refreshDueAccounts()
-
-    const saved = await loadAccounts()
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
+    const manager = new FallbackAccountManager({ fetchImpl: quotaFetch })
+    const report = await manager.keepAliveTick()
+    expect(report?.lease).toBe('acquired')
+    expect(report?.refreshed).toEqual([])
+    expect(tokenServer.presented).toEqual([])
+    expect(quotaFetch).not.toHaveBeenCalled()
   })
 
-  test('refresh backoff retry count resets after token rotation', () => {
-    const first = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
-      now: 1_000,
-      refreshToken: 'old-refresh',
-    })
-    const second = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
-      now: first.nextRetryAt ?? 2_000,
-      refreshToken: 'old-refresh',
-      previous: first,
-    })
-    const afterRelogin = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
-      now: second.nextRetryAt ?? 3_000,
-      refreshToken: 'new-refresh',
-      previous: second,
-    })
-
-    expect(second.retryCount).toBe(2)
-    expect(afterRelogin.retryCount).toBe(1)
-  })
-
-  test('backs off failed fallback refreshes instead of retrying every pass', async () => {
+  test('startKeepAlive calls the store keep-alive on start and on its interval', async () => {
     const storage = baseStorage()
-    storage.accounts.push({
-      id: 'rate-limited',
-      type: 'oauth',
-      access: 'expired-access',
-      refresh: 'old-refresh',
-      expires: 1,
-    })
     await saveAccounts(storage)
-
-    const fetchImpl = mock(() =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            error: { type: 'rate_limit_error', message: 'Rate limited' },
-          }),
-          { status: 429 },
-        ),
-      ),
-    ) as unknown as typeof fetch
-
+    let keepAliveCalls = 0
+    const intervals: Array<() => void> = []
     const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
-    })
-
-    await manager.refreshDueAccounts()
-    await manager.refreshDueAccounts()
-    await manager.refreshQuotaForDueAccounts()
-
-    const saved = await loadAccounts()
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(
-      expectOAuthAccount(saved?.accounts[0]).lastRefreshError?.nextRetryAt,
-    ).toBeGreaterThan(2_000)
-    expect(
-      expectOAuthAccount(saved?.accounts[0]).lastRefreshError?.retryCount,
-    ).toBe(1)
-  })
-
-  test('preserves existing refresh token when refresh response omits rotation', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'fallback-1',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 100,
-    })
-    await saveAccounts(storage)
-
-    const fetchImpl = mock(() =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            access_token: 'new-access',
-            expires_in: 3600,
-          }),
-          { status: 200 },
-        ),
-      ),
-    ) as unknown as typeof fetch
-
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 1_000,
-    })
-
-    await manager.refreshDueAccounts()
-
-    const saved = await loadAccounts()
-    expect(expectOAuthAccount(saved?.accounts[0]).access).toBe('new-access')
-    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('old-refresh')
-    expect(expectOAuthAccount(saved?.accounts[0]).lastRefreshedAt).toBe(1_000)
-  })
-
-  test('re-reads latest stored token before refreshing stale snapshots', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'fallback-1',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 100,
-    })
-    await saveAccounts(storage)
-
-    const manager = new FallbackAccountManager({
-      fetchImpl: mock(() => {
-        throw new Error('refresh should not be called')
-      }) as unknown as typeof fetch,
-      now: () => 2_000,
-    })
-
-    const stale = await loadAccounts()
-    if (!stale) throw new Error('missing fixture storage')
-
-    const newer = baseStorage()
-    newer.accounts.push({
-      id: 'fallback-1',
-      type: 'oauth',
-      access: 'fresh-access',
-      refresh: 'fresh-refresh',
-      expires: 20_000_000,
-    })
-    await saveAccounts(newer)
-
-    const refreshed = await manager.refreshAccount(
-      expectOAuthAccount(stale.accounts[0]),
-      stale,
-    )
-
-    expect(refreshed.access).toBe('fresh-access')
-    expect(expectOAuthAccount(stale.accounts[0]).refresh).toBe('fresh-refresh')
-  })
-
-  test('serializes concurrent fallback refreshes across manager instances', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'fallback-1',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 100,
-    })
-    await saveAccounts(storage)
-
-    let releaseRefresh!: () => void
-    const refreshStarted = Promise.withResolvers<void>()
-    const refreshCanFinish = new Promise<void>((resolve) => {
-      releaseRefresh = resolve
-    })
-    let calls = 0
-    const fetchImpl = mock(
-      async (_input: string | URL | Request, init?: RequestInit) => {
-        calls += 1
-        const call = calls
-        const body = JSON.parse(String(init?.body))
-        expect(body.refresh_token).toBe('old-refresh')
-        refreshStarted.resolve()
-        await refreshCanFinish
-        if (call > 1) {
-          return new Response(
-            JSON.stringify({
-              error: 'invalid_grant',
-              error_description: 'Refresh token not found or invalid',
-            }),
-            { status: 400 },
-          )
-        }
-        return new Response(
-          JSON.stringify({
-            access_token: 'new-access',
-            refresh_token: 'new-refresh',
-            expires_in: 28_800,
-          }),
-          { status: 200 },
-        )
+      store: {
+        keepAliveOnce: async () => {
+          keepAliveCalls += 1
+          return {
+            lease: 'acquired',
+            refreshed: [],
+            adopted: [],
+            failed: [],
+            skipped: [],
+          }
+        },
+        listAccounts: async () => [],
       },
-    ) as unknown as typeof fetch
-
-    const managerA = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
+      setIntervalImpl: ((handler: () => void) => {
+        intervals.push(handler)
+        return { unref() {} }
+      }) as unknown as typeof setInterval,
+      clearIntervalImpl: (() => {}) as unknown as typeof clearInterval,
     })
-    const managerB = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
-    })
-
-    const first = managerA.refreshDueAccounts()
-    await refreshStarted.promise
-    const second = managerB.refreshDueAccounts()
-    releaseRefresh()
-    await Promise.all([first, second])
-
-    const saved = await loadAccounts()
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(expectOAuthAccount(saved?.accounts[0]).access).toBe('new-access')
-    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
-    expect(
-      expectOAuthAccount(saved?.accounts[0]).lastRefreshError,
-    ).toBeUndefined()
-  })
-
-  test('preserves a permanent refresh classification across a concurrent refresh join', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'dead-fallback',
-      type: 'oauth',
-      access: 'expired-access',
-      refresh: 'expired-refresh',
-      expires: 100,
-    })
-    await saveAccounts(storage)
-
-    const refreshStarted = Promise.withResolvers<void>()
-    const refreshCanFinish = Promise.withResolvers<void>()
-    const fetchImpl = mock(async () => {
-      refreshStarted.resolve()
-      await refreshCanFinish.promise
-      return new Response(
-        JSON.stringify({
-          error: 'invalid_grant',
-          error_description: 'Refresh token not found or invalid',
-        }),
-        { status: 400 },
-      )
-    }) as unknown as typeof fetch
-    const managerA = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
-    })
-    const managerB = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
-    })
-
-    const first = managerA.refreshDueAccounts()
-    await refreshStarted.promise
-    const second = managerB.refreshDueAccounts()
-    await Bun.sleep(25)
-    refreshCanFinish.resolve()
-    await Promise.all([first, second])
-
-    const error = expectOAuthAccount(
-      (await loadAccounts())?.accounts[0],
-    ).lastRefreshError
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(error?.status).toBe(400)
-    expect(error?.permanent).toBe(true)
-    expect(error?.message).toContain('invalid_grant')
-  })
-
-  test('starts an immediate background refresh pass for unused expired fallbacks', async () => {
-    const storage = baseStorage()
-    storage.quota = { ...storage.quota, enabled: false }
-    storage.accounts.push({
-      id: 'unused-expired',
-      type: 'oauth',
-      access: 'expired-access',
-      refresh: 'old-refresh',
-      expires: 1,
-    })
-    await saveAccounts(storage)
-
-    const fetchImpl = mock(() =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            access_token: 'fresh-access',
-            refresh_token: 'fresh-refresh',
-            expires_in: 3600,
-          }),
-          { status: 200 },
-        ),
-      ),
-    ) as unknown as typeof fetch
-
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
-    })
-
-    manager.startBackgroundRefresh()
-    let saved: AccountStorage | null = null
-    for (let attempt = 0; attempt < 50; attempt++) {
-      saved = await loadAccounts()
-      if (expectOAuthAccount(saved?.accounts[0]).access === 'fresh-access')
-        break
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
-    manager.stopBackgroundRefresh()
-
-    expect(expectOAuthAccount(saved?.accounts[0]).access).toBe('fresh-access')
-    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('fresh-refresh')
-    expect(fetchImpl).toHaveBeenCalled()
+    manager.startKeepAlive()
+    await withTimeout(
+      (async () => {
+        while (keepAliveCalls < 1) await new Promise((r) => setTimeout(r, 5))
+      })(),
+      2_000,
+    )
+    expect(intervals).toHaveLength(1)
+    intervals[0]?.()
+    await withTimeout(
+      (async () => {
+        while (keepAliveCalls < 2) await new Promise((r) => setTimeout(r, 5))
+      })(),
+      2_000,
+    )
+    manager.stopKeepAlive()
+    expect(keepAliveCalls).toBe(2)
   })
 
   test('skips accounts below configured quota thresholds', async () => {
@@ -2499,7 +2014,6 @@ describe('FallbackAccountManager', () => {
       id: 'low-quota',
       type: 'oauth',
       access: 'access',
-      refresh: 'refresh',
       expires: 20_000_000,
       quota: {
         five_hour: { usedPercent: 95, remainingPercent: 5, checkedAt: 1_000 },
@@ -2508,7 +2022,10 @@ describe('FallbackAccountManager', () => {
     })
     await saveAccounts(storage)
 
-    const manager = new FallbackAccountManager({ now: () => 1_001 })
+    const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
+      now: () => 1_001,
+    })
     await expect(manager.getUsableFallbackAccounts()).resolves.toEqual([])
   })
 
@@ -2518,7 +2035,6 @@ describe('FallbackAccountManager', () => {
       id: 'fresh-quota',
       type: 'oauth',
       access: 'access',
-      refresh: 'refresh',
       expires: 20_000_000,
     })
     await saveAccounts(storage)
@@ -2537,6 +2053,7 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
 
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 2_000,
     })
@@ -2546,113 +2063,14 @@ describe('FallbackAccountManager', () => {
     expect(accounts[0]?.quota?.five_hour?.remainingPercent).toBe(75)
   })
 
-  test('does not overwrite a concurrently refreshed token after quota fetch', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'concurrent-refresh',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 20_000_000,
-    })
-    await saveAccounts(storage)
-
-    const fetchImpl = mock(async (input: string | URL | Request) => {
-      expect(String(input)).toContain('/api/oauth/usage')
-      const latest = await loadAccounts()
-      expect(latest).not.toBeNull()
-      ;(latest as AccountStorage).accounts[0] = {
-        ...((latest as AccountStorage).accounts[0] as OAuthAccount),
-        access: 'new-access',
-        refresh: 'new-refresh',
-        expires: 30_000_000,
-        lastRefreshedAt: 2_000,
-      }
-      await saveAccountState(latest as AccountStorage, accountPath, {
-        accounts: true,
-      })
-      return new Response(
-        JSON.stringify({
-          five_hour: { utilization: 25, resets_at: '2026-01-01T00:00:00Z' },
-          seven_day: { utilization: 50, resets_at: '2026-01-07T00:00:00Z' },
-        }),
-        { status: 200 },
-      )
-    }) as unknown as typeof fetch
-
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
-    })
-
-    const result = await manager.refreshQuotaForAllAccounts()
-
-    expect(result.errors).toEqual([])
-    const saved = await loadAccounts()
-    const account = expectOAuthAccount(saved?.accounts[0])
-    expect(account.access).toBe('new-access')
-    expect(account.refresh).toBe('new-refresh')
-    expect(account.quota).toBeUndefined()
-  })
-
-  test('persists token rotation from background quota refresh even when quota is still fresh', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'almost-expired-fresh-quota',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 1_600_000,
-      quota: {
-        five_hour: { usedPercent: 1, remainingPercent: 99, checkedAt: 1_000 },
-        seven_day: { usedPercent: 2, remainingPercent: 98, checkedAt: 1_000 },
-      },
-    })
-    await saveAccounts(storage)
-
-    const fetchImpl = mock(
-      (input: string | URL | Request, init?: RequestInit) => {
-        expect(String(input)).toBe('https://platform.claude.com/v1/oauth/token')
-        const body = JSON.parse(String(init?.body))
-        expect(body.refresh_token).toBe('old-refresh')
-        expect(new Headers(init?.headers).get('content-type')).toBe(
-          'application/json',
-        )
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              access_token: 'new-access',
-              refresh_token: 'new-refresh',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      },
-    ) as unknown as typeof fetch
-
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 1_000,
-    })
-
-    await manager.refreshQuotaForDueAccounts()
-
-    const saved = await loadAccounts()
-    expect(expectOAuthAccount(saved?.accounts[0]).access).toBe('new-access')
-    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
-    expect(expectOAuthAccount(saved?.accounts[0]).lastRefreshedAt).toBe(1_000)
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-  })
-
   test('refreshQuotaForDueAccounts fires onFallbackStorageChanged when storage changes', async () => {
     const storage = baseStorage()
     storage.accounts.push({
       id: 'idle-stale',
       type: 'oauth',
       access: 'idle-access',
-      refresh: 'idle-refresh',
-      expires: 20_000_000,
+      // Live access token: background polling only touches live accounts.
+      expires: 90_000_000,
       quota: {
         // checkedAt far in the past → stale → will be refreshed this pass.
         five_hour: { usedPercent: 5, remainingPercent: 95, checkedAt: 1 },
@@ -2675,6 +2093,7 @@ describe('FallbackAccountManager', () => {
 
     let fired = 0
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 50_000_000, // well past checkedAt → stale
       onFallbackStorageChanged: () => {
@@ -2688,49 +2107,25 @@ describe('FallbackAccountManager', () => {
     expect(fired).toBe(1)
   })
 
-  test('refreshes fallback token and retries quota check after stale access token 401', async () => {
+  test('a quota 401 makes the store re-authorize the bearer and the quota check is retried', async () => {
+    const seeded = await seedStoreAccount({ label: 'rejected-fallback' })
     const storage = baseStorage()
-    storage.accounts.push({
-      id: 'stale-access',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'refresh-token',
-      expires: 20_000_000,
-    })
+    storage.accounts.push({ id: seeded.id, type: 'oauth' })
     await saveAccounts(storage)
 
     const seen: string[] = []
     const fetchImpl = mock(
       (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input)
-        if (url.includes('/api/oauth/usage')) {
-          seen.push(new Headers(init?.headers).get('authorization') ?? '')
-          if (seen.length === 1) {
-            return Promise.resolve(new Response('expired', { status: 401 }))
-          }
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 9 },
-              }),
-              { status: 200 },
-            ),
-          )
+        expect(String(input)).toContain('/api/oauth/usage')
+        seen.push(new Headers(init?.headers).get('authorization') ?? '')
+        if (seen.length === 1) {
+          return Promise.resolve(new Response('expired', { status: 401 }))
         }
-
-        expect(url).toBe('https://platform.claude.com/v1/oauth/token')
-        const body = JSON.parse(String(init?.body))
-        expect(body.refresh_token).toBe('refresh-token')
-        expect(new Headers(init?.headers).get('content-type')).toBe(
-          'application/json',
-        )
         return Promise.resolve(
           new Response(
             JSON.stringify({
-              access_token: 'fresh-access',
-              refresh_token: 'fresh-refresh',
-              expires_in: 3600,
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 9 },
             }),
             { status: 200 },
           ),
@@ -2738,19 +2133,16 @@ describe('FallbackAccountManager', () => {
       },
     ) as unknown as typeof fetch
 
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
-    })
-
+    const manager = new FallbackAccountManager({ fetchImpl })
     const accounts = await manager.getUsableFallbackAccounts()
     expect(accounts).toHaveLength(1)
-    expect(accounts[0]?.access).toBe('fresh-access')
+    expect(accounts[0]?.access).toBe(tokenServer.rotatedAccess(1))
     expect(accounts[0]?.quota?.seven_day?.remainingPercent).toBe(91)
-    expect(seen).toEqual(['Bearer old-access', 'Bearer fresh-access'])
-
-    const saved = await loadAccounts()
-    expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('fresh-refresh')
+    expect(seen).toEqual([
+      `Bearer ${seeded.access}`,
+      `Bearer ${tokenServer.rotatedAccess(1)}`,
+    ])
+    expect(tokenServer.presented).toEqual([seeded.refresh])
   })
 
   test('uses cached passing quota when a stale quota refresh is rate limited', async () => {
@@ -2759,7 +2151,6 @@ describe('FallbackAccountManager', () => {
       id: 'stale-good-quota',
       type: 'oauth',
       access: 'access-token',
-      refresh: 'refresh-token',
       expires: 20_000_000,
       quota: {
         five_hour: {
@@ -2790,6 +2181,7 @@ describe('FallbackAccountManager', () => {
     ) as unknown as typeof fetch
 
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 10 * 60_000,
     })
@@ -2806,7 +2198,6 @@ describe('FallbackAccountManager', () => {
       id: 'stale-good-quota',
       type: 'oauth',
       access: 'access-token',
-      refresh: 'refresh-token',
       expires: 20_000_000,
       quota: {
         five_hour: {
@@ -2830,6 +2221,7 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
 
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 10 * 60_000,
     })
@@ -2846,7 +2238,6 @@ describe('FallbackAccountManager', () => {
       id: 'stale-low-quota',
       type: 'oauth',
       access: 'access-token',
-      refresh: 'refresh-token',
       expires: 20_000_000,
       quota: {
         five_hour: {
@@ -2877,6 +2268,7 @@ describe('FallbackAccountManager', () => {
     ) as unknown as typeof fetch
 
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 10 * 60_000,
     })
@@ -2893,7 +2285,6 @@ describe('FallbackAccountManager', () => {
       id: 'fresh-quota-with-old-error',
       type: 'oauth',
       access: 'access-token',
-      refresh: 'refresh-token',
       expires: 20_000_000,
       quota: {
         five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1_900 },
@@ -2911,6 +2302,7 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
 
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 2_000,
     })
@@ -2928,40 +2320,24 @@ describe('FallbackAccountManager', () => {
     ).toBeUndefined()
   })
 
-  test('returns refresh errors from explicit quota refresh', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'invalid-refresh',
-      type: 'oauth',
-      access: 'expired-access',
-      refresh: 'bad-refresh',
-      expires: 1,
+  test('explicit quota refresh does not spend a refresh token on an idle account', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'idle-quota',
+      expiresAt: Date.now() - 1_000,
     })
+    const storage = baseStorage()
+    storage.accounts.push({ id: seeded.id, type: 'oauth' })
     await saveAccounts(storage)
 
-    const fetchImpl = mock(() =>
-      Promise.resolve(new Response('invalid_grant', { status: 400 })),
-    ) as unknown as typeof fetch
+    const fetchImpl = mock(() => {
+      throw new Error('an idle account must not be polled for quota')
+    }) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({ fetchImpl })
 
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => 2_000,
-    })
-
-    const result = await manager.refreshQuotaForAllAccounts()
-    expect(
-      expectOAuthAccount(result.storage?.accounts[0]).quota,
-    ).toBeUndefined()
-    expect(result.errors).toEqual([
-      {
-        accountId: 'invalid-refresh',
-        message: 'Claude OAuth refresh failed: 400 — invalid_grant',
-      },
-    ])
-    const saved = await loadAccounts()
-    expect(
-      expectOAuthAccount(saved?.accounts[0]).lastQuotaRefreshError?.message,
-    ).toBe('Claude OAuth refresh failed: 400 — invalid_grant')
+    const result = await manager.refreshQuotaForAllAccounts({ force: true })
+    expect(result.errors).toEqual([])
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(tokenServer.presented).toEqual([])
   })
 
   test('force refreshes fresh accounts and persists the new quota', async () => {
@@ -2970,7 +2346,6 @@ describe('FallbackAccountManager', () => {
       id: 'fresh-but-forced',
       type: 'oauth',
       access: 'access-token',
-      refresh: 'refresh-token',
       expires: 20_000_000,
       // Fresh quota — would normally be skipped by the staleness gate.
       quota: {
@@ -2992,7 +2367,11 @@ describe('FallbackAccountManager', () => {
       ),
     ) as unknown as typeof fetch
 
-    const manager = new FallbackAccountManager({ fetchImpl, now: () => 2_000 })
+    const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
+      fetchImpl,
+      now: () => 2_000,
+    })
 
     // force: true bypasses the staleness skip and fetches anyway.
     const result = await manager.refreshQuotaForAllAccounts({ force: true })
@@ -3018,7 +2397,6 @@ describe('FallbackAccountManager', () => {
       id: 'fallback-1',
       type: 'oauth',
       access: 'fallback-access',
-      refresh: 'fallback-refresh',
       expires: Date.now() + 5 * 60 * 60_000,
       // Storage says PASSING (100% remaining).
       quota: {
@@ -3055,6 +2433,7 @@ describe('FallbackAccountManager', () => {
     )
 
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 1_000,
       quotaManager: qm,
@@ -3098,7 +2477,6 @@ describe('FallbackAccountManager', () => {
       id: 'scoped-only',
       type: 'oauth',
       access: 'fallback-access',
-      refresh: 'fallback-refresh',
       expires: 30_000_000,
       quota: {
         scoped: [
@@ -3118,6 +2496,7 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
     const qm = new QuotaManager({ storage, fetchImpl, now: () => 1_000_000 })
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 1_000_000,
       quotaManager: qm,
@@ -3143,7 +2522,6 @@ describe('FallbackAccountManager', () => {
       label: 'same-label',
       type: 'oauth',
       access: 'old-access',
-      refresh: 'old-refresh',
       expires: 30_000_000,
       quota: {
         five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: 1_900 },
@@ -3168,6 +2546,7 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
     const qm = new QuotaManager({ storage, fetchImpl, now: () => 2_000 })
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => 2_000,
       quotaManager: qm,
@@ -3186,7 +2565,6 @@ describe('FallbackAccountManager', () => {
       label: 'same-label',
       type: 'oauth',
       access: 'new-access',
-      refresh: 'new-refresh',
       expires: 30_000_000,
       enabled: true,
       addedAt: 2_000,
@@ -3204,103 +2582,6 @@ describe('FallbackAccountManager', () => {
   })
 })
 
-describe('buildRefreshOperationError', () => {
-  test('uses Retry-After when available on 429', () => {
-    const error = new ClaudeOAuthRefreshError(429, 'rate limited', '120')
-    const result = buildRefreshOperationError({
-      error,
-      now: 1000000,
-      refreshToken: 'test-token',
-    })
-    expect(result.nextRetryAt).toBe(1000000 + 120_000)
-  })
-
-  test('falls back to exponential backoff when no Retry-After', () => {
-    const error = new ClaudeOAuthRefreshError(429, 'rate limited')
-    const result = buildRefreshOperationError({
-      error,
-      now: 1000000,
-      refreshToken: 'test-token',
-    })
-    expect(result.nextRetryAt).toBe(1000000 + 5 * 60_000)
-  })
-
-  test('captures the error status on the operation error', () => {
-    const error = new ClaudeOAuthRefreshError(400, 'invalid_grant')
-    const result = buildRefreshOperationError({
-      error,
-      now: 1000000,
-      refreshToken: 'test-token',
-    })
-    expect(result.status).toBe(400)
-  })
-
-  test('captures duck-typed status when no ClaudeOAuthRefreshError', () => {
-    const result = buildRefreshOperationError({
-      error: { status: 429 },
-      now: 1000000,
-      refreshToken: 'test-token',
-    })
-    expect(result.status).toBe(429)
-  })
-
-  test('sets permanent true only for 400 invalid_grant', () => {
-    const dead = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
-      now: 1000000,
-      refreshToken: 't',
-    })
-    expect(dead.permanent).toBe(true)
-  })
-
-  test('sets permanent false for retry-exhausted transient (no status)', () => {
-    const exhausted = buildRefreshOperationError({
-      error: new Error('Token refresh exhausted all retries'),
-      now: 1000000,
-      refreshToken: 't',
-    })
-    expect(exhausted.permanent).toBe(false)
-  })
-
-  test('sets permanent false for a 429', () => {
-    const rateLimited = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
-      now: 1000000,
-      refreshToken: 't',
-    })
-    expect(rateLimited.permanent).toBe(false)
-  })
-
-  test('sets permanent false for a 400 that is NOT invalid_grant', () => {
-    // The OAuth spec allows 400 invalid_client / invalid_request /
-    // unsupported_grant_type — none of which re-login fixes. Only invalid_grant
-    // means the refresh token itself is dead.
-    const invalidClient = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_client"}'),
-      now: 1000000,
-      refreshToken: 't',
-    })
-    expect(invalidClient.status).toBe(400)
-    expect(invalidClient.permanent).toBe(false)
-    // Explicit false must short-circuit isPermanentRefreshError before the
-    // legacy status===400 fallback can wrongly flag it.
-    expect(isPermanentRefreshError(invalidClient)).toBe(false)
-  })
-
-  test('sets permanent true for a 400 invalid_grant from the body JSON', () => {
-    const dead = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(
-        400,
-        '{"error":"invalid_grant","error_description":"Refresh token expired"}',
-      ),
-      now: 1000000,
-      refreshToken: 't',
-    })
-    expect(dead.permanent).toBe(true)
-    expect(isPermanentRefreshError(dead)).toBe(true)
-  })
-})
-
 describe('getFallbackReauthLabels', () => {
   test('reports enabled OAuth fallbacks with permanent refresh failures only', () => {
     const storage = baseStorage()
@@ -3311,7 +2592,6 @@ describe('getFallbackReauthLabels', () => {
         label: 'ufuk2',
         enabled: true,
         access: 'expired-access',
-        refresh: 'expired-refresh',
         expires: 1,
         lastRefreshError: {
           message: 'invalid_grant: Refresh token expired',
@@ -3327,7 +2607,6 @@ describe('getFallbackReauthLabels', () => {
         label: 'temporary',
         enabled: true,
         access: 'transient-access',
-        refresh: 'transient-refresh',
         expires: 1,
         lastRefreshError: {
           message: 'service unavailable',
@@ -3344,30 +2623,27 @@ describe('getFallbackReauthLabels', () => {
 })
 
 describe('isPermanentRefreshError', () => {
-  test('400 (invalid_grant) → permanent (dead token, needs re-login)', () => {
-    const error = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
-      now: 1000000,
-      refreshToken: 't',
+  test("the store's dead-token verdict → permanent (needs re-login)", () => {
+    const error = refreshErrorFromSharedAccount({
+      refreshDead: true,
+      lastError: 'invalid_grant',
     })
+    expect(error?.status).toBe(400)
     expect(isPermanentRefreshError(error)).toBe(true)
   })
 
-  test('429 (rate limited) → NOT permanent (transient, recovers)', () => {
-    const error = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
-      now: 1000000,
-      refreshToken: 't',
+  test('a store error on a live token → NOT permanent (transient, recovers)', () => {
+    const error = refreshErrorFromSharedAccount({
+      refreshDead: false,
+      lastError: 'rate limited',
     })
+    expect(error?.message).toBe('rate limited')
     expect(isPermanentRefreshError(error)).toBe(false)
   })
 
-  test('500 (server error) → NOT permanent (transient)', () => {
-    const error = buildRefreshOperationError({
-      error: { status: 500 },
-      now: 1000000,
-      refreshToken: 't',
-    })
+  test('no store error → no verdict', () => {
+    const error = refreshErrorFromSharedAccount({ refreshDead: false })
+    expect(error).toBeUndefined()
     expect(isPermanentRefreshError(error)).toBe(false)
   })
 
@@ -3392,70 +2668,20 @@ describe('isPermanentRefreshError', () => {
     }
     expect(isPermanentRefreshError(error)).toBe(false)
   })
-
-  test('retry-exhausted transient error → NOT permanent (no false re-login nag)', () => {
-    // A network glitch that exhausts all retries throws a plain Error with NO
-    // status. isTransientRefreshError classifies it non-transient (no status,
-    // message is not "fetch failed"), so it gets the 24h backoff delay — but it
-    // is NOT a dead token. Built through buildRefreshOperationError, the explicit
-    // `permanent` flag must be false so it is not nagged for re-login.
-    const error = buildRefreshOperationError({
-      error: new Error('Token refresh exhausted all retries'),
-      now: 1000000,
-      refreshToken: 't',
-    })
-    // Sanity: it really did get the 24h non-transient delay (so the legacy
-    // heuristic alone would have wrongly flagged it permanent).
-    expect(error.nextRetryAt).toBe(1000000 + 24 * 60 * 60_000)
-    expect(isPermanentRefreshError(error)).toBe(false)
-  })
 })
 
-describe('isPermanentRefreshError across save/load round-trip', () => {
-  test('retry-exhausted transient survives round-trip as NON-permanent', async () => {
-    // The classification only matters once persisted. A retry-exhausted error
-    // is permanent=false in memory but gets a 24h NON_TRANSIENT backoff — if the
-    // status/permanent fields are dropped on load, the 24h-delay heuristic wrongly
-    // re-classifies it permanent and the sidebar falsely nags re-login.
-    const error = buildRefreshOperationError({
-      error: new Error('Token refresh exhausted all retries'),
-      now: Date.now(),
-      refreshToken: 'rt-exhausted',
-    })
-    expect(error.permanent).toBe(false)
-    expect(isPermanentRefreshError(error)).toBe(false)
-
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'exhausted',
-      type: 'oauth',
-      refresh: 'rt-exhausted',
-      lastRefreshError: error,
-    })
-    await saveAccounts(storage, accountPath)
-
-    const loaded = await loadAccounts(accountPath)
-    const reloaded = expectOAuthAccount(
-      loaded!.accounts.find((a) => a.id === 'exhausted'),
-    )
-    expect(reloaded.lastRefreshError?.permanent).toBe(false)
-    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(false)
-  })
-
-  test('400 invalid_grant survives round-trip as permanent', async () => {
-    const error = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
-      now: Date.now(),
-      refreshToken: 'rt-dead',
-    })
-    expect(error.permanent).toBe(true)
-
+describe('refresh verdicts are not persisted by the host', () => {
+  test('a lastRefreshError never reaches the host files (the store owns it)', async () => {
     const storage = baseStorage()
     storage.accounts.push({
       id: 'dead',
       type: 'oauth',
-      refresh: 'rt-dead',
-      lastRefreshError: error,
+      lastRefreshError: {
+        message: 'invalid_grant',
+        checkedAt: Date.now(),
+        status: 400,
+        permanent: true,
+      },
     })
     await saveAccounts(storage, accountPath)
 
@@ -3463,145 +2689,15 @@ describe('isPermanentRefreshError across save/load round-trip', () => {
     const reloaded = expectOAuthAccount(
       loaded!.accounts.find((a) => a.id === 'dead'),
     )
-    expect(reloaded.lastRefreshError?.status).toBe(400)
-    expect(reloaded.lastRefreshError?.permanent).toBe(true)
-    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(true)
-  })
-
-  test('400 non-invalid_grant survives round-trip as NON-permanent', async () => {
-    // A 400 invalid_client (misconfig) must NOT nag re-login — and the explicit
-    // permanent=false must survive load so the status===400 fallback never fires.
-    const error = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_client"}'),
-      now: Date.now(),
-      refreshToken: 'rt-misconfig',
-    })
-    expect(error.permanent).toBe(false)
-
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'misconfig',
-      type: 'oauth',
-      refresh: 'rt-misconfig',
-      lastRefreshError: error,
-    })
-    await saveAccounts(storage, accountPath)
-
-    const loaded = await loadAccounts(accountPath)
-    const reloaded = expectOAuthAccount(
-      loaded!.accounts.find((a) => a.id === 'misconfig'),
-    )
-    expect(reloaded.lastRefreshError?.status).toBe(400)
-    expect(reloaded.lastRefreshError?.permanent).toBe(false)
-    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(false)
+    expect(reloaded.lastRefreshError).toBeUndefined()
+    const raw = `${await readFile(accountPath, 'utf8')}${await readFile(
+      getAccountStatePath(accountPath),
+      'utf8',
+    )}`
+    expect(raw).not.toContain('invalid_grant')
   })
 })
 
-// ---------------------------------------------------------------------------
-// Duck-typed ProviderHttpError contract — isTransientRefreshError
-// (tested through buildRefreshOperationError)
-// ---------------------------------------------------------------------------
-describe('isTransientRefreshError via duck-typed error classification', () => {
-  const now = 1_000_000
-  const REFRESH_NON_TRANSIENT = 24 * 60 * 60_000
-
-  test('429 (duck-typed .status) → transient', () => {
-    const result = buildRefreshOperationError({
-      error: { status: 429 },
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
-  })
-
-  test('500 (duck-typed .status) → transient', () => {
-    const result = buildRefreshOperationError({
-      error: { status: 500 },
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
-  })
-
-  test('503 (duck-typed .status) → transient', () => {
-    const result = buildRefreshOperationError({
-      error: { status: 503 },
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
-  })
-
-  test('401 (duck-typed .status) → NOT transient', () => {
-    const result = buildRefreshOperationError({
-      error: { status: 401 },
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt).toBe(now + REFRESH_NON_TRANSIENT)
-  })
-
-  test('400 (duck-typed .status) → NOT transient', () => {
-    const result = buildRefreshOperationError({
-      error: { status: 400 },
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt).toBe(now + REFRESH_NON_TRANSIENT)
-  })
-
-  test('plain Error with fetch failed → transient (network path)', () => {
-    const result = buildRefreshOperationError({
-      error: new Error('fetch failed'),
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
-  })
-
-  test('ClaudeOAuthRefreshError 429 still classified transient (regression)', () => {
-    const result = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Duck-typed retryAfter propagation in buildRefreshOperationError
-// ---------------------------------------------------------------------------
-describe('buildRefreshOperationError retryAfter duck-typed propagation', () => {
-  const now = 1_000_000
-
-  test('reads .retryAfter from duck-typed error (no instanceof)', () => {
-    const error: Error & { retryAfter?: number } = Object.assign(
-      new Error('fail'),
-      { retryAfter: 60 },
-    )
-    const result = buildRefreshOperationError({
-      error,
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt).toBe(now + 60_000)
-  })
-
-  test('ClaudeOAuthRefreshError retryAfter still works (regression)', () => {
-    const result = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited', '120'),
-      now,
-      refreshToken: 't',
-    })
-    expect(result.nextRetryAt).toBe(now + 120_000)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Duck-typed ProviderHttpError contract — isTransientQuotaError
-// (tested through buildQuotaOperationError)
-// ---------------------------------------------------------------------------
 describe('isTransientQuotaError via duck-typed error classification', () => {
   const now = 1_000_000
   const QUOTA_NON_TRANSIENT = 5 * 60_000
@@ -3825,68 +2921,6 @@ describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
 // (tested through FallbackAccountManager integration path)
 // ---------------------------------------------------------------------------
 describe('recordQuotaRefreshError refresh-backoff arming', () => {
-  test('non-401 refresh error (status 500) arms refresh backoff', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'fb-500-refresh',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 1, // way in the past → tokenNeedsRefresh
-    })
-    await saveAccounts(storage)
-
-    const fetchImpl = mock((input: string | URL | Request) => {
-      return Promise.resolve(new Response('server error', { status: 500 }))
-    }) as unknown as typeof fetch
-
-    const now = 1_000_000
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => now,
-    })
-
-    await manager.refreshQuotaForDueAccounts()
-
-    const loaded = await loadAccounts()
-    const account = loaded?.accounts.find((a) => a.id === 'fb-500-refresh') as
-      | OAuthAccount
-      | undefined
-    expect(account?.lastRefreshError).toBeDefined()
-    expect(account?.lastRefreshError?.checkedAt).toBe(now)
-  })
-
-  test('401 refresh error arms refresh backoff (ClaudeOAuthRefreshError regression)', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'fb-401-refresh',
-      type: 'oauth',
-      access: 'old-access',
-      refresh: 'old-refresh',
-      expires: 1,
-    })
-    await saveAccounts(storage)
-
-    const fetchImpl = mock((input: string | URL | Request) => {
-      return Promise.resolve(new Response('unauthorized', { status: 401 }))
-    }) as unknown as typeof fetch
-
-    const now = 1_000_000
-    const manager = new FallbackAccountManager({
-      fetchImpl,
-      now: () => now,
-    })
-
-    await manager.refreshQuotaForDueAccounts()
-
-    const loaded = await loadAccounts()
-    const account = loaded?.accounts.find((a) => a.id === 'fb-401-refresh') as
-      | OAuthAccount
-      | undefined
-    expect(account?.lastRefreshError).toBeDefined()
-    expect(account?.lastRefreshError?.checkedAt).toBe(now)
-  })
-
   test('quota-endpoint 401 does NOT arm refresh backoff (isRefreshError boundary)', async () => {
     const now = 1_000_000
     const storage = baseStorage()
@@ -3894,7 +2928,6 @@ describe('recordQuotaRefreshError refresh-backoff arming', () => {
       id: 'fb-quota-401',
       type: 'oauth',
       access: 'old-access',
-      refresh: 'old-refresh',
       // Token is fresh → tokenNeedsRefresh returns false, skipping
       // the initial refresh step. This ensures the only error is from
       // the quota endpoint, not from a token refresh.
@@ -3928,6 +2961,7 @@ describe('recordQuotaRefreshError refresh-backoff arming', () => {
     }) as unknown as typeof fetch
 
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => now,
     })
@@ -3952,7 +2986,6 @@ describe('recordQuotaRefreshError refresh-backoff arming', () => {
       id: 'fb-quota-403',
       type: 'oauth',
       access: 'old-access',
-      refresh: 'old-refresh',
       // Token is fresh → tokenNeedsRefresh returns false, so the only failure
       // in this test comes from the quota endpoint, not token refresh.
       expires: now + 24 * 60 * 60_000,
@@ -3994,6 +3027,7 @@ describe('recordQuotaRefreshError refresh-backoff arming', () => {
     }) as unknown as typeof fetch
 
     const manager = new FallbackAccountManager({
+      store: storeFrom(storage),
       fetchImpl,
       now: () => now,
     })
@@ -4078,7 +3112,6 @@ describe('readJsonIfPresent corrupt-store handling', () => {
       id: 'test-account',
       type: 'oauth',
       access: 'access-token',
-      refresh: 'refresh-token',
       expires: Date.now() + 3600_000,
     })
     await saveAccounts(storage, accountPath)
@@ -4217,13 +3250,8 @@ describe('saveAccountState lost-update race (#9)', () => {
       mainQuotaCheckedAt: 100,
       mainQuotaToken: 'token-initial',
     }
-    storage.refresh = {
-      ...storage.refresh,
-      mainLastRefreshError: {
-        message: 'initial error',
-        checkedAt: 100,
-      },
-      mainRefreshLeaseId: 'lease-initial',
+    storage.prime = {
+      main: { count: 0, inputTokens: 0, outputTokens: 0, since: 100 },
     }
     await saveAccounts(storage)
 
@@ -4245,27 +3273,26 @@ describe('saveAccountState lost-update race (#9)', () => {
         mainQuotaToken: `token-quota-${round}`,
       }
 
-      const refreshStorage = baseStorage()
-      refreshStorage.refresh = {
-        ...refreshStorage.refresh,
-        mainLastRefreshError: {
-          message: `refresh error ${round}`,
-          checkedAt: 300 + round,
+      const primeStorage = baseStorage()
+      primeStorage.prime = {
+        main: {
+          count: round,
+          inputTokens: 400 + round,
+          outputTokens: 0,
+          since: 100,
         },
-        mainRefreshLeaseId: `lease-${round}`,
-        mainRefreshLeaseUntil: 400 + round,
       }
 
       await Promise.all([
         saveAccountState(quotaStorage, accountPath, { mainQuota: true }),
-        saveAccountState(refreshStorage, accountPath, { mainRefresh: true }),
+        saveAccountState(primeStorage, accountPath, { mainPrime: true }),
       ])
 
       const loaded = await loadAccounts()
       const quotaOk = loaded?.quota?.mainQuotaToken === `token-quota-${round}`
-      const refreshOk = loaded?.refresh?.mainRefreshLeaseId === `lease-${round}`
+      const primeOk = loaded?.prime?.main?.count === round
 
-      if (!quotaOk || !refreshOk) {
+      if (!quotaOk || !primeOk) {
         failures.push(round)
         // Don't break — collect all failures for diagnostics
       }
@@ -4279,7 +3306,7 @@ describe('saveAccountState lost-update race (#9)', () => {
       throw new Error(
         `Lost update in ${failures.length}/${ROUNDS} rounds (rounds: ${failures.slice(0, 10).join(', ')}). ` +
           `Last loaded mainQuotaToken=${loaded?.quota?.mainQuotaToken}, ` +
-          `mainRefreshLeaseId=${loaded?.refresh?.mainRefreshLeaseId}. ` +
+          `prime.main.count=${loaded?.prime?.main?.count}. ` +
           `State file: ${stateRaw.slice(0, 300)}`,
       )
     }
@@ -4288,8 +3315,8 @@ describe('saveAccountState lost-update race (#9)', () => {
     const final = await loadAccounts()
     expect(final?.quota?.mainQuotaToken).toBe(`token-quota-${ROUNDS - 1}`)
     expect(final?.quota?.mainQuotaCheckedAt).toBe(200 + ROUNDS - 1)
-    expect(final?.refresh?.mainRefreshLeaseId).toBe(`lease-${ROUNDS - 1}`)
-    expect(final?.refresh?.mainRefreshLeaseUntil).toBe(400 + ROUNDS - 1)
+    expect(final?.prime?.main?.count).toBe(ROUNDS - 1)
+    expect(final?.prime?.main?.inputTokens).toBe(400 + ROUNDS - 1)
   })
 })
 
@@ -4301,7 +3328,6 @@ describe('upsertAccount', () => {
     const account: OAuthAccount = {
       id: 'new-id',
       type: 'oauth',
-      refresh: 'refresh-token',
       label: 'new-label',
     }
     upsertAccount(storage, account)
@@ -4314,7 +3340,6 @@ describe('upsertAccount', () => {
     const original: OAuthAccount = {
       id: 'existing',
       type: 'oauth',
-      refresh: 'original-refresh',
       access: 'original-access',
       addedAt: 100,
     }
@@ -4322,13 +3347,11 @@ describe('upsertAccount', () => {
     upsertAccount(storage, {
       id: 'existing',
       type: 'oauth',
-      refresh: 'new-refresh',
       access: 'new-access',
     })
     expect(storage.accounts).toHaveLength(1)
     const updated = storage.accounts[0] as OAuthAccount
     expect(updated.access).toBe('new-access')
-    expect(updated.refresh).toBe('new-refresh')
     expect(updated.addedAt).toBe(100)
   })
 
@@ -4337,19 +3360,16 @@ describe('upsertAccount', () => {
     const original: OAuthAccount = {
       id: 'id-a',
       type: 'oauth',
-      refresh: 'refresh-a',
       label: 'shared-label',
     }
     storage.accounts.push(original)
     upsertAccount(storage, {
       id: 'id-b',
       type: 'oauth',
-      refresh: 'refresh-b',
       label: 'shared-label',
     })
     expect(storage.accounts).toHaveLength(1)
     expect(storage.accounts[0]!.id).toBe('id-b') // overwritten by incoming account
-    expect((storage.accounts[0] as OAuthAccount).refresh).toBe('refresh-b') // updated
   })
 
   test('merges oauth-specific fields on update', () => {
@@ -4357,7 +3377,6 @@ describe('upsertAccount', () => {
     const original: OAuthAccount = {
       id: 'oauth-1',
       type: 'oauth',
-      refresh: 'r1',
       quota: {
         five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1 },
       },
@@ -4369,7 +3388,6 @@ describe('upsertAccount', () => {
     upsertAccount(storage, {
       id: 'oauth-1',
       type: 'oauth',
-      refresh: 'r2',
       quota: {
         five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: 2 },
       },
@@ -4388,8 +3406,8 @@ describe('upsertAccount', () => {
 describe('removeAccount', () => {
   test('removes an existing account by id and returns true', () => {
     const storage = baseStorage()
-    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
-    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth' })
+    storage.accounts.push({ id: 'b', type: 'oauth' })
     expect(removeAccount(storage, 'a')).toBe(true)
     expect(storage.accounts.map((c) => c.id)).toEqual(['b'])
   })
@@ -4403,26 +3421,26 @@ describe('removeAccount', () => {
 describe('reorderAccounts', () => {
   test('reorders to match orderedIds', () => {
     const storage = baseStorage()
-    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
-    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
-    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'c', type: 'oauth' })
+    storage.accounts.push({ id: 'a', type: 'oauth' })
+    storage.accounts.push({ id: 'b', type: 'oauth' })
     reorderAccounts(storage, ['b', 'a', 'c'])
     expect(storage.accounts.map((c) => c.id)).toEqual(['b', 'a', 'c'])
   })
 
   test('unknown ids keep relative order at the end', () => {
     const storage = baseStorage()
-    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
-    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth' })
+    storage.accounts.push({ id: 'b', type: 'oauth' })
     reorderAccounts(storage, ['x']) // x unknown
     expect(storage.accounts.map((c) => c.id)).toEqual(['a', 'b'])
   })
 
   test('partial list puts known first, unknowns after preserving order', () => {
     const storage = baseStorage()
-    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
-    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
-    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'c', type: 'oauth' })
+    storage.accounts.push({ id: 'a', type: 'oauth' })
+    storage.accounts.push({ id: 'b', type: 'oauth' })
     reorderAccounts(storage, ['a']) // only 'a' specified
     expect(storage.accounts.map((c) => c.id)).toEqual(['a', 'c', 'b'])
   })
@@ -4434,13 +3452,11 @@ describe('setAccountEnabled', () => {
     storage.accounts.push({
       id: 'a',
       type: 'oauth',
-      refresh: 'r',
       enabled: true,
     })
     storage.accounts.push({
       id: 'b',
       type: 'oauth',
-      refresh: 'r',
       enabled: true,
     })
     expect(setAccountEnabled(storage, 'a', false)).toBe(true)
@@ -4464,7 +3480,6 @@ describe('multi-account persistence', () => {
       label: 'umut',
       type: 'oauth',
       access: 'umut-access',
-      refresh: 'umut-refresh',
     })
     await saveAccounts(current, accountPath)
 
@@ -4474,7 +3489,6 @@ describe('multi-account persistence', () => {
       label: 'yiyi',
       type: 'oauth',
       access: 'yiyi-access',
-      refresh: 'yiyi-refresh',
     })
     await saveAccounts(stale, accountPath)
 
@@ -4483,16 +3497,6 @@ describe('multi-account persistence', () => {
       'umut',
       'yiyi',
     ])
-    expect(
-      expectOAuthAccount(
-        loaded?.accounts.find((account) => account.id === 'umut'),
-      ).refresh,
-    ).toBe('umut-refresh')
-    expect(
-      expectOAuthAccount(
-        loaded?.accounts.find((account) => account.id === 'yiyi'),
-      ).refresh,
-    ).toBe('yiyi-refresh')
 
     const state = JSON.parse(
       await readFile(getAccountStatePath(accountPath), 'utf8'),
@@ -4507,7 +3511,6 @@ describe('multi-account persistence', () => {
           id: 'first',
           label: 'first',
           type: 'oauth',
-          refresh: 'first-refresh',
         },
         accountPath,
       ),
@@ -4516,7 +3519,6 @@ describe('multi-account persistence', () => {
           id: 'second',
           label: 'second',
           type: 'oauth',
-          refresh: 'second-refresh',
         },
         accountPath,
       ),
@@ -4532,7 +3534,7 @@ describe('multi-account persistence', () => {
 describe('removeAccountPersistent', () => {
   test('persists removal across load', async () => {
     const storage = baseStorage()
-    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'a', type: 'oauth' })
     await saveAccounts(storage)
     expect(await removeAccountPersistent('a', accountPath)).toBe(true)
     const loaded = await loadAccounts()
@@ -4553,7 +3555,6 @@ describe('removeAccountPersistent', () => {
       id: 'doomed',
       type: 'oauth',
       access: 'access-token',
-      refresh: 'refresh-token',
       expires: Date.now() + 3600_000,
       lastRefreshError: {
         message: 'boom',
@@ -4579,14 +3580,12 @@ describe('removeAccountPersistent', () => {
       id: 'keep',
       type: 'oauth',
       access: 'keep-access',
-      refresh: 'keep-refresh',
       expires: Date.now() + 3600_000,
     })
     storage.accounts.push({
       id: 'drop',
       type: 'oauth',
       access: 'drop-access',
-      refresh: 'drop-refresh',
       expires: Date.now() + 3600_000,
     })
     await saveAccounts(storage, accountPath)
@@ -4597,16 +3596,15 @@ describe('removeAccountPersistent', () => {
     const after = JSON.parse(await readFile(statePath, 'utf8'))
     expect(after.accounts?.drop).toBeUndefined()
     expect(after.accounts?.keep).toBeDefined()
-    expect(after.accounts?.keep?.refresh).toBe('keep-refresh')
   })
 })
 
 describe('reorderAccountsPersistent', () => {
   test('persists reorder across load', async () => {
     const storage = baseStorage()
-    storage.accounts.push({ id: 'c', type: 'oauth', refresh: 'r' })
-    storage.accounts.push({ id: 'a', type: 'oauth', refresh: 'r' })
-    storage.accounts.push({ id: 'b', type: 'oauth', refresh: 'r' })
+    storage.accounts.push({ id: 'c', type: 'oauth' })
+    storage.accounts.push({ id: 'a', type: 'oauth' })
+    storage.accounts.push({ id: 'b', type: 'oauth' })
     await saveAccounts(storage)
     await reorderAccountsPersistent(['b', 'a', 'c'], accountPath)
     const loaded = await loadAccounts()
@@ -4620,7 +3618,6 @@ describe('setAccountEnabledPersistent', () => {
     storage.accounts.push({
       id: 'a',
       type: 'oauth',
-      refresh: 'r',
       enabled: true,
     })
     await saveAccounts(storage)
@@ -4636,10 +3633,7 @@ describe('addAccountPersistent', () => {
   test('adds a new account and persists', async () => {
     const storage = baseStorage()
     await saveAccounts(storage)
-    await addAccountPersistent(
-      { id: 'new-acc', type: 'oauth', refresh: 'r' },
-      accountPath,
-    )
+    await addAccountPersistent({ id: 'new-acc', type: 'oauth' }, accountPath)
     const loaded = await loadAccounts()
     expect(loaded?.accounts).toHaveLength(1)
     expect(loaded?.accounts[0]?.id).toBe('new-acc')
@@ -4703,7 +3697,6 @@ describe('setPrimePersistentEnabled', () => {
     storage.accounts.push({
       id: 'work-alt',
       type: 'oauth',
-      refresh: 'r',
     })
     await saveAccounts(storage)
     await setPrimePersistentEnabled(true, accountPath)
@@ -4771,7 +3764,6 @@ describe('incrementPrimeUsagePersistent', () => {
     storage.accounts.push({
       id: 'work-alt',
       type: 'oauth',
-      refresh: 'r',
     })
     await saveAccounts(storage)
 
@@ -4817,13 +3809,11 @@ describe('incrementPrimeUsagePersistent', () => {
     storage.accounts.push({
       id: 'work-alt',
       type: 'oauth',
-      refresh: 'r',
       access: 'a',
     })
     storage.accounts.push({
       id: 'main-extra',
       type: 'oauth',
-      refresh: 'r2',
       access: 'b',
     })
     await saveAccounts(storage)
@@ -4836,8 +3826,8 @@ describe('incrementPrimeUsagePersistent', () => {
           acc.id === 'main-extra'
             ? ({
                 ...acc,
-                access: 'pre-existing',
-                lastRefreshedAt: 999,
+                authLineageId: 'pre-existing',
+                lastUsed: 999,
               } as OAuthAccount)
             : acc,
         ),
@@ -4861,8 +3851,8 @@ describe('incrementPrimeUsagePersistent', () => {
       | OAuthAccount
       | undefined
     expect(workAlt?.prime?.count).toBe(1)
-    expect(mainExtra?.access).toBe('pre-existing')
-    expect(mainExtra?.lastRefreshedAt).toBe(999)
+    expect(mainExtra?.authLineageId).toBe('pre-existing')
+    expect(mainExtra?.lastUsed).toBe(999)
   })
 
   test('a main prime increment preserves fallback state', async () => {
@@ -4870,7 +3860,6 @@ describe('incrementPrimeUsagePersistent', () => {
     storage.accounts.push({
       id: 'work-alt',
       type: 'oauth',
-      refresh: 'r',
       access: 'a',
     })
     await saveAccounts(storage)
@@ -4937,7 +3926,6 @@ describe('incrementPrimeUsagePersistent', () => {
     storage3.accounts.push({
       id: 'work-alt',
       type: 'oauth',
-      refresh: 'r',
       access: 'a',
     })
     await saveAccounts(storage3)
@@ -4957,7 +3945,7 @@ describe('incrementPrimeUsagePersistent', () => {
       | OAuthAccount
       | undefined
     expect(workAlt3?.prime).toBeUndefined()
-    expect(workAlt3?.access).toBe('a')
+    expect(workAlt3?.id).toBe('work-alt')
   })
 })
 
@@ -4967,7 +3955,6 @@ describe('getOrCreatePrimeAuthLineageId', () => {
     storage.accounts.push({
       id: 'work-alt',
       type: 'oauth',
-      refresh: 'rotating-refresh',
     })
     await saveAccounts(storage)
 

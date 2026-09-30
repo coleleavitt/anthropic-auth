@@ -27,3 +27,11 @@ process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
 )
 // Isolate refusal logging so tests don't pollute the real training log
 process.env.REFUSAL_LOG_DIR = join(testDir, 'refusal-logs')
+// The Rust account store talks to the OAuth token endpoint itself (JS fetch
+// mocks cannot intercept it). Default it to a dead loopback port so a test
+// that forgets `startMockTokenServer()` fails closed instead of reaching the
+// real endpoint; the fixture restores this value when its mock stops.
+process.env.ANTHROPIC_OAUTH_TOKEN_URL = 'http://127.0.0.1:9/v1/oauth/token'
+// Profile hydration calls the real profile endpoint; tests that exercise it
+// turn it back on explicitly.
+process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'

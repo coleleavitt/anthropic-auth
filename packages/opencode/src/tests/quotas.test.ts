@@ -186,7 +186,6 @@ describe('quota summaries', () => {
           id: 'fallback-1',
           label: 'personal',
           type: 'oauth',
-          refresh: 'refresh',
           enabled: false,
           lastRefreshedAt: 2,
           quota: {
@@ -238,7 +237,6 @@ describe('quota summaries', () => {
           id: 'fallback-1',
           label: 'personal',
           type: 'oauth',
-          refresh: 'refresh',
         },
       ],
     }

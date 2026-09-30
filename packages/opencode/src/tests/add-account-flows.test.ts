@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { startMockTokenServer } from '../../../core/src/tests/support/store-fixture.ts'
 
 let tempDir: string
 let accountPath: string
@@ -91,6 +92,35 @@ function scanLogsForSecrets(
     }
   }
   return hits
+}
+
+// Plugins built here start the store keep-alive, whose quota poll can land
+// after a test (for the account a mocked login just stored) and would reach
+// the real quota endpoint. Answer Anthropic/Claude hosts with a canned
+// "unmocked" response instead; nothing in this file asserts on quota.
+{
+  const realFetch = globalThis.fetch
+  globalThis.fetch = Object.assign(
+    (input: string | URL | Request, init?: RequestInit) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url
+      if (
+        /^https?:\/\/([^/]+\.)?(anthropic\.com|claude\.com|claude\.ai)(\/|$)/.test(
+          url,
+        )
+      ) {
+        return Promise.resolve(
+          new Response('unmocked in test', { status: 599 }),
+        )
+      }
+      return realFetch(input, init)
+    },
+    realFetch,
+  ) as typeof fetch
 }
 
 let capturedRecords: Array<{
@@ -245,8 +275,9 @@ describe('add-apikey flow', () => {
     const plugin = await getPlugin()
     await executeCommand(plugin, 'claude-account', 'add-apikey sk-ant-test123')
 
-    const { getSharedAccountStorePath, loadAccounts, loadSharedAccountStore } =
-      await import('@cortexkit/anthropic-auth-core')
+    const { loadAccounts, listSharedAccounts } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
     const loaded = await loadAccounts(accountPath)
     expect(loaded).not.toBeNull()
     expect(loaded!.accounts).toHaveLength(1)
@@ -259,12 +290,8 @@ describe('add-apikey flow', () => {
     }
     expect(account.enabled).toBe(true)
 
-    const shared = await loadSharedAccountStore({
-      path: getSharedAccountStorePath(),
-      legacyPaths: [],
-    })
-    expect(shared.source).toEqual({ type: 'empty' })
-    expect(shared.store.accounts).toEqual([])
+    // API keys stay host-owned: nothing is written to the shared store.
+    expect(await listSharedAccounts()).toEqual([])
   })
 
   test('persists with a label', async () => {
@@ -401,6 +428,19 @@ describe('add-oauth error paths', () => {
   })
 
   test('pending entry is always cleared after finish (even on failure)', async () => {
+    // The code exchange runs in Rust; point it at a mock that rejects the code.
+    const tokenServer = startMockTokenServer()
+    try {
+      await assertPendingClearedAfterFailure()
+      expect(tokenServer.codeExchanges.map((entry) => entry.code)).toEqual([
+        'garbage-code',
+      ])
+    } finally {
+      tokenServer.stop()
+    }
+  })
+
+  async function assertPendingClearedAfterFailure() {
     // This validates the finally-block behavior:
     // After calling add-oauth-finish with a real pending entry (from a real
     // add-oauth-start), the pending is consumed. A second finish call with the
@@ -408,12 +448,12 @@ describe('add-oauth error paths', () => {
     // block cleared it. We use the error-path here since exchange will fail
     // with the bad code, but the pending is still deleted by finally.
     //
-    // We call add-oauth-start (real authorize, creates pending entry),
-    // then add-oauth-finish with a garbage code (exchange returns failed).
+    // We call add-oauth-start (store login, creates pending entry),
+    // then add-oauth-finish with a garbage code (the exchange is rejected).
     // Then a second add-oauth-finish must get 'expired'.
     const plugin = await getPlugin()
 
-    // Start OAuth — this will make a real HTTP call to authorize()
+    // Start OAuth — builds the authorize URL (no network call)
     await executeCommand(
       plugin,
       'claude-account',
@@ -442,7 +482,7 @@ describe('add-oauth error paths', () => {
     const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
     const loaded = await loadAccounts(accountPath)
     expect(loaded!.accounts).toHaveLength(0)
-  })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -473,48 +513,41 @@ describe('add-oauth label threading', () => {
     throw new Error('no OAuth URL with state captured from prompt calls')
   }
 
+  let loginSequence = 0
+
   async function runOAuthAddWithLabel(labelArg: string | null) {
     const { plugin, client } = await getPluginWithClient()
     const sessionId = 'ses_oauth_label'
-
-    // Real add-oauth-start: builds a URL with a real state, stores pending,
-    // and delivers the URL text via session.promptAsync (TUI not connected).
-    await executeCommand(plugin, 'claude-account', 'add-oauth-start', sessionId)
-    const state = extractStateFromPromptCalls(client)
-
-    // Mock the token exchange endpoint to succeed.
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = mock((input: any) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
-      if (url.includes('oauth/token') || url.includes('/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              access_token: 'oauth-access',
-              refresh_token: 'oauth-refresh',
-              expires_in: 3600,
-              refresh_token_expires_in: 7200,
-            }),
-            { status: 200, headers: { 'content-type': 'application/json' } },
-          ),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
+    // The code exchange happens in Rust against this mock token endpoint.
+    const tokenServer = startMockTokenServer()
+    loginSequence += 1
+    const code = `dummy-code-${loginSequence}`
+    tokenServer.codes.set(code, {
+      email: 'person@example.com',
+      accountUuid: 'acct-person',
+      tag: `person${loginSequence}`,
+    })
 
     try {
+      // Real add-oauth-start: builds a URL with a real state, stores pending,
+      // and delivers the URL text via session.promptAsync (TUI not connected).
+      await executeCommand(
+        plugin,
+        'claude-account',
+        'add-oauth-start',
+        sessionId,
+      )
+      const state = extractStateFromPromptCalls(client)
       const finishArgs =
         labelArg == null
-          ? `add-oauth-finish dummy-code#${state}`
-          : `add-oauth-finish dummy-code#${state} --label ${labelArg}`
+          ? `add-oauth-finish ${code}#${state}`
+          : `add-oauth-finish ${code}#${state} --label ${labelArg}`
       await executeCommand(plugin, 'claude-account', finishArgs, sessionId)
+      expect(tokenServer.codeExchanges.map((entry) => entry.code)).toEqual([
+        code,
+      ])
     } finally {
-      globalThis.fetch = originalFetch
+      tokenServer.stop()
     }
 
     const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
@@ -529,19 +562,25 @@ describe('add-oauth label threading', () => {
     const account = loaded!.accounts[0]!
     expect(account.type).toBe('oauth')
     expect(account.label).toBe('work')
-    if (account.type === 'oauth') {
-      expect(account.refreshExpires).toBeGreaterThan(Date.now())
-    }
+    // The credential lives in the store, not in the host files.
+    expect(account).not.toHaveProperty('refresh')
+    const { listSharedAccounts } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    const rows = await listSharedAccounts()
+    const row = rows.find((candidate) => candidate.id === account.id)
+    expect(row?.refreshExpiresAt).toBeGreaterThan(Date.now())
+    expect(row?.email).toBe('person@example.com')
   })
 
-  test('add-oauth-finish without --label leaves label undefined (UUID-name fallback)', async () => {
+  test('add-oauth-finish without --label leaves label undefined (store names the row)', async () => {
     const loaded = await runOAuthAddWithLabel(null)
     expect(loaded).not.toBeNull()
     expect(loaded!.accounts).toHaveLength(1)
     const account = loaded!.accounts[0]!
     expect(account.label).toBeUndefined()
-    // id is a UUID (no natural key for OAuth)
-    expect(account.id).toMatch(/^[0-9a-f-]{36}$/)
+    // The store names an unlabelled login after the signed-in account.
+    expect(account.id).toBe('person@example.com')
   })
 
   test('a fresh login at the same label gets a new auth lineage', async () => {
@@ -551,6 +590,7 @@ describe('add-oauth label threading', () => {
     if (firstAccount.type !== 'oauth') throw new Error('expected OAuth account')
 
     const second = await runOAuthAddWithLabel('work')
+    expect(second!.accounts).toHaveLength(1)
     const secondAccount = second!.accounts[0]!
     expect(secondAccount.type).toBe('oauth')
     if (secondAccount.type !== 'oauth')

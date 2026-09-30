@@ -6,27 +6,19 @@ import {
   type AccountStorage,
   type ApiKeyAccount,
   addAccountPersistent,
-  authorize,
   discoverNativeClaudeCredentials,
-  exchange,
-  fallbackAccountToShared,
-  fetchOAuthAccountIdentity,
   generateRelayToken,
   getAccountStoragePath,
   importNativeClaudeAccount,
   isOAuthAccount,
   isValidApiBaseURL,
   loadAccounts,
-  loadSharedAccountStore,
   type OAuthAccount,
-  removeAccountPersistent,
-  revokeClaudeOAuthToken,
   saveAccounts,
   saveTrustedDeviceToken,
   setSharedAccountEnabled,
-  startOAuthLoopbackSession,
+  startSharedLoginWithLoopback,
   TrustedDeviceToken,
-  upsertSharedAccount,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -300,47 +292,33 @@ function closePromptInterface() {
 }
 
 /**
- * Dependencies the `login` command talks to the outside world through. All
- * default to the real implementations (the readline-backed prompt, and the
- * core authorize/exchange helpers) so the production `login` path is
- * unchanged; tests inject deterministic stubs to exercise the full login flow
- * in-process without a subprocess, real network, or stdin.
+ * Dependencies the `login` command talks to the outside world through. Both
+ * default to the real implementations (the readline-backed prompt and the
+ * store login, whose PKCE verifier, code exchange and tokens stay in the Rust
+ * binding); tests inject stubs to exercise the flow in-process.
  */
 export interface LoginDeps {
   prompt?: (message: string) => Promise<string>
-  authorize?: typeof authorize
-  exchange?: typeof exchange
-  startLoopback?: typeof startOAuthLoopbackSession
+  startLogin?: typeof startSharedLoginWithLoopback
 }
 
 export async function login(labelArg?: string, deps: LoginDeps = {}) {
   const ask = deps.prompt ?? prompt
-  const authorizeImpl = deps.authorize ?? authorize
-  const exchangeImpl = deps.exchange ?? exchange
-  // No label prompt: the token grant reports the signed-in account's email, so
-  // asking the user to retype it only invites a mismatch between the label and
-  // the account they actually authenticated as.
+  // No label prompt: the store names the row after the signed-in account's
+  // email (qualified by organization when needed), so a re-login lands on the
+  // row it supersedes.
   const label = labelArg?.trim()
-  const startLoopback = deps.startLoopback ?? startOAuthLoopbackSession
-  let loopback: Awaited<ReturnType<typeof startOAuthLoopbackSession>> | null =
-    null
-  let authorization: Awaited<ReturnType<typeof authorize>>
-  try {
-    loopback = await startLoopback()
-    authorization = await authorizeImpl('max', {
-      redirectUri: loopback.redirectUri,
-      state: loopback.state,
-    })
-  } catch {
-    loopback = null
-    authorization = await authorizeImpl('max')
+  const { login: pending, loopback } = await (
+    deps.startLogin ?? startSharedLoginWithLoopback
+  )({ mode: 'max' })
+  if (!loopback) {
     console.warn(
       'Could not start the localhost OAuth callback; using manual paste-back.',
     )
   }
 
   console.log('\nOpen this URL in your browser and complete Claude sign-in:\n')
-  console.log(`${authorization.url}\n`)
+  console.log(`${pending.url}\n`)
   const manualCode = ask(
     'Paste the full callback URL or authorization code here: ',
   )
@@ -363,102 +341,42 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   } else {
     code = await manualCode
   }
-  const result = await exchangeImpl(
-    code,
-    authorization.verifier,
-    authorization.redirectUri,
-    authorization.state,
-  )
 
-  if (result.type === 'failed') {
-    throw new Error('Authentication failed')
+  let added: Awaited<ReturnType<typeof pending.complete>>
+  try {
+    added = await pending.complete({
+      callback: code,
+      ...(label ? { label } : {}),
+      setCurrent: false,
+    })
+  } catch (error) {
+    throw new Error(
+      `Authentication failed: ${error instanceof Error ? error.message : String(error)}`,
+    )
   }
-
-  // Ask Anthropic who just signed in rather than inferring it. The grant only
-  // carries `account.email_address` when it happens to include it, while the
-  // profile endpoint always does — so this is what lets `login` name itself
-  // with no argument, and lets a re-login land on the row it supersedes.
-  const identity = await fetchOAuthAccountIdentity({
-    accessToken: result.access,
-  })
 
   // A credential that cannot run inference is useless for routing, and the
   // failure would otherwise surface much later as an opaque 403.
-  if (result.scopes?.length && !result.scopes.includes('user:inference')) {
+  if (added.scopes.length && !added.scopes.includes('user:inference')) {
+    await setSharedAccountEnabled(added.id, false).catch(() => {})
     throw new Error(
-      `Authentication succeeded but the granted scopes do not include user:inference (got: ${result.scopes.join(' ')})`,
+      `Authentication succeeded but the granted scopes do not include user:inference (got: ${added.scopes.join(' ')}); the account was stored disabled`,
     )
   }
 
   const now = Date.now()
-  const sharedStoreForNaming = await loadSharedAccountStore()
-  const organizationUuid = result.organizationId ?? identity.organizationUuid
-
-  // Prefer the profile email, then the grant's: both are stable across
-  // re-logins, so signing in again updates the existing account instead of
-  // stacking a second copy under a fresh random id.
-  //
-  // An email is not unique on its own, though — one person can hold a grant in
-  // several organizations, and those are separate routable credentials. If the
-  // plain email is already taken by a *different* organization, qualify this
-  // one so the two coexist instead of overwriting each other.
-  const preferredId = label || identity.email || result.email
-  const collidesWithOtherOrg =
-    !label &&
-    Boolean(preferredId) &&
-    sharedStoreForNaming.store.accounts.some(
-      (candidate) =>
-        candidate.id === preferredId &&
-        candidate.credential.type === 'oauth' &&
-        candidate.credential.organization?.uuid !== organizationUuid,
-    )
-  const organizationSuffix =
-    identity.organizationName ?? organizationUuid?.slice(0, 8)
-  const derivedId =
-    collidesWithOtherOrg && organizationSuffix
-      ? `${preferredId} (${organizationSuffix})`
-      : preferredId
-
   const account: OAuthAccount = {
-    id: derivedId || crypto.randomUUID(),
-    label: derivedId || undefined,
+    id: added.id,
+    label: added.label ?? added.email ?? added.id,
     type: 'oauth',
     authLineageId: crypto.randomUUID(),
-    access: result.access,
-    refresh: result.refresh,
-    expires: result.expires,
-    refreshExpires: result.refreshTokenExpiresAt,
     enabled: true,
     addedAt: now,
     lastUsed: now,
-    lastRefreshedAt: now,
   }
-  const sharedStore = sharedStoreForNaming
-  const existingSharedAccount = sharedStore.store.accounts.find(
-    (candidate) => candidate.id === account.id,
-  )
-  const sharedAccount = fallbackAccountToShared(account, existingSharedAccount)
-  if (sharedAccount.credential.type === 'oauth') {
-    if (identity.email ?? result.email) {
-      sharedAccount.email = identity.email ?? result.email
-    }
-    if (result.scopes) sharedAccount.credential.scopes = result.scopes
-    const accountUuid = result.accountId ?? identity.accountUuid
-    if (accountUuid) {
-      const email = identity.email ?? result.email
-      sharedAccount.credential.account = {
-        uuid: accountUuid,
-        ...(email ? { email_address: email } : {}),
-      }
-    }
-    if (organizationUuid) {
-      sharedAccount.credential.organization = { uuid: organizationUuid }
-    }
-  }
-  await upsertSharedAccount(sharedAccount)
   await addAccountPersistent(account)
 
-  console.log(`\nSaved fallback account${derivedId ? ` "${derivedId}"` : ''}.`)
+  console.log(`\nSaved fallback account "${account.label}".`)
 }
 
 /**
@@ -552,35 +470,15 @@ export async function importNative(
   )
 }
 
-export async function revokeAccount(
-  accountIdArg: string | undefined,
-  deps: {
-    prompt?: (message: string) => Promise<string>
-    revoke?: typeof revokeClaudeOAuthToken
-  } = {},
-) {
+/**
+ * Remote revocation needs the refresh token, which now lives only in the Rust
+ * account store; the binding exposes no revoke call. Disable or remove the
+ * account locally instead.
+ */
+export async function revokeAccount(accountIdArg: string | undefined) {
   const accountId = requireText(accountIdArg, 'Account id')
-  const loaded = await loadSharedAccountStore()
-  const account = loaded.store.accounts.find((entry) => entry.id === accountId)
-  if (!account) throw new Error(`Account "${accountId}" not found`)
-  if (account.credential.type !== 'oauth') {
-    throw new Error('Only OAuth accounts can be remotely revoked')
-  }
-  const ask = deps.prompt ?? prompt
-  const confirmation = await ask(
-    `Remote revocation cannot be undone. Type revoke to revoke "${account.label ?? account.id}": `,
-  )
-  if (confirmation !== 'revoke') throw new Error('OAuth revocation cancelled')
-
-  const outcome = await (deps.revoke ?? revokeClaudeOAuthToken)({
-    refreshToken: account.credential.refresh,
-  })
-  // Disable canonical state first. If the process stops during cleanup, the
-  // revoked credential cannot be selected or re-adopted from a stale sidecar.
-  await setSharedAccountEnabled(account.id, false)
-  await removeAccountPersistent(account.id).catch(() => {})
-  console.log(
-    `OAuth token ${outcome === 'already-inactive' ? 'was already inactive' : 'was revoked'}; account "${account.label ?? account.id}" is disabled locally.`,
+  throw new Error(
+    `Remote revocation of "${accountId}" is unavailable: the refresh token lives only in the account store and its binding has no revoke. Use \`disable\` or \`remove\` instead.`,
   )
 }
 

@@ -1,17 +1,61 @@
+/**
+ * OpenCode's view of the machine-wide Anthropic account store.
+ *
+ * The store (Rust binding, `~/.anthropic-accounts/accounts.json`) is the only
+ * custodian of OAuth refresh tokens. This module never writes a token into it
+ * except through the one-time `importHostOAuthCredential` migration of the
+ * credential OpenCode itself still holds in `auth.json`; after that import the
+ * host copy is replaced with {@link STORE_MANAGED_REFRESH_PLACEHOLDER}.
+ */
 import {
+  type AccountOperationError,
   type FallbackAccount,
-  fallbackAccountToShared,
-  findSharedAccountByCredential,
-  isFirstPartyAnthropicApiAccount,
-  loadSharedAccountStore,
+  getSharedAccessToken,
+  handleSharedUnauthorized,
+  importHostOAuthCredential,
+  isStoreManagedRefreshPlaceholder,
+  listSharedAccounts,
+  logger,
+  markSharedAccountUsed,
   materializeSharedFallbackAccounts,
   pickSharedAccount,
-  type SharedAccountStoreOptions,
+  refreshErrorFromSharedAccount,
+  type SharedAccountAccess,
   type SharedAnthropicAccount,
-  type SharedAnthropicCredential,
-  updateSharedAccountStore,
+  STORE_MANAGED_REFRESH_PLACEHOLDER,
+  sharedKeepAliveOnce,
+  tokenFingerprint,
   type WifAuth,
 } from '@cortexkit/anthropic-auth-core'
+
+/**
+ * Everything OpenCode asks of the account store. Production uses the Rust
+ * binding; plugin-level tests substitute a fixture store (the store itself is
+ * exercised against the real binding in the shared-auth and account tests).
+ */
+export type StoreAccess = SharedAccountAccess & {
+  importCredential: typeof importHostOAuthCredential
+}
+
+const bindingStoreAccess: StoreAccess = {
+  getAccessToken: (accountId) => getSharedAccessToken(accountId),
+  handleUnauthorized: (accessToken) => handleSharedUnauthorized(accessToken),
+  keepAliveOnce: () => sharedKeepAliveOnce(),
+  listAccounts: () => listSharedAccounts(),
+  markUsed: (accountId) => markSharedAccountUsed(accountId),
+  importCredential: (options) => importHostOAuthCredential(options),
+}
+
+let storeAccessOverride: Partial<StoreAccess> | undefined
+
+/** Test seam: replace (parts of) the store the plugin talks to. */
+export function __setStoreAccessForTests(access?: Partial<StoreAccess>) {
+  storeAccessOverride = access
+}
+
+export function storeAccess(): StoreAccess {
+  return { ...bindingStoreAccess, ...storeAccessOverride }
+}
 
 export type OpenCodeAnthropicAuth =
   | {
@@ -31,33 +75,33 @@ export type OpenCodeAnthropicAuth =
 export type ResolvedMainAnthropicAuth =
   | {
       type: 'oauth'
+      /** Empty when the store could not produce a token (see refreshError). */
       access: string
-      refresh?: string
       expires: number
-      refreshTokenExpiresAt?: number
       key?: undefined
+      /** Store row serving as main; absent for static/env credentials. */
       sharedAccountId?: string
+      /** The store's verdict when it could not produce a token. */
+      refreshError?: AccountOperationError
       source: 'shared' | 'opencode' | 'environment'
     }
   | {
       type: 'api'
       key: string
       access?: undefined
-      refresh?: undefined
       expires?: undefined
-      refreshTokenExpiresAt?: undefined
-      sharedAccountId?: string
-      source: 'shared' | 'opencode' | 'environment'
+      sharedAccountId?: undefined
+      refreshError?: undefined
+      source: 'opencode' | 'environment'
     }
   | {
       type: 'wif'
       provider: WifAuth
       key?: undefined
       access?: undefined
-      refresh?: undefined
       expires?: undefined
-      refreshTokenExpiresAt?: undefined
       sharedAccountId?: undefined
+      refreshError?: undefined
       source: 'wif'
     }
 
@@ -65,125 +109,110 @@ export type ReconciledAnthropicAuth = {
   auth: ResolvedMainAnthropicAuth | null
   fallbacks: FallbackAccount[]
   sharedMain?: SharedAnthropicAccount
+  /** The store rows the reconciliation saw (non-secret). */
+  accounts: SharedAnthropicAccount[]
 }
 
-export async function getSharedAnthropicAuthType(
-  options: SharedAccountStoreOptions = {},
-) {
-  const loaded = await loadSharedAccountStore(options)
-  const account = pickSharedAccount(loaded.store, options.now?.() ?? Date.now())
-  if (!account) return null
-  return account.credential.type === 'oauth' ? 'oauth' : 'api'
-}
+/** Writes OpenCode's own `auth.json` entry (client.auth.set). */
+export type SetOpenCodeAuth = (auth: {
+  type: 'oauth'
+  access: string
+  refresh: string
+  expires: number
+}) => Promise<void>
 
 function nonEmpty(value: string | undefined) {
   const trimmed = value?.trim()
   return trimmed || undefined
 }
 
-function credentialFromOpenCodeAuth(
+function oauthRows(accounts: readonly SharedAnthropicAccount[]) {
+  return accounts.filter((account) => account.kind === 'oauth')
+}
+
+export async function getSharedAnthropicAuthType() {
+  const accounts = await storeAccess().listAccounts()
+  return pickSharedAccount(oauthRows(accounts)) ? 'oauth' : null
+}
+
+/**
+ * Host credentials already handled in this process, keyed by refresh-token
+ * fingerprint: `store` when the store now holds the login, `static` when the
+ * store rejected it as malformed (then it is used as a fixed bearer).
+ */
+const hostCredentialOutcomes = new Map<string, 'store' | 'static'>()
+
+/** Test hook: forget which host credentials were already migrated. */
+export function resetHostCredentialMigrationForTests() {
+  hostCredentialOutcomes.clear()
+}
+
+/**
+ * One-time move of the credential OpenCode holds in `auth.json` into the store
+ * (the store's copy wins when it already has the login). Returns how the host
+ * credential should be treated from now on, or undefined when it is not a
+ * real OAuth credential.
+ */
+export async function migrateOpenCodeAuthIntoStore(
   auth: OpenCodeAnthropicAuth,
-): SharedAnthropicCredential | null {
-  if (auth.type === 'api') {
-    const key = nonEmpty(auth.key)
-    return key ? { type: 'api_key', key } : null
-  }
-  if (auth.type !== 'oauth') return null
-  const access = nonEmpty(auth.access)
+  setOpenCodeAuth?: SetOpenCodeAuth,
+): Promise<'store' | 'static' | undefined> {
+  if (auth.type !== 'oauth') return undefined
   const refresh = nonEmpty(auth.refresh)
-  if (!access || !refresh || typeof auth.expires !== 'number') return null
-  return {
-    type: 'oauth',
-    access,
-    refresh,
-    expires_at: auth.expires,
+  const access = nonEmpty(auth.access)
+  if (!refresh || isStoreManagedRefreshPlaceholder(refresh)) return undefined
+  const key = tokenFingerprint(refresh)
+  const known = hostCredentialOutcomes.get(key)
+  if (known) return known
+  const imported = await storeAccess().importCredential({
+    label: nonEmpty(auth.email) ?? 'OpenCode Anthropic',
+    accessToken: access ?? '',
+    refreshToken: refresh,
+    expiresAt:
+      typeof auth.expires === 'number' && Number.isFinite(auth.expires)
+        ? auth.expires
+        : 0,
     ...(typeof auth.refreshTokenExpiresAt === 'number'
-      ? { refresh_expires_at: auth.refreshTokenExpiresAt }
+      ? { refreshExpiresAt: auth.refreshTokenExpiresAt }
       : {}),
-    scopes: auth.scopes?.length ? auth.scopes : ['user:inference'],
-    ...(auth.accountId
-      ? {
-          account: {
-            uuid: auth.accountId,
-            ...(auth.email ? { email_address: auth.email } : {}),
-          },
-        }
-      : {}),
-    ...(auth.organizationId
-      ? { organization: { uuid: auth.organizationId } }
-      : {}),
+    ...(auth.scopes?.length ? { scopes: auth.scopes } : {}),
+    ...(auth.accountId ? { accountUuid: auth.accountId } : {}),
+    ...(auth.email ? { email: auth.email } : {}),
+    ...(auth.organizationId ? { organizationUuid: auth.organizationId } : {}),
+  })
+  if (imported.status === 'invalid') {
+    hostCredentialOutcomes.set(key, 'static')
+    logger.info('auth', 'opencode host credential kept as a static bearer', {
+      reason: imported.message,
+    })
+    return 'static'
   }
-}
-
-function sharedAccountFromOpenCodeAuth(
-  auth: OpenCodeAnthropicAuth,
-  existing: SharedAnthropicAccount | undefined,
-  now: number,
-): SharedAnthropicAccount | null {
-  const credential = credentialFromOpenCodeAuth(auth)
-  if (!credential) return null
-  if (
-    auth.type === 'oauth' &&
-    credential.type === 'oauth' &&
-    existing?.credential.type === 'oauth'
-  ) {
-    if (!auth.scopes?.length) credential.scopes = existing.credential.scopes
-    credential.refresh_expires_at ??= existing.credential.refresh_expires_at
-    credential.account ??= existing.credential.account
-    if (
-      credential.account &&
-      !credential.account.email_address &&
-      existing.credential.account?.email_address
-    ) {
-      credential.account.email_address =
-        existing.credential.account.email_address
-    }
-    credential.organization ??= existing.credential.organization
-  }
-  const accountId = auth.type === 'oauth' ? nonEmpty(auth.accountId) : undefined
-  return {
-    id:
-      existing?.id ??
-      accountId ??
-      (auth.type === 'oauth' ? 'opencode-main' : 'anthropic-api-key'),
-    label:
-      existing?.label ??
-      (auth.type === 'oauth' ? 'OpenCode Anthropic' : 'Anthropic API key'),
-    email:
-      (auth.type === 'oauth' ? nonEmpty(auth.email) : undefined) ??
-      existing?.email,
-    credential,
-    enabled: true,
-    created_at: existing?.created_at ?? new Date(now).toISOString(),
-    last_used_at: existing?.last_used_at,
-    rate_limited_until: existing?.rate_limited_until,
-    last_error: existing?.last_error,
-  }
-}
-
-function resolveSharedAccount(
-  account: SharedAnthropicAccount,
-): ResolvedMainAnthropicAuth {
-  if (account.credential.type === 'api_key') {
-    return {
-      type: 'api',
-      key: account.credential.key,
-      sharedAccountId: account.id,
-      source: 'shared',
+  hostCredentialOutcomes.set(key, 'store')
+  logger.info('auth', 'opencode host credential moved into the store', {
+    status: imported.status,
+    accountId: imported.accountId,
+  })
+  if (setOpenCodeAuth) {
+    try {
+      await setOpenCodeAuth({
+        type: 'oauth',
+        access: access ?? '',
+        refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+        expires:
+          typeof auth.expires === 'number' && Number.isFinite(auth.expires)
+            ? auth.expires
+            : 0,
+      })
+    } catch (error) {
+      logger.warn('auth', 'could not replace the opencode host refresh token', {
+        error: error instanceof Error ? error.message : String(error),
+      })
     }
   }
-  return {
-    type: 'oauth',
-    access: account.credential.access,
-    refresh: account.credential.refresh,
-    expires: account.credential.expires_at,
-    refreshTokenExpiresAt: account.credential.refresh_expires_at,
-    sharedAccountId: account.id,
-    source: 'shared',
-  }
+  return 'store'
 }
 
-function resolveOpenCodeAuth(
+function resolveStaticOpenCodeAuth(
   auth: OpenCodeAnthropicAuth,
 ): ResolvedMainAnthropicAuth | null {
   if (auth.type === 'api') {
@@ -192,18 +221,12 @@ function resolveOpenCodeAuth(
   }
   if (auth.type !== 'oauth') return null
   const access = nonEmpty(auth.access)
-  const refresh = nonEmpty(auth.refresh)
-  // Keep an OAuth credential that carries only a refresh token (no live access
-  // token yet): the downstream refresh path mints the access token before use.
-  // Dropping it here would strip the credential the prime and refresh flows need.
-  if (!access && !refresh) return null
+  if (!access) return null
   return {
     type: 'oauth',
-    access: access ?? '',
-    refresh,
+    access,
     expires:
       typeof auth.expires === 'number' ? auth.expires : Number.MAX_SAFE_INTEGER,
-    refreshTokenExpiresAt: auth.refreshTokenExpiresAt,
     source: 'opencode',
   }
 }
@@ -224,259 +247,89 @@ function resolveEnvironmentAuth(): ResolvedMainAnthropicAuth | null {
   return apiKey ? { type: 'api', key: apiKey, source: 'environment' } : null
 }
 
+/** A live bearer for the store main, or the store's reason it has none. */
+async function resolveStoreMain(
+  main: SharedAnthropicAccount,
+): Promise<ResolvedMainAnthropicAuth> {
+  try {
+    const token = await storeAccess().getAccessToken(main.id)
+    return {
+      type: 'oauth',
+      access: token.accessToken,
+      expires: token.expiresAt,
+      sharedAccountId: main.id,
+      source: 'shared',
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const code = (error as { code?: unknown }).code
+    return {
+      type: 'oauth',
+      access: '',
+      expires: 0,
+      sharedAccountId: main.id,
+      source: 'shared',
+      refreshError: refreshErrorFromSharedAccount(main) ?? {
+        message,
+        checkedAt: Date.now(),
+        permanent: code === 'invalid_grant',
+        ...(code === 'invalid_grant' ? { status: 400 } : {}),
+      },
+    }
+  }
+}
+
+/**
+ * Resolve OpenCode's main credential and fallback list from the store.
+ *
+ * Order: the store's preferred OAuth row; else OpenCode's own credential when
+ * the store could not take it (a static bearer, never refreshed) or it is an
+ * API key; else the environment; else workload identity. Fallbacks are the
+ * host's configured list over the store rows, minus main.
+ */
 export async function reconcileAnthropicAuth(input: {
   openCodeAuth: OpenCodeAnthropicAuth
   legacyAccounts: readonly FallbackAccount[]
   wifAuth?: WifAuth | null
-  options?: SharedAccountStoreOptions
+  setOpenCodeAuth?: SetOpenCodeAuth
 }): Promise<ReconciledAnthropicAuth> {
-  const options = input.options ?? {}
-  const now = options.now?.() ?? Date.now()
-  const loaded = await loadSharedAccountStore(options)
-  const hostCredential = credentialFromOpenCodeAuth(input.openCodeAuth)
-  const existingHost = hostCredential
-    ? findSharedAccountByCredential(loaded.store, hostCredential)
-    : undefined
-  const sharedMainBeforeUpdate = pickSharedAccount(loaded.store, now)
-  const hostOwnsSharedMain = Boolean(
-    sharedMainBeforeUpdate &&
-      (sharedMainBeforeUpdate.id === 'opencode-main' ||
-        sharedMainBeforeUpdate.id === 'anthropic-api-key' ||
-        (input.openCodeAuth.type === 'oauth' &&
-          input.openCodeAuth.accountId === sharedMainBeforeUpdate.id) ||
-        existingHost?.id === sharedMainBeforeUpdate.id),
-  )
-  const shouldUpdateSharedMain = Boolean(
-    hostCredential &&
-      sharedMainBeforeUpdate &&
-      hostOwnsSharedMain &&
-      ((hostCredential.type === 'oauth' &&
-        sharedMainBeforeUpdate.credential.type === 'oauth' &&
-        // A different refresh token is a rotation the host performed, not a
-        // regression to an older credential, so it is adopted regardless of
-        // expiry. Gating it on `expires_at >=` meant a freshly rotated token
-        // with a shorter lifetime than the stale stored one was rejected, and
-        // the store kept serving a credential the host had already replaced.
-        (hostCredential.refresh !== sharedMainBeforeUpdate.credential.refresh ||
-          (hostCredential.expires_at >=
-            sharedMainBeforeUpdate.credential.expires_at &&
-            hostCredential.access !==
-              sharedMainBeforeUpdate.credential.access))) ||
-        (hostCredential.type === 'api_key' &&
-          sharedMainBeforeUpdate.credential.type === 'api_key' &&
-          hostCredential.key !== sharedMainBeforeUpdate.credential.key)),
-  )
-  const shouldAdoptHost = loaded.store.accounts.length === 0 && !!hostCredential
-  const migratableLegacy = input.legacyAccounts.filter((account) =>
-    account.type === 'oauth'
-      ? Boolean(account.access?.trim() && account.refresh.trim())
-      : Boolean(
-          account.apiKey?.trim() && isFirstPartyAnthropicApiAccount(account),
-        ),
-  )
+  const hostOutcome = await migrateOpenCodeAuthIntoStore(
+    input.openCodeAuth,
+    input.setOpenCodeAuth,
+  ).catch((error) => {
+    logger.warn('auth', 'opencode host credential import deferred', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return undefined
+  })
+  const accounts = await storeAccess().listAccounts()
+  const sharedMain = pickSharedAccount(oauthRows(accounts))
 
-  const legacyNeedsSharedUpdate = (legacy: FallbackAccount) => {
-    const candidate = fallbackAccountToShared(legacy, undefined, now)
-    const byId = loaded.store.accounts.find(
-      (account) => account.id === candidate.id,
-    )
-    if (!byId) {
-      return !findSharedAccountByCredential(loaded.store, candidate.credential)
-    }
-    return (
-      candidate.credential.type === 'oauth' &&
-      byId.credential.type === 'oauth' &&
-      candidate.credential.expires_at > byId.credential.expires_at
-    )
-  }
-  const hasLegacyUpdates = migratableLegacy.some(legacyNeedsSharedUpdate)
-
-  let store = loaded.store
-  if (
-    shouldAdoptHost ||
-    shouldUpdateSharedMain ||
-    hasLegacyUpdates ||
-    loaded.source.type === 'legacy'
+  let auth: ResolvedMainAnthropicAuth | null = null
+  if (sharedMain) {
+    auth = await resolveStoreMain(sharedMain)
+  } else if (
+    input.openCodeAuth.type === 'api' ||
+    hostOutcome === 'static' ||
+    (input.openCodeAuth.type === 'oauth' &&
+      isStoreManagedRefreshPlaceholder(nonEmpty(input.openCodeAuth.refresh)))
   ) {
-    const updated = await updateSharedAccountStore((next) => {
-      if (shouldUpdateSharedMain && sharedMainBeforeUpdate) {
-        const index = next.accounts.findIndex(
-          (account) => account.id === sharedMainBeforeUpdate.id,
-        )
-        const refreshed = sharedAccountFromOpenCodeAuth(
-          input.openCodeAuth,
-          sharedMainBeforeUpdate,
-          now,
-        )
-        if (index >= 0 && refreshed) next.accounts[index] = refreshed
-      } else if (shouldAdoptHost) {
-        const sharedHost = sharedAccountFromOpenCodeAuth(
-          input.openCodeAuth,
-          existingHost,
-          now,
-        )
-        if (sharedHost) {
-          const match =
-            findSharedAccountByCredential(next, sharedHost.credential) ??
-            next.accounts.find((account) => account.id === sharedHost.id)
-          if (!match) next.accounts.unshift(sharedHost)
-          next.current = match?.id ?? sharedHost.id
-        }
-      }
-      for (const legacy of migratableLegacy) {
-        const candidate = fallbackAccountToShared(legacy, undefined, now)
-        const byId = next.accounts.find(
-          (account) => account.id === candidate.id,
-        )
-        if (byId) {
-          if (
-            candidate.credential.type === 'oauth' &&
-            byId.credential.type === 'oauth' &&
-            candidate.credential.expires_at > byId.credential.expires_at
-          ) {
-            byId.credential = {
-              ...candidate.credential,
-              scopes: byId.credential.scopes,
-              account: byId.credential.account,
-              organization: byId.credential.organization,
-            }
-            byId.last_used_at = candidate.last_used_at
-            byId.last_error = candidate.last_error
-          }
-          continue
-        }
-        if (findSharedAccountByCredential(next, candidate.credential)) continue
-        next.accounts.push(candidate)
-      }
-    }, options)
-    store = updated.store
+    auth = resolveStaticOpenCodeAuth(input.openCodeAuth)
   }
-
-  const sharedMain = pickSharedAccount(store, now)
-  const hostStableAccountId =
-    input.openCodeAuth.type === 'oauth'
-      ? nonEmpty(input.openCodeAuth.accountId)
-      : undefined
-  const hostBlockedByDisabledSharedAccount = store.accounts.some(
-    (account) =>
-      !account.enabled &&
-      (account.id === existingHost?.id ||
-        account.id === hostStableAccountId ||
-        (input.openCodeAuth.type === 'oauth' &&
-          !hostStableAccountId &&
-          account.id === 'opencode-main')),
-  )
-  // The stored copy of the host's own session drifts from the host in both
-  // directions: it keeps the previous expiry after the host's token has aged
-  // out, and it keeps a stale one after the host's has moved forward. Either
-  // way the host is the authority on its own session, and serving the stored
-  // expiry instead makes the request path mis-judge whether a refresh is due.
-  //
-  // A genuine host rotation has already been written into the store by
-  // `shouldUpdateSharedMain` above, so by this point the two agree and this
-  // stays false — a rotated credential keeps its canonical `shared` provenance.
-  const hostOAuth =
-    input.openCodeAuth.type === 'oauth' ? input.openCodeAuth : undefined
-  const hostMirrorsSharedMain = Boolean(
-    sharedMain &&
-      hostOwnsSharedMain &&
-      hostOAuth &&
-      sharedMain.credential.type === 'oauth' &&
-      hostOAuth.refresh === sharedMain.credential.refresh &&
-      // A host session carrying no access token at all is the strongest
-      // possible statement that its token is gone. `credentialFromOpenCodeAuth`
-      // returns null for that shape (it needs access + refresh + a numeric
-      // expiry), so read the host auth directly rather than via
-      // `hostCredential`, which would be null exactly when it matters most.
-      (!hostOAuth.access?.trim() ||
-        (typeof hostOAuth.expires === 'number' &&
-          hostOAuth.expires !== sharedMain.credential.expires_at)),
-  )
+  auth ??=
+    resolveEnvironmentAuth() ??
+    (input.wifAuth
+      ? { type: 'wif', provider: input.wifAuth, source: 'wif' }
+      : null)
 
   return {
-    auth:
-      (hostMirrorsSharedMain
-        ? resolveOpenCodeAuth(input.openCodeAuth)
-        : null) ??
-      (sharedMain ? resolveSharedAccount(sharedMain) : null) ??
-      (hostBlockedByDisabledSharedAccount
-        ? null
-        : resolveOpenCodeAuth(input.openCodeAuth)) ??
-      resolveEnvironmentAuth() ??
-      (input.wifAuth
-        ? { type: 'wif', provider: input.wifAuth, source: 'wif' }
-        : null),
+    auth,
     fallbacks: materializeSharedFallbackAccounts(
       input.legacyAccounts,
-      store,
-      now,
+      accounts,
+      { mainId: sharedMain?.id },
     ),
     sharedMain,
+    accounts,
   }
-}
-
-export async function persistConnectedAnthropicAuth(
-  auth: OpenCodeAnthropicAuth,
-  options: SharedAccountStoreOptions = {},
-) {
-  const credential = credentialFromOpenCodeAuth(auth)
-  if (!credential) return null
-  const now = options.now?.() ?? Date.now()
-  const updated = await updateSharedAccountStore((store) => {
-    const expectedId =
-      auth.type === 'oauth'
-        ? (nonEmpty(auth.accountId) ?? 'opencode-main')
-        : 'anthropic-api-key'
-    const existing =
-      findSharedAccountByCredential(store, credential) ??
-      store.accounts.find((candidate) => candidate.id === expectedId) ??
-      (auth.type === 'oauth' && store.current === 'opencode-main'
-        ? store.accounts.find((candidate) => candidate.id === 'opencode-main')
-        : undefined)
-    const account = sharedAccountFromOpenCodeAuth(auth, existing, now)
-    if (!account) return null
-    const index = store.accounts.findIndex(
-      (candidate) => candidate.id === account.id,
-    )
-    if (index >= 0) store.accounts[index] = account
-    else store.accounts.push(account)
-    store.current = account.id
-    return account
-  }, options)
-  return updated.result
-}
-
-export async function persistRefreshedSharedOAuth(input: {
-  accountId: string
-  access: string
-  refresh: string
-  expires: number
-  refreshTokenExpiresAt?: number
-  expectedRefresh?: string
-  options?: SharedAccountStoreOptions
-}) {
-  const { result } = await updateSharedAccountStore((store) => {
-    const account = store.accounts.find(
-      (candidate) => candidate.id === input.accountId,
-    )
-    if (account?.credential.type !== 'oauth') {
-      throw new Error(
-        `Unknown shared Anthropic OAuth account: ${input.accountId}`,
-      )
-    }
-    if (
-      input.expectedRefresh !== undefined &&
-      account.credential.refresh !== input.expectedRefresh
-    ) {
-      return false
-    }
-    account.credential.access = input.access
-    account.credential.refresh = input.refresh
-    account.credential.expires_at = input.expires
-    account.credential.refresh_expires_at =
-      input.refreshTokenExpiresAt ?? account.credential.refresh_expires_at
-    account.last_error = undefined
-    return true
-  }, input.options)
-  return result
 }

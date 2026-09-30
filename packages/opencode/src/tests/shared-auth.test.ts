@@ -1,30 +1,36 @@
-import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 
 import {
-  loadSharedAccountStore,
-  type SharedAnthropicAccount,
-  saveSharedAccountStore,
+  type FallbackAccount,
+  listSharedAccounts,
+  STORE_MANAGED_REFRESH_PLACEHOLDER,
+  setSharedAccountEnabled,
   WifAuth,
 } from '@cortexkit/anthropic-auth-core'
 import {
-  persistConnectedAnthropicAuth,
-  persistRefreshedSharedOAuth,
+  fakeAccessToken,
+  fakeRefreshToken,
+  type MockTokenServer,
+  seedStoreAccount,
+  startMockTokenServer,
+  type TempStore,
+  useTempStore,
+} from '../../../core/src/tests/support/store-fixture.ts'
+import {
   reconcileAnthropicAuth,
+  resetHostCredentialMigrationForTests,
+  type SetOpenCodeAuth,
 } from '../shared-auth.ts'
 
-const tempDirectories: string[] = []
 const originalOAuth = process.env.ANTHROPIC_OAUTH_TOKEN
 const originalAuthToken = process.env.ANTHROPIC_AUTH_TOKEN
 const originalApiKey = process.env.ANTHROPIC_API_KEY
 
-async function storePath() {
-  const directory = await mkdtemp(join(tmpdir(), 'opencode-shared-auth-'))
-  tempDirectories.push(directory)
-  return join(directory, 'accounts.json')
-}
+// Every test runs against a temp store and a mock token endpoint, so any
+// refresh the store performs lands on the mock.
+let store: TempStore
+let tokenServer: MockTokenServer
+let hostSequence = 0
 
 function workloadIdentity() {
   return new WifAuth(
@@ -43,375 +49,268 @@ function workloadIdentity() {
   )
 }
 
-function oauthAccount(
-  id: string,
-  access = 'shared-access',
-): SharedAnthropicAccount {
+/** A well-formed host credential with tokens unique to this test run. */
+function hostCredential(
+  overrides: { accountId?: string; email?: string } = {},
+) {
+  hostSequence += 1
+  const tag = `host${process.pid}n${hostSequence}`
   return {
-    id,
-    credential: {
-      type: 'oauth',
-      access,
-      refresh: 'shared-refresh',
-      expires_at: 2_000_000_000_000,
-      scopes: ['user:inference'],
-    },
-    enabled: true,
-    created_at: '2026-08-14T00:00:00.000Z',
+    type: 'oauth' as const,
+    access: fakeAccessToken(tag),
+    refresh: fakeRefreshToken(tag),
+    expires: Date.now() + 3_600_000,
+    ...overrides,
   }
 }
 
-afterEach(async () => {
+beforeEach(() => {
+  delete process.env.ANTHROPIC_OAUTH_TOKEN
+  delete process.env.ANTHROPIC_AUTH_TOKEN
+  delete process.env.ANTHROPIC_API_KEY
+  resetHostCredentialMigrationForTests()
+  store = useTempStore()
+  tokenServer = startMockTokenServer()
+})
+
+afterEach(() => {
+  tokenServer.stop()
+  store.dispose()
   if (originalOAuth === undefined) delete process.env.ANTHROPIC_OAUTH_TOKEN
   else process.env.ANTHROPIC_OAUTH_TOKEN = originalOAuth
   if (originalAuthToken === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN
   else process.env.ANTHROPIC_AUTH_TOKEN = originalAuthToken
   if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
   else process.env.ANTHROPIC_API_KEY = originalApiKey
-  await Promise.all(
-    tempDirectories
-      .splice(0)
-      .map((directory) => rm(directory, { recursive: true, force: true })),
-  )
 })
 
-describe('OpenCode shared Anthropic auth adapter', () => {
-  test('adopts OpenCode OAuth as current when the shared store is empty', async () => {
-    const path = await storePath()
-    const reconciled = await reconcileAnthropicAuth({
-      openCodeAuth: {
-        type: 'oauth',
-        accountId: 'account-1',
-        access: 'host-access',
-        refresh: 'host-refresh',
-        expires: 2_000_000_000_000,
-      },
-      legacyAccounts: [
-        {
-          id: 'legacy-fallback',
-          type: 'oauth',
-          access: 'legacy-access',
-          refresh: 'legacy-refresh',
-          expires: 2_000_000_000_000,
-        },
-      ],
-      options: { path, legacyPaths: [] },
-    })
+describe('OpenCode auth over the account store', () => {
+  test('moves OpenCode OAuth into the store once and leaves a placeholder in auth.json', async () => {
+    const host = hostCredential()
+    const setOpenCodeAuth = mock<SetOpenCodeAuth>(async () => {})
 
-    expect(reconciled.auth).toMatchObject({
-      type: 'oauth',
-      access: 'host-access',
-      sharedAccountId: 'account-1',
-      source: 'shared',
-    })
-    expect(reconciled.fallbacks).toEqual([
-      expect.objectContaining({ id: 'legacy-fallback', type: 'oauth' }),
-    ])
-    const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
-    expect(loaded.store.current).toBe('account-1')
-    expect(loaded.store.accounts.map((account) => account.id)).toEqual([
-      'account-1',
-      'legacy-fallback',
-    ])
-  })
-
-  test('honors ordered-first semantics for an unpinned canonical store', async () => {
-    const path = await storePath()
-    await saveSharedAccountStore(
-      {
-        version: 1,
-        accounts: [oauthAccount('fallback-only', 'fallback-access')],
-      },
-      { path },
-    )
-
-    const reconciled = await reconcileAnthropicAuth({
-      openCodeAuth: {
-        type: 'oauth',
-        access: 'host-access',
-        refresh: 'host-refresh',
-        expires: 2_100_000_000_000,
-      },
+    const first = await reconcileAnthropicAuth({
+      openCodeAuth: host,
       legacyAccounts: [],
-      options: { path, legacyPaths: [] },
+      setOpenCodeAuth,
     })
-
-    expect(reconciled.auth).toMatchObject({
+    expect(first.auth).toMatchObject({
       type: 'oauth',
-      access: 'fallback-access',
+      access: host.access,
       source: 'shared',
     })
-    expect(reconciled.fallbacks).toEqual([])
-  })
+    expect(first.auth?.sharedAccountId).toBeString()
+    const rows = await listSharedAccounts()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.current).toBe(true)
 
-  test('uses canonical API-key credentials instead of stale host OAuth', async () => {
-    const path = await storePath()
-    await saveSharedAccountStore(
-      {
-        version: 1,
-        current: 'api-main',
-        accounts: [
-          {
-            id: 'api-main',
-            credential: { type: 'api_key', key: 'canonical-api-key' },
-            enabled: true,
-            created_at: '2026-08-14T00:00:00.000Z',
-          },
-        ],
-      },
-      { path },
-    )
-
-    const reconciled = await reconcileAnthropicAuth({
-      openCodeAuth: {
-        type: 'oauth',
-        access: 'stale-host-access',
-        refresh: 'stale-host-refresh',
-        expires: 2_000_000_000_000,
-      },
-      legacyAccounts: [],
-      options: { path, legacyPaths: [] },
+    // The host copy of the refresh token is replaced, never re-imported.
+    expect(setOpenCodeAuth).toHaveBeenCalledTimes(1)
+    expect(setOpenCodeAuth.mock.calls[0]?.[0]).toEqual({
+      type: 'oauth',
+      access: host.access,
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: host.expires,
     })
-    expect(reconciled.auth).toEqual({
-      type: 'api',
-      key: 'canonical-api-key',
-      sharedAccountId: 'api-main',
-      source: 'shared',
-    })
-  })
-
-  test('synchronizes a newer OpenCode token rotation for an adopted main account', async () => {
-    const path = await storePath()
     await reconcileAnthropicAuth({
+      openCodeAuth: host,
+      legacyAccounts: [],
+      setOpenCodeAuth,
+    })
+    expect(setOpenCodeAuth).toHaveBeenCalledTimes(1)
+    expect(await listSharedAccounts()).toHaveLength(1)
+    // No refresh was spent to resolve a live credential.
+    expect(tokenServer.presented).toEqual([])
+  })
+
+  test("the store's copy wins over a host credential for the same login", async () => {
+    const seeded = await seedStoreAccount({
+      label: 'work',
+      email: 'work@example.com',
+      accountUuid: 'acct-work',
+    })
+    const host = hostCredential({
+      accountId: 'acct-work',
+      email: 'work@example.com',
+    })
+
+    const reconciled = await reconcileAnthropicAuth({
+      openCodeAuth: host,
+      legacyAccounts: [],
+    })
+    expect(reconciled.auth).toMatchObject({
+      type: 'oauth',
+      access: seeded.access,
+      sharedAccountId: seeded.id,
+      source: 'shared',
+    })
+    expect(await listSharedAccounts()).toHaveLength(1)
+  })
+
+  test('a host credential the store cannot parse is used as a static bearer', async () => {
+    const setOpenCodeAuth = mock<SetOpenCodeAuth>(async () => {})
+    const reconciled = await reconcileAnthropicAuth({
       openCodeAuth: {
         type: 'oauth',
-        access: 'first-access',
-        refresh: 'first-refresh',
-        expires: 1_900_000_000_000,
+        access: 'test-access-token',
+        refresh: 'test-refresh-token',
+        expires: Date.now() + 60_000,
       },
       legacyAccounts: [],
-      options: { path, legacyPaths: [] },
+      setOpenCodeAuth,
+    })
+    expect(reconciled.auth).toMatchObject({
+      type: 'oauth',
+      access: 'test-access-token',
+      source: 'opencode',
+    })
+    expect(reconciled.auth?.sharedAccountId).toBeUndefined()
+    expect(setOpenCodeAuth).not.toHaveBeenCalled()
+    expect(await listSharedAccounts()).toEqual([])
+  })
+
+  test('an expired store main is refreshed by the store, exactly once', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'expired',
+      expiresAt: Date.now() - 1_000,
     })
     const reconciled = await reconcileAnthropicAuth({
       openCodeAuth: {
         type: 'oauth',
-        access: 'rotated-access',
-        refresh: 'rotated-refresh',
-        expires: 2_000_000_000_000,
+        access: 'stale',
+        refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
       },
       legacyAccounts: [],
-      options: { path, legacyPaths: [] },
     })
-
     expect(reconciled.auth).toMatchObject({
       type: 'oauth',
-      access: 'rotated-access',
-      refresh: 'rotated-refresh',
-      source: 'shared',
+      access: tokenServer.rotatedAccess(1),
+      sharedAccountId: seeded.id,
     })
+    expect(tokenServer.presented).toEqual([seeded.refresh])
   })
 
-  test('supports inherited OAuth and API-key environment credentials without persisting them', async () => {
-    const oauthPath = await storePath()
-    delete process.env.ANTHROPIC_AUTH_TOKEN
-    process.env.ANTHROPIC_OAUTH_TOKEN = 'environment-oauth'
-    process.env.ANTHROPIC_API_KEY = 'environment-api-key'
-    const oauth = await reconcileAnthropicAuth({
+  test("a dead store main carries the store's invalid_grant verdict", async () => {
+    const seeded = await seedStoreAccount({
+      label: 'dead',
+      expiresAt: Date.now() - 1_000,
+    })
+    tokenServer.dead.add(seeded.refresh)
+    const reconciled = await reconcileAnthropicAuth({
       openCodeAuth: { type: 'wellknown' },
       legacyAccounts: [],
-      options: { path: oauthPath, legacyPaths: [] },
     })
-    expect(oauth.auth).toMatchObject({
-      type: 'oauth',
-      access: 'environment-oauth',
-      source: 'environment',
-    })
-    expect(
-      (await loadSharedAccountStore({ path: oauthPath, legacyPaths: [] }))
-        .source.type,
-    ).toBe('empty')
+    expect(reconciled.auth?.type).toBe('oauth')
+    if (reconciled.auth?.type !== 'oauth') throw new Error('expected oauth')
+    expect(reconciled.auth.access).toBe('')
+    expect(reconciled.auth.refreshError?.permanent).toBe(true)
+    expect(tokenServer.presented).toEqual([seeded.refresh])
+  })
 
-    delete process.env.ANTHROPIC_OAUTH_TOKEN
-    process.env.ANTHROPIC_AUTH_TOKEN = 'standard-auth-token'
-    const authTokenPath = await storePath()
-    const authToken = await reconcileAnthropicAuth({
-      openCodeAuth: { type: 'wellknown' },
+  test('a placeholder host credential is not imported and a disabled store row is not resurrected', async () => {
+    const seeded = await seedStoreAccount({ label: 'blocked' })
+    await setSharedAccountEnabled(seeded.id, false)
+    const reconciled = await reconcileAnthropicAuth({
+      openCodeAuth: {
+        type: 'oauth',
+        access: seeded.access,
+        refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+        expires: Date.now() + 60_000,
+      },
       legacyAccounts: [],
-      options: { path: authTokenPath, legacyPaths: [] },
     })
-    expect(authToken.auth).toMatchObject({
+    // The access token in auth.json is a copy of the store's: until it
+    // expires it is still usable, but nothing refreshes it outside the store.
+    expect(reconciled.auth).toMatchObject({
       type: 'oauth',
-      access: 'standard-auth-token',
-      source: 'environment',
+      access: seeded.access,
+      source: 'opencode',
     })
+    expect(reconciled.sharedMain).toBeUndefined()
+    expect((await listSharedAccounts())[0]?.enabled).toBe(false)
+  })
 
-    delete process.env.ANTHROPIC_AUTH_TOKEN
-    const apiPath = await storePath()
+  test('supports environment credentials and WIF only after the store and host', async () => {
+    process.env.ANTHROPIC_API_KEY = 'env-api-key'
     const api = await reconcileAnthropicAuth({
       openCodeAuth: { type: 'wellknown' },
       legacyAccounts: [],
-      options: { path: apiPath, legacyPaths: [] },
     })
     expect(api.auth).toEqual({
       type: 'api',
-      key: 'environment-api-key',
+      key: 'env-api-key',
       source: 'environment',
     })
-  })
 
-  test('uses WIF only after canonical, host, and ordinary environment auth', async () => {
-    delete process.env.ANTHROPIC_OAUTH_TOKEN
-    delete process.env.ANTHROPIC_AUTH_TOKEN
     delete process.env.ANTHROPIC_API_KEY
-    const path = await storePath()
+    process.env.ANTHROPIC_OAUTH_TOKEN = 'env-oauth'
+    const oauth = await reconcileAnthropicAuth({
+      openCodeAuth: { type: 'wellknown' },
+      legacyAccounts: [],
+    })
+    expect(oauth.auth).toMatchObject({
+      type: 'oauth',
+      access: 'env-oauth',
+      source: 'environment',
+    })
+
+    delete process.env.ANTHROPIC_OAUTH_TOKEN
     const provider = workloadIdentity()
     const wif = await reconcileAnthropicAuth({
       openCodeAuth: { type: 'wellknown' },
       legacyAccounts: [],
       wifAuth: provider,
-      options: { path, legacyPaths: [] },
     })
-    expect(wif.auth).toMatchObject({
-      type: 'wif',
-      provider,
-      source: 'wif',
-    })
+    expect(wif.auth).toMatchObject({ type: 'wif', provider, source: 'wif' })
 
-    await saveSharedAccountStore(
-      { version: 1, accounts: [oauthAccount('canonical')] },
-      { path },
-    )
+    await seedStoreAccount({ label: 'canonical' })
     const canonical = await reconcileAnthropicAuth({
       openCodeAuth: { type: 'wellknown' },
       legacyAccounts: [],
       wifAuth: provider,
-      options: { path, legacyPaths: [] },
     })
-    expect(canonical.auth?.type).toBe('oauth')
     expect(canonical.auth?.source).toBe('shared')
   })
 
-  test('a disabled canonical match blocks stale host credential resurrection', async () => {
-    const path = await storePath()
-    const blocked = oauthAccount('blocked', 'host-access')
-    blocked.enabled = false
-    if (blocked.credential.type === 'oauth') {
-      blocked.credential.refresh = 'host-refresh'
-    }
-    await saveSharedAccountStore({ version: 1, accounts: [blocked] }, { path })
+  test('uses an OpenCode API key when the store holds no OAuth account', async () => {
     const reconciled = await reconcileAnthropicAuth({
-      openCodeAuth: {
-        type: 'oauth',
-        accountId: 'blocked',
-        access: 'different-stale-access',
-        refresh: 'different-stale-refresh',
-        expires: 2_000_000_000_000,
-      },
+      openCodeAuth: { type: 'api', key: 'host-key' },
       legacyAccounts: [],
-      options: { path, legacyPaths: [] },
     })
-    expect(reconciled.auth).toBeNull()
-  })
-
-  test('preserves canonical metadata when reconnecting the same OAuth account', async () => {
-    const path = await storePath()
-    await saveSharedAccountStore(
-      {
-        version: 1,
-        current: 'connected',
-        accounts: [
-          {
-            id: 'connected',
-            label: 'Work',
-            email: 'me@example.com',
-            credential: {
-              type: 'oauth',
-              access: 'old-access',
-              refresh: 'old-refresh',
-              expires_at: 1_900_000_000_000,
-              scopes: ['user:profile', 'user:inference'],
-              account: {
-                uuid: 'connected',
-                email_address: 'me@example.com',
-              },
-              organization: { uuid: 'org-1' },
-            },
-            enabled: true,
-            created_at: '2026-01-01T00:00:00.000Z',
-          },
-        ],
-      },
-      { path },
-    )
-
-    await persistConnectedAnthropicAuth(
-      {
-        type: 'oauth',
-        accountId: 'connected',
-        access: 'new-access',
-        refresh: 'new-refresh',
-        expires: 2_000_000_000_000,
-      },
-      { path, legacyPaths: [] },
-    )
-
-    const account = (await loadSharedAccountStore({ path, legacyPaths: [] }))
-      .store.accounts[0]
-    expect(account).toMatchObject({
-      label: 'Work',
-      email: 'me@example.com',
-      created_at: '2026-01-01T00:00:00.000Z',
-      credential: {
-        access: 'new-access',
-        refresh: 'new-refresh',
-        scopes: ['user:profile', 'user:inference'],
-        account: { uuid: 'connected', email_address: 'me@example.com' },
-        organization: { uuid: 'org-1' },
-      },
+    expect(reconciled.auth).toEqual({
+      type: 'api',
+      key: 'host-key',
+      source: 'opencode',
     })
   })
 
-  test('persists explicit connections and rotated OAuth tokens', async () => {
-    const path = await storePath()
-    await persistConnectedAnthropicAuth(
+  test('fallbacks are the host list over the store, minus main', async () => {
+    const main = await seedStoreAccount({ label: 'main-acct' })
+    const second = await seedStoreAccount({ label: 'second' })
+    const third = await seedStoreAccount({ label: 'third' })
+    const legacy: FallbackAccount[] = [
       {
-        type: 'oauth',
-        accountId: 'connected',
-        access: 'first-access',
-        refresh: 'first-refresh',
-        expires: 1_900_000_000_000,
-        refreshTokenExpiresAt: 2_100_000_000_000,
+        id: 'route',
+        type: 'api',
+        apiKey: 'route-key',
+        baseURL: 'https://api.example.com',
       },
-      { path, legacyPaths: [] },
-    )
-    await persistRefreshedSharedOAuth({
-      accountId: 'connected',
-      expectedRefresh: 'first-refresh',
-      access: 'rotated-access',
-      refresh: 'rotated-refresh',
-      expires: 2_000_000_000_000,
-      options: { path, legacyPaths: [] },
+      { id: third.id, type: 'oauth', label: 'Third (host label)' },
+      { id: 'gone', type: 'oauth', label: 'removed elsewhere' },
+    ]
+    const reconciled = await reconcileAnthropicAuth({
+      openCodeAuth: { type: 'wellknown' },
+      legacyAccounts: legacy,
     })
-    const stale = await persistRefreshedSharedOAuth({
-      accountId: 'connected',
-      expectedRefresh: 'first-refresh',
-      access: 'stale-access',
-      refresh: 'stale-refresh',
-      expires: 2_200_000_000_000,
-      options: { path, legacyPaths: [] },
-    })
-    expect(stale).toBe(false)
-
-    const loaded = await loadSharedAccountStore({ path, legacyPaths: [] })
-    expect(loaded.store.current).toBe('connected')
-    expect(loaded.store.accounts[0]?.credential).toEqual({
-      type: 'oauth',
-      access: 'rotated-access',
-      refresh: 'rotated-refresh',
-      expires_at: 2_000_000_000_000,
-      refresh_expires_at: 2_100_000_000_000,
-      scopes: ['user:inference'],
-      account: { uuid: 'connected' },
-    })
+    expect(reconciled.sharedMain?.id).toBe(main.id)
+    expect(reconciled.fallbacks.map((account) => account.id)).toEqual([
+      'route',
+      third.id,
+      second.id,
+    ])
+    for (const account of reconciled.fallbacks) {
+      expect(account).not.toHaveProperty('refresh')
+      if (account.type === 'oauth') expect(account.access).toBeUndefined()
+    }
   })
 })

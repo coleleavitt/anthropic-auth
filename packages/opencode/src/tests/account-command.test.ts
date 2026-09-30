@@ -47,21 +47,18 @@ const baseStorage = (): AccountStorage => ({
       id: 'fallback-1',
       label: 'Work account',
       type: 'oauth' as const,
-      refresh: 'refresh-token-1',
       enabled: true,
     },
     {
       id: 'fallback-2',
       label: 'Personal account',
       type: 'oauth' as const,
-      refresh: 'refresh-token-2',
       enabled: true,
     },
     {
       id: 'fallback-3',
       label: 'Disabled account',
       type: 'oauth' as const,
-      refresh: 'refresh-token-3',
       enabled: false,
     },
   ],
@@ -220,7 +217,7 @@ describe('buildAccountList', () => {
   test('no label falls back to id', () => {
     const storage: AccountStorage = {
       version: 1,
-      accounts: [{ id: 'abc', type: 'oauth', refresh: 'x' }],
+      accounts: [{ id: 'abc', type: 'oauth' }],
     }
     const list = buildAccountList(storage)
     expect(list[1]!.label).toBe('abc')

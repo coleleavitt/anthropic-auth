@@ -8,14 +8,9 @@ import {
   type AccountStorage,
   acquireRefreshFileLock,
   buildPrimeRequestBody,
-  buildRefreshOperationError,
-  ClaudeOAuthRefreshError,
   extractBillingHeaderCCH,
   getAccountStatePath,
   getClaudeCodeIdentity,
-  getOrCreatePrimeAuthLineageId,
-  getSharedAccountStorePath,
-  hashRefreshToken,
   type LogTestRecord,
   loadAccounts,
   type OAuthAccount,
@@ -24,10 +19,11 @@ import {
   resetCache1hState,
   resetDumpState,
   resetFastModeState,
+  STORE_MANAGED_REFRESH_PLACEHOLDER,
   saveAccountState,
   saveAccounts,
-  saveSharedAccountStore,
   setLogLevel,
+  storeCredentialIdentity,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin, primeQuotaSnapshotIsFreshSince } from '../index'
@@ -42,6 +38,10 @@ import {
   SERVER_SIDE_FALLBACK_BETA,
 } from '../server-fallback'
 import {
+  __setStoreAccessForTests,
+  resetHostCredentialMigrationForTests,
+} from '../shared-auth.ts'
+import {
   __setInitialSidebarRoutingTestHooks,
   __setSidebarStateWriteTestHooks,
   drainSidebarWrites,
@@ -51,6 +51,42 @@ import {
   setSidebarState,
 } from '../sidebar-state'
 import { rewriteRequestBody } from '../transform.ts'
+import { FixtureStore, OPENCODE_MAIN_ROW } from './support/fixture-store.ts'
+
+// Plugin tests route with plain fixture tokens through an in-memory store;
+// the Rust store itself is covered by shared-auth.test.ts / accounts.test.ts.
+// Tests that do not mock fetch (and background work a test leaves behind)
+// must never reach Anthropic: answer those hosts with a canned "unmocked"
+// response. Installed before any describe captures `originalFetch`.
+{
+  const realFetch = globalThis.fetch
+  globalThis.fetch = Object.assign(
+    (input: string | URL | Request, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (
+        /^https?:\/\/([^/]+\.)?(anthropic\.com|claude\.com|claude\.ai)(\/|$)/.test(
+          url,
+        )
+      ) {
+        return Promise.resolve(
+          new Response('unmocked in test', { status: 599 }),
+        )
+      }
+      return realFetch(input, init)
+    },
+    realFetch,
+  ) as typeof fetch
+}
+
+let fixtureStore = new FixtureStore()
+beforeEach(() => {
+  fixtureStore = new FixtureStore()
+  resetHostCredentialMigrationForTests()
+  __setStoreAccessForTests(fixtureStore.access())
+})
+afterEach(() => {
+  __setStoreAccessForTests(undefined)
+})
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -136,7 +172,6 @@ function createFallbackStorage(
         id: 'fallback-1',
         type: 'oauth',
         access: 'fallback-access',
-        refresh: 'fallback-refresh',
         expires: Date.now() + 5 * 60 * 60 * 1000,
         quota: {
           five_hour: {
@@ -154,6 +189,20 @@ function createFallbackStorage(
     ],
     ...overrides,
   }
+}
+
+/**
+ * Write host accounts and mirror them into the fixture store, the way a real
+ * login/remove updates both: OAuth accounts with an access token become store
+ * rows, and store rows the saved list no longer names are dropped.
+ */
+async function saveFixtureAccounts(
+  storage: AccountStorage,
+  path?: string,
+  options?: Parameters<typeof saveAccounts>[2],
+) {
+  fixtureStore.sync(storage)
+  await saveAccounts(storage, path, options)
 }
 
 async function useTempAccountFile(storage: AccountStorage) {
@@ -182,6 +231,7 @@ async function useTempAccountFile(storage: AccountStorage) {
     'cachekeep-registry',
   )
   await saveAccounts(storage)
+  fixtureStore.register(storage)
   if (storage.main?.profile) {
     await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
       mainProfile: true,
@@ -250,42 +300,6 @@ async function waitForMockCall(fn: { mock?: { calls: unknown[] } }) {
   }
 }
 
-/**
- * Set up the common test scaffolding for concurrent refresh tests:
- * mocks setTimeout to be synchronous and creates a plugin loader
- * with an already-expired OAuth token.
- */
-async function setupExpiredTokenLoader() {
-  const setTimeoutMock = mock((handler: () => unknown) => {
-    handler()
-    return 0 as unknown as ReturnType<typeof setTimeout>
-  }) as unknown as typeof setTimeout
-
-  const mockClient = createMockClient()
-  const plugin = await getPlugin(mockClient, undefined, {
-    setTimeout: setTimeoutMock,
-  })
-  const result = await plugin.auth.loader(
-    () =>
-      Promise.resolve({
-        type: 'oauth',
-        access: 'expired-token',
-        refresh: 'old-refresh',
-        expires: Date.now() - 1000,
-      }),
-    { models: {} },
-  )
-
-  return { mockClient, result }
-}
-
-/** Fire 5 concurrent fetch requests against /v1/messages. */
-function fireConcurrentFetches(result: { fetch: typeof fetch }) {
-  return Promise.all(
-    Array.from({ length: 5 }, () => result.fetch(MESSAGES_URL, EMPTY_POST)),
-  )
-}
-
 type PluginTimerOverrides = Partial<{
   setTimeout: typeof globalThis.setTimeout
   setInterval: typeof globalThis.setInterval
@@ -315,33 +329,30 @@ async function getPlugin(
 }
 
 describe('sidebar needsReauth (dead-fallback indicator)', () => {
-  function fallbackWithRefreshError(status: number) {
-    const refresh = 'fallback-refresh'
-    const now = Date.now()
-    // A genuinely-dead token returns 400 invalid_grant; only that classifies as
-    // permanent (a bare 400 / other OAuth errors do not).
-    const body = status === 400 ? '{"error":"invalid_grant"}' : 'boom'
-    const error = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(status, body),
-      now,
-      refreshToken: refresh,
-    })
-    return createFallbackStorage({
-      accounts: [
-        {
-          id: 'fallback-1',
-          type: 'oauth',
-          access: 'fallback-access',
-          refresh,
-          expires: now + 5 * 60 * 60 * 1000,
-          lastRefreshError: error,
-        },
-      ],
-    })
+  // The refresh verdict comes from the store row, not from the host files.
+  async function fallbackWithStoreVerdict(verdict: 'dead' | 'transient') {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+          },
+        ],
+      }),
+    )
+    const row = fixtureStore.row('fallback-1')
+    if (verdict === 'dead') {
+      row.refreshDead = true
+      row.lastError = 'invalid_grant'
+    } else {
+      row.lastError = 'rate limited'
+    }
   }
 
-  test('dead (400 invalid_grant) fallback → needsReauth true', async () => {
-    await useTempAccountFile(fallbackWithRefreshError(400))
+  async function loadMain() {
     const plugin = await getPlugin()
     await plugin.auth.loader(
       () =>
@@ -354,29 +365,20 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
       { models: {} },
     )
     await drainSidebarWrites()
-    const state = await waitForSidebarState(
+    return waitForSidebarState(
       (candidate) => candidate.fallbacks[0]?.id === 'fallback-1',
     )
+  }
+
+  test('dead (store invalid_grant) fallback → needsReauth true', async () => {
+    await fallbackWithStoreVerdict('dead')
+    const state = await loadMain()
     expect(state.fallbacks[0]?.needsReauth).toBe(true)
   })
 
-  test('transient (429 rate-limited) fallback → needsReauth false', async () => {
-    await useTempAccountFile(fallbackWithRefreshError(429))
-    const plugin = await getPlugin()
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
-    )
-    await drainSidebarWrites()
-    const state = await waitForSidebarState(
-      (candidate) => candidate.fallbacks[0]?.id === 'fallback-1',
-    )
+  test('transient store error on a fallback → needsReauth false', async () => {
+    await fallbackWithStoreVerdict('transient')
+    const state = await loadMain()
     expect(state.fallbacks[0]?.needsReauth).toBe(false)
   })
 })
@@ -639,43 +641,6 @@ describe('provider.models', () => {
     })
   })
 
-  test('uses canonical API-key cost semantics over stale OpenCode OAuth metadata', async () => {
-    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
-    await saveSharedAccountStore(
-      {
-        version: 1,
-        current: 'api-main',
-        accounts: [
-          {
-            id: 'api-main',
-            credential: { type: 'api_key', key: 'canonical-api-key' },
-            enabled: true,
-            created_at: '2026-08-14T00:00:00.000Z',
-          },
-        ],
-      },
-      { path: getSharedAccountStorePath() },
-    )
-    const plugin = await getPlugin()
-    const models = {
-      'claude-opus-4-8': {
-        id: 'claude-opus-4-8',
-        cost: { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
-      },
-    }
-
-    const result = await plugin.provider?.models?.(
-      { models } as never,
-      { auth: { type: 'oauth' } } as never,
-    )
-
-    expect(result?.['claude-opus-4-8']?.cost).toEqual({
-      input: 5,
-      output: 25,
-      cache: { read: 0.5, write: 6.25 },
-    })
-  })
-
   test('publishes Opus 5.5 with its own pricing when the host lacks it', async () => {
     const plugin = await getPlugin()
     const models = {
@@ -861,7 +826,10 @@ describe('auth.loader', () => {
     resetNotificationsForTest()
     __setInitialSidebarRoutingTestHooks(null)
     __setSidebarStateWriteTestHooks(null)
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    // Keep profile hydration off between tests (see setup.ts): a later
+    // plugin created without a fetch mock would otherwise hydrate over the
+    // real network.
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await drainSidebarWrites()
     restoreProcessTestFiles()
@@ -951,56 +919,6 @@ describe('auth.loader', () => {
     }
   })
 
-  test('an OAuth loader switches to canonical API-key headers when current changes', async () => {
-    const captured: Headers[] = []
-    globalThis.fetch = mock(
-      (_input: string | URL | Request, init?: RequestInit) => {
-        captured.push(new Headers(init?.headers))
-        return Promise.resolve(new Response(null, { status: 200 }))
-      },
-    ) as unknown as typeof fetch
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'oauth-access',
-          refresh: 'oauth-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
-    )
-    await saveSharedAccountStore(
-      {
-        version: 1,
-        current: 'api-main',
-        accounts: [
-          {
-            id: 'api-main',
-            credential: { type: 'api_key', key: 'canonical-api-key' },
-            enabled: true,
-            created_at: '2026-08-14T00:00:00.000Z',
-          },
-        ],
-      },
-      { path: getSharedAccountStorePath() },
-    )
-
-    await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      body: '{}',
-      headers: {
-        authorization: 'Bearer stale-oauth',
-        'anthropic-beta': 'oauth-2025-04-20,fast-mode-2026-02-01',
-      },
-    })
-
-    expect(captured).toHaveLength(1)
-    expect(captured[0]?.get('authorization')).toBeNull()
-    expect(captured[0]?.get('x-api-key')).toBe('canonical-api-key')
-    expect(captured[0]?.get('anthropic-beta')).toBe('fast-mode-2026-02-01')
-  })
-
   test('returns fetch wrapper for oauth auth', async () => {
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(
@@ -1048,7 +966,6 @@ describe('auth.loader', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'work-access',
-            refresh: 'work-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1082,7 +999,6 @@ describe('auth.loader', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'work-access',
-            refresh: 'work-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1116,7 +1032,6 @@ describe('auth.loader', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'work-access',
-            refresh: 'work-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1178,7 +1093,6 @@ describe('auth.loader', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'work-access',
-            refresh: 'work-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1217,7 +1131,7 @@ describe('auth.loader', () => {
     ).toBe(false)
     await useTempAccountFile(capturedStorage)
     const plugin = await getPlugin()
-    await saveAccounts(
+    await saveFixtureAccounts(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
         accounts: [
@@ -1225,7 +1139,6 @@ describe('auth.loader', () => {
             id: 'work-2',
             type: 'oauth',
             access: 'work-2-access',
-            refresh: 'work-2-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1261,14 +1174,13 @@ describe('auth.loader', () => {
     const capturedStorage = createFallbackStorage({ accounts: [] })
     await useTempAccountFile(capturedStorage)
     const plugin = await getPlugin()
-    await saveAccounts(
+    await saveFixtureAccounts(
       createFallbackStorage({
         accounts: [
           {
             id: 'work-fresh',
             type: 'oauth',
             access: 'work-fresh-access',
-            refresh: 'work-fresh-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1303,7 +1215,6 @@ describe('auth.loader', () => {
             id: 'work-deleted',
             type: 'oauth',
             access: 'work-deleted-access',
-            refresh: 'work-deleted-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1313,7 +1224,7 @@ describe('auth.loader', () => {
     // v1.16.0's mergeAccountsForSave unions existing+incoming accounts, so a
     // deletion must be declared explicitly via removedAccountIds — a plain
     // save without the account no longer removes it.
-    await saveAccounts(
+    await saveFixtureAccounts(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
         accounts: [
@@ -1321,7 +1232,6 @@ describe('auth.loader', () => {
             id: 'work-current',
             type: 'oauth',
             access: 'work-current-access',
-            refresh: 'work-current-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1572,14 +1482,12 @@ describe('auth.loader', () => {
             id: 'fallback-a',
             type: 'oauth',
             access: 'fallback-a-access',
-            refresh: 'fallback-a-refresh',
             expires: Date.now() + 100000,
           },
           {
             id: 'fallback-b',
             type: 'oauth',
             access: 'fallback-b-access',
-            refresh: 'fallback-b-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -1643,7 +1551,10 @@ describe('auth.loader', () => {
     const stateAfterStaleFile = await getSidebarState()
     expect(stateAfterStaleFile.activeId).toBe('fallback-b')
     expect(stateAfterStaleFile.route).toBe('fallback-first')
-  })
+    // Each /claude-quota force-polls main and both (live) fallbacks, and the
+    // quota API is spaced 1 s apart: two commands need more than the
+    // default 5 s.
+  }, 15_000)
 
   test('real routing decisions overwrite fresh routing from another session', async () => {
     await useTempAccountFile(
@@ -1654,7 +1565,6 @@ describe('auth.loader', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'work-access',
-            refresh: 'work-refresh',
             expires: Date.now() + 100000,
           },
         ],
@@ -2040,7 +1950,6 @@ describe('auth.loader', () => {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -2385,7 +2294,6 @@ describe('auth.loader', () => {
             id: 'fallback-empty',
             type: 'oauth',
             access: 'fallback-empty-access',
-            refresh: 'fallback-empty-refresh',
             expires: now + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -2414,7 +2322,6 @@ describe('auth.loader', () => {
             id: 'fallback-ok',
             type: 'oauth',
             access: 'fallback-ok-access',
-            refresh: 'fallback-ok-refresh',
             expires: now + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -2725,7 +2632,6 @@ describe('auth.loader', () => {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -2977,7 +2883,6 @@ describe('auth.loader', () => {
             id: 'oauth-fallback',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60_000,
           },
         ],
@@ -3352,7 +3257,7 @@ describe('auth.loader', () => {
       { models: {} },
     )
 
-    await saveAccounts(
+    await saveFixtureAccounts(
       createFallbackStorage({
         accounts: [],
         relay: {
@@ -3409,7 +3314,7 @@ describe('auth.loader', () => {
       { models: {} },
     )
 
-    await saveAccounts(
+    await saveFixtureAccounts(
       createFallbackStorage({
         accounts: [],
         relay: {
@@ -3924,7 +3829,6 @@ describe('auth.loader', () => {
             label: 'fallback personal',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -4413,97 +4317,6 @@ describe('auth.loader', () => {
     expect(profileCalls).toBe(1)
   })
 
-  test('late fallback profile hydration cannot restore rotated credentials', async () => {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
-    await useTempAccountFile(
-      createFallbackStorage({
-        quota: { enabled: false },
-        main: {
-          type: 'opencode',
-          provider: 'anthropic',
-          profile: {
-            tier: 'default_claude_max_20x',
-            orgType: 'claude_max',
-            checkedAt: Date.now(),
-            tokenFingerprint: tokenFingerprint('main-access'),
-          },
-        },
-        accounts: [
-          {
-            id: 'fb',
-            type: 'oauth',
-            access: 'old-access',
-            refresh: 'old-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            lastRefreshedAt: 100,
-          },
-        ],
-      }),
-    )
-    let resolveProfile!: (response: Response) => void
-    let markProfileStarted!: () => void
-    const profileStarted = new Promise<void>((resolve) => {
-      markProfileStarted = resolve
-    })
-    globalThis.fetch = mock((input: string | URL | Request) => {
-      if (extractUrl(input).includes('/api/oauth/profile')) {
-        markProfileStarted()
-        return new Promise<Response>((resolve) => {
-          resolveProfile = resolve
-        })
-      }
-      return Promise.resolve(new Response('ok'))
-    }) as unknown as typeof fetch
-    const plugin = await getPlugin()
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
-      { models: {} },
-    )
-    await profileStarted
-    await drainSidebarWrites()
-    const initialSidebarUpdatedAt = (await getSidebarState()).lastUpdated
-
-    const rotated = await loadAccounts()
-    const fallback = rotated?.accounts[0]
-    if (!rotated || fallback?.type !== 'oauth') {
-      throw new Error('expected fallback OAuth account')
-    }
-    fallback.access = 'new-access'
-    fallback.refresh = 'new-refresh'
-    fallback.lastRefreshedAt = 200
-    await saveAccounts(rotated)
-    await Bun.sleep(2)
-    resolveProfile(
-      Response.json({
-        organization: {
-          organization_type: 'claude_team',
-          rate_limit_tier: 'default_claude_max_5x',
-        },
-      }),
-    )
-    await waitForSidebarState(
-      (state) => state.lastUpdated > initialSidebarUpdatedAt,
-    )
-
-    const reloaded = await loadAccounts()
-    const reloadedFallback = reloaded?.accounts[0]
-    expect(reloadedFallback).toMatchObject({
-      access: 'new-access',
-      refresh: 'new-refresh',
-      lastRefreshedAt: 200,
-    })
-    if (reloadedFallback?.type !== 'oauth') {
-      throw new Error('expected reloaded fallback OAuth account')
-    }
-    expect(reloadedFallback.profile).toBeUndefined()
-  })
-
   test('late main profile hydration cannot replace a rotated-token profile', async () => {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
@@ -4986,8 +4799,8 @@ describe('auth.loader', () => {
       () =>
         Promise.resolve({
           type: 'oauth',
-          access: liveAccess,
-          refresh: `refresh-${liveAccess}`,
+          access: 'token-0',
+          refresh: 'refresh-token-0',
           expires: Date.now() + 100000,
         }),
       { models: {} },
@@ -5003,8 +4816,12 @@ describe('auth.loader', () => {
       ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
     }
 
+    // Main's access token rotates in the store (the store refreshes it);
+    // OpenCode's own auth.json keeps the placeholder.
+    const mainRow = fixtureStore.row(OPENCODE_MAIN_ROW)
     for (let generation = 0; generation < 66; generation++) {
       liveAccess = `token-${generation}`
+      mainRow.access = liveAccess
       await showAccounts()
       const expectedFingerprint = tokenFingerprint(liveAccess)
       await waitForAccountStorage(
@@ -5013,6 +4830,7 @@ describe('auth.loader', () => {
       )
     }
     liveAccess = 'token-0'
+    mainRow.access = liveAccess
     await showAccounts()
     await waitForAccountStorage(
       (storage) =>
@@ -5560,224 +5378,6 @@ describe('auth.loader', () => {
     })
   })
 
-  test('background refresh timers include per-process jitter', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: { enabled: false },
-        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
-      }),
-    )
-    Math.random = () => 0.5
-    const intervalDelays: number[] = []
-    const setIntervalMock = mock((handler: () => void, delay?: number) => {
-      void handler
-      intervalDelays.push(Number(delay))
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-
-    const plugin = await getPlugin(createMockClient(), undefined, {
-      setInterval: setIntervalMock,
-      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
-    })
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'access',
-          refresh: 'refresh',
-          expires: Date.now() + 8 * 60 * 60_000,
-        }),
-      { models: {} },
-    )
-
-    expect(intervalDelays).toContain(90_000)
-  })
-
-  test('background refresh proactively rotates main oauth before expiry', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: { enabled: false },
-        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
-      }),
-    )
-    const intervalHandlers: Array<() => void> = []
-    const setIntervalMock = mock((handler: () => void) => {
-      intervalHandlers.push(handler)
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'background-refresh-new',
-              access_token: 'background-access-new',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, undefined, {
-      setInterval: setIntervalMock,
-      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
-    })
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'old-access',
-          refresh: 'old-refresh',
-          expires: Date.now() + 5 * 60_000,
-        }),
-      { models: {} },
-    )
-
-    expect(intervalHandlers.length).toBeGreaterThanOrEqual(2)
-    for (const handler of intervalHandlers) handler()
-    await waitForMockCall(mockClient.auth.set)
-
-    expect(mockClient.auth.set).toHaveBeenCalledWith({
-      path: { id: 'anthropic' },
-      body: {
-        type: 'oauth',
-        refresh: 'background-refresh-new',
-        access: 'background-access-new',
-        expires: expect.any(Number),
-      },
-    })
-  })
-
-  test('background refresh uses a four-hour minimum window for main oauth', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: { enabled: false },
-        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
-      }),
-    )
-    const intervalHandlers: Array<() => void> = []
-    const setIntervalMock = mock((handler: () => void) => {
-      intervalHandlers.push(handler)
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'early-refresh-new',
-              access_token: 'early-access-new',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, undefined, {
-      setInterval: setIntervalMock,
-      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
-    })
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'old-access',
-          refresh: 'old-refresh',
-          expires: Date.now() + 3 * 60 * 60_000,
-        }),
-      { models: {} },
-    )
-
-    for (const handler of intervalHandlers) handler()
-    await waitForMockCall(mockClient.auth.set)
-
-    expect(mockClient.auth.set).toHaveBeenCalledWith({
-      path: { id: 'anthropic' },
-      body: {
-        type: 'oauth',
-        refresh: 'early-refresh-new',
-        access: 'early-access-new',
-        expires: expect.any(Number),
-      },
-    })
-  })
-
-  test('fetch wrapper backs off main oauth refresh after rate limits', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: { enabled: false },
-        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
-      }),
-    )
-    let tokenRefreshCalls = 0
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        tokenRefreshCalls += 1
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              error: { type: 'rate_limit_error', message: 'Rate limited' },
-            }),
-            { status: 429 },
-          ),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const plugin = await getPlugin(createMockClient())
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'expired',
-          refresh: 'refresh-token',
-          expires: Date.now() - 1000,
-        }),
-      { models: {} },
-    )
-
-    await expect(
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-    ).rejects.toThrow('Claude OAuth refresh failed: 429')
-    await expect(
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-    ).rejects.toThrow('Claude OAuth refresh is backed off')
-
-    expect(tokenRefreshCalls).toBe(1)
-    const savedConfig = JSON.parse(
-      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
-    )
-    expect(savedConfig.refresh?.mainLastRefreshError).toBeUndefined()
-    const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
-    expect(savedState.main.lastRefreshError.nextRetryAt).toBeGreaterThan(
-      Date.now(),
-    )
-  })
-
   test('fallback-first uses stale passing fallback quota while quota refresh is in progress even when main refresh is backed off', async () => {
     const now = Date.now()
     await useTempAccountFile(
@@ -5787,21 +5387,12 @@ describe('auth.loader', () => {
           enabled: true,
           intervalMinutes: 10,
           refreshBeforeExpiryMinutes: 240,
-          mainLastRefreshError: {
-            message:
-              'Claude OAuth refresh failed: 400 — {"error":"invalid_grant"}',
-            checkedAt: now,
-            nextRetryAt: now + 60_000,
-            retryCount: 1,
-            tokenHash: hashRefreshToken('main-refresh'),
-          },
         },
         accounts: [
           {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: now + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -5846,6 +5437,8 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    // The store holds main's refresh token and has recorded it dead.
+    fixtureStore.row(OPENCODE_MAIN_ROW).refreshDead = true
 
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
@@ -5854,172 +5447,86 @@ describe('auth.loader', () => {
     expect(authorizations).toEqual(['Bearer fallback-access'])
   })
 
-  test('fetch wrapper refreshes expired token', async () => {
-    const fetchCalls: Array<{ url: string; body?: string }> = []
-
+  test('an expired main is re-read from the store; no refresh happens in TypeScript', async () => {
+    const fetchCalls: Array<{ url: string; authorization: string | null }> = []
     globalThis.fetch = mock((input: any, init: any) => {
       const url = extractUrl(input)
-      fetchCalls.push({ url, body: init?.body })
-
-      if (url.includes('/v1/oauth/token')) {
+      fetchCalls.push({
+        url,
+        authorization: new Headers(init?.headers).get('authorization'),
+      })
+      if (url.includes('/api/oauth/usage')) {
         return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'new-refresh',
-              access_token: 'new-access',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
+          Response.json({
+            five_hour: { utilization: 10 },
+            seven_day: { utilization: 10 },
+          }),
         )
       }
-
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
     const mockClient = createMockClient()
     const plugin = await getPlugin(mockClient)
-
     const result = await plugin.auth.loader(
       () =>
         Promise.resolve({
           type: 'oauth',
           access: 'expired-token',
           refresh: 'old-refresh',
-          expires: Date.now() - 1000, // expired
+          expires: Date.now() - 1000,
         }),
       { models: {} },
     )
+    // The row the store now holds has expired; the store refreshes it.
+    const mainRow = fixtureStore.row(OPENCODE_MAIN_ROW)
+    mainRow.expires = Date.now() - 1_000
+    mainRow.refreshTo = {
+      access: 'store-fresh-access',
+      expires: Date.now() + 3_600_000,
+    }
 
     await result.fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       body: '{}',
     })
 
-    // Should have called token endpoint first
-    const tokenCall = fetchCalls.find((c) => c.url.includes('/v1/oauth/token'))
-    expect(tokenCall).toBeDefined()
-    expect(tokenCall!.url).toBe('https://platform.claude.com/v1/oauth/token')
-    const tokenBody = JSON.parse(tokenCall!.body!)
-    expect(tokenBody.grant_type).toBe('refresh_token')
-    expect(tokenBody.refresh_token).toBe('old-refresh')
-
-    // Should have called client.auth.set with new tokens
-    expect(mockClient.auth.set).toHaveBeenCalled()
+    expect(fetchCalls.some((call) => call.url.includes('/oauth/token'))).toBe(
+      false,
+    )
+    const messages = fetchCalls.filter((call) =>
+      call.url.includes('/v1/messages'),
+    )
+    expect(messages.at(-1)?.authorization).toBe('Bearer store-fresh-access')
+    // OpenCode's auth.json only ever receives the placeholder.
+    for (const [call] of mockClient.auth.set.mock.calls as unknown as Array<
+      [{ body: { refresh: string } }]
+    >) {
+      expect(call.body.refresh).toBe(STORE_MANAGED_REFRESH_PLACEHOLDER)
+    }
   })
 
-  test('fetch wrapper retries transient token refresh failures', async () => {
-    let tokenRefreshCalls = 0
-    const setTimeoutMock = mock((handler: () => unknown) => {
-      handler()
-      return 0 as unknown as ReturnType<typeof setTimeout>
-    }) as unknown as typeof setTimeout
-
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-
-      if (url.includes('/v1/oauth/token')) {
-        tokenRefreshCalls += 1
-
-        if (tokenRefreshCalls === 1) {
-          return Promise.resolve(
-            new Response('Temporary failure', { status: 500 }),
-          )
-        }
-
+  test('a 401 on the store main re-authorizes that bearer in the store and re-sends once', async () => {
+    const bearers: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
         return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'new-refresh',
-              access_token: 'new-access',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
+          Response.json({
+            five_hour: { utilization: 10 },
+            seven_day: { utilization: 10 },
+          }),
         )
       }
-
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, undefined, {
-      setTimeout: setTimeoutMock,
-    })
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'expired',
-          refresh: 'refresh',
-          expires: Date.now() - 1000,
-        }),
-      { models: {} },
-    )
-
-    await result.fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      body: '{}',
-    })
-
-    expect(tokenRefreshCalls).toBe(2)
-    expect(setTimeoutMock).toHaveBeenCalledTimes(1)
-    expect(setTimeoutMock).toHaveBeenCalledWith(expect.any(Function), 500)
-    expect(mockClient.auth.set).toHaveBeenCalledTimes(1)
-  })
-
-  test('fetch wrapper keeps main oauth retry count bounded when helper also supports retries', async () => {
-    let tokenRefreshCalls = 0
-    const setTimeoutMock = mock((handler: () => unknown) => {
-      handler()
-      return 0 as unknown as ReturnType<typeof setTimeout>
-    }) as unknown as typeof setTimeout
-
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        tokenRefreshCalls += 1
-        return Promise.resolve(
-          new Response('Temporary failure', { status: 500 }),
-        )
+      if (!extractUrl(input).includes('/v1/messages')) {
+        return Promise.resolve(new Response(null, { status: 200 }))
       }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const plugin = await getPlugin(createMockClient(), undefined, {
-      setTimeout: setTimeoutMock,
-    })
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'expired',
-          refresh: 'refresh',
-          expires: Date.now() - 1000,
+      const bearer = new Headers(init?.headers).get('authorization') ?? ''
+      bearers.push(bearer)
+      return Promise.resolve(
+        new Response(null, {
+          status: bearer === 'Bearer main-renewed' ? 200 : 401,
         }),
-      { models: {} },
-    )
-
-    await expect(
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-    ).rejects.toThrow('Claude OAuth refresh failed: 500')
-
-    expect(tokenRefreshCalls).toBe(3)
-  })
-
-  test('fetch wrapper does not retry non-transient token refresh failures', async () => {
-    let tokenRefreshCalls = 0
-
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        tokenRefreshCalls += 1
-        return Promise.resolve(new Response('Forbidden', { status: 403 }))
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
+      )
     }) as unknown as typeof fetch
 
     const plugin = await getPlugin()
@@ -6027,21 +5534,80 @@ describe('auth.loader', () => {
       () =>
         Promise.resolve({
           type: 'oauth',
-          access: 'expired',
-          refresh: 'refresh',
-          expires: Date.now() - 1000,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3_600_000,
         }),
       { models: {} },
     )
+    fixtureStore.row(OPENCODE_MAIN_ROW).onUnauthorized = {
+      access: 'main-renewed',
+      expires: Date.now() + 3_600_000,
+    }
 
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: '{}',
+    })
+    expect(response.status).toBe(200)
+    expect(fixtureStore.calls.handleUnauthorized).toEqual(['main-access'])
+    expect(bearers).toEqual(['Bearer main-access', 'Bearer main-renewed'])
+  })
+
+  test("OpenCode's own credential is imported into the store once and replaced by the placeholder", async () => {
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(null, { status: 200 })),
+    ) as unknown as typeof fetch
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const expires = Date.now() + 3_600_000
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'host-access',
+          refresh: 'host-refresh',
+          expires,
+        }),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, { method: 'POST', body: '{}' })
+    await result.fetch(MESSAGES_URL, { method: 'POST', body: '{}' })
+
+    expect(fixtureStore.calls.importCredential).toBe(1)
+    expect(mockClient.auth.set).toHaveBeenCalledTimes(1)
     expect(
-      result.fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        body: '{}',
-      }),
-    ).rejects.toThrow('Claude OAuth refresh failed: 403')
+      (mockClient.auth.set.mock.calls as unknown as unknown[][])[0],
+    ).toEqual([
+      {
+        path: { id: 'anthropic' },
+        body: {
+          type: 'oauth',
+          access: 'host-access',
+          refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+          expires,
+        },
+      },
+    ])
+  })
 
-    expect(tokenRefreshCalls).toBe(1)
+  test('plugin start runs the store keep-alive instead of refreshing idle accounts', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    // An idle fallback: its access token has expired.
+    fixtureStore.row('fallback-1').expires = Date.now() - 1_000
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(null, { status: 200 })),
+    ) as unknown as typeof fetch
+    await getPlugin()
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if (fixtureStore.calls.keepAliveOnce > 0) break
+      await Bun.sleep(10)
+    }
+    expect(fixtureStore.calls.keepAliveOnce).toBeGreaterThanOrEqual(1)
+    await Bun.sleep(20)
+    // Nothing asked the store for the idle fallback's token (which would
+    // make the store refresh it).
+    expect(fixtureStore.calls.getAccessToken).not.toContain('fallback-1')
   })
 
   test('fetch wrapper strips tool prefix from streaming response', async () => {
@@ -6087,174 +5653,6 @@ describe('auth.loader', () => {
     const text = await response.text()
     expect(text).toContain('"name": "bash"')
     expect(text).not.toContain('mcp_bash')
-  })
-
-  test('concurrent expired token refresh should deduplicate to a single token request', async () => {
-    let tokenRefreshCount = 0
-
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-
-      if (url.includes('/v1/oauth/token')) {
-        tokenRefreshCount++
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'new-refresh',
-              access_token: 'new-access',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const { result } = await setupExpiredTokenLoader()
-    await fireConcurrentFetches(result)
-
-    // With deduplication, only ONE refresh request should be made, not 5
-    expect(tokenRefreshCount).toBe(1)
-  })
-
-  test('concurrent refresh with token rotation should not cause cascading failures', async () => {
-    const usedRefreshTokens = new Set<string>()
-
-    globalThis.fetch = mock((input: any, init: any) => {
-      const url = extractUrl(input)
-
-      if (url.includes('/v1/oauth/token')) {
-        const body = JSON.parse(String(init?.body))
-        const refreshToken = body.refresh_token ?? ''
-
-        // Simulate refresh token rotation: first use succeeds, subsequent uses
-        // return 401 because the old token has been invalidated
-        if (usedRefreshTokens.has(refreshToken)) {
-          return Promise.resolve(
-            new Response(JSON.stringify({ error: 'invalid_grant' }), {
-              status: 401,
-            }),
-          )
-        }
-
-        usedRefreshTokens.add(refreshToken)
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'rotated-refresh',
-              access_token: 'new-access',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const { result } = await setupExpiredTokenLoader()
-
-    // Fire 5 concurrent requests — ALL should succeed because only one refresh
-    // fires and the rest reuse its result
-    const outcomes = await Promise.all(
-      Array.from({ length: 5 }, () =>
-        result.fetch(MESSAGES_URL, EMPTY_POST).then(
-          () => 'ok' as const,
-          () => 'fail' as const,
-        ),
-      ),
-    )
-
-    // With deduplication, all callers share the single successful refresh.
-    // Without it, 4 out of 5 get 401 from the rotated-away token → cascading failures.
-    expect(outcomes).toEqual(['ok', 'ok', 'ok', 'ok', 'ok'])
-  })
-
-  test('concurrent refresh should persist tokens exactly once', async () => {
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-
-      if (url.includes('/v1/oauth/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'new-refresh',
-              access_token: 'new-access',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const { mockClient, result } = await setupExpiredTokenLoader()
-    await fireConcurrentFetches(result)
-
-    // With deduplication, client.auth.set should be called exactly once.
-    // Without it, each concurrent refresh calls auth.set independently → 5 calls.
-    expect(mockClient.auth.set).toHaveBeenCalledTimes(1)
-  })
-
-  test('refresh always reads the latest refresh token, not a stale snapshot', async () => {
-    const tokenRequestBodies: string[] = []
-
-    globalThis.fetch = mock((input: any, init: any) => {
-      const url = extractUrl(input)
-
-      if (url.includes('/v1/oauth/token')) {
-        tokenRequestBodies.push(init?.body)
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'rotated-refresh',
-              access_token: 'fresh-access',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    let callCount = 0
-    const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient)
-
-    const result = await plugin.auth.loader(
-      () => {
-        callCount++
-        if (callCount === 1) {
-          return Promise.resolve({
-            type: 'oauth',
-            access: 'expired-access',
-            refresh: 'stale-refresh',
-            expires: Date.now() - 1000,
-          })
-        }
-        return Promise.resolve({
-          type: 'oauth',
-          access: 'expired-access',
-          refresh: 'rotated-refresh-from-storage',
-          expires: Date.now() - 1000,
-        })
-      },
-      { models: {} },
-    )
-
-    await result.fetch(MESSAGES_URL, EMPTY_POST)
-
-    expect(tokenRequestBodies).toHaveLength(1)
-    const sentBody = JSON.parse(tokenRequestBodies[0] ?? '{}')
-    expect(sentBody.refresh_token).toBe('rotated-refresh-from-storage')
-    expect(sentBody.refresh_token).not.toBe('stale-refresh')
   })
 
   test('fetch wrapper adds beta=true to /v1/messages URL', async () => {
@@ -6503,7 +5901,6 @@ describe('auth.loader', () => {
             id: 'fallback-low',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -6967,7 +6364,6 @@ describe('auth.loader', () => {
             id: 'fallback-low',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -7035,7 +6431,6 @@ describe('auth.loader', () => {
             id: 'fallback-low',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -7171,7 +6566,6 @@ describe('auth.loader', () => {
             id: 'yiyi',
             type: 'oauth',
             access: 'scarce-access',
-            refresh: 'scarce-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(13),
           },
@@ -7179,7 +6573,6 @@ describe('auth.loader', () => {
             id: 'ufuk2',
             type: 'oauth',
             access: 'abundant-access',
-            refresh: 'abundant-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(98),
           },
@@ -7332,16 +6725,6 @@ describe('auth.loader', () => {
           enabled: true,
           intervalMinutes: 10,
           refreshBeforeExpiryMinutes: 240,
-          mainLastRefreshError: {
-            message:
-              'Claude OAuth refresh failed: 400 — {"error":"invalid_grant"}',
-            checkedAt,
-            nextRetryAt: checkedAt + 24 * 60 * 60_000,
-            retryCount: 1,
-            tokenHash: hashRefreshToken('main-refresh'),
-            status: 400,
-            permanent: true,
-          },
         },
         quota: {
           enabled: true,
@@ -7357,7 +6740,6 @@ describe('auth.loader', () => {
             id: 'fallback-a',
             type: 'oauth',
             access: 'fallback-a-access',
-            refresh: 'fallback-a-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(0),
           },
@@ -7365,7 +6747,6 @@ describe('auth.loader', () => {
             id: 'fallback-b',
             type: 'oauth',
             access: 'fallback-b-access',
-            refresh: 'fallback-b-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(0),
           },
@@ -7389,6 +6770,8 @@ describe('auth.loader', () => {
       () => Promise.resolve(currentAuth),
       { models: {} },
     )
+    // The store holds main's refresh token and has recorded it dead.
+    fixtureStore.row(OPENCODE_MAIN_ROW).refreshDead = true
     const response = await result.fetch(MESSAGES_URL, {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses_sticky_no_fable_route' },
@@ -7429,6 +6812,7 @@ describe('auth.loader', () => {
     expect(recovered.status).toBe(200)
     expect(messageRequests).toBe(1)
     const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    // Refresh verdicts are never persisted by the host.
     expect(savedState.main?.lastRefreshError).toBeUndefined()
   })
 
@@ -7474,7 +6858,6 @@ describe('auth.loader', () => {
             id: 'oauth-fallback',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(100),
           },
@@ -7596,7 +6979,6 @@ describe('auth.loader', () => {
             id: 'ufuk2',
             type: 'oauth',
             access: 'abundant-access',
-            refresh: 'abundant-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(98),
           },
@@ -7639,7 +7021,7 @@ describe('auth.loader', () => {
     const storage = await loadAccounts(process.env.OPENCODE_ANTHROPIC_AUTH_FILE)
     if (!storage) throw new Error('missing test storage')
     storage.routing = { mode: 'sticky-balanced' }
-    await saveAccounts(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE)
+    await saveFixtureAccounts(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE)
     await (await result.fetch(MESSAGES_URL, request)).text()
 
     expect(authorizations).toEqual(['Bearer main-access', 'Bearer main-access'])
@@ -7694,7 +7076,6 @@ describe('auth.loader', () => {
             id: 'yiyi',
             type: 'oauth',
             access: 'scarce-access',
-            refresh: 'scarce-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(13),
           },
@@ -7702,7 +7083,6 @@ describe('auth.loader', () => {
             id: 'ufuk2',
             type: 'oauth',
             access: 'abundant-access',
-            refresh: 'abundant-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(98),
           },
@@ -9101,7 +8481,6 @@ describe('auth.loader', () => {
             id: 'fable-fallback',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: now + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -9222,7 +8601,6 @@ describe('auth.loader', () => {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               // Stale (old checkedAt) → background pass will refresh it.
@@ -9670,7 +9048,9 @@ describe('auth.loader', () => {
 
       const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
       await requestStarted
+      // The store rotates main's bearer while the request is in flight.
       liveAccessToken = 'new-main-access'
+      fixtureStore.row(OPENCODE_MAIN_ROW).access = liveAccessToken
       resolveResponse?.(new Response('main-ok', { headers: quotaHeaders }))
       await responsePromise
       await Bun.sleep(100)
@@ -10435,7 +9815,6 @@ describe('claude-start integration', () => {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             quota: {
               five_hour: {
@@ -11404,7 +10783,6 @@ describe('killswitch fetch gate', () => {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
           },
         ],
@@ -11464,7 +10842,6 @@ describe('killswitch fetch gate', () => {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
           },
         ],
@@ -11560,7 +10937,6 @@ describe('killswitch fetch gate', () => {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
           },
         ],
@@ -11615,7 +10991,6 @@ describe('killswitch fetch gate', () => {
             id: 'fallback-1',
             type: 'oauth',
             access: 'fallback-access',
-            refresh: 'fallback-refresh',
             expires: Date.now() + 5 * 60 * 60 * 1000,
           },
         ],
@@ -11879,7 +11254,7 @@ describe('claude-prime direct request', () => {
     expect(observedAuth).toContain('main-access')
   })
 
-  test('main host credential replacement primes a new lineage in the same reset window', async () => {
+  test('a different store account as main primes a new lineage in the same reset window', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
@@ -11951,13 +11326,22 @@ describe('claude-prime direct request', () => {
     ) as { main?: { primeAuthLineageId?: string } }
     const firstLineage = firstState.main?.primeAuthLineageId
 
+    // The store's main is now a different account (another login).
+    fixtureStore.rows.clear()
+    fixtureStore.rows.set('other-main', {
+      id: 'other-main',
+      access: 'main-access-b',
+      expires: Date.now() + 100000,
+      enabled: true,
+      current: true,
+    })
     const secondPlugin = await getPlugin()
     await secondPlugin.auth.loader(
       () =>
         Promise.resolve({
           type: 'oauth',
           access: 'main-access-b',
-          refresh: 'main-refresh-b',
+          refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
           expires: Date.now() + 100000,
         }),
       { models: {} },
@@ -11977,7 +11361,7 @@ describe('claude-prime direct request', () => {
     expect(state.main?.primeAuthLineageId).not.toBe(firstLineage)
   })
 
-  test('main refresh through the plugin keeps the lineage and prime claim', async () => {
+  test('a store refresh of main keeps the lineage and prime claim', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
@@ -12002,58 +11386,9 @@ describe('claude-prime direct request', () => {
         prime: { enabled: true },
       }),
     )
-
-    const intervalHandlers: Array<() => void> = []
-    globalThis.setInterval = mock((handler: () => void) => {
-      intervalHandlers.push(handler)
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-    let hostAuth = {
-      type: 'oauth',
-      access: 'main-access-a',
-      refresh: 'main-refresh-a',
-      expires: Date.now() + 5 * 60 * 60_000,
-    }
-    const mockClient = createMockClient()
-    let lineageObservedBeforePublish: string | undefined
-    let lineageObservedDuringPublish: string | undefined
-    ;(mockClient.auth as any).set = mock(
-      async (input: {
-        body: {
-          type: string
-          access: string
-          refresh: string
-          expires: number
-        }
-      }) => {
-        lineageObservedBeforePublish = await getOrCreatePrimeAuthLineageId(
-          'main',
-          process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-          hostAuth.refresh,
-        )
-        hostAuth = { ...input.body }
-        lineageObservedDuringPublish = await getOrCreatePrimeAuthLineageId(
-          'main',
-          process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-          hostAuth.refresh,
-        )
-      },
-    )
     let sends = 0
     globalThis.fetch = mock((input: any) => {
       const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'main-refresh-b',
-              access_token: 'main-access-b',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
       if (url.includes('/v1/messages')) {
         sends += 1
         return Promise.resolve(
@@ -12076,8 +11411,17 @@ describe('claude-prime direct request', () => {
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch
 
-    const plugin = await getPlugin(mockClient)
-    await plugin.auth.loader(() => Promise.resolve(hostAuth), { models: {} })
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access-a',
+          refresh: 'main-refresh-a',
+          expires: Date.now() + 5 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
     const manager = (plugin as any).__primeManager
     await manager.tick()
     const before = JSON.parse(
@@ -12089,93 +11433,24 @@ describe('claude-prime direct request', () => {
       }
     }
 
-    hostAuth.expires = Date.now() - 1
-    // Addressed by name, not by registration order: several other subsystems
-    // register intervals after this one, so `intervalHandlers.at(-1)` used to
-    // invoke an unrelated timer and the refresh silently never ran.
-    await (plugin as any).__mainBackgroundRefreshTick()
-    await waitForMockCall(mockClient.auth.set)
+    // The store refreshes main: a new bearer for the same store row.
+    const row = fixtureStore.row(OPENCODE_MAIN_ROW)
+    row.expires = Date.now() - 1
+    row.refreshTo = {
+      access: 'main-access-b',
+      expires: Date.now() + 5 * 60 * 60_000,
+    }
     await manager.tick()
 
     const after = JSON.parse(
       await readFile(getAccountStatePath(), 'utf8'),
     ) as typeof before
     expect(sends).toBe(1)
-    expect(lineageObservedBeforePublish).toBe(before.main?.primeAuthLineageId)
-    expect(lineageObservedDuringPublish).toBe(before.main?.primeAuthLineageId)
+    expect(before.main?.primeAuthLineageId).toMatch(/^[0-9a-f-]{36}$/)
     expect(after.main?.primeAuthLineageId).toBe(before.main?.primeAuthLineageId)
+    // Bound to the store row, not to any token.
     expect(after.main?.primeAuthLineageRefreshTokenFingerprint).toBe(
-      tokenFingerprint('main-refresh-b'),
-    )
-  })
-
-  test('a main refresh lease adopter advances the lineage binding', async () => {
-    const lineage = 'main-lineage-a'
-    const refreshToken = 'main-refresh-a'
-    const storage = createFallbackStorage({
-      accounts: [],
-      refresh: {
-        enabled: true,
-        refreshBeforeExpiryMinutes: 30,
-        mainRefreshLeaseId: 'other-process',
-        mainRefreshLeaseUntil: Date.now() + 60_000,
-        mainRefreshLeaseTokenHash: hashRefreshToken(refreshToken),
-      },
-      prime: {
-        enabled: true,
-        mainAuthLineageId: lineage,
-        mainAuthLineageRefreshTokenFingerprint: tokenFingerprint(refreshToken),
-      },
-    })
-    await useTempAccountFile(storage)
-    await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
-      mainRefresh: true,
-      mainPrime: true,
-    })
-
-    let hostAuth = {
-      type: 'oauth',
-      access: 'main-access-a',
-      refresh: refreshToken,
-      expires: Date.now() + 5 * 60 * 60_000,
-    }
-    let observedAuthorization: string | null = null
-    globalThis.fetch = mock((_input: any, init?: RequestInit) => {
-      observedAuthorization = new Headers(init?.headers).get('authorization')
-      return Promise.resolve(
-        new Response('{}', {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-      )
-    }) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(() => Promise.resolve(hostAuth), {
-      models: {},
-    })
-    hostAuth.expires = Date.now() - 1
-    const request = result.fetch(MESSAGES_URL, EMPTY_POST)
-    await Bun.sleep(25)
-    hostAuth = {
-      type: 'oauth',
-      access: 'main-access-b',
-      refresh: 'main-refresh-b',
-      expires: Date.now() + 60 * 60_000,
-    }
-    const response = await request
-
-    expect(response.status).toBe(200)
-    expect(String(observedAuthorization)).toContain('main-access-b')
-    const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8')) as {
-      main?: {
-        primeAuthLineageId?: string
-        primeAuthLineageRefreshTokenFingerprint?: string
-      }
-    }
-    expect(state.main?.primeAuthLineageId).toBe(lineage)
-    expect(state.main?.primeAuthLineageRefreshTokenFingerprint).toBe(
-      tokenFingerprint('main-refresh-b'),
+      tokenFingerprint(storeCredentialIdentity(OPENCODE_MAIN_ROW)),
     )
   })
 
@@ -12196,7 +11471,6 @@ describe('claude-prime direct request', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'fb-access',
-            refresh: 'fb-refresh',
             // expires must exceed the refresh-before-expiry window (4h default)
             // so the token is NOT marked as needing refresh and the prime
             // request flows through without the OAuth refresh fetch.
@@ -12280,7 +11554,7 @@ describe('claude-prime direct request', () => {
     expect(primeCall?.auth).toContain('fb-access')
   })
 
-  test('fallback refresh-token rotation keeps one prime claim per reset window', async () => {
+  test('fallback token rotation in the store keeps one prime claim per reset window', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
@@ -12290,7 +11564,6 @@ describe('claude-prime direct request', () => {
             id: 'work-rotating',
             type: 'oauth',
             access: 'fb-access-a',
-            refresh: 'fb-refresh-a',
             expires: Date.now() + 5 * 60 * 60 * 1000,
             authLineageId: 'lineage-work',
             quota: {
@@ -12357,14 +11630,8 @@ describe('claude-prime direct request', () => {
     ).__primeManager
 
     await mgr!.tick()
-    const rotated = await loadAccounts()
-    const account = rotated!.accounts.find(
-      (candidate) => candidate.id === 'work-rotating',
-    )!
-    if (account.type !== 'oauth') throw new Error('expected OAuth account')
-    account.access = 'fb-access-b'
-    account.refresh = 'fb-refresh-b'
-    await saveAccounts(rotated!)
+    // The store rotates the fallback's bearer (same store row).
+    fixtureStore.row('work-rotating').access = 'fb-access-b'
     await mgr!.tick()
 
     expect(sends).toBe(1)
@@ -12549,7 +11816,6 @@ describe('claude-prime direct request', () => {
       }),
     )
 
-    let authCallCount = 0
     const primeCalls: Array<{ url: string; init: RequestInit | undefined }> = []
     let _quotaCalls = 0
     globalThis.fetch = mock((input: any, init?: RequestInit) => {
@@ -12591,28 +11857,23 @@ describe('claude-prime direct request', () => {
     }) as unknown as typeof fetch
 
     const plugin = await getPlugin()
-    // First call: getAuth returns oauth WITHOUT access (triggers refresh).
-    // Second call: getAuth returns oauth WITH the refreshed access token.
     await plugin.auth.loader(
-      () => {
-        authCallCount += 1
-        if (authCallCount === 1) {
-          return Promise.resolve({
-            type: 'oauth',
-            access: undefined,
-            refresh: 'main-refresh',
-            expires: undefined,
-          })
-        }
-        return Promise.resolve({
+      () =>
+        Promise.resolve({
           type: 'oauth',
-          access: 'refreshed-main-access',
+          access: 'main-access',
           refresh: 'main-refresh',
           expires: Date.now() + 3600_000,
-        })
-      },
+        }),
       { models: {} },
     )
+    // Main's stored bearer has expired; the store refreshes it on read.
+    const row = fixtureStore.row(OPENCODE_MAIN_ROW)
+    row.expires = Date.now() - 1
+    row.refreshTo = {
+      access: 'refreshed-main-access',
+      expires: Date.now() + 3600_000,
+    }
     const mgr = (
       plugin as unknown as { __primeManager?: { tick: () => Promise<void> } }
     ).__primeManager
@@ -13006,7 +12267,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'fb-access',
-            refresh: 'fb-refresh',
             // expires must exceed the 4h refresh-before-expiry window so
             // the token is NOT marked as needing refresh (otherwise the
             // refresh path would make a second fetch to /v1/oauth/token).
@@ -13115,7 +12375,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'fb-access',
-            refresh: 'fb-refresh',
             expires: now + 10 * 60 * 60_000,
             quota: cachedQuota,
           },
@@ -13221,6 +12480,7 @@ describe('claude-prime — warn dedup (R3)', () => {
     // which is mocked to throw. This is the ONLY way to exercise the
     // `prime token refresh failed` event from the main path.
     const records: any[] = []
+    let primeArmed = false
     globalThis.fetch = mock((input: any) => {
       const url = typeof input === 'string' ? input : input.url
       if (url.includes('/v1/messages')) {
@@ -13232,6 +12492,13 @@ describe('claude-prime — warn dedup (R3)', () => {
         )
       }
       if (url.includes('/api/oauth/usage')) {
+        // After the fresh-check the store can no longer serve main: its
+        // refresh token is dead.
+        const main = fixtureStore.rows.get(OPENCODE_MAIN_ROW)
+        if (main && primeArmed) {
+          main.expires = Date.now() - 1_000
+          main.refreshDead = true
+        }
         return freshPrimeQuotaResponse({
           five_hour: {
             utilization: 0,
@@ -13267,34 +12534,17 @@ describe('claude-prime — warn dedup (R3)', () => {
     )
 
     const plugin = await getPlugin()
-    // The init loader calls getAuth once (call 1). Prime lineage
-    // reconciliation observes the refresh token (call 2), then the fresh-check
-    // calls getAuth (call 3) — return a valid token. The fire path calls getAuth
-    // (call 4) — return a no-access / past-expiry auth so the refresh path is
-    // exercised. The refresh function
-    // fetches the token endpoint which the mock returns 599 for —
-    // this is the genuine token-refresh failure.
-    let authCallCount = 0
     await plugin.auth.loader(
-      () => {
-        authCallCount += 1
-        if (authCallCount <= 3) {
-          return Promise.resolve({
-            type: 'oauth',
-            access: 'main-access',
-            refresh: 'main-refresh',
-            expires: Date.now() + 3600_000,
-          })
-        }
-        return Promise.resolve({
+      () =>
+        Promise.resolve({
           type: 'oauth',
-          access: undefined,
+          access: 'main-access',
           refresh: 'main-refresh',
-          expires: Date.now() - 1000,
-        })
-      },
+          expires: Date.now() + 3600_000,
+        }),
       { models: {} },
     )
+    primeArmed = true
 
     // Capture logs via the dist sink (prime.ts compiled to dist/prime.js
     // imports dist/logger.js; the dist sink captures all events).
@@ -13471,7 +12721,6 @@ describe('claude-prime — warn dedup (R3)', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'fb-access',
-            refresh: 'fb-refresh',
             expires: Date.now() + 10 * 60 * 60 * 1000,
             quota: dueQuota,
           },
@@ -13510,7 +12759,7 @@ describe('claude-prime — warn dedup (R3)', () => {
       const storage = await loadAccounts()
       if (!storage) throw new Error('missing test storage')
       storage.accounts = []
-      await saveAccounts(storage)
+      await saveFixtureAccounts(storage)
       return { quota: dueQuota, fresh: true }
     }
 
@@ -13533,7 +12782,7 @@ describe('claude-prime — warn dedup (R3)', () => {
     ).toHaveLength(1)
   })
 
-  test('R3: a fallback refreshAccount failure logs `prime token refresh failed`', async () => {
+  test('R3: a fallback token failure in the store logs `prime token refresh failed`', async () => {
     const records: any[] = []
     const dueQuota = {
       five_hour: {
@@ -13550,7 +12799,6 @@ describe('claude-prime — warn dedup (R3)', () => {
             id: 'work-alt',
             type: 'oauth',
             access: 'fb-access',
-            refresh: 'fb-refresh',
             expires: Date.now() + 5 * 60 * 60_000,
             quota: dueQuota,
           },
@@ -13589,13 +12837,10 @@ describe('claude-prime — warn dedup (R3)', () => {
         }),
       { models: {} },
     )
-    const storage = await loadAccounts()
-    const fallback = storage!.accounts.find(
-      (account) => account.id === 'work-alt',
-    )!
-    if (fallback.type !== 'oauth') throw new Error('expected OAuth account')
-    fallback.expires = Date.now() - 1_000
-    await saveAccounts(storage!)
+    // The store cannot produce a bearer for the fallback: dead refresh token.
+    const fallbackRow = fixtureStore.row('work-alt')
+    fallbackRow.expires = Date.now() - 1_000
+    fallbackRow.refreshDead = true
     const mgr = (plugin as any).__primeManager
     mgr.options.refreshQuota = async () => ({ quota: dueQuota, fresh: true })
 

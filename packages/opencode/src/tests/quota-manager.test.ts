@@ -58,7 +58,6 @@ describe('QuotaManager', () => {
           id: 'fallback-1',
           type: 'oauth',
           access: 'fallback-token',
-          refresh: 'fallback-refresh',
           expires: now + 60_000,
           quota: {
             checkedAt: now,
@@ -587,7 +586,6 @@ describe('QuotaManager', () => {
           id: 'fallback-1',
           type: 'oauth',
           access: 'old-fallback-token',
-          refresh: 'refresh-token',
           expires: 2_000_000,
           quota: {
             five_hour: {
@@ -623,7 +621,6 @@ describe('QuotaManager', () => {
           id: 'scoped-only',
           type: 'oauth',
           access: 'fallback-token',
-          refresh: 'refresh-token',
           expires: 2_000_000,
           quota: {
             scoped: [
@@ -678,7 +675,6 @@ describe('QuotaManager', () => {
           id: 'fallback-1',
           type: 'oauth',
           access: 'fallback-token',
-          refresh: 'refresh-token',
           expires: 2_000_000,
           quota: {
             five_hour: {

@@ -51,7 +51,7 @@
     "tui.js"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --root src --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui",
+    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --root src --target node --format esm --splitting --external @opencode-ai/plugin --external @coleleavitt/anthropic-napi --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui",
     "build:tui": "bun scripts/build-tui.ts",
     "smoke:tui": "bun scripts/smoke-tui-pack-install.ts",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
@@ -67,6 +67,7 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
+    "@coleleavitt/anthropic-napi": "file:../../../../../RustProjects/active/anthropic/anthropic-napi",
     "@cortexkit/anthropic-auth-core": "999.0.0-dev.20260825",
     "@opentui/core": "0.5.6",
     "@opentui/solid": "0.5.6",

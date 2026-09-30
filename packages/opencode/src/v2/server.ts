@@ -512,10 +512,10 @@ export async function setup(context: V2Context) {
             },
           }
         },
-        // Never exchange the refresh token here: the V1 pipeline refreshes
-        // under the shared-store lock, and presenting one refresh token from
-        // two places revokes the whole token family. V2's stored bearer is
-        // replaced on the bridge, so only its expiry needs to move forward.
+        // Never exchange a refresh token here: refresh happens only in the
+        // Rust account store (V1 pipeline), and V2 holds at most the store's
+        // placeholder refresh token. V2's stored bearer is replaced on the
+        // bridge, so only its expiry needs to move forward.
         refresh: async (credential: OAuthCredential) => ({
           ...credential,
           expires: Date.now() + 60 * 60 * 1000,
