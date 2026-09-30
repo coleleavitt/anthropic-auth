@@ -2,10 +2,10 @@
  * Verify every place this monorepo is consumed actually runs the current build.
  *
  * A stale consumer is silent: the plugin loads, requests work, and only a
- * specific fix is quietly absent. That matters most for the cross-process
- * refresh claim — it only prevents a double-spend if *every* app has it, so one
- * consumer left on an old copy reintroduces the exact bug the claim exists to
- * stop.
+ * specific fix is quietly absent. That matters most for the account store:
+ * refresh must happen only in the Rust binding, so one consumer left on an old
+ * copy (with the TS refresh and host token copies) reintroduces the exact
+ * double-spend the binding exists to stop.
  *
  *   bun run scripts/doctor-install.ts          # report
  *   bun run scripts/doctor-install.ts --fix    # rebuild and relink
@@ -21,8 +21,9 @@ const FIX = process.argv.includes('--fix')
 
 /** Exports that must be present, so a stale build is caught by behaviour. */
 const CORE_MARKERS = [
-  'claimSharedAccountRefresh',
-  'markSharedRefreshTokenDead',
+  'getSharedAccessToken',
+  'importHostOAuthCredential',
+  'STORE_MANAGED_REFRESH_PLACEHOLDER',
   'recordSharedAccountQuota',
   'CONTEXT_1M_BETA',
   'classifyRetry',

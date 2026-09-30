@@ -16,6 +16,7 @@
  * `<run dir>/network-violations.log`, which the runner turns into a failed
  * run even when the throwing call was caught and swallowed.
  */
+import { afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -277,3 +278,12 @@ for (const path of bindingPaths) {
     }
   }
 }
+
+// Bun crashes at exit (segfault/abort) when a Node-API async call into the
+// binding is still outstanding (a keep-alive pass or quota poll a test left
+// running). Let those settle before the runner exits.
+afterAll(async () => {
+  const settle = (globalThis as Record<string, unknown>)
+    .__anthropicAuthSettleStoreCalls as (() => Promise<void>) | undefined
+  await settle?.()
+})

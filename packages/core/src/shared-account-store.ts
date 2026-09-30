@@ -145,8 +145,48 @@ function runningUnderTest() {
  * a byte is sent); otherwise construction is refused, so a test can never
  * refresh a fixture token against production.
  */
+const inFlightStoreCalls = new Set<Promise<unknown>>()
+
+/**
+ * A handle whose async calls are tracked until they settle. Bun (1.4 canary)
+ * crashed at process exit (segfault/abort) when a Node-API async call into
+ * the binding was still outstanding; hosts and the test preload await
+ * {@link settleStoreCalls} before exiting.
+ */
+function trackedAuth(auth: AnthropicAuth): AnthropicAuth {
+  return new Proxy(auth, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target)
+      if (typeof value !== 'function') return value
+      return (...args: unknown[]) => {
+        const result = (value as (...a: unknown[]) => unknown).apply(
+          target,
+          args,
+        )
+        if (result && typeof (result as Promise<unknown>).then === 'function') {
+          const pending = Promise.resolve(result)
+          inFlightStoreCalls.add(pending)
+          const forget = () => inFlightStoreCalls.delete(pending)
+          pending.then(forget, forget)
+        }
+        return result
+      }
+    },
+  })
+}
+
+/** Resolve once no call into the binding is outstanding. */
+export async function settleStoreCalls(): Promise<void> {
+  while (inFlightStoreCalls.size) {
+    await Promise.allSettled([...inFlightStoreCalls])
+  }
+}
+
+;(globalThis as Record<string, unknown>).__anthropicAuthSettleStoreCalls =
+  settleStoreCalls
+
 function createAnthropicAuth(config: AuthConfig): AnthropicAuth {
-  const auth = new AnthropicAuth(config)
+  const auth = trackedAuth(new AnthropicAuth(config))
   if (runningUnderTest() && auth.testMode !== true) {
     throw new Error(
       'refusing to use the Anthropic account store under test without ANTHROPIC_OAUTH_TEST_MODE=1',

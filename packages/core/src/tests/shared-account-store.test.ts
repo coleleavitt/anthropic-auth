@@ -72,6 +72,28 @@ describe('store path', () => {
     }
   })
 
+  test('isolates OpenCode tests beside their temporary sidecar', () => {
+    const file = process.env[SHARED_ACCOUNT_STORE_FILE_ENV]
+    const testDir = process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
+    const sidecar = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    delete process.env[SHARED_ACCOUNT_STORE_FILE_ENV]
+    process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = '/tmp/oc-test'
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE =
+      '/tmp/oc-test/anthropic-auth.json'
+    try {
+      expect(getSharedAccountStorePath()).toBe(
+        '/tmp/oc-test/shared-anthropic-accounts.json',
+      )
+    } finally {
+      process.env[SHARED_ACCOUNT_STORE_FILE_ENV] = file
+      if (testDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR = testDir
+      if (sidecar === undefined) delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+      else process.env.OPENCODE_ANTHROPIC_AUTH_FILE = sidecar
+    }
+  })
+
   test('the binding is always handed the resolved store path and overrides', () => {
     const config = anthropicAuthConfig()
     expect(config.storePath).toBe(store.path)
@@ -182,6 +204,36 @@ describe('listing and import', () => {
     expect(row?.quota?.sevenDayPercent).toBe(100)
     expect(row?.available).toBe(false)
   })
+
+  test('an exhausted five-hour window also makes the row unavailable', async () => {
+    const a = await seedStoreAccount({ label: 'a' })
+    await recordSharedAccountQuota(a.id, { fiveHourPercent: 100 })
+    const [row] = await listSharedAccounts()
+    expect(row?.available).toBe(false)
+  })
+
+  test('an exhausted account neither strands its neighbours nor keeps the pin', async () => {
+    const a = await seedStoreAccount({ label: 'a' })
+    const b = await seedStoreAccount({ label: 'b' })
+    await setSharedCurrentAccount(a.id)
+    await recordSharedAccountQuota(a.id, { sevenDayPercent: 100 })
+    const rows = await listSharedAccounts()
+    expect(rows.find((row) => row.id === b.id)?.available).toBe(true)
+    expect(pickSharedAccount(rows)?.id).toBe(b.id)
+    await recordSharedAccountQuota(b.id, { sevenDayPercent: 100 })
+    // Every account exhausted: nothing is picked rather than a doomed one.
+    expect(pickSharedAccount(await listSharedAccounts())).toBeUndefined()
+  })
+
+  test('a stale exhausted reading does not strand the account', async () => {
+    const a = await seedStoreAccount({ label: 'a' })
+    await recordSharedAccountQuota(a.id, {
+      sevenDayPercent: 100,
+      checkedAt: Date.now() - 2 * HOUR,
+    })
+    const [row] = await listSharedAccounts()
+    expect(row?.available).toBe(true)
+  })
 })
 
 describe('access tokens', () => {
@@ -233,6 +285,25 @@ describe('access tokens', () => {
       permanent: true,
       status: 400,
     })
+  })
+
+  test('refreshes of different accounts do not block each other', async () => {
+    const a = await seedStoreAccount({
+      label: 'a',
+      expiresAt: Date.now() - HOUR,
+    })
+    const b = await seedStoreAccount({
+      label: 'b',
+      expiresAt: Date.now() - HOUR,
+    })
+    const [ta, tb] = await Promise.all([
+      getSharedAccessToken(a.id),
+      getSharedAccessToken(b.id),
+    ])
+    expect(ta.source).toBe('refreshed')
+    expect(tb.source).toBe('refreshed')
+    expect(new Set(mock.presented)).toEqual(new Set([a.refresh, b.refresh]))
+    expect(mock.presented).toHaveLength(2)
   })
 
   test('a 401 on a stored bearer triggers one claimed refresh and a retry', async () => {
