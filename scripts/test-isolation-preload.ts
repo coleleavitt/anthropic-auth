@@ -72,6 +72,9 @@ for (const [key, value] of Object.entries(DEAD_OAUTH_URLS)) {
   process.env[key] ||= value
 }
 process.env.ANTHROPIC_AUTH_TEST_MODE = '1'
+// Bun's process.env writes never reach the addon's getenv; the binding's
+// loader forwards a snapshot of these keys to Rust at construction.
+process.env.ANTHROPIC_OAUTH_TEST_MODE = '1'
 
 const FORBIDDEN_HOSTS = [
   'platform.claude.com',
@@ -252,6 +255,11 @@ for (const path of bindingPaths) {
         )
       }
       super(config)
+      if ((this as { testMode?: unknown }).testMode !== true) {
+        throw violation(
+          'AnthropicAuth constructed without the binding test mode (ANTHROPIC_OAUTH_TEST_MODE)',
+        )
+      }
     }
   }
   napi.AnthropicAuth = GuardedAnthropicAuth

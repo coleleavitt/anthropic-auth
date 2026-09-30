@@ -9,14 +9,16 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createRequire } from 'node:module'
 
-import { FallbackAccountManager } from '../accounts.ts'
+import { FallbackAccountManager, type OAuthAccount } from '../accounts.ts'
 import {
   ANTHROPIC_OAUTH_TOKEN_URL_ENV,
   AnthropicAuth,
   anthropicAuthConfig,
+  getAnthropicAuth,
   getSharedAccessToken,
   isAnthropicAuthError,
   listSharedAccounts,
+  startSharedLogin,
 } from '../shared-account-store.ts'
 import {
   seedStoreAccount,
@@ -52,6 +54,52 @@ describe('no test can reach a production OAuth endpoint', () => {
     expect(new URL(tokenUrl).hostname).toBe('127.0.0.1')
   })
 
+  test('every handle the store layer constructs is in the binding test mode', () => {
+    expect(process.env.ANTHROPIC_OAUTH_TEST_MODE).toBe('1')
+    expect(getAnthropicAuth().testMode).toBe(true)
+    // A loopback login gets its own handle; it must be in test mode too.
+    expect(() =>
+      startSharedLogin({ redirectUri: 'http://localhost:54546/callback' }),
+    ).not.toThrow()
+  })
+
+  test('the binding itself refuses a production token host in test mode', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'rustguard',
+      expiresAt: Date.now() - HOUR,
+    })
+    // A separate process without this preload: only the Rust-side switch
+    // (ANTHROPIC_OAUTH_TEST_MODE) stands between it and the production
+    // host. (The runner's network namespace would stop the packet anyway.)
+    const napiPath = createRequire(import.meta.url).resolve(
+      '@coleleavitt/anthropic-napi',
+    )
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '-e',
+        `const { AnthropicAuth } = require(${JSON.stringify(napiPath)});
+         const auth = new AnthropicAuth({ storePath: ${JSON.stringify(store.path)} });
+         try { await auth.getAccessToken({ account: ${JSON.stringify(seeded.id)} }); console.log('REFRESHED') }
+         catch (e) { console.log(auth.testMode, e.code, e.message) }`,
+      ],
+      {
+        env: {
+          ...process.env,
+          ANTHROPIC_OAUTH_TEST_MODE: '1',
+          ANTHROPIC_OAUTH_TOKEN_URL:
+            'https://platform.claude.com/v1/oauth/token',
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    expect(await child.exited).toBe(0)
+    const output = (await new Response(child.stdout).text()).trim()
+    expect(output.startsWith('true config')).toBe(true)
+    expect(output).not.toContain('REFRESHED')
+  })
+
   test('an expired row with no mock server fails with a connect error, not a production refresh', async () => {
     const seeded = await seedStoreAccount({
       label: 'unmocked',
@@ -66,7 +114,7 @@ describe('no test can reach a production OAuth endpoint', () => {
     expect(row?.refreshDead).toBe(false)
     expect(row?.accessLive).toBe(false)
 
-    const account = { id: seeded.id, type: 'oauth' as const }
+    const account: OAuthAccount = { id: seeded.id, type: 'oauth' }
     await expect(
       new FallbackAccountManager().ensureAccessToken(account),
     ).rejects.toThrow()

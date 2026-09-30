@@ -130,6 +130,31 @@ export function anthropicAuthConfig(
 
 let cachedAuth: { key: string; auth: AnthropicAuth } | undefined
 
+/** Whether this process is a test run (Bun and Node set NODE_ENV=test). */
+function runningUnderTest() {
+  return Boolean(
+    process.env.ANTHROPIC_AUTH_TEST_ISOLATED ||
+      process.env.ANTHROPIC_OAUTH_TEST_MODE ||
+      process.env.NODE_ENV === 'test',
+  )
+}
+
+/**
+ * Construct a binding handle. Under test the handle must be in the binding's
+ * OAuth test mode (every OAuth call to a non-loopback host is refused before
+ * a byte is sent); otherwise construction is refused, so a test can never
+ * refresh a fixture token against production.
+ */
+function createAnthropicAuth(config: AuthConfig): AnthropicAuth {
+  const auth = new AnthropicAuth(config)
+  if (runningUnderTest() && auth.testMode !== true) {
+    throw new Error(
+      'refusing to use the Anthropic account store under test without ANTHROPIC_OAUTH_TEST_MODE=1',
+    )
+  }
+  return auth
+}
+
 /**
  * The shared handle. Recreated whenever the resolved configuration changes (a
  * test switching store path or mock endpoint), otherwise reused.
@@ -138,7 +163,7 @@ export function getAnthropicAuth(): AnthropicAuth {
   const config = anthropicAuthConfig()
   const key = JSON.stringify(config)
   if (cachedAuth?.key !== key) {
-    cachedAuth = { key, auth: new AnthropicAuth(config) }
+    cachedAuth = { key, auth: createAnthropicAuth(config) }
   }
   return cachedAuth.auth
 }
@@ -338,7 +363,7 @@ export function startSharedLogin(
   } = {},
 ): SharedLogin {
   const auth = options.redirectUri
-    ? new AnthropicAuth(
+    ? createAnthropicAuth(
         anthropicAuthConfig({ redirectUri: options.redirectUri }),
       )
     : getAnthropicAuth()

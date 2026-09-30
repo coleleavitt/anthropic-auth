@@ -188,6 +188,9 @@ function sandboxEnv(runDir: string, home: string): NodeJS.ProcessEnv {
   env.ANTHROPIC_OAUTH_AUTHORIZE_URL = `${DEAD_OAUTH_BASE}/oauth/authorize`
   env.ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL = `${DEAD_OAUTH_BASE}/oauth/authorize`
   env.ANTHROPIC_AUTH_TEST_MODE = '1'
+  // The binding's own fail-closed switch: any OAuth call to a non-loopback
+  // host is refused before a byte is sent.
+  env.ANTHROPIC_OAUTH_TEST_MODE = '1'
   // Bun keeps its install cache under HOME; point it back at the real one so
   // a test run never re-downloads packages (read-only use, outside the
   // protected set).
