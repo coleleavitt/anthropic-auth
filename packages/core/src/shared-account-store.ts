@@ -4,10 +4,14 @@
  *
  * Everything that touches `~/.anthropic-accounts/accounts.json` goes through
  * the binding: listing, selection, refresh (claimed, compare-and-swap,
- * fail-closed), dead-token bookkeeping, keep-alive, login token exchange and
- * the one-time import of host-held credentials. **Refresh tokens never cross
- * into JavaScript**; no value returned here carries one, and the only call
- * that accepts one ({@link importHostOAuthCredential}) moves it into the store.
+ * fail-closed), dead-token bookkeeping, keep-alive, login token exchange,
+ * revoke, API-key rows, legacy-store adoption, identity backfill, the
+ * one-time import of host-held credentials, and publishing a rotation back to
+ * Claude Code's `.credentials.json` when it held the spent token. **Refresh
+ * tokens never cross into JavaScript**; no value returned here carries one,
+ * and the only call that accepts one ({@link importHostOAuthCredential})
+ * moves it into the store. API keys come back only from
+ * {@link getSharedApiKey}.
  *
  * This module used to be a TypeScript reader/writer of the same file with its
  * own lock, refresh claim and legacy-file migration. That code was deleted:
@@ -23,12 +27,18 @@ import { dirname, join } from 'node:path'
 import type {
   AccessToken,
   AccountInfo,
+  AddApiKeyResult,
+  ApiKeyCredential,
   AuthConfig,
+  BackfillEntry,
   ErrorCode,
+  ExchangedAccess,
   ImportOAuthAccountOptions,
   ImportResult,
   KeepAliveOnceOptions,
   KeepAliveResult,
+  NativeClaudeInfo,
+  RevokeAccountResult,
   UnauthorizedResult,
 } from '@coleleavitt/anthropic-napi'
 
@@ -42,11 +52,17 @@ const napi: typeof import('@coleleavitt/anthropic-napi') = createRequire(
 export type {
   AccessToken,
   AccountInfo,
+  AddApiKeyResult,
+  ApiKeyCredential,
   AuthConfig,
+  BackfillEntry,
+  ExchangedAccess,
   ImportOAuthAccountOptions,
   ImportResult,
   KeepAliveOnceOptions,
   KeepAliveResult,
+  NativeClaudeInfo,
+  RevokeAccountResult,
   UnauthorizedResult,
 }
 export type AnthropicAuthErrorCode = ErrorCode
@@ -67,6 +83,10 @@ export const ANTHROPIC_OAUTH_AUTHORIZE_URL_ENV = 'ANTHROPIC_OAUTH_AUTHORIZE_URL'
 /** Console authorize URL override. */
 export const ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL_ENV =
   'ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL'
+/** Revoke endpoint override (tests point it at a local mock server). */
+export const ANTHROPIC_OAUTH_REVOKE_URL_ENV = 'ANTHROPIC_OAUTH_REVOKE_URL'
+/** Profile endpoint override (identity backfill). */
+export const ANTHROPIC_OAUTH_PROFILE_URL_ENV = 'ANTHROPIC_OAUTH_PROFILE_URL'
 
 /**
  * One store row, non-secret fields only (the binding's `AccountInfo`). The
@@ -122,9 +142,13 @@ export function anthropicAuthConfig(
   const consoleAuthorizeUrl = nonEmptyEnvironmentPath(
     ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL_ENV,
   )
+  const revokeUrl = nonEmptyEnvironmentPath(ANTHROPIC_OAUTH_REVOKE_URL_ENV)
+  const profileUrl = nonEmptyEnvironmentPath(ANTHROPIC_OAUTH_PROFILE_URL_ENV)
   if (tokenUrl) config.tokenUrl = tokenUrl
   if (authorizeUrl) config.authorizeUrl = authorizeUrl
   if (consoleAuthorizeUrl) config.consoleAuthorizeUrl = consoleAuthorizeUrl
+  if (revokeUrl) config.revokeUrl = revokeUrl
+  if (profileUrl) config.profileUrl = profileUrl
   return { ...config, ...overrides }
 }
 
@@ -339,40 +363,91 @@ export type ImportHostCredentialResult =
   | ImportResult
   | { status: 'invalid'; message: string }
 
+/** Store a static API key as an `api_key` row (the store validates it). */
+export function addSharedApiKey(input: { key: string; label?: string }) {
+  return getAnthropicAuth().addApiKey({
+    key: input.key,
+    ...(input.label ? { label: input.label } : {}),
+  })
+}
+
 /**
- * The store's token shape (`sk-ant-oat<digits>-<20+ url-safe chars>` for
- * access, `sk-ant-ort…` for refresh, at most 500 bytes); mirrors the Rust
- * validator so a malformed token is recognised before the binding is asked.
+ * The key of an `api_key` row (`accountId`, else the store's pin, else the
+ * first enabled one). Send it as `x-api-key`; never log it.
  */
-export function isWellFormedOAuthToken(
-  value: string | undefined,
-  kind: 'access' | 'refresh',
-): boolean {
-  if (!value || value.length > 500) return false
-  const prefix = kind === 'access' ? 'sk-ant-oat' : 'sk-ant-ort'
-  return new RegExp(`^${prefix}\\d+-[A-Za-z0-9_-]{20,}$`).test(value)
+export function getSharedApiKey(accountId?: string): Promise<ApiKeyCredential> {
+  return getAnthropicAuth().getApiKey(accountId ? { account: accountId } : null)
+}
+
+/**
+ * Revoke an OAuth row's refresh token at Anthropic (in Rust, under the row's
+ * refresh claim), then remove the row, or keep it disabled with the token
+ * recorded dead. A failed request changes nothing.
+ */
+export function revokeSharedAccount(
+  accountId: string,
+  options: { disable?: boolean } = {},
+): Promise<RevokeAccountResult> {
+  return getAnthropicAuth().revokeAccount({
+    accountId,
+    ...(options.disable ? { disable: true } : {}),
+  })
+}
+
+/**
+ * Fill account uuid / email / organization of rows imported without an
+ * identity, from the profile endpoint with each row's live access token.
+ * Never spends a refresh token.
+ */
+export function backfillSharedIdentities(): Promise<BackfillEntry[]> {
+  return getAnthropicAuth().backfillIdentities()
+}
+
+/**
+ * Non-secret facts about Claude Code's credential file at `path`, including
+ * the store row that holds the same refresh token (whose refreshes the store
+ * publishes back to that file), or null when there is no file.
+ */
+export function readNativeClaudeStatus(
+  path: string,
+): Promise<NativeClaudeInfo | null> {
+  return getAnthropicAuth().readNativeClaudeOAuth({ path })
+}
+
+/**
+ * Import Claude Code's plaintext credential file into the store. The tokens
+ * are read and stored by the binding and never reach JavaScript; from then on
+ * a store refresh of that token is published back to the file.
+ */
+export function importNativeClaudeFile(input: {
+  path: string
+  label?: string
+}): Promise<ImportResult> {
+  return getAnthropicAuth().importNativeClaudeAccount({
+    path: input.path,
+    ...(input.label ? { label: input.label } : {}),
+  })
 }
 
 /**
  * One-time migration of a credential a host still holds. The store is the
  * custodian: when it already has this login, its copy wins (`kept`). A token
- * that is not a well-formed OAuth token is reported as `invalid` without
- * touching the store; every binding failure (an unreadable store included)
- * throws so the caller keeps the credential and retries later.
+ * the store rejects as malformed (the binding's `invalid_token`) is reported
+ * as `invalid` without touching the store; every other binding failure (an
+ * unreadable store included) throws so the caller keeps the credential and
+ * retries later.
  */
 export async function importHostOAuthCredential(
   options: ImportOAuthAccountOptions,
 ): Promise<ImportHostCredentialResult> {
-  if (
-    !isWellFormedOAuthToken(options.accessToken, 'access') ||
-    !isWellFormedOAuthToken(options.refreshToken, 'refresh')
-  ) {
-    return {
-      status: 'invalid',
-      message: 'not a well-formed OAuth access/refresh token pair',
+  try {
+    return await getAnthropicAuth().importOAuthAccount(options)
+  } catch (error) {
+    if (isAnthropicAuthError(error, 'invalid_token')) {
+      return { status: 'invalid', message: error.message }
     }
+    throw error
   }
-  return getAnthropicAuth().importOAuthAccount(options)
 }
 
 export type SharedLoginMode = 'max' | 'console'
@@ -387,29 +462,34 @@ export type SharedLogin = {
     label?: string
     setCurrent?: boolean
   }) => Promise<SharedAnthropicAccount>
+  /**
+   * Exchange the code (in Rust) **without storing anything** and return the
+   * access token only (the Console "create an API key" flow). The grant's
+   * refresh token is dropped in Rust.
+   */
+  exchange: (callback: string) => Promise<ExchangedAccess>
 }
 
 /**
  * Begin an OAuth PKCE login. The verifier stays in Rust; `complete` exchanges
- * the code and writes the account into the store. A loopback login passes its
- * `redirectUri`, which gets a dedicated handle so the authorize URL and the
- * code exchange agree on it.
+ * the code and writes the account into the store, `exchange` only exchanges
+ * it. A loopback login passes its `redirectUri` and the `state` its listener
+ * already expects; both apply to this login only.
  */
 export function startSharedLogin(
   options: {
     mode?: SharedLoginMode
     redirectUri?: string
+    state?: string
     loginHint?: string
   } = {},
 ): SharedLogin {
-  const auth = options.redirectUri
-    ? createAnthropicAuth(
-        anthropicAuthConfig({ redirectUri: options.redirectUri }),
-      )
-    : getAnthropicAuth()
+  const auth = getAnthropicAuth()
   const started = auth.startLogin({
     mode: options.mode ?? 'max',
     ...(options.loginHint ? { loginHint: options.loginHint } : {}),
+    ...(options.redirectUri ? { redirectUri: options.redirectUri } : {}),
+    ...(options.state ? { state: options.state } : {}),
   })
   return {
     url: started.url,
@@ -424,6 +504,8 @@ export function startSharedLogin(
           ? { setCurrent: input.setCurrent }
           : {}),
       }),
+    exchange: (callback) =>
+      auth.exchangeCode({ loginId: started.loginId, callback }),
   }
 }
 

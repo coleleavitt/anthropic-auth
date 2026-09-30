@@ -68,6 +68,8 @@ const DEAD_OAUTH_URLS: Record<string, string> = {
   ANTHROPIC_OAUTH_TOKEN_URL: `${DEAD_OAUTH_BASE}/v1/oauth/token`,
   ANTHROPIC_OAUTH_AUTHORIZE_URL: `${DEAD_OAUTH_BASE}/oauth/authorize`,
   ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL: `${DEAD_OAUTH_BASE}/oauth/authorize`,
+  ANTHROPIC_OAUTH_REVOKE_URL: `${DEAD_OAUTH_BASE}/v1/oauth/token/revoke`,
+  ANTHROPIC_OAUTH_PROFILE_URL: `${DEAD_OAUTH_BASE}/api/oauth/profile`,
 }
 for (const [key, value] of Object.entries(DEAD_OAUTH_URLS)) {
   process.env[key] ||= value

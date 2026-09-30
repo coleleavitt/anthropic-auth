@@ -3,23 +3,37 @@
  * store file and a local mock token endpoint (see support/store-fixture.ts).
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { readFileSync, statSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { refreshErrorFromSharedAccount } from '../accounts.ts'
 import {
   ANTHROPIC_OAUTH_TOKEN_URL_ENV,
+  AnthropicAuth,
+  addSharedApiKey,
   anthropicAuthConfig,
+  backfillSharedIdentities,
   getSharedAccessToken,
   getSharedAccountStorePath,
+  getSharedApiKey,
   handleSharedUnauthorized,
   importHostOAuthCredential,
   isAnthropicAuthError,
   listSharedAccounts,
   pickSharedAccount,
+  readNativeClaudeStatus,
   recordSharedAccountQuota,
   removeSharedAccount,
   reorderSharedAccounts,
+  revokeSharedAccount,
   SHARED_ACCOUNT_STORE_DIR_ENV,
   SHARED_ACCOUNT_STORE_FILE_ENV,
   setSharedAccountEnabled,
@@ -397,5 +411,222 @@ describe('login', () => {
     expect(new URL(login.url).searchParams.get('redirect_uri')).toBe(
       'http://localhost:54545/callback',
     )
+  })
+})
+
+describe('login: console exchange stores nothing', () => {
+  test('exchange returns an access token and no account is written', async () => {
+    mock.codes.set('console-code', {
+      email: 'console@example.com',
+      accountUuid: 'uuid-console',
+      tag: 'console',
+    })
+    const login = startSharedLogin({ mode: 'console' })
+    const exchanged = await login.exchange(`console-code#${login.state}`)
+    expect(exchanged.accessToken).toBe(mock.loginAccess('console'))
+    expect(exchanged.email).toBe('console@example.com')
+    expect(JSON.stringify(exchanged)).not.toContain('sk-ant-ort')
+    expect(await listSharedAccounts()).toHaveLength(0)
+    expect(mock.codeExchanges).toHaveLength(1)
+    // A tampered state never reaches the token endpoint.
+    const second = startSharedLogin({ mode: 'console' })
+    await expect(second.exchange('console-code#forged')).rejects.toThrow()
+    expect(mock.codeExchanges).toHaveLength(1)
+  })
+})
+
+describe('revoke and API keys through the binding', () => {
+  test('revoke sends the stored refresh token and disables or removes the row', async () => {
+    const a = await seedStoreAccount({ label: 'to-disable' })
+    const b = await seedStoreAccount({ label: 'to-remove' })
+    expect(await revokeSharedAccount(a.id, { disable: true })).toEqual({
+      accountId: a.id,
+      outcome: 'revoked',
+      removed: false,
+    })
+    expect(await revokeSharedAccount(b.id)).toMatchObject({ removed: true })
+    expect(mock.revoked).toEqual([a.refresh, b.refresh])
+    const rows = await listSharedAccounts()
+    expect(rows.map((row) => row.id)).toEqual([a.id])
+    expect(rows[0]).toMatchObject({ enabled: false, refreshDead: true })
+    // A disabled, dead row is never refreshed or served.
+    await expect(getSharedAccessToken(a.id)).rejects.toThrow()
+    expect(mock.presented).toEqual([])
+  })
+
+  test('store API keys: added, handed out by id or pin, listed as a suffix only', async () => {
+    const key = 'sk-ant-api03-corecorecorecorecorecoreKEY9'
+    expect(await addSharedApiKey({ key, label: 'Console key' })).toEqual({
+      accountId: 'Console key',
+      status: 'added',
+    })
+    const listed = await listSharedAccounts()
+    expect(listed).toEqual([
+      expect.objectContaining({
+        id: 'Console key',
+        kind: 'api_key',
+        apiKeySuffix: 'KEY9',
+      }),
+    ])
+    expect(JSON.stringify(listed)).not.toContain(key)
+    expect((await getSharedApiKey()).apiKey).toBe(key)
+    expect((await getSharedApiKey('Console key')).accountId).toBe('Console key')
+    let malformed: unknown
+    try {
+      await addSharedApiKey({ key: 'not-a-key' })
+    } catch (error) {
+      malformed = error
+    }
+    expect(isAnthropicAuthError(malformed, 'invalid_token')).toBe(true)
+  })
+})
+
+describe('legacy stores and Claude Code publish through the binding', () => {
+  const HOUR_MS = 3_600_000
+
+  test('legacyPaths adopts a flat ~/.grok-style store once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'legacy-adopt-'))
+    try {
+      const legacy = join(dir, 'grok', 'anthropic-accounts.json')
+      mkdirSync(join(dir, 'grok'))
+      writeFileSync(
+        legacy,
+        JSON.stringify({
+          version: 1,
+          active_index: 0,
+          accounts: [
+            {
+              uuid: 'grok-login',
+              email: 'grok@example.com',
+              accessToken: fakeAccessToken('grokadopt'),
+              refreshToken: fakeRefreshToken('grokadopt'),
+              expiresAt: Date.now() + HOUR_MS,
+              addedAt: Date.now() - HOUR_MS,
+              scopes: ['user:inference'],
+              enabled: true,
+            },
+          ],
+        }),
+      )
+      const auth = new AnthropicAuth({
+        ...anthropicAuthConfig(),
+        legacyPaths: [legacy],
+      })
+      expect((await auth.listAccounts()).map((row) => row.id)).toEqual([
+        'grok-login',
+      ])
+      expect(
+        JSON.parse(readFileSync(store.path, 'utf8')).migrated_from,
+      ).toEqual([legacy])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a store refresh of the token Claude Code holds is published to its file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'native-publish-'))
+    try {
+      const native = join(dir, '.credentials.json')
+      const seeded = await seedStoreAccount({
+        label: 'claude-code',
+        expiresAt: Date.now() - HOUR_MS,
+      })
+      writeFileSync(
+        native,
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: seeded.access,
+            refreshToken: seeded.refresh,
+            expiresAt: Date.now() - HOUR_MS,
+            scopes: ['user:inference'],
+            subscriptionType: 'max',
+          },
+        }),
+        { mode: 0o600 },
+      )
+      expect((await readNativeClaudeStatus(native))?.storeAccountId).toBe(
+        seeded.id,
+      )
+      // OAuth test mode never resolves Claude Code's real file, so the test
+      // names the (temp) file explicitly.
+      const auth = new AnthropicAuth({
+        ...anthropicAuthConfig(),
+        nativeCredentialsPath: native,
+      })
+      const token = await auth.getAccessToken({ account: seeded.id })
+      expect(token.source).toBe('refreshed')
+      const written = JSON.parse(readFileSync(native, 'utf8'))
+      expect(written.claudeAiOauth).toMatchObject({
+        accessToken: mock.rotatedAccess(1),
+        refreshToken: mock.rotatedRefresh(1),
+        subscriptionType: 'max',
+      })
+      expect(statSync(native).mode & 0o777).toBe(0o600)
+      expect((await readNativeClaudeStatus(native))?.storeAccountId).toBe(
+        seeded.id,
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('identity backfill and error codes', () => {
+  test('backfill names an imported row from the profile endpoint without refreshing', async () => {
+    const bearers: string[] = []
+    const profile = Bun.serve({
+      port: 0,
+      fetch(req) {
+        bearers.push(req.headers.get('authorization') ?? '')
+        return Response.json({
+          account: { uuid: 'uuid-profile', email: 'profile@example.com' },
+          organization: { uuid: 'org-profile' },
+        })
+      },
+    })
+    const previous = process.env.ANTHROPIC_OAUTH_PROFILE_URL
+    // Imported while the profile endpoint was unreachable (the runner's dead
+    // loopback): the row has no identity yet.
+    const seeded = await seedStoreAccount({ label: 'anonymous' })
+    expect((await listSharedAccounts())[0]?.accountUuid).toBeUndefined()
+    process.env.ANTHROPIC_OAUTH_PROFILE_URL = `http://127.0.0.1:${profile.port}/api/oauth/profile`
+    try {
+      expect(await backfillSharedIdentities()).toEqual([
+        {
+          accountId: seeded.id,
+          status: 'filled',
+          email: 'profile@example.com',
+        },
+      ])
+      expect(bearers).toEqual([`Bearer ${seeded.access}`])
+      expect((await listSharedAccounts())[0]).toMatchObject({
+        email: 'profile@example.com',
+        accountUuid: 'uuid-profile',
+        organizationUuid: 'org-profile',
+      })
+      expect(mock.presented).toEqual([])
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_OAUTH_PROFILE_URL
+      else process.env.ANTHROPIC_OAUTH_PROFILE_URL = previous
+      profile.stop(true)
+    }
+  })
+
+  test('an unreadable store is store_corrupt and is left as it is', async () => {
+    writeFileSync(store.path, '{ "accounts": [', { mode: 0o600 })
+    let caught: unknown
+    try {
+      await listSharedAccounts()
+    } catch (error) {
+      caught = error
+    }
+    expect(isAnthropicAuthError(caught, 'store_corrupt')).toBe(true)
+    expect(readFileSync(store.path, 'utf8')).toBe('{ "accounts": [')
+    const imported = await importHostOAuthCredential({
+      accessToken: 'not-a-token',
+      refreshToken: 'not-a-token',
+      expiresAt: 0,
+    })
+    expect(imported.status).toBe('invalid')
   })
 })

@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  ANTHROPIC_OAUTH_REVOKE_URL_ENV,
   ANTHROPIC_OAUTH_TOKEN_URL_ENV,
   importHostOAuthCredential,
   SHARED_ACCOUNT_STORE_FILE_ENV,
@@ -58,6 +59,8 @@ export type MockTokenServer = {
   unavailable: Set<string>
   /** Authorization-code exchanges received, in order. */
   codeExchanges: Array<Record<string, string>>
+  /** Refresh tokens revoked at `/v1/oauth/token/revoke`, in order. */
+  revoked: string[]
   /** Codes the authorization_code grant accepts, with the login they mint. */
   codes: Map<string, { email: string; accountUuid: string; tag: string }>
   /** The access token the n-th refresh (1-based) of this server returns. */
@@ -91,6 +94,7 @@ export function startMockTokenServer(): MockTokenServer {
   const dead = new Set<string>()
   const unavailable = new Set<string>()
   const codeExchanges: Array<Record<string, string>> = []
+  const revoked: string[] = []
   const codes = new Map<
     string,
     { email: string; accountUuid: string; tag: string }
@@ -107,6 +111,10 @@ export function startMockTokenServer(): MockTokenServer {
         string,
         string
       >
+      if (new URL(req.url).pathname === '/v1/oauth/token/revoke') {
+        revoked.push(body.token ?? '')
+        return Response.json({})
+      }
       if (body.grant_type === 'authorization_code') {
         codeExchanges.push(body)
         const login = codes.get(body.code ?? '')
@@ -154,14 +162,17 @@ export function startMockTokenServer(): MockTokenServer {
     },
   })
   const previous = process.env[ANTHROPIC_OAUTH_TOKEN_URL_ENV]
+  const previousRevoke = process.env[ANTHROPIC_OAUTH_REVOKE_URL_ENV]
   const url = `http://127.0.0.1:${server.port}/v1/oauth/token`
   process.env[ANTHROPIC_OAUTH_TOKEN_URL_ENV] = url
+  process.env[ANTHROPIC_OAUTH_REVOKE_URL_ENV] = `${url}/revoke`
   return {
     url,
     presented,
     dead,
     unavailable,
     codeExchanges,
+    revoked,
     codes,
     rotatedAccess,
     rotatedRefresh,
@@ -170,6 +181,9 @@ export function startMockTokenServer(): MockTokenServer {
       if (previous === undefined)
         delete process.env[ANTHROPIC_OAUTH_TOKEN_URL_ENV]
       else process.env[ANTHROPIC_OAUTH_TOKEN_URL_ENV] = previous
+      if (previousRevoke === undefined)
+        delete process.env[ANTHROPIC_OAUTH_REVOKE_URL_ENV]
+      else process.env[ANTHROPIC_OAUTH_REVOKE_URL_ENV] = previousRevoke
       server.stop(true)
     },
   }

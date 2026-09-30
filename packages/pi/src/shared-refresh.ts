@@ -54,14 +54,17 @@ export function accountSpanId(id: string): string {
 /**
  * Classify a failure for the span. `revoked` is the token family being gone
  * (nothing to retry); `refused` is the store declining to serve (no account,
- * reserve, bad input); `error` is everything the network did to us.
+ * reserve, bad input, a malformed token, an unreadable store); `error` is
+ * everything the network did to us.
  */
 function classifyRefreshFailure(error: unknown): RefreshOutcome {
   if (isAnthropicAuthError(error, 'invalid_grant')) return 'revoked'
   if (
     isAnthropicAuthError(error, 'auth_required') ||
     isAnthropicAuthError(error, 'quota_reserve') ||
-    isAnthropicAuthError(error, 'config')
+    isAnthropicAuthError(error, 'config') ||
+    isAnthropicAuthError(error, 'invalid_token') ||
+    isAnthropicAuthError(error, 'store_corrupt')
   ) {
     return 'refused'
   }

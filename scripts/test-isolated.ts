@@ -187,6 +187,8 @@ function sandboxEnv(runDir: string, home: string): NodeJS.ProcessEnv {
   env.ANTHROPIC_OAUTH_TOKEN_URL = `${DEAD_OAUTH_BASE}/v1/oauth/token`
   env.ANTHROPIC_OAUTH_AUTHORIZE_URL = `${DEAD_OAUTH_BASE}/oauth/authorize`
   env.ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL = `${DEAD_OAUTH_BASE}/oauth/authorize`
+  env.ANTHROPIC_OAUTH_REVOKE_URL = `${DEAD_OAUTH_BASE}/v1/oauth/token/revoke`
+  env.ANTHROPIC_OAUTH_PROFILE_URL = `${DEAD_OAUTH_BASE}/api/oauth/profile`
   env.ANTHROPIC_AUTH_TEST_MODE = '1'
   // The binding's own fail-closed switch: any OAuth call to a non-loopback
   // host is refused before a byte is sent.
