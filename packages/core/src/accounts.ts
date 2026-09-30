@@ -75,6 +75,12 @@ export type ApiKeyAccount = AccountBase & {
   apiKey?: string
   baseURL: string
   authHeader?: 'authorization-bearer' | 'x-api-key'
+  /**
+   * The key belongs to an `api_key` row of the shared store. It is handed
+   * out by the binding when the list is materialized and is never written
+   * to the host config or state files.
+   */
+  storeManaged?: boolean
 }
 
 export type FallbackAccount = OAuthAccount | ApiKeyAccount
@@ -544,9 +550,10 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     return {
       ...normalizeAccountBase(value),
       type: 'api',
-      apiKey: apiKey || undefined,
+      apiKey: value.storeManaged === true ? undefined : apiKey || undefined,
       baseURL,
       authHeader,
+      ...(value.storeManaged === true ? { storeManaged: true } : {}),
     }
   }
 
@@ -1255,13 +1262,16 @@ function accountConfig(account: FallbackAccount) {
     addedAt: account.addedAt,
     baseURL: account.type === 'api' ? account.baseURL : undefined,
     authHeader: account.type === 'api' ? account.authHeader : undefined,
+    storeManaged:
+      account.type === 'api' && account.storeManaged ? true : undefined,
   })
 }
 
 function accountRuntimeState(account: FallbackAccount) {
   if (account.type === 'api') {
     return objectWithDefinedEntries({
-      apiKey: account.apiKey,
+      // A store-managed key stays in the store.
+      apiKey: account.storeManaged ? undefined : account.apiKey,
       lastUsed: account.lastUsed,
     })
   }

@@ -1,10 +1,19 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 import {
+  addSharedApiKey,
+  createEmptyStorage,
   type FallbackAccount,
   listSharedAccounts,
+  loadAccounts,
   STORE_MANAGED_REFRESH_PLACEHOLDER,
+  saveAccounts,
   setSharedAccountEnabled,
+  setSharedCurrentAccount,
   WifAuth,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -282,6 +291,81 @@ describe('OpenCode auth over the account store', () => {
       key: 'host-key',
       source: 'opencode',
     })
+  })
+
+  test('uses a store API key instead of stale host OAuth', async () => {
+    const key = 'sk-ant-api03-storemainstoremainstoremainMAIN'
+    await addSharedApiKey({ label: 'api-main', key })
+    const reconciled = await reconcileAnthropicAuth({
+      openCodeAuth: hostCredential(),
+      legacyAccounts: [],
+    })
+    expect(reconciled.auth).toEqual({
+      type: 'api',
+      key,
+      sharedAccountId: 'api-main',
+      source: 'shared',
+    })
+    expect(reconciled.sharedMain?.kind).toBe('api_key')
+    // The listing never carries the key, only its suffix.
+    expect(JSON.stringify(reconciled.accounts)).not.toContain(key)
+    expect(
+      reconciled.accounts.find((row) => row.id === 'api-main')?.apiKeySuffix,
+    ).toBe('MAIN')
+  })
+
+  test('store API keys are first-party fallbacks and never reach the host files', async () => {
+    const main = await seedStoreAccount({ label: 'oauth-main' })
+    await setSharedCurrentAccount(main.id)
+    const key = 'sk-ant-api03-fallbackfallbackfallbackfbKEY1'
+    await addSharedApiKey({ label: 'console-key', key })
+    const reconciled = await reconcileAnthropicAuth({
+      openCodeAuth: { type: 'wellknown' },
+      legacyAccounts: [],
+    })
+    expect(reconciled.sharedMain?.id).toBe(main.id)
+    expect(reconciled.fallbacks).toEqual([
+      expect.objectContaining({
+        id: 'console-key',
+        type: 'api',
+        apiKey: key,
+        baseURL: 'https://api.anthropic.com',
+        authHeader: 'x-api-key',
+        storeManaged: true,
+      }),
+    ])
+    const dir = await mkdtemp(join(tmpdir(), 'opencode-store-key-'))
+    try {
+      const path = join(dir, 'anthropic-auth.json')
+      await saveAccounts(
+        { ...createEmptyStorage(), accounts: reconciled.fallbacks },
+        path,
+      )
+      const written = [
+        await readFile(path, 'utf8'),
+        await readFile(join(dir, 'anthropic-auth-state.json'), 'utf8').catch(
+          () => '',
+        ),
+      ].join('\n')
+      expect(written).not.toContain(key)
+      const reloaded = await loadAccounts(path)
+      expect(reloaded?.accounts[0]).toMatchObject({
+        id: 'console-key',
+        storeManaged: true,
+      })
+      expect(reloaded?.accounts[0]).not.toHaveProperty('apiKey', key)
+      // Reconciling over the reloaded host list hydrates the key again.
+      const again = await reconcileAnthropicAuth({
+        openCodeAuth: { type: 'wellknown' },
+        legacyAccounts: reloaded?.accounts ?? [],
+      })
+      expect(again.fallbacks[0]).toMatchObject({
+        id: 'console-key',
+        apiKey: key,
+      })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   test('fallbacks are the host list over the store, minus main', async () => {

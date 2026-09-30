@@ -2,15 +2,18 @@
  * OpenCode's view of the machine-wide Anthropic account store.
  *
  * The store (Rust binding, `~/.anthropic-accounts/accounts.json`) is the only
- * custodian of OAuth refresh tokens. This module never writes a token into it
- * except through the one-time `importHostOAuthCredential` migration of the
- * credential OpenCode itself still holds in `auth.json`; after that import the
- * host copy is replaced with {@link STORE_MANAGED_REFRESH_PLACEHOLDER}.
+ * custodian of OAuth refresh tokens and of store API keys. This module never
+ * writes a token into it except through the one-time
+ * `importHostOAuthCredential` migration of the credential OpenCode itself
+ * still holds in `auth.json`; after that import the host copy is replaced
+ * with {@link STORE_MANAGED_REFRESH_PLACEHOLDER}. Store `api_key` rows are
+ * served through the binding's `getApiKey` and never written to host files.
  */
 import {
   type AccountOperationError,
   type FallbackAccount,
   getSharedAccessToken,
+  getSharedApiKey,
   handleSharedUnauthorized,
   importHostOAuthCredential,
   isStoreManagedRefreshPlaceholder,
@@ -35,10 +38,12 @@ import {
  */
 export type StoreAccess = SharedAccountAccess & {
   importCredential: typeof importHostOAuthCredential
+  getApiKey: typeof getSharedApiKey
 }
 
 const bindingStoreAccess: StoreAccess = {
   getAccessToken: (accountId) => getSharedAccessToken(accountId),
+  getApiKey: (accountId) => getSharedApiKey(accountId),
   handleUnauthorized: (accessToken) => handleSharedUnauthorized(accessToken),
   keepAliveOnce: () => sharedKeepAliveOnce(),
   listAccounts: () => listSharedAccounts(),
@@ -90,9 +95,10 @@ export type ResolvedMainAnthropicAuth =
       key: string
       access?: undefined
       expires?: undefined
-      sharedAccountId?: undefined
+      /** Store `api_key` row serving as main, for `source: 'shared'`. */
+      sharedAccountId?: string
       refreshError?: undefined
-      source: 'opencode' | 'environment'
+      source: 'shared' | 'opencode' | 'environment'
     }
   | {
       type: 'wif'
@@ -126,13 +132,35 @@ function nonEmpty(value: string | undefined) {
   return trimmed || undefined
 }
 
-function oauthRows(accounts: readonly SharedAnthropicAccount[]) {
-  return accounts.filter((account) => account.kind === 'oauth')
-}
-
+/**
+ * The kind of the store's main credential (`oauth` or `api` for a store API
+ * key), or null when the store has none. Cost zeroing follows it.
+ */
 export async function getSharedAnthropicAuthType() {
   const accounts = await storeAccess().listAccounts()
-  return pickSharedAccount(oauthRows(accounts)) ? 'oauth' : null
+  const main = pickSharedAccount(accounts)
+  if (!main) return null
+  return main.kind === 'oauth' ? 'oauth' : 'api'
+}
+
+/**
+ * The keys of the store `api_key` rows other than main (skipped when the
+ * binding cannot hand one out), for materializing them as fallback routes.
+ */
+async function storeApiKeys(
+  accounts: readonly SharedAnthropicAccount[],
+  mainId: string | undefined,
+): Promise<Map<string, string>> {
+  const keys = new Map<string, string>()
+  for (const account of accounts) {
+    if (account.kind !== 'api_key' || account.id === mainId) continue
+    try {
+      keys.set(account.id, (await storeAccess().getApiKey(account.id)).apiKey)
+    } catch {
+      // Disabled or cooling down: not a usable route right now.
+    }
+  }
+  return keys
 }
 
 /**
@@ -282,10 +310,11 @@ async function resolveStoreMain(
 /**
  * Resolve OpenCode's main credential and fallback list from the store.
  *
- * Order: the store's preferred OAuth row; else OpenCode's own credential when
- * the store could not take it (a static bearer, never refreshed) or it is an
- * API key; else the environment; else workload identity. Fallbacks are the
- * host's configured list over the store rows, minus main.
+ * Order: the store's preferred row (an OAuth account, or a store API key);
+ * else OpenCode's own credential when the store could not take it (a static
+ * bearer, never refreshed) or it is an API key; else the environment; else
+ * workload identity. Fallbacks are the host's configured list over the store
+ * rows (store API keys as first-party routes), minus main.
  */
 export async function reconcileAnthropicAuth(input: {
   openCodeAuth: OpenCodeAnthropicAuth
@@ -303,10 +332,22 @@ export async function reconcileAnthropicAuth(input: {
     return undefined
   })
   const accounts = await storeAccess().listAccounts()
-  const sharedMain = pickSharedAccount(oauthRows(accounts))
+  const sharedMain = pickSharedAccount(accounts)
 
   let auth: ResolvedMainAnthropicAuth | null = null
-  if (sharedMain) {
+  if (sharedMain?.kind === 'api_key') {
+    auth = await storeAccess()
+      .getApiKey(sharedMain.id)
+      .then(
+        (credential): ResolvedMainAnthropicAuth => ({
+          type: 'api',
+          key: credential.apiKey,
+          sharedAccountId: sharedMain.id,
+          source: 'shared',
+        }),
+      )
+      .catch(() => null)
+  } else if (sharedMain) {
     auth = await resolveStoreMain(sharedMain)
   } else if (
     input.openCodeAuth.type === 'api' ||
@@ -327,7 +368,10 @@ export async function reconcileAnthropicAuth(input: {
     fallbacks: materializeSharedFallbackAccounts(
       input.legacyAccounts,
       accounts,
-      { mainId: sharedMain?.id },
+      {
+        mainId: sharedMain?.id,
+        apiKeys: await storeApiKeys(accounts, sharedMain?.id),
+      },
     ),
     sharedMain,
     accounts,

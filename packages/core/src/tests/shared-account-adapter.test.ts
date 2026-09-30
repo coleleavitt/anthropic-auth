@@ -117,12 +117,54 @@ describe('store rows as host fallback accounts', () => {
     expect(ids).toEqual(['kept'])
   })
 
-  test('store api_key rows are not materialized (the binding hands out no keys)', () => {
+  test('a store api_key row without a key handed out is not materialized', () => {
     const ids = materializeSharedFallbackAccounts(
       [],
       [row('key', { kind: 'api_key' }), row('oauth')],
     ).map((account) => account.id)
     expect(ids).toEqual(['oauth'])
+  })
+
+  test('store api_key rows become first-party x-api-key routes managed by the store', () => {
+    const accounts = materializeSharedFallbackAccounts(
+      [customRoute],
+      [row('key', { kind: 'api_key', label: 'Console' }), row('oauth')],
+      { apiKeys: new Map([['key', 'sk-ant-api03-storekey']]) },
+    )
+    expect(accounts.map((account) => account.id)).toEqual([
+      'custom-route',
+      'key',
+      'oauth',
+    ])
+    expect(accounts[1]).toMatchObject({
+      type: 'api',
+      label: 'Console',
+      apiKey: 'sk-ant-api03-storekey',
+      baseURL: 'https://api.anthropic.com',
+      authHeader: 'x-api-key',
+      storeManaged: true,
+    })
+    expect(isFirstPartyAnthropicApiAccount(accounts[1] as ApiKeyAccount)).toBe(
+      true,
+    )
+    // The host custom route is untouched.
+    expect(accounts[0]).toEqual(customRoute)
+  })
+
+  test('never attaches a store key to a host route sharing its id; drops orphaned store-managed entries', () => {
+    const orphan: ApiKeyAccount = {
+      id: 'gone',
+      type: 'api',
+      baseURL: 'https://api.anthropic.com',
+      authHeader: 'x-api-key',
+      storeManaged: true,
+    }
+    const accounts = materializeSharedFallbackAccounts(
+      [customRoute, orphan],
+      [row('custom-route', { kind: 'api_key' })],
+      { apiKeys: new Map([['custom-route', 'sk-ant-api03-storekey']]) },
+    )
+    expect(accounts).toEqual([customRoute])
   })
 
   test('recognises first-party API-key routes', () => {
