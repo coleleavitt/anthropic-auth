@@ -1,5 +1,4 @@
 import {
-  authorize,
   type CatalogModel,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
@@ -8,14 +7,12 @@ import {
   CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
   CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
   CLAUDE_OPUS_5_5_MODEL_ID,
-  exchange,
-  findSharedAccountByCredential,
   getClaudeCodeVersion,
-  loadSharedAccountStore,
+  getSharedAccessToken,
+  listSharedAccounts,
   resolveAnthropicModelCatalog,
   resolveModelCost,
-  startOAuthLoopbackSession,
-  updateSharedAccountStore,
+  startSharedLoginWithLoopback,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   OAuthCredentials,
@@ -27,30 +24,26 @@ import { adoptSharedCredentialIntoHostAuth } from './adopt-host-credential.ts'
 import { registerCommands } from './commands.ts'
 import {
   currentSharedAccount,
-  forgetDeadRefreshTokens,
+  hostCredentialsFor,
   refreshAnthropicToken,
   sharedCredentialIsLive,
 } from './shared-refresh.ts'
 import { streamCortexKitAnthropic } from './stream.ts'
 import { errorHttpStatus, withAuthSpan } from './trace-bridge.ts'
 
+/**
+ * Pi's `/login anthropic`. The Rust binding owns the PKCE verifier, the code
+ * exchange and the store write, so no token passes through here except the
+ * access token Pi needs for `getApiKey`; Pi's `auth.json` gets the store
+ * placeholder instead of the refresh token.
+ */
 export async function loginAnthropic(
   callbacks: OAuthLoginCallbacks,
 ): Promise<OAuthCredentials> {
-  let loopback: Awaited<ReturnType<typeof startOAuthLoopbackSession>> | null =
-    null
-  let auth: Awaited<ReturnType<typeof authorize>>
-  try {
-    loopback = await startOAuthLoopbackSession()
-    auth = await authorize('max', {
-      redirectUri: loopback.redirectUri,
-      state: loopback.state,
-    })
-  } catch {
-    loopback = null
-    auth = await authorize('max')
-  }
-  callbacks.onAuth({ url: auth.url })
+  const { login, loopback } = await startSharedLoginWithLoopback({
+    mode: 'max',
+  })
+  callbacks.onAuth({ url: login.url })
   const manualCallback = callbacks.onPrompt({
     message: 'Paste the Claude OAuth callback URL or code:',
   })
@@ -75,62 +68,8 @@ export async function loginAnthropic(
   } else {
     callback = await manualCallback
   }
-  const result = await exchange(
-    callback,
-    auth.verifier,
-    auth.redirectUri,
-    auth.state,
-  )
-  if (result.type !== 'success') {
-    throw new Error('Anthropic OAuth exchange failed')
-  }
-  const now = Date.now()
-  await updateSharedAccountStore((store) => {
-    const credential = {
-      type: 'oauth' as const,
-      access: result.access,
-      refresh: result.refresh,
-      expires_at: result.expires,
-      ...(typeof result.refreshTokenExpiresAt === 'number'
-        ? { refresh_expires_at: result.refreshTokenExpiresAt }
-        : {}),
-      ...(result.scopes?.length ? { scopes: result.scopes } : {}),
-      ...(result.accountId
-        ? {
-            account: {
-              uuid: result.accountId,
-              ...(result.email ? { email_address: result.email } : {}),
-            },
-          }
-        : {}),
-      ...(result.organizationId
-        ? { organization: { uuid: result.organizationId } }
-        : {}),
-    }
-    const existing =
-      findSharedAccountByCredential(store, credential) ??
-      store.accounts.find(
-        (account) => account.id === (result.accountId ?? 'pi-main'),
-      )
-    const account = {
-      id: existing?.id ?? result.accountId ?? 'pi-main',
-      label: existing?.label ?? 'Pi Anthropic',
-      email: result.email ?? existing?.email,
-      credential,
-      enabled: true,
-      created_at: existing?.created_at ?? new Date(now).toISOString(),
-      last_used_at: existing?.last_used_at,
-    }
-    const index = store.accounts.findIndex((entry) => entry.id === account.id)
-    if (index >= 0) store.accounts[index] = account
-    else store.accounts.push(account)
-    store.current = account.id
-  })
-  return {
-    refresh: result.refresh,
-    access: result.access,
-    expires: result.expires,
-  }
+  const account = await login.complete({ callback, setCurrent: true })
+  return hostCredentialsFor(await getSharedAccessToken(account.id))
 }
 
 function textImageInput(): Array<'text' | 'image'> {
@@ -191,13 +130,17 @@ export const FALLBACK_MODEL_CATALOG: CatalogModel[] = [
   fallbackModel('claude-haiku-4-5', 'Claude Haiku 4.5', 200_000, 64_000),
 ]
 
+/**
+ * A live access token for the catalog request, only when the store already
+ * holds one: fetching the model list is not a reason to spend a refresh token.
+ */
 async function currentSharedAccessToken(): Promise<string | undefined> {
-  const loaded = await loadSharedAccountStore().catch(() => null)
-  if (!loaded) return undefined
-  const account = currentSharedAccount(loaded.store)
+  const accounts = await listSharedAccounts().catch(() => null)
+  if (!accounts) return undefined
+  const account = currentSharedAccount(accounts)
   if (!account || !sharedCredentialIsLive(account, Date.now())) return undefined
-  const credential = account.credential
-  return credential.type === 'oauth' ? credential.access : undefined
+  const token = await getSharedAccessToken(account.id).catch(() => null)
+  return token?.accessToken
 }
 
 export async function resolvePiModelCatalog(): Promise<CatalogModel[]> {
@@ -266,4 +209,4 @@ export default async function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
   })
 }
 
-export { forgetDeadRefreshTokens, refreshAnthropicToken }
+export { refreshAnthropicToken }

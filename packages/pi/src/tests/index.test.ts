@@ -1,15 +1,24 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  saveSharedAccountStore,
-  updateSharedAccountStore,
+  listSharedAccounts,
+  STORE_MANAGED_REFRESH_PLACEHOLDER,
 } from '@cortexkit/anthropic-auth-core'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
+import {
+  fakeAccessToken,
+  fakeRefreshToken,
+  type MockTokenServer,
+  seedStoreAccount,
+  startMockTokenServer,
+  type TempStore,
+  useTempStore,
+} from '../../../core/src/tests/support/store-fixture.ts'
 import cortexKitPiAnthropicAuth, {
-  forgetDeadRefreshTokens,
+  loginAnthropic,
   refreshAnthropicToken,
 } from '../index'
 
@@ -90,123 +99,6 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
     })
   })
 
-  async function seedRotatedStore(sharedExpiresAt: number) {
-    const directory = await mkdtemp(join(tmpdir(), 'pi-refresh-rotated-'))
-    tempDirectories.push(directory)
-    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
-    await saveSharedAccountStore({
-      version: 1,
-      current: 'pi-main',
-      accounts: [
-        {
-          id: 'pi-main',
-          credential: {
-            type: 'oauth',
-            access: 'rotated-access',
-            refresh: 'rotated-refresh',
-            expires_at: sharedExpiresAt,
-            refresh_expires_at: Date.now() + 86_400_000,
-          },
-          enabled: true,
-          created_at: new Date().toISOString(),
-        },
-      ],
-    })
-    let refreshCalls = 0
-    globalThis.fetch = (async () => {
-      refreshCalls += 1
-      return Response.json({
-        access_token: 'doomed-access',
-        refresh_token: 'doomed-refresh',
-        expires_in: 3600,
-      })
-    }) as unknown as typeof fetch
-    return { calls: () => refreshCalls }
-  }
-
-  test('adopts the rotated shared credential instead of spending a superseded refresh token', async () => {
-    const sharedExpiry = Date.now() + 3_600_000
-    const refresh = await seedRotatedStore(sharedExpiry)
-
-    await expect(
-      refreshAnthropicToken({
-        access: 'superseded-access',
-        refresh: 'superseded-refresh',
-        expires: Date.now() - 1_000,
-      }),
-    ).resolves.toEqual({
-      access: 'rotated-access',
-      refresh: 'rotated-refresh',
-      expires: sharedExpiry,
-    })
-    expect(refresh.calls()).toBe(0)
-  })
-
-  test('refreshes normally when the rotated shared credential is also expired', async () => {
-    const refresh = await seedRotatedStore(Date.now() - 1_000)
-
-    await expect(
-      refreshAnthropicToken({
-        access: 'superseded-access',
-        refresh: 'superseded-refresh',
-        expires: Date.now() - 1_000,
-      }),
-    ).resolves.toMatchObject({ access: 'doomed-access' })
-    expect(refresh.calls()).toBe(1)
-  })
-
-  test('uses the canonical winner when another process supersedes refresh CAS', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'pi-refresh-cas-'))
-    tempDirectories.push(directory)
-    const path = join(directory, 'accounts.json')
-    process.env.ANTHROPIC_ACCOUNTS_FILE = path
-    await saveSharedAccountStore({
-      version: 1,
-      current: 'pi-main',
-      accounts: [
-        {
-          id: 'pi-main',
-          credential: {
-            type: 'oauth',
-            access: 'old-access',
-            refresh: 'old-refresh',
-            expires_at: 1,
-            refresh_expires_at: Date.now() + 60_000,
-          },
-          enabled: true,
-          created_at: new Date().toISOString(),
-        },
-      ],
-    })
-    globalThis.fetch = (async () => {
-      await updateSharedAccountStore((store) => {
-        const account = store.accounts[0]
-        if (account?.credential.type === 'oauth') {
-          account.credential.access = 'winner-access'
-          account.credential.refresh = 'winner-refresh'
-          account.credential.expires_at = 9_999_999
-        }
-      })
-      return Response.json({
-        access_token: 'loser-access',
-        refresh_token: 'loser-refresh',
-        expires_in: 3600,
-      })
-    }) as unknown as typeof fetch
-
-    await expect(
-      refreshAnthropicToken({
-        access: 'old-access',
-        refresh: 'old-refresh',
-        expires: 1,
-      }),
-    ).resolves.toEqual({
-      access: 'winner-access',
-      refresh: 'winner-refresh',
-      expires: 9_999_999,
-    })
-  })
-
   test('exposes Claude Opus 5 in the Pi Anthropic catalog', async () => {
     await isolateCatalogState()
     globalThis.fetch = (() => {
@@ -231,264 +123,210 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
   })
 })
 
-describe('a revoked refresh token is only presented once', () => {
-  test('stops re-presenting a token Anthropic rejected with invalid_grant', async () => {
-    // Observed in production: Pi holds its own credential, which is not in the
-    // shared store, so the store's dead-token guard could never match it. When
-    // that family was revoked the same token was presented on every request —
-    // 156 rejected refreshes in one hour — and each failure surfaced to the
-    // user as "Authentication failed for anthropic".
-    forgetDeadRefreshTokens()
-    const directory = await mkdtemp(join(tmpdir(), 'pi-dead-refresh-'))
-    tempDirectories.push(directory)
-    // A path that does not exist: the store is empty, mirroring a host whose
-    // credential Pi holds privately.
-    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'absent.json')
+describe('refreshAnthropicToken answers from the account store', () => {
+  let store: TempStore
+  let mock: MockTokenServer
 
-    let tokenPosts = 0
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
-      if (url.includes('/v1/oauth/token')) {
-        tokenPosts += 1
-        return new Response(
-          '{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}',
-          { status: 400 },
-        )
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof fetch
+  function begin() {
+    store = useTempStore()
+    mock = startMockTokenServer()
+  }
 
-    const credentials = {
-      refresh: `sk-ant-ort01-${'z'.repeat(24)}`,
-      access: `sk-ant-oat01-${'z'.repeat(24)}`,
-      expires: Date.now() - 60_000,
-    }
-
-    const failures: string[] = []
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await refreshAnthropicToken(credentials).catch((error: Error) =>
-        failures.push(error.message),
-      )
-    }
-
-    // Every call still fails — the token really is dead — but only the first
-    // one reaches Anthropic.
-    expect(failures).toHaveLength(5)
-    expect(tokenPosts).toBe(1)
-    expect(failures.at(-1)).toContain('revoked')
-  })
-})
-
-describe('shared credential adoption skips dead accounts', () => {
-  test('adopts a live account when the first enabled one has expired', async () => {
-    // The chain behind the outage: `current` was unset, so account selection
-    // fell back to the first enabled account — whose access token had expired
-    // 35 hours earlier. Adoption declined it, and the caller then spent its own
-    // revoked refresh token instead of using one of five healthy logins.
-    forgetDeadRefreshTokens()
-    const directory = await mkdtemp(join(tmpdir(), 'pi-adopt-live-'))
-    tempDirectories.push(directory)
-    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
-
-    const oauth = (id: string, suffix: string, expiresAt: number) => ({
-      id,
-      label: id,
-      email: `${id}@example.com`,
-      credential: {
-        type: 'oauth' as const,
-        access: `sk-ant-oat01-${suffix.repeat(24)}`,
-        refresh: `sk-ant-ort01-${suffix.repeat(24)}`,
-        expires_at: expiresAt,
-        scopes: ['user:inference'],
-      },
-      enabled: true,
-      created_at: '2026-08-27T00:00:00.000Z',
-    })
-
-    await saveSharedAccountStore({
-      version: 1,
-      // No `current`, and the first account is long expired.
-      accounts: [
-        oauth('expired-first', 'a', Date.now() - 35 * 60 * 60_000),
-        oauth('live-second', 'b', Date.now() + 6 * 60 * 60_000),
-      ],
-    })
-
-    let tokenPosts = 0
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
-      if (url.includes('/v1/oauth/token')) {
-        tokenPosts += 1
-        return new Response('{"error": "invalid_grant"}', { status: 400 })
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof fetch
-
-    // A credential Pi holds privately, absent from the store and revoked.
-    const adopted = await refreshAnthropicToken({
-      refresh: `sk-ant-ort01-${'z'.repeat(24)}`,
-      access: `sk-ant-oat01-${'z'.repeat(24)}`,
-      expires: Date.now() - 60_000,
-    })
-
-    // The live account's credential was adopted; the dead token was never spent.
-    expect(adopted.access).toContain('b'.repeat(24))
-    expect(tokenPosts).toBe(0)
-  })
-})
-
-describe('shared refresh lease safety', () => {
-  test('honors the host abort signal before spending a refresh token', async () => {
-    const controller = new AbortController()
-    controller.abort(new Error('host cancelled'))
-    let posts = 0
-    globalThis.fetch = (async () => {
-      posts += 1
-      throw new Error('must not fetch')
-    }) as unknown as typeof fetch
-
-    await expect(
-      refreshAnthropicToken(
-        { access: 'old-access', refresh: 'old-refresh', expires: 1 },
-        controller.signal,
-      ),
-    ).rejects.toThrow('host cancelled')
-    expect(posts).toBe(0)
+  afterEach(() => {
+    mock?.stop()
+    store?.dispose()
   })
 
-  test('never spends a refresh token after claim contention times out', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'pi-refresh-held-'))
-    tempDirectories.push(directory)
-    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
-    await saveSharedAccountStore({
-      version: 1,
-      current: 'pi-main',
-      accounts: [
-        {
-          id: 'pi-main',
-          enabled: true,
-          created_at: new Date().toISOString(),
-          credential: {
-            type: 'oauth',
-            access: 'old-access',
-            refresh: 'old-refresh',
-            expires_at: 1,
-          },
-          refresh_lease: {
-            id: 'peer',
-            until: Date.now() + 60_000,
-            token_fingerprint: 'peer',
-            holder_pid: 42,
-          },
-        },
-      ],
-    })
-    let posts = 0
-    globalThis.fetch = (async () => {
-      posts += 1
-      return Response.json({
-        access_token: 'bad',
-        refresh_token: 'bad',
-        expires_in: 3600,
-      })
-    }) as unknown as typeof fetch
+  test('a placeholder credential gets the live store token without a refresh', async () => {
+    begin()
+    const seeded = await seedStoreAccount({ label: 'main' })
 
-    await expect(
-      refreshAnthropicToken(
-        { access: 'old-access', refresh: 'old-refresh', expires: 1 },
-        { claimMaxAttempts: 0 },
-      ),
-    ).rejects.toThrow('refresh claim')
-    expect(posts).toBe(0)
+    const rotated = await refreshAnthropicToken({
+      access: '',
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: 0,
+    })
+
+    expect(rotated.access).toBe(seeded.access)
+    expect(rotated.refresh).toBe(STORE_MANAGED_REFRESH_PLACEHOLDER)
+    expect(rotated.expires).toBeGreaterThan(Date.now())
+    expect(mock.presented).toEqual([])
   })
 
-  test('rejects a refresh timeout that can outlive the shared lease', async () => {
-    let posts = 0
-    globalThis.fetch = (async () => {
-      posts += 1
-      throw new Error('must not fetch')
-    }) as unknown as typeof fetch
+  test('an expired store token is refreshed once, by the store', async () => {
+    begin()
+    const seeded = await seedStoreAccount({
+      label: 'main',
+      expiresAt: Date.now() - 60_000,
+    })
 
-    await expect(
-      refreshAnthropicToken(
-        { access: 'old-access', refresh: 'old-refresh', expires: 1 },
-        { refreshTimeoutMs: 30_000 },
-      ),
-    ).rejects.toThrow('below the refresh lease')
-    expect(posts).toBe(0)
+    const rotated = await refreshAnthropicToken({
+      access: '',
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: 0,
+    })
+
+    expect(mock.presented).toEqual([seeded.refresh])
+    expect(rotated).toEqual({
+      access: mock.rotatedAccess(1),
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: expect.any(Number),
+    })
+    // The next ask is served from the store: nothing is spent twice.
+    await refreshAnthropicToken({
+      access: rotated.access,
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: rotated.expires,
+    })
+    expect(mock.presented).toHaveLength(1)
   })
 
-  test('adopts native rotation into the shared store and releases its lease', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'pi-native-adopt-'))
-    tempDirectories.push(directory)
-    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
-    process.env.CLAUDE_CONFIG_DIR = directory
-    await saveSharedAccountStore({
-      version: 1,
-      current: 'missing',
-      accounts: [
-        {
-          id: 'pi-main',
-          enabled: true,
-          created_at: new Date().toISOString(),
-          credential: {
-            type: 'oauth',
-            access: 'old-access',
-            refresh: 'old-refresh',
-            expires_at: 1,
-          },
-        },
-      ],
-    })
-    const expiresAt = Date.now() + 3_600_000
-    await writeFile(
-      join(directory, '.credentials.json'),
-      JSON.stringify({
-        claudeAiOauth: {
-          accessToken: 'native-access',
-          refreshToken: 'native-refresh',
-          expiresAt,
-        },
-      }),
-    )
-    let posts = 0
-    globalThis.fetch = (async () => {
-      posts += 1
-      throw new Error('must not fetch')
-    }) as unknown as typeof fetch
+  test('a real refresh token held by Pi moves into the store once', async () => {
+    begin()
+    const access = fakeAccessToken(`pihost${process.pid}a`)
+    const refresh = fakeRefreshToken(`pihost${process.pid}a`)
 
+    const first = await refreshAnthropicToken({
+      access,
+      refresh,
+      expires: Date.now() + 3_600_000,
+    })
+
+    // Pi gets the store's (still live) token and never its refresh token back.
+    expect(first).toEqual({
+      access,
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: expect.any(Number),
+    })
+    const rows = await listSharedAccounts()
+    expect(rows).toHaveLength(1)
+    expect(mock.presented).toEqual([])
+
+    // A second call with the credential Pi now stores imports nothing.
+    await refreshAnthropicToken(first)
+    expect(await listSharedAccounts()).toHaveLength(1)
+  })
+
+  test('the store copy wins over the same login held by Pi', async () => {
+    begin()
+    const seeded = await seedStoreAccount({
+      label: 'main',
+      expiresAt: Date.now() + 3_600_000,
+    })
+
+    const result = await refreshAnthropicToken({
+      access: seeded.access,
+      refresh: seeded.refresh,
+      expires: Date.now() - 1_000,
+    })
+
+    expect(result.access).toBe(seeded.access)
+    expect(result.refresh).toBe(STORE_MANAGED_REFRESH_PLACEHOLDER)
+    expect(await listSharedAccounts()).toHaveLength(1)
+    expect(mock.presented).toEqual([])
+  })
+
+  test('a host token the store cannot parse asks for a re-login and spends nothing', async () => {
+    begin()
     await expect(
       refreshAnthropicToken({
-        access: 'old-access',
-        refresh: 'old-refresh',
-        expires: 1,
+        access: 'yiyi-access',
+        refresh: 'yiyi-refresh',
+        expires: Date.now() - 1_000,
       }),
-    ).resolves.toEqual({
-      access: 'native-access',
-      refresh: 'native-refresh',
-      expires: expiresAt,
+    ).rejects.toThrow('log in again')
+    expect(await listSharedAccounts()).toEqual([])
+    expect(mock.presented).toEqual([])
+  })
+
+  test('a revoked store token is presented once, then refused locally', async () => {
+    begin()
+    const seeded = await seedStoreAccount({
+      label: 'main',
+      expiresAt: Date.now() - 60_000,
     })
-    const stored = JSON.parse(
-      await readFile(process.env.ANTHROPIC_ACCOUNTS_FILE, 'utf8'),
+    mock.dead.add(seeded.refresh)
+    const credential = {
+      access: '',
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: 0,
+    }
+
+    await expect(refreshAnthropicToken(credential)).rejects.toMatchObject({
+      code: 'invalid_grant',
+    })
+    await expect(refreshAnthropicToken(credential)).rejects.toBeDefined()
+
+    expect(mock.presented).toEqual([seeded.refresh])
+    const [row] = await listSharedAccounts()
+    expect(row?.refreshDead).toBe(true)
+  })
+
+  test('honors the host abort signal before touching the store', async () => {
+    begin()
+    const seeded = await seedStoreAccount({
+      label: 'main',
+      expiresAt: Date.now() - 60_000,
+    })
+    const controller = new AbortController()
+    controller.abort(new Error('host aborted'))
+
+    await expect(
+      refreshAnthropicToken(
+        { access: '', refresh: seeded.refresh, expires: 0 },
+        controller.signal,
+      ),
+    ).rejects.toThrow('host aborted')
+    expect(mock.presented).toEqual([])
+  })
+})
+
+describe('loginAnthropic', () => {
+  let store: TempStore
+  let mock: MockTokenServer
+
+  afterEach(() => {
+    mock?.stop()
+    store?.dispose()
+  })
+
+  test('the binding exchanges the code and Pi receives only the placeholder refresh', async () => {
+    store = useTempStore()
+    mock = startMockTokenServer()
+    const tag = `pilogin${process.pid}`
+    mock.codes.set('the-code', {
+      email: 'login@example.com',
+      accountUuid: `uuid-${tag}`,
+      tag,
+    })
+
+    let authUrl = ''
+    const credentials = await loginAnthropic({
+      onAuth: ({ url }: { url: string }) => {
+        authUrl = url
+      },
+      onPrompt: async () => {
+        const state = new URL(authUrl).searchParams.get('state')
+        return `the-code#${state}`
+      },
+    } as never)
+
+    expect(credentials).toEqual({
+      access: mock.loginAccess(tag),
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: expect.any(Number),
+    })
+    expect(mock.codeExchanges).toHaveLength(1)
+    // The redirect URI the exchange used is the loopback one the URL named.
+    expect(mock.codeExchanges[0]?.redirect_uri).toBe(
+      new URL(authUrl).searchParams.get('redirect_uri') ?? '',
     )
-    expect(stored.current).toBe('pi-main')
-    expect(stored.accounts[0].credential).toMatchObject({
-      access: 'native-access',
-      refresh: 'native-refresh',
-      expires_at: expiresAt,
+    const rows = await listSharedAccounts()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      email: 'login@example.com',
+      current: true,
     })
-    expect(stored.accounts[0].refresh_lease).toBeUndefined()
-    expect(posts).toBe(0)
   })
 })
 

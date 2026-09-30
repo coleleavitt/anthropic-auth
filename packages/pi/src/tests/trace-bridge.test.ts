@@ -3,13 +3,17 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { saveSharedAccountStore } from '@cortexkit/anthropic-auth-core'
+import { STORE_MANAGED_REFRESH_PLACEHOLDER } from '@cortexkit/anthropic-auth-core'
 
-import { resolvePiModelCatalog } from '../index.ts'
 import {
-  forgetDeadRefreshTokens,
-  refreshAnthropicToken,
-} from '../shared-refresh.ts'
+  type MockTokenServer,
+  seedStoreAccount,
+  startMockTokenServer,
+  type TempStore,
+  useTempStore,
+} from '../../../core/src/tests/support/store-fixture.ts'
+import { resolvePiModelCatalog } from '../index.ts'
+import { refreshAnthropicToken } from '../shared-refresh.ts'
 import { streamCortexKitAnthropic } from '../stream.ts'
 import {
   errorHttpStatus,
@@ -240,101 +244,46 @@ describe('trace bridge', () => {
 })
 
 describe('auth.refresh spans', () => {
-  const originalFetch = globalThis.fetch
-  const originalStorePath = process.env.ANTHROPIC_ACCOUNTS_FILE
-  const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
-  let directory: string
+  let store: TempStore
+  let mock: MockTokenServer
 
-  beforeEach(async () => {
-    forgetDeadRefreshTokens()
-    directory = await mkdtemp(join(tmpdir(), 'pi-trace-refresh-'))
-    process.env.ANTHROPIC_ACCOUNTS_FILE = join(directory, 'accounts.json')
-    // Keep the developer's real Claude Code credential out of adoption.
-    process.env.CLAUDE_CONFIG_DIR = join(directory, 'claude')
+  beforeEach(() => {
+    store = useTempStore()
+    mock = startMockTokenServer()
   })
 
-  afterEach(async () => {
-    globalThis.fetch = originalFetch
-    if (originalStorePath === undefined)
-      delete process.env.ANTHROPIC_ACCOUNTS_FILE
-    else process.env.ANTHROPIC_ACCOUNTS_FILE = originalStorePath
-    if (originalClaudeConfigDir === undefined)
-      delete process.env.CLAUDE_CONFIG_DIR
-    else process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir
-    await rm(directory, { recursive: true, force: true })
+  afterEach(() => {
+    mock.stop()
+    store.dispose()
   })
 
-  const refresh = `sk-ant-ort01-${'t'.repeat(24)}`
-  const access = `sk-ant-oat01-${'t'.repeat(24)}`
+  const placeholder = {
+    access: '',
+    refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+    expires: Date.now() - 1_000,
+  }
 
-  async function seedStore() {
-    await saveSharedAccountStore({
-      version: 1,
-      current: 'pi-main',
-      accounts: [
-        {
-          id: 'pi-main',
-          credential: {
-            type: 'oauth',
-            access,
-            refresh,
-            expires_at: Date.now() - 1_000,
-            refresh_expires_at: Date.now() + 86_400_000,
-          },
-          enabled: true,
-          created_at: new Date().toISOString(),
-        },
-      ],
+  test('records one ok span for a refresh the store performed', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'pi-main',
+      expiresAt: Date.now() - 1_000,
     })
-  }
-
-  function fakeTokenEndpoint(reply: () => Response) {
-    let posts = 0
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
-      if (url.includes('/v1/oauth/token')) {
-        posts += 1
-        return reply()
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof fetch
-    return () => posts
-  }
-
-  test('records one ok span for a successful refresh', async () => {
-    await seedStore()
-    const posts = fakeTokenEndpoint(() =>
-      Response.json({
-        access_token: `sk-ant-oat01-${'n'.repeat(24)}`,
-        refresh_token: `sk-ant-ort01-${'n'.repeat(24)}`,
-        expires_in: 3600,
-      }),
-    )
     const host = fakeTraceApi()
     setTraceApiForTests(host.api)
 
-    const rotated = await refreshAnthropicToken({
-      refresh,
-      access,
-      expires: Date.now() - 1_000,
-    })
+    const rotated = await refreshAnthropicToken(placeholder)
 
-    expect(rotated.access).toContain('n'.repeat(24))
-    expect(posts()).toBe(1)
+    expect(rotated.access).toBe(mock.rotatedAccess(1))
+    expect(mock.presented).toEqual([seeded.refresh])
     const refreshes = host.spans.filter((span) => span.name === 'auth.refresh')
     expect(refreshes).toHaveLength(1)
     expect(refreshes[0]).toMatchObject({
       status: 'ok',
       attrs: {
-        'auth.account': 'pi-main',
+        'auth.account': seeded.id,
         'auth.reason': 'expired',
         'auth.outcome': 'ok',
-        'auth.source': 'refreshed',
+        'auth.source': 'store-refreshed',
       },
     })
     // Attributes carry ids and fingerprints, never token material.
@@ -343,77 +292,46 @@ describe('auth.refresh spans', () => {
     }
   })
 
-  test('records one revoked span with the HTTP status for invalid_grant', async () => {
-    await seedStore()
-    const posts = fakeTokenEndpoint(
-      () =>
-        new Response(
-          '{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}',
-          { status: 400 },
-        ),
-    )
+  test('records one revoked span for invalid_grant', async () => {
+    const seeded = await seedStoreAccount({
+      label: 'pi-main',
+      expiresAt: Date.now() - 1_000,
+    })
+    mock.dead.add(seeded.refresh)
     const host = fakeTraceApi()
     setTraceApiForTests(host.api)
 
     await expect(
-      refreshAnthropicToken(
-        { refresh, access, expires: Date.now() - 1_000 },
-        { reason: 'forced' },
-      ),
-    ).rejects.toThrow('invalid_grant')
+      refreshAnthropicToken(placeholder, { reason: 'forced' }),
+    ).rejects.toMatchObject({ code: 'invalid_grant' })
 
-    expect(posts()).toBe(1)
+    expect(mock.presented).toEqual([seeded.refresh])
     const refreshes = host.spans.filter((span) => span.name === 'auth.refresh')
     expect(refreshes).toHaveLength(1)
     expect(refreshes[0]).toMatchObject({
       status: 'error',
       attrs: {
-        'auth.account': 'pi-main',
         'auth.reason': 'forced',
         'auth.outcome': 'revoked',
-        'http.status': 400,
       },
     })
   })
 
-  test('marks a refresh the plugin declined to spend as refused', async () => {
-    await seedStore()
-    const posts = fakeTokenEndpoint(() => {
-      throw new Error('must not fetch')
-    })
+  test('marks a credential the store refuses to import as refused', async () => {
     const host = fakeTraceApi()
     setTraceApiForTests(host.api)
 
     await expect(
-      refreshAnthropicToken(
-        { refresh, access, expires: Date.now() - 1_000 },
-        { refreshTimeoutMs: 30_000 },
-      ),
-    ).rejects.toThrow('below the refresh lease')
+      refreshAnthropicToken({
+        refresh: 'not-a-refresh-token',
+        access: 'not-an-access-token',
+        expires: Date.now() - 1_000,
+      }),
+    ).rejects.toThrow('log in again')
 
-    expect(posts()).toBe(0)
+    expect(mock.presented).toEqual([])
     expect(host.spans).toHaveLength(1)
     expect(host.spans[0]!.attrs['auth.outcome']).toBe('refused')
-  })
-
-  test('labels a credential the store has never seen by fingerprint only', async () => {
-    fakeTokenEndpoint(
-      () => new Response('{"error": "invalid_grant"}', { status: 400 }),
-    )
-    const host = fakeTraceApi()
-    setTraceApiForTests(host.api)
-
-    await refreshAnthropicToken({
-      refresh: `sk-ant-ort01-${'q'.repeat(24)}`,
-      access: `sk-ant-oat01-${'q'.repeat(24)}`,
-      expires: Date.now() + 60_000,
-    }).catch(() => {})
-
-    expect(host.spans).toHaveLength(1)
-    const attrs = host.spans[0]!.attrs
-    expect(attrs['auth.reason']).toBe('preemptive')
-    expect(attrs['auth.outcome']).toBe('revoked')
-    expect(String(attrs['auth.account'])).toMatch(/^[0-9a-f]{8}$/)
   })
 })
 
@@ -495,24 +413,9 @@ describe('auth.route spans', () => {
   })
 
   test('names the selected shared account under the ambient request span', async () => {
-    await saveSharedAccountStore({
-      version: 1,
-      current: 'shared-main',
-      accounts: [
-        {
-          id: 'shared-main',
-          label: 'shared-main',
-          credential: {
-            type: 'oauth',
-            access: `sk-ant-oat01-${'a'.repeat(24)}`,
-            refresh: `sk-ant-ort01-${'a'.repeat(24)}`,
-            expires_at: Date.now() + 24 * 60 * 60_000,
-            scopes: ['user:inference'],
-          },
-          enabled: true,
-          created_at: '2026-08-14T00:00:00.000Z',
-        },
-      ],
+    const seeded = await seedStoreAccount({
+      label: 'shared-main',
+      expiresAt: Date.now() + 24 * 60 * 60_000,
     })
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url =
@@ -568,7 +471,7 @@ describe('auth.route spans', () => {
       status: 'ok',
       attrs: {
         'auth.pool_size': 1,
-        'auth.selected': 'shared-main',
+        'auth.selected': seeded.id,
         'auth.outcome': 'selected',
       },
     })

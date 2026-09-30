@@ -12,7 +12,19 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
-import { saveAccounts, tokenFingerprint } from '@cortexkit/anthropic-auth-core'
+import {
+  handleSharedUnauthorized,
+  saveAccounts,
+  tokenFingerprint,
+} from '@cortexkit/anthropic-auth-core'
+
+import {
+  type MockTokenServer,
+  seedStoreAccount,
+  startMockTokenServer,
+  type TempStore,
+  useTempStore,
+} from '../../../core/src/tests/support/store-fixture.ts'
 
 import {
   buildExplicitBaseMessagesUrl,
@@ -90,6 +102,29 @@ afterEach(async () => {
   tempDir = undefined
 })
 
+/**
+ * Seed the store (through the binding) for a routing test. The first label
+ * becomes the store's `current` account, i.e. Pi's main; the rest are
+ * fallbacks. Resolves the seeded rows in order.
+ */
+let routingStore: TempStore | undefined
+let routingTokenServer: MockTokenServer | undefined
+afterEach(() => {
+  routingTokenServer?.stop()
+  routingTokenServer = undefined
+  routingStore?.dispose()
+  routingStore = undefined
+})
+async function seedRoutingStore(
+  accounts: Array<{ label: string; expiresAt?: number }>,
+) {
+  routingStore = useTempStore()
+  routingTokenServer = startMockTokenServer()
+  const seeded = []
+  for (const account of accounts) seeded.push(await seedStoreAccount(account))
+  return seeded
+}
+
 describe('Pi API fallback routing helpers', () => {
   test('preserves provider base path when building /v1/messages URL', () => {
     const url = buildExplicitBaseMessagesUrl('https://api.kie.ai/claude')
@@ -158,6 +193,11 @@ describe('Pi API fallback routing helpers', () => {
       tempDir,
       'sticky-routes.json',
     )
+    const [main, scarce, abundant] = await seedRoutingStore([
+      { label: 'main' },
+      { label: 'yiyi' },
+      { label: 'ufuk2' },
+    ])
     const checkedAt = Date.now()
     const quota = (fableRemaining: number) => ({
       checkedAt,
@@ -201,26 +241,12 @@ describe('Pi API fallback routing helpers', () => {
           failClosedOnUnknownQuota: true,
           mainQuota: quota(0),
           mainQuotaCheckedAt: checkedAt,
-          mainQuotaToken: tokenFingerprint('main-access'),
+          mainQuotaToken: tokenFingerprint(main!.access),
         },
         routing: { mode: 'sticky-balanced' },
         accounts: [
-          {
-            id: 'yiyi',
-            type: 'oauth',
-            access: 'scarce-access',
-            refresh: 'scarce-refresh',
-            expires: checkedAt + 5 * 60 * 60_000,
-            quota: quota(13),
-          },
-          {
-            id: 'ufuk2',
-            type: 'oauth',
-            access: 'abundant-access',
-            refresh: 'abundant-refresh',
-            expires: checkedAt + 5 * 60 * 60_000,
-            quota: quota(98),
-          },
+          { id: scarce!.id, type: 'oauth', quota: quota(13) },
+          { id: abundant!.id, type: 'oauth', quota: quota(98) },
         ],
       },
       storagePath,
@@ -252,7 +278,7 @@ describe('Pi API fallback routing helpers', () => {
         const authorization =
           new Headers(init?.headers).get('authorization') ?? ''
         authorizations.push(authorization)
-        if (authorization === 'Bearer main-access') {
+        if (authorization === `Bearer ${main!.access}`) {
           return Promise.resolve(new Response('unauthorized', { status: 401 }))
         }
         return Promise.resolve(
@@ -273,7 +299,7 @@ describe('Pi API fallback routing helpers', () => {
         anthropicModel,
         anthropicContext,
         {
-          apiKey: 'main-access',
+          apiKey: main!.access,
           sessionId: 'ses_pi_sticky',
         },
       )
@@ -286,7 +312,7 @@ describe('Pi API fallback routing helpers', () => {
       { ...anthropicModel, id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
       anthropicContext,
       {
-        apiKey: 'main-access',
+        apiKey: main!.access,
         sessionId: 'ses_pi_direct_opus',
       },
     )
@@ -295,10 +321,10 @@ describe('Pi API fallback routing helpers', () => {
     }
 
     expect(authorizations).toEqual([
-      'Bearer abundant-access',
-      'Bearer abundant-access',
-      'Bearer main-access',
-      'Bearer abundant-access',
+      `Bearer ${abundant!.access}`,
+      `Bearer ${abundant!.access}`,
+      `Bearer ${main!.access}`,
+      `Bearer ${abundant!.access}`,
     ])
   })
 
@@ -310,6 +336,18 @@ describe('Pi API fallback routing helpers', () => {
       tempDir,
       'sticky-routes.json',
     )
+    // The main login was revoked server-side: a 401 on its (unexpired) access
+    // token made the store present its refresh token, which came back
+    // invalid_grant, so the store records it dead (re-login needed). The
+    // fallbacks are healthy logins whose host quota says Fable is exhausted.
+    const [main, fallbackA, fallbackB] = await seedRoutingStore([
+      { label: 'main' },
+      { label: 'fallback-a' },
+      { label: 'fallback-b' },
+    ])
+    routingTokenServer!.dead.add(main!.refresh)
+    const recovery = await handleSharedUnauthorized(main!.access)
+    expect(recovery.retry).toBe(false)
     const checkedAt = Date.now()
     const quota = (fableRemaining: number) => ({
       checkedAt,
@@ -345,12 +383,6 @@ describe('Pi API fallback routing helpers', () => {
           enabled: true,
           intervalMinutes: 10,
           refreshBeforeExpiryMinutes: 240,
-          mainLastRefreshError: {
-            message: 'invalid_grant',
-            checkedAt,
-            status: 400,
-            permanent: true,
-          },
         },
         quota: {
           enabled: true,
@@ -359,26 +391,12 @@ describe('Pi API fallback routing helpers', () => {
           failClosedOnUnknownQuota: true,
           mainQuota: quota(88),
           mainQuotaCheckedAt: checkedAt,
-          mainQuotaToken: tokenFingerprint('main-access'),
+          mainQuotaToken: tokenFingerprint(main!.access),
         },
         routing: { mode: 'sticky-balanced' },
         accounts: [
-          {
-            id: 'fallback-a',
-            type: 'oauth',
-            access: 'fallback-a-access',
-            refresh: 'fallback-a-refresh',
-            expires: checkedAt + 5 * 60 * 60_000,
-            quota: quota(0),
-          },
-          {
-            id: 'fallback-b',
-            type: 'oauth',
-            access: 'fallback-b-access',
-            refresh: 'fallback-b-refresh',
-            expires: checkedAt + 5 * 60 * 60_000,
-            quota: quota(0),
-          },
+          { id: fallbackA!.id, type: 'oauth', quota: quota(0) },
+          { id: fallbackB!.id, type: 'oauth', quota: quota(0) },
         ],
       },
       storagePath,
@@ -398,7 +416,7 @@ describe('Pi API fallback routing helpers', () => {
 
     const events = []
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
-      apiKey: 'main-access',
+      apiKey: main!.access,
       sessionId: 'ses_pi_sticky_no_fable_route',
     })
     for await (const event of stream) events.push(event)
@@ -419,6 +437,10 @@ describe('Pi API fallback routing helpers', () => {
       tempDir,
       'sticky-routes.json',
     )
+    const [main, oauthFallback] = await seedRoutingStore([
+      { label: 'main' },
+      { label: 'oauth-fallback' },
+    ])
     const checkedAt = Date.now()
     const quota = (remainingPercent: number) => ({
       checkedAt,
@@ -455,18 +477,11 @@ describe('Pi API fallback routing helpers', () => {
           failClosedOnUnknownQuota: true,
           mainQuota: quota(0),
           mainQuotaCheckedAt: checkedAt,
-          mainQuotaToken: tokenFingerprint('main-access'),
+          mainQuotaToken: tokenFingerprint(main!.access),
         },
         routing: { mode: 'sticky-balanced' },
         accounts: [
-          {
-            id: 'oauth-fallback',
-            type: 'oauth',
-            access: 'fallback-access',
-            refresh: 'fallback-refresh',
-            expires: checkedAt + 5 * 60 * 60_000,
-            quota: quota(100),
-          },
+          { id: oauthFallback!.id, type: 'oauth', quota: quota(100) },
           {
             id: 'api-fallback',
             type: 'api',
@@ -519,7 +534,7 @@ describe('Pi API fallback routing helpers', () => {
           apiBody = JSON.parse(String(init?.body))
           apiBetas = new Headers(init?.headers).get('anthropic-beta') ?? ''
         }
-        if (authorization === 'Bearer fallback-access') {
+        if (authorization === `Bearer ${oauthFallback!.access}`) {
           return Promise.resolve(new Response('exhausted', { status: 429 }))
         }
         return Promise.resolve(
@@ -576,7 +591,7 @@ describe('Pi API fallback routing helpers', () => {
       anthropicModel,
       markerContext as never,
       {
-        apiKey: 'main-access',
+        apiKey: main!.access,
         sessionId: 'ses_pi_sticky_api',
       },
     )
@@ -584,7 +599,10 @@ describe('Pi API fallback routing helpers', () => {
       // Drain the provider stream.
     }
 
-    expect(authorizations).toEqual(['Bearer fallback-access', 'Bearer api-key'])
+    expect(authorizations).toEqual([
+      `Bearer ${oauthFallback!.access}`,
+      'Bearer api-key',
+    ])
     expect(apiBody?.fallbacks).toBeUndefined()
     expect(JSON.stringify(apiBody)).not.toContain(
       'cortexkit-server-fallback-v1:',
@@ -1663,6 +1681,7 @@ describe('Pi routes from the shared account store', () => {
 
 describe('Pi credential fallback', () => {
   const sharedStoreDir = sharedTestDir
+  let tokenServer: MockTokenServer | undefined
 
   async function writeSharedStore(accounts: unknown[]) {
     await mkdir(sharedStoreDir, { recursive: true })
@@ -1677,6 +1696,8 @@ describe('Pi credential fallback', () => {
   })
 
   afterEach(async () => {
+    tokenServer?.stop()
+    tokenServer = undefined
     await rm(join(sharedStoreDir, 'accounts.json'), { force: true })
   })
 
@@ -1700,6 +1721,10 @@ describe('Pi credential fallback', () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-no-host-key-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
 
+    // The store refreshes through this mock (the Rust binding does not use
+    // `globalThis.fetch`). The 'r' fixture stands in for a revoked login.
+    tokenServer = startMockTokenServer()
+    tokenServer.dead.add(`sk-ant-ort01-${'r'.repeat(24)}`)
     const seenTokens: string[] = []
     globalThis.fetch = mock(
       (input: string | URL | Request, init?: RequestInit) => {
@@ -1709,27 +1734,6 @@ describe('Pi credential fallback', () => {
             : input instanceof URL
               ? input.toString()
               : input.url
-        if (url.includes('/v1/oauth/token')) {
-          const body = String(init?.body ?? '')
-          // The 'r' fixture stands in for a revoked login.
-          if (body.includes('sk-ant-ort01-rrr')) {
-            return Promise.resolve(
-              new Response(JSON.stringify({ error: 'invalid_grant' }), {
-                status: 400,
-              }),
-            )
-          }
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                access_token: 'sk-ant-oat01-refreshed',
-                refresh_token: 'sk-ant-ort01-rotated',
-                expires_in: 3600,
-              }),
-              { status: 200 },
-            ),
-          )
-        }
         if (!url.includes('/v1/messages')) {
           return Promise.resolve(new Response('{}', { status: 200 }))
         }
@@ -1809,12 +1813,18 @@ describe('Pi credential fallback', () => {
   })
 
   async function runSharedWithMessages(
-    respond: (authorization: string, call: number) => Response,
+    respond: (
+      authorization: string,
+      call: number,
+      rotatedAccess: (n: number) => string,
+    ) => Response,
   ) {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-shared-401-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+    const server = startMockTokenServer()
+    tokenServer = server
+    server.dead.add(`sk-ant-ort01-${'r'.repeat(24)}`)
     const seenTokens: string[] = []
-    let refreshCalls = 0
     globalThis.fetch = mock(
       (input: string | URL | Request, init?: RequestInit) => {
         const url =
@@ -1823,34 +1833,15 @@ describe('Pi credential fallback', () => {
             : input instanceof URL
               ? input.toString()
               : input.url
-        if (url.includes('/v1/oauth/token')) {
-          refreshCalls += 1
-          const body = String(init?.body ?? '')
-          if (body.includes('sk-ant-ort01-rrr')) {
-            return Promise.resolve(
-              new Response(JSON.stringify({ error: 'invalid_grant' }), {
-                status: 400,
-              }),
-            )
-          }
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                access_token: 'sk-ant-oat01-refreshed-after-401',
-                refresh_token: 'sk-ant-ort01-rotated-after-401',
-                expires_in: 3600,
-              }),
-              { status: 200 },
-            ),
-          )
-        }
         if (!url.includes('/v1/messages')) {
           return Promise.resolve(new Response('{}', { status: 200 }))
         }
         const authorization =
           new Headers(init?.headers).get('authorization') ?? ''
         seenTokens.push(authorization)
-        return Promise.resolve(respond(authorization, seenTokens.length))
+        return Promise.resolve(
+          respond(authorization, seenTokens.length, server.rotatedAccess),
+        )
       },
     ) as unknown as typeof fetch
 
@@ -1866,7 +1857,8 @@ describe('Pi credential fallback', () => {
       terminalTypes,
       result: await stream.result(),
       seenTokens,
-      refreshCalls: () => refreshCalls,
+      refreshCalls: () => server.presented.length,
+      rotatedAccess: server.rotatedAccess,
     }
   }
 
@@ -1893,8 +1885,8 @@ describe('Pi credential fallback', () => {
     const shared = sharedOAuthAccount('shared-main', 'a')
     await writeSharedStore([shared])
 
-    const run = await runSharedWithMessages((authorization) =>
-      authorization.includes('refreshed-after-401')
+    const run = await runSharedWithMessages((authorization, _call, rotated) =>
+      authorization === `Bearer ${rotated(1)}`
         ? new Response(okSse, { status: 200 })
         : unauthorizedResponse(),
     )
@@ -1902,7 +1894,7 @@ describe('Pi credential fallback', () => {
     expect(run.terminalTypes).toEqual(['done'])
     expect(run.seenTokens).toEqual([
       `Bearer ${shared.credential.access}`,
-      'Bearer sk-ant-oat01-refreshed-after-401',
+      `Bearer ${run.rotatedAccess(1)}`,
     ])
     expect(run.refreshCalls()).toBe(1)
   })
@@ -1975,7 +1967,7 @@ describe('Pi credential fallback', () => {
     const { terminalTypes, seenTokens } = await runWithoutHostKey()
 
     expect(terminalTypes).toEqual(['done'])
-    expect(seenTokens.some((token) => token.includes('refreshed'))).toBe(true)
+    expect(seenTokens).toEqual([`Bearer ${tokenServer?.rotatedAccess(1)}`])
   })
 
   test('tries the next account when one refresh token is revoked', async () => {
@@ -1988,7 +1980,13 @@ describe('Pi credential fallback', () => {
     const { terminalTypes, seenTokens } = await runWithoutHostKey()
 
     expect(terminalTypes).toEqual(['done'])
-    expect(seenTokens.some((token) => token.includes('refreshed'))).toBe(true)
+    expect(seenTokens).toEqual([`Bearer ${tokenServer?.rotatedAccess(1)}`])
+    // The revoked login was presented at most once and is now recorded dead.
+    expect(
+      tokenServer?.presented.filter(
+        (token) => token === `sk-ant-ort01-${'r'.repeat(24)}`,
+      ).length,
+    ).toBeLessThanOrEqual(1)
   })
 
   test('names both stores when neither holds a credential', async () => {

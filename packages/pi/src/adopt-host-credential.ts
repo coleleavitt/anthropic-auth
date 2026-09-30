@@ -16,7 +16,8 @@
  * `auth.json` is therefore the single case nothing covered.
  *
  * Adoption is a seed, not a sync: it never overwrites an entry Pi already has.
- * Once seeded, `refreshAnthropicToken` owns rotation.
+ * The seed carries the store placeholder, never a real refresh token; once
+ * seeded, `refreshAnthropicToken` answers every refresh from the store.
  */
 import {
   existsSync,
@@ -27,7 +28,13 @@ import {
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 
-import { loadSharedAccountStore, logger } from '@cortexkit/anthropic-auth-core'
+import {
+  getSharedAccessToken,
+  listSharedAccounts,
+  logger,
+  type SharedAnthropicAccount,
+  STORE_MANAGED_REFRESH_PLACEHOLDER,
+} from '@cortexkit/anthropic-auth-core'
 
 import { getPiConfigDir } from './paths.ts'
 import {
@@ -84,24 +91,21 @@ function hasHostAnthropicEntry(auth: Record<string, unknown>): boolean {
  * Pick the account to seed.
  *
  * A live access token is preferred. Failing that, any enabled OAuth account
- * holding a refresh token still beats adopting nothing: Pi's stored-credential
- * gate does not check expiry, so the seeded entry lets the run start, and Pi's
- * first `getApiKey` sees the expired timestamp and routes through
- * `refreshAnthropicToken`, which reconciles against the shared store properly.
+ * whose refresh token is not recorded dead still beats adopting nothing: Pi's
+ * stored-credential gate does not check expiry, so the seeded (expired) entry
+ * lets the run start, and Pi's first `getApiKey` routes through
+ * `refreshAnthropicToken`, which asks the store for a live token.
  */
 function selectAccountToAdopt(
-  store: Awaited<ReturnType<typeof loadSharedAccountStore>>['store'],
+  accounts: readonly SharedAnthropicAccount[],
   now: number,
 ) {
-  const live = currentSharedAccount(store, now)
+  const live = currentSharedAccount(accounts, now)
   if (live && sharedCredentialIsLive(live, now)) {
     return { account: live, refreshPending: false }
   }
-  const refreshable = store.accounts.find(
-    (entry) =>
-      entry.enabled !== false &&
-      entry.credential?.type === 'oauth' &&
-      Boolean(entry.credential.refresh),
+  const refreshable = accounts.find(
+    (entry) => entry.enabled && entry.kind === 'oauth' && !entry.refreshDead,
   )
   if (refreshable) return { account: refreshable, refreshPending: true }
   return undefined
@@ -153,19 +157,22 @@ export async function adoptSharedCredentialIntoHostAuth(
     return { outcome: 'already-present' }
   }
 
-  const loaded = await loadSharedAccountStore().catch((error) => {
+  const accounts = await listSharedAccounts().catch((error: unknown) => {
     logger.debug('pi-auth', 'shared account store unreadable during adoption', {
       error: error instanceof Error ? error.message : String(error),
     })
     return null
   })
-  if (!loaded) return { outcome: 'store-unavailable' }
+  if (!accounts) return { outcome: 'store-unavailable' }
 
-  const selected = selectAccountToAdopt(loaded.store, now)
+  const selected = selectAccountToAdopt(accounts, now)
   if (!selected) return { outcome: 'no-usable-account' }
 
-  const credential = selected.account.credential
-  if (credential.type !== 'oauth') return { outcome: 'no-usable-account' }
+  // A live row's token is handed out as-is (no refresh). An expired one is
+  // seeded expired; the store refreshes it when Pi first asks.
+  const token = selected.refreshPending
+    ? undefined
+    : await getSharedAccessToken(selected.account.id).catch(() => undefined)
 
   // Re-read immediately before writing: a peer Pi may have completed a login
   // while the store was loading, and its credential must win over our seed.
@@ -174,9 +181,9 @@ export async function adoptSharedCredentialIntoHostAuth(
 
   current.anthropic = {
     type: 'oauth',
-    access: credential.access,
-    refresh: credential.refresh,
-    expires: credential.expires_at,
+    access: token?.accessToken ?? '',
+    refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+    expires: token?.expiresAt ?? 0,
   }
 
   try {
@@ -192,11 +199,11 @@ export async function adoptSharedCredentialIntoHostAuth(
     selected.account.email ?? selected.account.label ?? selected.account.id
   logger.info('pi-auth', 'seeded host auth from shared account store', {
     account,
-    refreshPending: selected.refreshPending,
+    refreshPending: !token,
   })
   return {
     outcome: 'adopted',
     account,
-    refreshPending: selected.refreshPending,
+    refreshPending: !token,
   }
 }

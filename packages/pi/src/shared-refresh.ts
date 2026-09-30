@@ -1,25 +1,34 @@
 /**
- * Safe rotation of the machine-wide Anthropic credential.
+ * Pi's view of the machine-wide Anthropic credential.
+ *
+ * The shared account store (the Rust binding behind
+ * `@cortexkit/anthropic-auth-core`) is the only custodian of refresh tokens:
+ * it selects, refreshes (claimed, compare-and-swap, fail-closed) and records
+ * dead tokens. Pi's own `auth.json` only ever holds the access token plus
+ * {@link STORE_MANAGED_REFRESH_PLACEHOLDER} in place of a refresh token, so a
+ * refresh Pi asks for is answered from the store and nothing here presents a
+ * refresh token to Anthropic.
+ *
+ * This file used to carry a complete TS refresh (store claim, retries, a
+ * process-local dead-token set, native Claude Code publish). That code was
+ * deleted with the move to the binding.
  *
  * Lives apart from `index.ts` because `stream.ts` needs it too: `index.ts`
- * already imports `stream.ts`, so putting the refresh there and importing it
- * back would close an import cycle. A cycle here would resolve at runtime by
- * accident of hoisting, which is exactly the kind of thing that breaks later
- * under a bundler.
+ * already imports `stream.ts`, so putting it there and importing it back
+ * would close an import cycle.
  */
 import {
-  claimSharedAccountRefresh,
-  type LoadedSharedAccountStore,
-  loadSharedAccountStore,
+  type AccessToken,
+  getSharedAccessToken,
+  importHostOAuthCredential,
+  isAnthropicAuthError,
+  isStoreManagedRefreshPlaceholder,
+  listSharedAccounts,
   logger,
-  markSharedRefreshTokenDead,
-  publishNativeClaudeOAuth,
-  readNativeClaudeOAuth,
-  refreshClaudeOAuthToken,
-  releaseSharedAccountRefresh,
+  pickSharedAccount,
   type SharedAnthropicAccount,
+  STORE_MANAGED_REFRESH_PLACEHOLDER,
   tokenFingerprint,
-  updateSharedAccountStore,
 } from '@cortexkit/anthropic-auth-core'
 import type { OAuthCredentials } from '@earendil-works/pi-ai'
 import {
@@ -27,8 +36,6 @@ import {
   type TraceSpan,
   withAuthSpan,
 } from './trace-bridge.ts'
-
-const SHARED_CREDENTIAL_ADOPTION_SKEW_MS = 60_000
 
 /** Why a refresh was attempted; recorded on the `auth.refresh` span. */
 export type RefreshReason = 'expired' | 'preemptive' | 'forced' | '401-retry'
@@ -45,117 +52,103 @@ export function accountSpanId(id: string): string {
 }
 
 /**
- * Classify a refresh failure for the span. `revoked` is the token family
- * being gone (nothing to retry); `error` is everything the network or the
- * host did to us. Refusals — the plugin declining to spend — are stamped at
- * the point of refusal, since only that code knows it never called out.
+ * Classify a failure for the span. `revoked` is the token family being gone
+ * (nothing to retry); `refused` is the store declining to serve (no account,
+ * reserve, bad input); `error` is everything the network did to us.
  */
 function classifyRefreshFailure(error: unknown): RefreshOutcome {
-  if (!(error instanceof Error)) return 'error'
-  if (error.message.includes('invalid_grant')) return 'revoked'
-  if ((error as { code?: unknown }).code === 'refresh_token_expired')
-    return 'revoked'
-  if ((error as { permanent?: unknown }).permanent === true) return 'revoked'
+  if (isAnthropicAuthError(error, 'invalid_grant')) return 'revoked'
+  if (
+    isAnthropicAuthError(error, 'auth_required') ||
+    isAnthropicAuthError(error, 'quota_reserve') ||
+    isAnthropicAuthError(error, 'config')
+  ) {
+    return 'refused'
+  }
   return 'error'
 }
 
-export function currentSharedAccount(
-  store: LoadedSharedAccountStore['store'],
-  now = Date.now(),
-): SharedAnthropicAccount | undefined {
-  const enabled = store.accounts.filter((entry) => entry.enabled !== false)
-  const named = enabled.find((entry) => entry.id === store.current)
-  if (named && sharedCredentialIsLive(named, now)) return named
-  // `current` was unset or points at a dead credential. The old fallback took
-  // the first enabled account regardless of health, which picked an account
-  // whose access token had expired 35 hours earlier — so adoption declined it
-  // and the caller spent its own (revoked) refresh token instead, on every
-  // request. Prefer an account that can actually serve.
-  return enabled.find((entry) => sharedCredentialIsLive(entry, now)) ?? named
-}
-
-/** An enabled OAuth account whose access token has not expired. */
+/** An enabled OAuth row whose stored access token is live right now. */
 export function sharedCredentialIsLive(
   account: SharedAnthropicAccount,
   now: number,
 ) {
-  const credential = account.credential
-  if (credential.type !== 'oauth' || !credential.access) return false
-  return credential.expires_at > now
+  return (
+    account.kind === 'oauth' &&
+    account.enabled &&
+    account.accessLive &&
+    (typeof account.expiresAt !== 'number' || account.expiresAt > now)
+  )
 }
 
 /**
- * Anthropic rotates the refresh token on every refresh, so a peer process that
- * refreshed first leaves this one holding a superseded token whose failure
- * invalidates the whole login, not just one request.
+ * The account Pi should use: the store's preferred available account when its
+ * token is live, else any available account with a live token, else the
+ * preferred one (the store refreshes it on demand).
  */
-function adoptableSharedCredential(
-  store: LoadedSharedAccountStore['store'],
-  credentials: OAuthCredentials,
-  now: number,
-): OAuthCredentials | undefined {
-  const credential = currentSharedAccount(store)?.credential
-  if (credential?.type !== 'oauth') return undefined
-  // An unrotated match means no peer refreshed; this caller still has to.
-  if (credential.refresh === credentials.refresh) return undefined
-  if (credential.expires_at <= now + SHARED_CREDENTIAL_ADOPTION_SKEW_MS)
-    return undefined
-  return {
-    refresh: credential.refresh,
-    access: credential.access,
-    expires: credential.expires_at,
+export function currentSharedAccount(
+  accounts: readonly SharedAnthropicAccount[],
+  now = Date.now(),
+): SharedAnthropicAccount | undefined {
+  const oauth = accounts.filter((account) => account.kind === 'oauth')
+  const preferred = pickSharedAccount(oauth)
+  if (preferred && sharedCredentialIsLive(preferred, now)) return preferred
+  return (
+    oauth.find(
+      (account) => account.available && sharedCredentialIsLive(account, now),
+    ) ?? preferred
+  )
+}
+
+/**
+ * Store account ids by the access token the store handed out, so a quota
+ * reading or a 401 can be attributed to the row it belongs to without ever
+ * holding a refresh token. Bounded; oldest first out.
+ */
+const storeAccountByAccessToken = new Map<string, string>()
+const REMEMBERED_TOKENS_LIMIT = 64
+
+export function rememberStoreAccessToken(token: AccessToken) {
+  storeAccountByAccessToken.delete(token.accessToken)
+  storeAccountByAccessToken.set(token.accessToken, token.accountId)
+  while (storeAccountByAccessToken.size > REMEMBERED_TOKENS_LIMIT) {
+    const oldest = storeAccountByAccessToken.keys().next().value
+    if (oldest === undefined) break
+    storeAccountByAccessToken.delete(oldest)
   }
 }
 
-/** Bounded like the CLI's refresh lock retry (5 attempts, jittered waits). */
-const REFRESH_CLAIM_MAX_ATTEMPTS = 5
-
-/**
- * Refresh tokens Anthropic has already rejected with `invalid_grant`.
- *
- * The shared store records this per account, but the host can hand us a
- * credential that is not in the store at all — Pi keeps its own auth file, and
- * calls `refreshToken` before every request. When that token's family is
- * revoked there is nothing to look it up by, so the store's dead-token guard
- * never fires and the same dead token is re-presented on every single request:
- * 156 rejected refreshes in one hour, observed. `invalid_grant` is terminal —
- * no retry can succeed — so remember the fingerprint and fail fast instead.
- *
- * Process-local by design: the store already persists this for accounts it
- * knows, and a token absent from the store has no durable home. That is enough
- * to stop the hammering, which happens within one long-lived agent process.
- */
-const deadRefreshFingerprints = new Set<string>()
-
-/** Exposed so tests can assert the guard without a live OAuth endpoint. */
-export function forgetDeadRefreshTokens() {
-  deadRefreshFingerprints.clear()
+/** The store row a remembered access token belongs to, if known. */
+export function storeAccountIdForAccessToken(accessToken: string) {
+  return storeAccountByAccessToken.get(accessToken)
 }
 
-function abortableWait(ms: number, signal?: AbortSignal): Promise<void> {
-  signal?.throwIfAborted()
-  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    const onAbort = () => {
-      clearTimeout(timer)
-      reject(signal.reason)
-    }
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
+/** Pi credentials for a store token: never a real refresh token. */
+export function hostCredentialsFor(token: AccessToken): OAuthCredentials {
+  rememberStoreAccessToken(token)
+  return {
+    access: token.accessToken,
+    refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+    expires: token.expiresAt,
+  }
 }
 
 export interface RefreshAnthropicTokenOptions {
-  claimMaxAttempts?: number
-  refreshTimeoutMs?: number
   signal?: AbortSignal
   /** Defaults to `expired` or `preemptive` from the credential's expiry. */
   reason?: RefreshReason
 }
 
+/**
+ * Pi's `oauth.refreshToken`. Answers from the store:
+ *
+ * - A credential still carrying a real refresh token (written by an older
+ *   version) is moved into the store once with `importOAuthAccount`; when the
+ *   store already holds that login its copy wins. The returned credential
+ *   carries the placeholder, so Pi never writes the real token again.
+ * - The store then hands out a live access token for that account (or its
+ *   own preferred account), refreshing it itself when it has expired.
+ */
 export async function refreshAnthropicToken(
   credentials: OAuthCredentials,
   optionsOrSignal: AbortSignal | RefreshAnthropicTokenOptions = {},
@@ -172,19 +165,10 @@ export async function refreshAnthropicToken(
       : 'preemptive')
   return withAuthSpan(
     'auth.refresh',
-    {
-      'auth.reason': reason,
-      // Replaced by the store id once the account is known; a fingerprint
-      // prefix is all that identifies a credential the store has never seen.
-      'auth.account': tokenFingerprint(credentials.refresh).slice(0, 8),
-    },
+    { 'auth.reason': reason, 'auth.account': 'store' },
     async (span) => {
       try {
-        const rotated = await performAnthropicRefresh(
-          credentials,
-          options,
-          span,
-        )
+        const rotated = await resolveFromStore(credentials, options, span)
         span.setAttributes({ 'auth.outcome': 'ok' })
         return rotated
       } catch (error) {
@@ -198,302 +182,47 @@ export async function refreshAnthropicToken(
   )
 }
 
-async function performAnthropicRefresh(
+async function resolveFromStore(
   credentials: OAuthCredentials,
   options: RefreshAnthropicTokenOptions,
   span: TraceSpan,
 ): Promise<OAuthCredentials> {
-  const signal = options.signal
-  signal?.throwIfAborted()
-  const refreshTimeoutMs = options.refreshTimeoutMs ?? 20_000
-  if (refreshTimeoutMs >= 30_000) {
-    span.setAttributes({ 'auth.outcome': 'refused' })
-    throw new Error(
-      'Anthropic refresh timeout must remain below the refresh lease',
-    )
-  }
-  const loaded = await loadSharedAccountStore().catch(() => null)
-  const sharedAccount = loaded?.store.accounts.find(
-    (account) =>
-      account.credential.type === 'oauth' &&
-      account.credential.refresh === credentials.refresh,
-  )
-  if (loaded && !sharedAccount) {
-    const adopted = adoptableSharedCredential(
-      loaded.store,
-      credentials,
-      Date.now(),
-    )
-    if (adopted) {
-      span.setAttributes({ 'auth.source': 'adopted-shared' })
-      return adopted
-    }
-  }
-  if (sharedAccount) {
-    span.setAttributes({ 'auth.account': accountSpanId(sharedAccount.id) })
-  }
-  const refreshExpiry =
-    sharedAccount?.credential.type === 'oauth'
-      ? sharedAccount.credential.refresh_expires_at
-      : undefined
-
-  // Anthropic revokes the whole token family when a refresh token is presented
-  // twice, so the network call has to be serialised across processes. Claiming
-  // first — and re-reading under the claim — is what stops two agents sharing
-  // this store from spending the same token and killing the account. The store
-  // CAS below is not enough on its own: by the time it runs, both POSTs have
-  // already reached Anthropic.
-  let leaseId: string | undefined
-  if (sharedAccount) {
-    const claimMaxAttempts =
-      options.claimMaxAttempts ?? REFRESH_CLAIM_MAX_ATTEMPTS
-    for (let attempt = 0; ; attempt += 1) {
-      const claim = await claimSharedAccountRefresh(
-        sharedAccount.id,
-        credentials.refresh,
-        {},
-      )
-      if (claim.status === 'claimed') {
-        leaseId = claim.leaseId
-        break
-      }
-      if (claim.status === 'already-refreshed') {
-        logger.info('refresh.spend', 'peer already rotated; adopting', {
-          accountId: sharedAccount.id,
-          selfPid: process.pid,
-        })
-        span.setAttributes({ 'auth.source': 'adopted-peer' })
-        return {
-          refresh: claim.credential.refresh,
-          access: claim.credential.access,
-          expires: claim.credential.expires_at,
-        }
-      }
-      if (claim.status === 'dead-token') {
-        // Anthropic already rejected this token; the family is gone.
-        logger.error('refresh.spend', 'skipping a known-dead refresh token', {
-          accountId: sharedAccount.id,
-          selfPid: process.pid,
-        })
-        span.setAttributes({ 'auth.outcome': 'revoked' })
-        throw new Error(
-          `Anthropic account ${sharedAccount.id} has a revoked refresh token; re-login is required`,
-        )
-      }
-      if (claim.status === 'unknown-account') {
-        span.setAttributes({ 'auth.outcome': 'refused' })
-        throw new Error('Anthropic refresh claim account disappeared')
-      }
-      if (attempt >= claimMaxAttempts) {
-        logger.error(
-          'refresh.spend',
-          'refresh claim timed out; refusing spend',
-          {
-            accountId: sharedAccount.id,
-            selfPid: process.pid,
-            holderPid: claim.status === 'held' ? claim.holderPid : undefined,
-            attempts: attempt + 1,
-          },
-        )
-        span.setAttributes({
-          'auth.outcome': 'refused',
-          'auth.claim_attempts': attempt + 1,
-        })
-        throw new Error(
-          'Anthropic refresh claim timed out; refresh was not attempted',
-        )
-      }
-      // Matches the CLI's lock retry: bounded attempts, jittered waits.
-      logger.info('refresh.spend', 'claim held by another process', {
-        accountId: sharedAccount.id,
-        selfPid: process.pid,
-        holderPid: claim.holderPid,
-        heldForMs: claim.until - Date.now(),
-        attempt,
+  options.signal?.throwIfAborted()
+  let accountId: string | undefined
+  const refresh = credentials.refresh?.trim()
+  if (refresh && !isStoreManagedRefreshPlaceholder(refresh)) {
+    const imported = await importHostOAuthCredential({
+      accessToken: credentials.access ?? '',
+      refreshToken: refresh,
+      expiresAt:
+        typeof credentials.expires === 'number' &&
+        Number.isFinite(credentials.expires)
+          ? credentials.expires
+          : 0,
+    })
+    if (imported.status === 'invalid') {
+      logger.warn('pi-auth', 'host credential rejected by the account store', {
+        error: imported.message,
       })
-      await abortableWait(1_000 + Math.random() * 1_000, signal)
-    }
-  }
-
-  try {
-    const nativeOptions = process.env.CLAUDE_CONFIG_DIR
-      ? { configDirectory: process.env.CLAUDE_CONFIG_DIR }
-      : {}
-    // Claude Code may hold this very credential. Anthropic revokes the family
-    // when a superseded refresh token is presented, so a rotation that is not
-    // published back forks the two copies and the next refresh from either side
-    // kills the account for both. Check before spending, and adopt whatever the
-    // native app already has rather than racing it.
-    const nativeBefore = await readNativeClaudeOAuth(nativeOptions).catch(
-      () => null,
-    )
-    const sharesNativeCredential =
-      nativeBefore?.refreshToken === credentials.refresh
-    if (nativeBefore && !sharesNativeCredential) {
-      // The native app already moved on. Its token is the live one.
-      if (
-        nativeBefore.accessToken &&
-        typeof nativeBefore.expiresAt === 'number' &&
-        nativeBefore.expiresAt > Date.now()
-      ) {
-        logger.info('refresh.spend', 'adopting the native app rotation', {
-          selfPid: process.pid,
-        })
-        const adopted = {
-          refresh: nativeBefore.refreshToken,
-          access: nativeBefore.accessToken,
-          expires: nativeBefore.expiresAt,
-        }
-        if (sharedAccount && leaseId) {
-          const persisted = await updateSharedAccountStore((store) => {
-            const current = store.accounts.find(
-              (account) => account.id === sharedAccount.id,
-            )
-            if (
-              current?.credential.type !== 'oauth' ||
-              current.credential.refresh !== credentials.refresh ||
-              current.refresh_lease?.id !== leaseId
-            ) {
-              return false
-            }
-            current.credential.access = adopted.access
-            current.credential.refresh = adopted.refresh
-            current.credential.expires_at = adopted.expires
-            current.dead_refresh_fingerprint = undefined
-            current.last_error = undefined
-            current.refresh_lease = undefined
-            store.current = current.id
-            return true
-          })
-          if (!persisted.result) {
-            span.setAttributes({ 'auth.outcome': 'refused' })
-            throw new Error(
-              'Anthropic native credential adoption was superseded',
-            )
-          }
-        }
-        span.setAttributes({ 'auth.source': 'adopted-native' })
-        return adopted
-      }
-    }
-
-    const refreshFp = tokenFingerprint(credentials.refresh)
-    if (deadRefreshFingerprints.has(refreshFp)) {
-      logger.error('refresh.spend', 'skipping a known-dead refresh token', {
-        refreshFp: refreshFp.slice(0, 8),
-        accountId: sharedAccount?.id,
-        selfPid: process.pid,
-      })
-      if (sharedAccount && leaseId) {
-        await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
-          () => {},
-        )
-      }
-      span.setAttributes({ 'auth.outcome': 'revoked' })
+      span.setAttributes({ 'auth.outcome': 'refused' })
       throw new Error(
-        'Anthropic refresh token was revoked; re-login is required (run `/login anthropic` in Pi, or `opencode-anthropic-auth login`)',
+        'Pi holds an Anthropic credential the account store cannot use; log in again (run `/login anthropic` in Pi)',
       )
     }
-
-    let refreshed: Awaited<ReturnType<typeof refreshClaudeOAuthToken>>
-    try {
-      refreshed = await refreshClaudeOAuthToken({
-        refreshToken: credentials.refresh,
-        refreshTokenExpiresAt: refreshExpiry,
-        timeoutMs: refreshTimeoutMs,
-        signal,
-      })
-    } catch (error) {
-      if (error instanceof Error && error.message.includes('invalid_grant')) {
-        // Terminal for this token whether or not the store knows the account.
-        deadRefreshFingerprints.add(refreshFp)
-        if (sharedAccount) {
-          await markSharedRefreshTokenDead(
-            sharedAccount.id,
-            credentials.refresh,
-          ).catch(() => {})
-        }
-      }
-      if (sharedAccount && leaseId) {
-        await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
-          () => {},
-        )
-      }
-      throw error
-    }
-
-    if (sharedAccount) {
-      const persisted = await updateSharedAccountStore((store) => {
-        const current = store.accounts.find(
-          (account) => account.id === sharedAccount.id,
-        )
-        if (
-          current?.credential.type !== 'oauth' ||
-          current.credential.refresh !== credentials.refresh
-        ) {
-          return false
-        }
-        current.credential.access = refreshed.access
-        current.credential.refresh = refreshed.refresh
-        current.credential.expires_at = refreshed.expires
-        current.credential.refresh_expires_at =
-          refreshed.refreshTokenExpiresAt ??
-          current.credential.refresh_expires_at
-        current.dead_refresh_fingerprint = undefined
-        current.last_error = undefined
-        current.refresh_lease = undefined
-        store.current = current.id
-        return true
-      })
-      if (!persisted.result) {
-        const winner = (await loadSharedAccountStore()).store.accounts.find(
-          (account) => account.id === sharedAccount.id,
-        )
-        if (winner?.credential.type !== 'oauth') {
-          span.setAttributes({ 'auth.outcome': 'refused' })
-          throw new Error('Anthropic OAuth refresh was superseded')
-        }
-        span.setAttributes({ 'auth.source': 'adopted-winner' })
-        return {
-          refresh: winner.credential.refresh,
-          access: winner.credential.access,
-          expires: winner.credential.expires_at,
-        }
-      }
-    }
-
-    if (sharesNativeCredential) {
-      // Publish the rotation so Claude Code's mtime watch picks it up; without
-      // this its copy is superseded the moment we succeed.
-      const outcome = await publishNativeClaudeOAuth(
-        {
-          accessToken: refreshed.access,
-          refreshToken: refreshed.refresh,
-          expiresAt: refreshed.expires,
-          ...(refreshed.refreshTokenExpiresAt !== undefined
-            ? { refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt }
-            : {}),
-          ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
-        },
-        nativeOptions,
-      ).catch(() => 'absent' as const)
-      logger.info('refresh.spend', 'published rotation to Claude Code', {
-        outcome,
-        selfPid: process.pid,
-      })
-    }
-
-    span.setAttributes({ 'auth.source': 'refreshed' })
-    return {
-      refresh: refreshed.refresh,
-      access: refreshed.access,
-      expires: refreshed.expires,
-    }
-  } finally {
-    if (sharedAccount && leaseId) {
-      await releaseSharedAccountRefresh(sharedAccount.id, leaseId).catch(
-        () => {},
-      )
-    }
+    accountId = imported.accountId
+    logger.info('pi-auth', 'moved the host credential into the store', {
+      accountId,
+      status: imported.status,
+    })
+    span.setAttributes({ 'auth.source': `import-${imported.status}` })
+  } else {
+    accountId = currentSharedAccount(await listSharedAccounts())?.id
   }
+  options.signal?.throwIfAborted()
+  const token = await getSharedAccessToken(accountId)
+  span.setAttributes({
+    'auth.account': accountSpanId(token.accountId),
+    'auth.source': span.attrs['auth.source'] ?? `store-${token.source}`,
+  })
+  return hostCredentialsFor(token)
 }

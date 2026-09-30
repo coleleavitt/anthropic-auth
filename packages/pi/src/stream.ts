@@ -1,5 +1,4 @@
 import {
-  type AccountStorage,
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
@@ -17,12 +16,15 @@ import {
   FAST_MODE_BETA,
   FallbackAccountManager,
   filterRequestBodyGuarded,
+  getAnthropicAuth,
   getCache1hPersistentMode,
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
   getRelayConfig,
   getRoutingMode,
+  getSharedAccessToken,
   getStickyRoutingStatePath,
+  handleSharedUnauthorized,
   isApiKeyAccount,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
@@ -36,8 +38,8 @@ import {
   isPermanentRefreshError,
   isValidApiBaseURL,
   killswitchPassesPolicy,
+  listSharedAccounts,
   loadAccounts,
-  loadSharedAccountStore,
   logContentFilterOutcome,
   logger,
   logRefusal,
@@ -48,13 +50,12 @@ import {
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
-  pickSharedAccount,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
-  recordSharedAccountQuota,
   refreshClaudeCodeVersion,
+  refreshErrorFromSharedAccount,
   requiredClaudeCodeVersion,
   resolveClaudeCodeIdentity,
   resolveModelCost,
@@ -70,7 +71,6 @@ import {
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
-  syncRefreshedFallbackAccountInSharedStore,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -89,7 +89,12 @@ import {
 } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
 import { getPiAccountStoragePath } from './paths.ts'
-import { accountSpanId, refreshAnthropicToken } from './shared-refresh.ts'
+import {
+  accountSpanId,
+  currentSharedAccount,
+  rememberStoreAccessToken,
+  storeAccountIdForAccessToken,
+} from './shared-refresh.ts'
 import {
   errorHttpStatus,
   type TraceSpan,
@@ -244,20 +249,10 @@ function getPiRoutingServices(
     fallbackManager = new FallbackAccountManager({
       configPath: storagePath,
       quotaManager,
-      // Persist every rotation back into the shared store. Without this the new
-      // token lands only in Pi's sidecar — which does not exist on a host that
-      // has never run Pi's own login — so the next routing pass re-reads the
-      // *old* refresh token from the shared store and presents it a second
-      // time. Anthropic revokes the whole family on the second presentation,
-      // which is a single-process double-spend that no cross-process claim can
-      // prevent, because both spends genuinely believe they hold a live token.
-      onFallbackCredentialChanged: async (account, expectedRefresh) => {
-        const synced = await syncRefreshedFallbackAccountInSharedStore(
-          account,
-          expectedRefresh,
-        )
-        return synced.result
-      },
+      // Credentials come from the shared store (Rust binding), which refreshes
+      // under its own claim. Pi starts no keep-alive of its own: Pi runs are
+      // short-lived, and the machine-wide keep-alive belongs to a long-lived
+      // host (OpenCode's plugin or ckl).
     })
     setBoundedService(quotaManagers, storagePath, quotaManager)
     setBoundedService(fallbackManagers, storagePath, fallbackManager)
@@ -922,170 +917,84 @@ function sharedAccessToken(): Promise<string | undefined> {
 async function selectSharedAccessToken(
   span: TraceSpan,
 ): Promise<string | undefined> {
-  const loaded = await loadSharedAccountStore().catch((error) => {
+  const accounts = await listSharedAccounts().catch((error) => {
     logger.warn('pi.stream', 'shared account store unreadable', {
       error: errorText(error),
     })
     span.setAttributes({ 'auth.reason': 'store-unreadable' })
     return null
   })
-  if (!loaded) {
+  if (!accounts) {
     span.setAttributes({ 'auth.pool_size': 0, 'auth.outcome': 'none' })
     return undefined
   }
-  span.setAttributes({ 'auth.pool_size': loaded.store.accounts.length })
+  span.setAttributes({ 'auth.pool_size': accounts.length })
 
-  // This token is used as a bearer directly — nothing on this path refreshes
-  // it. `pickSharedAccount` only judges quota and cooldown, so it will happily
-  // return an account whose access token expired days ago: every request then
-  // ships its full body to earn a guaranteed 401. Skip expired credentials and
-  // take the next usable account instead.
-  const now = Date.now()
-  let candidate = pickSharedAccount(loaded.store, now)
-  if (candidate && !oauthCredentialIsLive(candidate, now)) {
-    logger.warn('pi.stream', 'shared main credential is expired; skipping', {
-      accountId: candidate.id,
-      expiredForMs:
-        candidate.credential.type === 'oauth' &&
-        typeof candidate.credential.expires_at === 'number'
-          ? now - candidate.credential.expires_at
-          : undefined,
-    })
-    span.setAttributes({ 'auth.reason': 'main-expired' })
-    candidate = loaded.store.accounts.find(
-      (account) =>
-        account.id !== candidate?.id && oauthCredentialIsLive(account, now),
-    )
-  }
-  if (candidate?.credential.type !== 'oauth') {
-    // Every access token is expired, which is not the same as having no
-    // credential: refresh tokens live for weeks and outlast their access
-    // tokens by design, so the store is usually one rotation away from
-    // healthy. Giving up here told the user to re-login while six accounts
-    // held refresh tokens valid for another three weeks.
-    span.setAttributes({ 'auth.reason': 'all-expired' })
-    const refreshed = await refreshExpiredSharedAccount(loaded.store, now)
-    if (refreshed) {
-      span.setAttributes({
-        'auth.selected': accountSpanId(refreshed.accountId),
-        'auth.outcome': 'refreshed',
-      })
-      return refreshed.access
-    }
-    logger.error('pi.stream', 'no shared account has a live access token', {
-      accounts: loaded.store.accounts.length,
-    })
-    span.setAttributes({ 'auth.outcome': 'none' })
-    return undefined
-  }
-  logger.info('pi.stream', 'using a shared-store credential', {
-    accountId: candidate.id,
-  })
-  span.setAttributes({
-    'auth.selected': accountSpanId(candidate.id),
-    'auth.outcome': 'selected',
-  })
-  return candidate.credential.access || undefined
-}
-
-/**
- * Spend a refresh token to revive the store when no access token is live.
- *
- * Tries accounts in turn because a single revoked login must not strand the
- * healthy ones — that is the failure this exists to prevent. The refresh call
- * carries the cross-process lease, the dead-token guard and the store write,
- * so each attempt here is just a call.
- */
-async function refreshExpiredSharedAccount(
-  store: Awaited<ReturnType<typeof loadSharedAccountStore>>['store'],
-  now: number,
-): Promise<{ access: string; accountId: string } | undefined> {
-  const candidates = store.accounts.filter(
-    (account) =>
-      account.enabled !== false &&
-      account.credential.type === 'oauth' &&
-      account.credential.refresh &&
-      // A refresh token past its own expiry buys a guaranteed rejection.
-      (typeof account.credential.refresh_expires_at !== 'number' ||
-        account.credential.refresh_expires_at > now),
-  )
-  for (const account of candidates) {
-    if (account.credential.type !== 'oauth') continue
+  // Prefer the account selection would route to; the store refreshes it (under
+  // its own claim) when its access token has expired. When that fails, let the
+  // store rotate past failing accounts itself: a single revoked login must not
+  // strand the healthy ones.
+  const candidate = currentSharedAccount(accounts)
+  for (const accountId of candidate ? [candidate.id, undefined] : [undefined]) {
     try {
-      const rotated = await refreshAnthropicToken(
-        {
-          refresh: account.credential.refresh,
-          access: account.credential.access,
-          expires: account.credential.expires_at,
-        },
-        { reason: 'expired' },
-      )
-      if (rotated.access) {
-        logger.info('pi.stream', 'revived the shared store by refreshing', {
-          accountId: account.id,
-        })
-        return { access: rotated.access, accountId: account.id }
-      }
+      const token = await getSharedAccessToken(accountId)
+      rememberStoreAccessToken(token)
+      logger.info('pi.stream', 'using a shared-store credential', {
+        accountId: token.accountId,
+        source: token.source,
+      })
+      span.setAttributes({
+        'auth.selected': accountSpanId(token.accountId),
+        'auth.outcome': token.source === 'store' ? 'selected' : 'refreshed',
+      })
+      return token.accessToken
     } catch (error) {
-      logger.warn('pi.stream', 'shared account refresh failed; trying next', {
-        accountId: account.id,
+      logger.warn('pi.stream', 'shared store could not serve a token', {
+        accountId: accountId ?? '(store choice)',
         error: errorText(error),
       })
     }
   }
+  span.setAttributes({ 'auth.outcome': 'none' })
   return undefined
 }
 
 /**
- * The shared store picker trusts the stored `expires_at`, but the server can
- * revoke an access token early (another client rotated the refresh token, a
- * logout, a server-side invalidation). When the key we sent comes back 401,
- * force one refresh of the account that owns it. `refreshAnthropicToken` runs
- * under the cross-process claim and adopts a peer's rotation when one exists,
- * so this never double-spends the refresh token. Returns the new access token,
- * or undefined when the rejected key is not a refreshable shared-store key.
+ * The stored `expires_at` can be wrong: the server can revoke an access token
+ * early. When the key we sent comes back 401, the store performs one claimed
+ * refresh of the row that owns it and hands back a new bearer only when it
+ * got one. Returns undefined when there is nothing new to try.
  */
 function recoverSharedAccessTokenAfter401(
   rejectedAccess: string,
 ): Promise<string | undefined> {
   return withAuthSpan('auth.route', undefined, async (span) => {
     span.setAttributes({ 'auth.reason': '401-retry' })
-    const loaded = await loadSharedAccountStore().catch(() => null)
-    const account = loaded?.store.accounts.find(
-      (candidate) =>
-        candidate.credential.type === 'oauth' &&
-        candidate.credential.access === rejectedAccess,
-    )
-    if (account?.credential.type !== 'oauth' || !account.credential.refresh) {
-      span.setAttributes({ 'auth.outcome': 'not-shared' })
-      return undefined
-    }
-    span.setAttributes({ 'auth.selected': accountSpanId(account.id) })
     try {
-      const rotated = await refreshAnthropicToken(
-        {
-          refresh: account.credential.refresh,
-          access: account.credential.access,
-          expires: account.credential.expires_at,
-        },
-        { reason: '401-retry' },
-      )
-      if (!rotated.access || rotated.access === rejectedAccess) {
+      const recovery = await handleSharedUnauthorized(rejectedAccess)
+      if (!recovery.retry || !recovery.token) {
         span.setAttributes({ 'auth.outcome': 'unchanged' })
+        logger.warn('pi.stream', 'shared access token 401 not recoverable', {
+          reason: recovery.reason,
+          failureCode: recovery.failureCode,
+        })
         return undefined
       }
+      rememberStoreAccessToken(recovery.token)
+      span.setAttributes({
+        'auth.selected': accountSpanId(recovery.token.accountId),
+        'auth.outcome': 'refreshed',
+      })
       logger.info(
         'pi.stream',
         'shared access token rejected with 401; refreshed',
         {
-          accountId: account.id,
+          accountId: recovery.token.accountId,
         },
       )
-      span.setAttributes({ 'auth.outcome': 'refreshed' })
-      return rotated.access
+      return recovery.token.accessToken
     } catch (error) {
       logger.warn('pi.stream', 'shared access token 401 refresh failed', {
-        accountId: account.id,
         error: errorText(error),
       })
       span.setAttributes({ 'auth.outcome': 'refresh-failed' })
@@ -1161,14 +1070,14 @@ function refreshErrorIsPermanent(error: unknown) {
 function refreshRouteAccountAfter401(
   manager: FallbackAccountManager,
   account: OAuthAccount,
-  storage: AccountStorage,
 ) {
   return withAuthSpan(
     'auth.refresh',
     { 'auth.reason': '401-retry', 'auth.account': accountSpanId(account.id) },
     async (span) => {
       try {
-        const refreshed = await manager.refreshAccount(account, storage, {
+        // One claimed refresh in the store of the bearer that got the 401.
+        const refreshed = await manager.ensureAccessToken(account, {
           force: true,
         })
         span.setAttributes({
@@ -1186,21 +1095,6 @@ function refreshRouteAccountAfter401(
   )
 }
 
-/** An OAuth account whose access token is present and not past its expiry. */
-function oauthCredentialIsLive(
-  account: {
-    credential: { type: string; access?: string; expires_at?: unknown }
-  },
-  now: number,
-) {
-  const credential = account.credential
-  if (credential.type !== 'oauth' || !credential.access) return false
-  // A missing expiry is treated as live: the server is the authority, and
-  // refusing to try would strand an otherwise usable credential.
-  if (typeof credential.expires_at !== 'number') return true
-  return credential.expires_at > now
-}
-
 async function loadRoutingStorage(storagePath: string) {
   logger.trace('pi.route', 'loadRoutingStorage: start', { storagePath })
   const storage = await loadAccounts(storagePath)
@@ -1208,17 +1102,16 @@ async function loadRoutingStorage(storagePath: string) {
     present: storage !== null,
     sidecarAccounts: storage?.accounts?.length ?? 0,
   })
-  const loaded = await loadSharedAccountStore().catch((error) => {
+  const shared = await listSharedAccounts().catch((error) => {
     logger.warn('pi.route', 'shared account store unreadable', {
       error: errorText(error),
     })
     return null
   })
   logger.trace('pi.route', 'loadRoutingStorage: shared store read', {
-    source: loaded?.source.type,
-    sharedAccounts: loaded?.store.accounts.length ?? 0,
+    sharedAccounts: shared?.length ?? 0,
   })
-  if (!loaded?.store.accounts.length) {
+  if (!shared?.length) {
     logger.debug('pi.route', 'no shared accounts; using sidecar only')
     return { storage, mainAccountId: undefined }
   }
@@ -1227,18 +1120,17 @@ async function loadRoutingStorage(storagePath: string) {
   // quota reading: selection can move between the read and the write, and
   // stamping one account's usage onto another cascades until every account
   // looks exhausted. Attribution goes by access token instead.
-  const mainAccountId = pickSharedAccount(loaded.store)?.id
+  const main = currentSharedAccount(shared)
+  const mainAccountId = main?.id
   logger.debug('pi.route', 'shared main selected', {
     mainAccountId: mainAccountId ?? '(none available)',
-    pinned: loaded.store.current ?? '(unpinned)',
+    pinned: shared.find((account) => account.current)?.id ?? '(unpinned)',
   })
-  // Drop accounts the store already knows are spent. `accountAvailable` fails
-  // open on a missing or stale reading, so only a *freshly observed* exhausted
-  // account is skipped — and skipping it here is what stops every request
-  // paying a round trip to be told 429 by an account whose weekly window does
-  // not reset for days.
+  // Drop accounts the store already knows are spent (cooling down or
+  // exhausted), so no request pays a round trip to be told 429 by an account
+  // whose window does not reset for days.
   const spent = new Set(
-    loaded.store.accounts
+    shared
       .filter((account) => !sharedAccountIsAvailable(account))
       .map((account) => account.id),
   )
@@ -1249,15 +1141,24 @@ async function loadRoutingStorage(storagePath: string) {
   }
   const accounts = materializeSharedFallbackAccounts(
     storage?.accounts ?? [],
-    loaded.store,
+    shared,
+    { mainId: mainAccountId },
   ).filter((account) => !spent.has(account.id))
   logger.debug('pi.route', 'routing pool built', {
     fallbacks: accounts.length,
     ids: accounts.map((account) => account.id),
   })
-  if (!accounts.length) return { storage, mainAccountId }
+  const base = storage ?? createEmptyStorage()
+  // The store's verdict on the main row's refresh token (runtime only).
+  const mainLastRefreshError = main
+    ? refreshErrorFromSharedAccount(main)
+    : undefined
   return {
-    storage: { ...(storage ?? createEmptyStorage()), accounts },
+    storage: {
+      ...base,
+      refresh: { ...(base.refresh ?? {}), mainLastRefreshError },
+      accounts,
+    },
     mainAccountId,
   }
 }
@@ -1418,28 +1319,26 @@ async function executeWithFallback(options: {
     // whichever row selection happens to favour, and because a stamped row is
     // then skipped, the next pick inherits the same figures — an exhausted
     // account cascades until every account looks exhausted.
-    const loaded = await loadSharedAccountStore().catch(() => null)
-    const accountId = loaded?.store.accounts.find(
-      (candidate) =>
-        candidate.credential.type === 'oauth' &&
-        candidate.credential.access === accessToken,
-    )?.id
+    // The store attributes the reading to exactly the row holding this token.
+    const fiveHour = quota.five_hour?.usedPercent
+    const sevenDay = quota.seven_day?.usedPercent
+    if (fiveHour === undefined && sevenDay === undefined) return
+    const accountId = await getAnthropicAuth()
+      .recordQuota({
+        accessToken,
+        ...(fiveHour !== undefined ? { fiveHourPercent: fiveHour } : {}),
+        ...(sevenDay !== undefined ? { sevenDayPercent: sevenDay } : {}),
+      })
+      .catch(() => null)
     if (!accountId) {
       logger.debug('pi.quota', 'no shared account matches this token', {})
       return
     }
-    const fiveHour = quota.five_hour?.usedPercent
-    const sevenDay = quota.seven_day?.usedPercent
-    if (fiveHour === undefined && sevenDay === undefined) return
-    logger.info('pi.quota', 'recording quota observation', {
+    logger.info('pi.quota', 'recorded quota observation', {
       accountId,
       fiveHourPercent: fiveHour,
       sevenDayPercent: sevenDay,
     })
-    await recordSharedAccountQuota(accountId, {
-      ...(fiveHour !== undefined ? { fiveHourPercent: fiveHour } : {}),
-      ...(sevenDay !== undefined ? { sevenDayPercent: sevenDay } : {}),
-    }).catch(() => {})
   }
 
   /**
@@ -1453,22 +1352,19 @@ async function executeWithFallback(options: {
   async function describePrimary() {
     const token = options.primaryAccessToken
     const fp = tokenFingerprint(token)
-    try {
-      const loaded = await loadSharedAccountStore()
-      const match = loaded.store.accounts.find(
-        (candidate) =>
-          candidate.credential.type === 'oauth' &&
-          candidate.credential.access === token,
-      )
-      return {
-        tokenFp: fp,
-        accountId: match?.id ?? 'unknown (not in the shared store)',
-        storeQuota: match?.quota
-          ? `5h ${match.quota.five_hour_percent}% / 7d ${match.quota.seven_day_percent}%`
-          : 'none recorded',
-      }
-    } catch {
-      return { tokenFp: fp, accountId: 'unknown (store unreadable)' }
+    const accountId = storeAccountIdForAccessToken(token)
+    if (!accountId) {
+      return { tokenFp: fp, accountId: 'unknown (not from the shared store)' }
+    }
+    const row = await listSharedAccounts()
+      .then((accounts) => accounts.find((account) => account.id === accountId))
+      .catch(() => undefined)
+    return {
+      tokenFp: fp,
+      accountId,
+      storeQuota: row?.quota
+        ? `5h ${row.quota.fiveHourPercent}% / 7d ${row.quota.sevenDayPercent}%`
+        : 'none recorded',
     }
   }
 
@@ -1831,12 +1727,11 @@ async function executeWithFallback(options: {
         route.account &&
         storage
       ) {
-        const authRouteId = route.id
+        const authAccount = route.account
         try {
           const refreshed = await refreshRouteAccountAfter401(
             manager,
-            route.account,
-            storage,
+            authAccount,
           )
           if (refreshed.access) {
             route = { ...route, access: refreshed.access, account: refreshed }
@@ -1850,11 +1745,9 @@ async function executeWithFallback(options: {
           permanentAuthFailure =
             preflight instanceof Response && preflight.status === 401
         } catch (error) {
-          const latest = await loadAccounts(options.storagePath)
-          const refreshError = latest?.accounts.find(
-            (account): account is OAuthAccount =>
-              account.id === authRouteId && isOAuthAccount(account),
-          )?.lastRefreshError
+          // The manager stamps the store's verdict on the account it hydrated;
+          // it is not persisted in Pi's files any more.
+          const refreshError = authAccount.lastRefreshError
           if (!isPermanentRefreshError(refreshError)) throw error
           permanentAuthFailure = true
         }

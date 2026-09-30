@@ -10,11 +10,20 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CacheKeepSessionRegistry } from '@cortexkit/anthropic-auth-core'
+import {
+  CacheKeepSessionRegistry,
+  listSharedAccounts,
+} from '@cortexkit/anthropic-auth-core'
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from '@earendil-works/pi-coding-agent'
+import {
+  fakeAccessToken,
+  fakeRefreshToken,
+  startMockTokenServer,
+  useTempStore,
+} from '../../../core/src/tests/support/store-fixture.ts'
 import { registerCommands } from '../commands'
 
 const ENV_KEY = 'PI_ANTHROPIC_AUTH_FILE'
@@ -94,8 +103,6 @@ describe('claude-account persistence', () => {
             id: 'a1',
             label: 'One',
             type: 'oauth',
-            access: 'tok',
-            refresh: 'rtok',
             enabled: true,
             addedAt: 1,
           },
@@ -140,8 +147,6 @@ describe('claude-account persistence', () => {
             id: 'a1',
             label: 'One',
             type: 'oauth',
-            access: 'tok',
-            refresh: 'rtok',
             enabled: true,
             addedAt: 1,
           },
@@ -186,8 +191,6 @@ describe('claude-account persistence', () => {
             id: 'a1',
             label: 'One',
             type: 'oauth',
-            access: 'tok',
-            refresh: 'rtok',
             enabled: false,
             addedAt: 1,
           },
@@ -217,8 +220,6 @@ describe('claude-account persistence', () => {
           id: 'a1',
           label: 'One',
           type: 'oauth',
-          access: 'tok',
-          refresh: 'rtok',
           enabled: true,
           addedAt: 1,
         },
@@ -240,6 +241,58 @@ describe('claude-account persistence', () => {
 
     const storage = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(storage).toEqual(original)
+  })
+  test('moves tokens an older version left in Pi state files into the store', async () => {
+    // Pi's ~/.pi/agent/anthropic-auth-state.json used to carry every
+    // fallback account's access and refresh token. The first load moves them
+    // into the account store (the store's copy wins) and rewrites the files
+    // without tokens.
+    const store = useTempStore()
+    const tokenServer = startMockTokenServer()
+    try {
+      const tag = `pistate${process.pid}`
+      const access = fakeAccessToken(tag)
+      const refresh = fakeRefreshToken(tag)
+      await writeFile(
+        accountPath,
+        JSON.stringify({
+          version: 1,
+          accounts: [
+            { id: 'legacy', label: 'Legacy', type: 'oauth', enabled: true },
+          ],
+        }),
+        'utf8',
+      )
+      await writeFile(
+        statePath,
+        JSON.stringify({
+          version: 1,
+          accounts: {
+            legacy: { access, refresh, expires: Date.now() + 3_600_000 },
+          },
+        }),
+        'utf8',
+      )
+
+      const { pi, commands } = mockPi()
+      registerCommands(pi)
+      const { ctx, notified } = mockNotify()
+      await commands.get('claude-account')!.handler('', ctx)
+
+      expect(notified[0] ?? '').toInclude('Legacy')
+      const stateText = await readFile(statePath, 'utf8')
+      const configText = await readFile(accountPath, 'utf8')
+      expect(stateText).not.toContain(refresh)
+      expect(stateText).not.toContain(access)
+      expect(configText).not.toContain(refresh)
+      const rows = await listSharedAccounts()
+      expect(rows.map((row) => row.label)).toEqual(['Legacy'])
+      // Importing spends nothing.
+      expect(tokenServer.presented).toEqual([])
+    } finally {
+      tokenServer.stop()
+      store.dispose()
+    }
   })
 })
 
