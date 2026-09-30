@@ -5,6 +5,7 @@ import {
   OAuthLoopbackError,
   startOAuthLoopbackSession,
 } from '../oauth-loopback.ts'
+import { startSharedLogin } from '../shared-account-store.ts'
 import { startSharedLoginWithLoopback } from '../shared-login.ts'
 
 function connectURL(redirectUri: string, query = '') {
@@ -233,20 +234,25 @@ describe('OAuth loopback session', () => {
 })
 
 describe('OAuth loopback session bound to a store login', () => {
-  test('adopts the state the Rust login generated', async () => {
-    const session = await startOAuthLoopbackSession({ state: 'throwaway' })
+  test("the store login takes the listener's own state; the listener is never re-keyed", async () => {
+    const session = await startOAuthLoopbackSession({
+      state: 'listener-state-0123456789abcdefghijklmn',
+    })
     try {
-      session.expectState('state-from-binding')
-      expect(session.state).toBe('state-from-binding')
+      const login = startSharedLogin({
+        redirectUri: session.redirectUri,
+        state: session.state,
+      })
+      expect(login.state).toBe('listener-state-0123456789abcdefghijklmn')
+      const url = new URL(login.url)
+      expect(url.searchParams.get('state')).toBe(session.state)
+      expect(url.searchParams.get('redirect_uri')).toBe(session.redirectUri)
       expect(() =>
-        session.submitManualCallback({ code: 'code', state: 'throwaway' }),
+        session.submitManualCallback({ code: 'code', state: 'other-state' }),
       ).toThrow(OAuthLoopbackError)
       expect(
-        session.submitManualCallback({
-          code: 'code',
-          state: 'state-from-binding',
-        }),
-      ).toMatchObject({ code: 'code', state: 'state-from-binding' })
+        session.submitManualCallback({ code: 'code', state: login.state }),
+      ).toMatchObject({ code: 'code', state: login.state })
     } finally {
       await session.close().catch(() => {})
     }

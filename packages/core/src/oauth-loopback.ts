@@ -173,25 +173,6 @@ export class OAuthLoopbackSession {
     return this.expectedState
   }
 
-  /**
-   * Replace the expected state before any callback arrives.
-   *
-   * The Rust binding generates the PKCE verifier and the state together, and
-   * needs this session's redirect URI (known only once the socket is bound)
-   * to do it. So the session starts first with a throwaway state and adopts
-   * the binding's state here.
-   */
-  expectState(state: string): void {
-    assertSafeCallbackValue(state, 'OAuth state')
-    if (!this.pending) {
-      throw new OAuthLoopbackError(
-        'closed',
-        'The OAuth flow is no longer pending',
-      )
-    }
-    this.expectedState = state
-  }
-
   get port(): number {
     return this.boundPort
   }

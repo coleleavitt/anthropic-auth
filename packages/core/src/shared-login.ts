@@ -17,12 +17,12 @@ export type SharedLoginWithLoopback = {
 /**
  * Begin a store login, with a loopback listener when one can be bound.
  *
- * The Rust binding owns the PKCE verifier and the state and exchanges the
- * code itself, so no token reaches JavaScript. The loopback starts first
- * (its redirect URI depends on the bound port), the binding login is created
- * for that redirect URI, and the listener then adopts the binding's state.
- * Callers race `loopback.waitForCallback()` against a manual paste and pass
- * the result to `login.complete`.
+ * The Rust binding owns the PKCE verifier and exchanges the code itself, so
+ * no token reaches JavaScript. The loopback starts first (its redirect URI
+ * depends on the bound port) and the binding login is created for that
+ * redirect URI and the state the listener already expects. Callers race
+ * `loopback.waitForCallback()` against a manual paste and pass the result to
+ * `login.complete`.
  */
 export async function startSharedLoginWithLoopback(
   options: {
@@ -39,9 +39,10 @@ export async function startSharedLoginWithLoopback(
     const login = startSharedLogin({
       mode: options.mode,
       loginHint: options.loginHint,
-      redirectUri: loopback?.redirectUri,
+      ...(loopback
+        ? { redirectUri: loopback.redirectUri, state: loopback.state }
+        : {}),
     })
-    loopback?.expectState(login.state)
     return { login, loopback }
   } catch (error) {
     await loopback?.close().catch(() => {})
