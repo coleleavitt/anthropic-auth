@@ -1,9 +1,9 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { parseRetryAfterSeconds, refreshClaudeOAuthToken } from './auth.ts'
+import { parseRetryAfterSeconds } from './auth.ts'
 import { getCachedClaudeCodeVersion } from './claude-version.ts'
 import {
   CACHE_1H_MODES,
@@ -12,9 +12,16 @@ import {
 } from './constants.ts'
 import { type LogLevel, log, logger } from './logger.ts'
 import {
-  claimSharedAccountRefresh,
-  markSharedRefreshTokenDead,
-  releaseSharedAccountRefresh,
+  type AccessToken,
+  getSharedAccessToken,
+  handleSharedUnauthorized,
+  importHostOAuthCredential,
+  type KeepAliveResult,
+  listSharedAccounts,
+  markSharedAccountUsed,
+  type SharedAnthropicAccount,
+  sharedKeepAliveOnce,
+  type UnauthorizedResult,
 } from './shared-account-store.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -35,11 +42,20 @@ export type AccountBase = {
   lastUsed?: number
 }
 
+/**
+ * An OAuth account served by the shared store.
+ *
+ * The refresh token lives only in the store (Rust binding) and never in this
+ * object. `access` and `expires` are runtime values: they are hydrated from
+ * the store just before use (`FallbackAccountManager.ensureAccessToken`) and
+ * are never written to the host config or state file. `refreshExpires`,
+ * `lastRefreshedAt` and `lastRefreshError` mirror the store row (non-secret)
+ * and are not persisted by the host either.
+ */
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
   authLineageId?: string
   access?: string
-  refresh: string
   expires?: number
   refreshExpires?: number
   lastRefreshedAt?: number
@@ -225,13 +241,20 @@ export type AccountStorage = {
   }
   fallbackOn?: number[]
   refresh?: {
+    /** `false` turns the periodic store keep-alive off for this host. */
     enabled?: boolean
+    /** Keep-alive cadence (default 10 minutes). */
     intervalMinutes?: number
+    /**
+     * Unused since refresh moved into the store; kept so existing configs
+     * still parse.
+     */
     refreshBeforeExpiryMinutes?: number
+    /**
+     * Runtime only: the store's refresh verdict for the main account, filled
+     * in by the host from the store row. Never persisted.
+     */
     mainLastRefreshError?: AccountOperationError
-    mainRefreshLeaseId?: string
-    mainRefreshLeaseUntil?: number
-    mainRefreshLeaseTokenHash?: string
   }
   quota?: {
     enabled?: boolean
@@ -305,17 +328,15 @@ export function isCostZeroingEnabled(
   return storage.costZeroing?.enabled !== false
 }
 
+/**
+ * Per-account runtime state persisted in the host state file. It carries no
+ * OAuth token: those live only in the shared store.
+ */
 export type AccountRuntimeEntry = Partial<
   Pick<
     OAuthAccount,
-    | 'access'
     | 'authLineageId'
-    | 'refresh'
-    | 'expires'
-    | 'refreshExpires'
     | 'lastUsed'
-    | 'lastRefreshedAt'
-    | 'lastRefreshError'
     | 'lastQuotaRefreshError'
     | 'quota'
     | 'profile'
@@ -323,6 +344,20 @@ export type AccountRuntimeEntry = Partial<
   > &
     Pick<ApiKeyAccount, 'apiKey' | 'lastUsed'>
 >
+
+/**
+ * Fields older plugin versions wrote into the host config/state files. They
+ * are imported into the store once ({@link loadAccounts}) and never written
+ * again.
+ */
+const LEGACY_TOKEN_FIELDS = [
+  'access',
+  'refresh',
+  'expires',
+  'refreshExpires',
+  'lastRefreshedAt',
+  'lastRefreshError',
+] as const
 
 export type AccountRuntimeState = {
   version: 1
@@ -333,10 +368,6 @@ export type AccountRuntimeState = {
     quotaCheckedAt?: number
     quotaToken?: string
     lastQuotaApiError?: AccountOperationError
-    lastRefreshError?: AccountOperationError
-    refreshLeaseId?: string
-    refreshLeaseUntil?: number
-    refreshLeaseTokenHash?: string
     prime?: PrimeUsageCounters
     primeAuthLineageId?: string
     primeAuthLineageRefreshTokenFingerprint?: string
@@ -348,7 +379,6 @@ export type AccountRuntimeState = {
 export type AccountStateSaveScope = {
   mainProfile?: boolean
   mainQuota?: boolean
-  mainRefresh?: boolean
   mainPrime?: boolean
   accounts?: true | string[]
 }
@@ -393,25 +423,38 @@ type OAuthUsageResponse = {
   } | null
 }
 
-export type FallbackCredentialSyncResult =
-  | { status: 'applied' }
-  | { status: 'superseded'; account: OAuthAccount }
-  | { status: 'rejected' }
+/**
+ * The store operations the account manager needs. Defaults to the Rust
+ * binding; tests may substitute parts of it.
+ */
+export type SharedAccountAccess = {
+  getAccessToken: (accountId: string) => Promise<AccessToken>
+  handleUnauthorized: (accessToken: string) => Promise<UnauthorizedResult>
+  keepAliveOnce: () => Promise<KeepAliveResult>
+  listAccounts: () => Promise<SharedAnthropicAccount[]>
+  markUsed: (accountId: string) => Promise<boolean>
+}
+
+const defaultSharedAccountAccess: SharedAccountAccess = {
+  getAccessToken: (accountId) => getSharedAccessToken(accountId),
+  handleUnauthorized: (accessToken) => handleSharedUnauthorized(accessToken),
+  keepAliveOnce: () => sharedKeepAliveOnce(),
+  listAccounts: () => listSharedAccounts(),
+  markUsed: (accountId) => markSharedAccountUsed(accountId),
+}
 
 export type AccountManagerOptions = {
   now?: () => number
   fetchImpl?: typeof fetch
   configPath?: string
   quotaManager?: import('./quota-manager.ts').QuotaManager
-  // Invoked after a background quota pass persists at least one fallback storage
-  // change (token refresh, quota update, or error recording), so consumers
-  // (e.g. the OpenCode sidebar) can re-render without a request flowing through
-  // the fetch handler.
+  // Invoked after a background pass persists at least one fallback storage
+  // change (quota update or error recording), so consumers (e.g. the OpenCode
+  // sidebar) can re-render without a request flowing through the fetch
+  // handler.
   onFallbackStorageChanged?: () => void
-  onFallbackCredentialChanged?: (
-    account: OAuthAccount,
-    expectedRefresh: string,
-  ) => FallbackCredentialSyncResult | Promise<FallbackCredentialSyncResult>
+  /** Store access; defaults to the Rust binding. */
+  store?: Partial<SharedAccountAccess>
   setIntervalImpl?: typeof globalThis.setInterval
   clearIntervalImpl?: typeof globalThis.clearInterval
 }
@@ -424,12 +467,18 @@ export type AccountRefreshError = {
 // 529 is Anthropic's overload status; Claude Code treats it as the canonical
 // capacity signal alongside a mid-stream overloaded_error.
 const DEFAULT_FALLBACK_ON = [401, 403, 429, 529]
-const MIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
-const DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES = MIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
-const MIN_REFRESH_RETRY_DELAY_MS = 5 * 60_000
-const MAX_REFRESH_RETRY_DELAY_MS = 60 * 60_000
-const NON_TRANSIENT_REFRESH_RETRY_DELAY_MS = 24 * 60 * 60_000
+/**
+ * Legacy persisted refresh errors (from before the store owned refresh) used
+ * a 24 h backoff to mean "dead token". Only {@link isPermanentRefreshError}
+ * still reads that shape.
+ */
+const LEGACY_PERMANENT_REFRESH_DELAY_MS = 24 * 60 * 60_000
+/** Backoff after the store reports a transient refresh failure. */
+const MIN_ACCESS_RETRY_DELAY_MS = 60_000
+const MAX_ACCESS_RETRY_DELAY_MS = 15 * 60_000
+/** An access token this close to expiry is re-read from the store. */
+const ACCESS_TOKEN_EXPIRY_MARGIN_MS = 60_000
 const MIN_QUOTA_RETRY_DELAY_MS = 60_000
 const MAX_QUOTA_RETRY_DELAY_MS = 15 * 60_000
 const NON_TRANSIENT_QUOTA_RETRY_DELAY_MS = 5 * 60_000
@@ -439,11 +488,7 @@ const DEFAULT_MINIMUM_REMAINING: Record<QuotaWindowName, number> = {
   seven_day: 0,
 }
 const DEFAULT_FAIL_CLOSED_ON_UNKNOWN_QUOTA = true
-const BACKGROUND_TICK_MS = 60_000
-const BACKGROUND_TICK_JITTER_MS = 60_000
-const FALLBACK_REFRESH_LOCK_TTL_MS = 10 * 60_000
-const FALLBACK_REFRESH_JOIN_WAIT_MS = 10_000
-const FALLBACK_REFRESH_JOIN_POLL_MS = 100
+const KEEPALIVE_TICK_JITTER_MS = 60_000
 
 function getConfigDir() {
   if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
@@ -506,8 +551,9 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 
   if (value.type !== 'oauth') return null
-  if (typeof value.refresh !== 'string' || !value.refresh.trim()) return null
 
+  // Token fields an older version persisted are deliberately not read: the
+  // store owns the credential, and `loadAccounts` has already imported them.
   return {
     ...normalizeAccountBase(value),
     type: 'oauth',
@@ -515,18 +561,6 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
       typeof value.authLineageId === 'string' && value.authLineageId.trim()
         ? value.authLineageId
         : undefined,
-    access: typeof value.access === 'string' ? value.access : undefined,
-    refresh: value.refresh,
-    expires: typeof value.expires === 'number' ? value.expires : undefined,
-    refreshExpires:
-      typeof value.refreshExpires === 'number'
-        ? value.refreshExpires
-        : undefined,
-    lastRefreshedAt:
-      typeof value.lastRefreshedAt === 'number'
-        ? value.lastRefreshedAt
-        : undefined,
-    lastRefreshError: normalizeOperationError(value.lastRefreshError),
     lastQuotaRefreshError: normalizeOperationError(value.lastQuotaRefreshError),
     quota: normalizeQuota(value.quota),
     profile: normalizeOAuthAccountProfile(value.profile),
@@ -844,56 +878,10 @@ function objectWithDefinedEntries(value: Record<string, unknown>) {
   )
 }
 
-function numericField(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
-function accountCredentialTimestamp(value: Record<string, unknown>): number {
-  return Math.max(
-    numericField(value.lastRefreshedAt),
-    numericField(value.lastUsed),
-    numericField(value.addedAt),
-  )
-}
-
-function legacyConfigCredentialsAreNewer(
-  account: Record<string, unknown>,
-  stateAccount: Record<string, unknown>,
-): boolean {
-  if (account.type !== 'oauth') return false
-  if (typeof account.refresh !== 'string' || !account.refresh.trim()) {
-    return false
-  }
-  const tokenChanged = Boolean(
-    (typeof account.access === 'string' &&
-      typeof stateAccount.access === 'string' &&
-      account.access !== stateAccount.access) ||
-      (typeof account.refresh === 'string' &&
-        typeof stateAccount.refresh === 'string' &&
-        account.refresh !== stateAccount.refresh),
-  )
-  if (!tokenChanged) return false
-  return (
-    accountCredentialTimestamp(account) >
-    accountCredentialTimestamp(stateAccount)
-  )
-}
-
 function mergeConfigAccountAndState(
   account: Record<string, unknown>,
   stateAccount: Record<string, unknown>,
 ): Record<string, unknown> {
-  if (legacyConfigCredentialsAreNewer(account, stateAccount)) {
-    const merged = { ...stateAccount, ...account }
-    const configTimestamp = accountCredentialTimestamp(account)
-    if (configTimestamp > numericField(merged.lastRefreshedAt)) {
-      merged.lastRefreshedAt = configTimestamp
-    }
-    delete merged.quota
-    delete merged.lastRefreshError
-    delete merged.lastQuotaRefreshError
-    return merged
-  }
   return { ...account, ...stateAccount }
 }
 
@@ -909,7 +897,6 @@ function mergeConfigAndState(
   const quotaConfig = isRecord(configValue.quota) ? configValue.quota : {}
   const refreshConfig = isRecord(configValue.refresh) ? configValue.refresh : {}
   const mainQuotaSource = mainState ?? quotaConfig
-  const mainRefreshSource = mainState ?? refreshConfig
 
   const accounts = Array.isArray(configValue.accounts)
     ? configValue.accounts.map((account) => {
@@ -930,11 +917,9 @@ function mergeConfigAndState(
       profile: normalizeOAuthAccountProfile(mainState?.profile),
     },
     refresh: objectWithDefinedEntries({
-      ...refreshConfig,
-      mainLastRefreshError: mainRefreshSource.lastRefreshError,
-      mainRefreshLeaseId: mainRefreshSource.refreshLeaseId,
-      mainRefreshLeaseUntil: mainRefreshSource.refreshLeaseUntil,
-      mainRefreshLeaseTokenHash: mainRefreshSource.refreshLeaseTokenHash,
+      enabled: refreshConfig.enabled,
+      intervalMinutes: refreshConfig.intervalMinutes,
+      refreshBeforeExpiryMinutes: refreshConfig.refreshBeforeExpiryMinutes,
     }),
     quota: objectWithDefinedEntries({
       ...quotaConfig,
@@ -994,15 +979,260 @@ function mergeConfigAndState(
   }
 }
 
-export async function loadAccounts(path = getAccountStoragePath()) {
-  const config = await readJsonIfPresent(path)
-  const state = await readJsonIfPresent(getAccountStatePath(path))
-  // Runtime-only flows (main-OAuth refresh with no fallback accounts) write the
-  // state file but never the config file, so the store is absent only when
-  // neither exists. Synthesize an empty config to merge state into otherwise.
+export function loadAccounts(path = getAccountStoragePath()) {
+  return loadAccountsWith(path, () => migrateLegacyHostTokens(path))
+}
+
+/** {@link loadAccounts} for callers already holding both write locks. */
+function loadAccountsLocked(path: string) {
+  return loadAccountsWith(path, () => migrateLegacyHostTokensLocked(path))
+}
+
+async function loadAccountsWith(
+  path: string,
+  migrate: () => Promise<unknown>,
+): Promise<AccountStorage | null> {
+  let config = await readJsonIfPresent(path)
+  let state = await readJsonIfPresent(getAccountStatePath(path))
+  // Runtime-only flows write the state file but never the config file, so the
+  // store is absent only when neither exists. Synthesize an empty config to
+  // merge state into otherwise.
   if (!config.exists && !state.exists) return null
+  if (
+    hostFileCarriesTokens(config.value) ||
+    hostFileCarriesTokens(state.value)
+  ) {
+    await migrate()
+    config = await readJsonIfPresent(path)
+    state = await readJsonIfPresent(getAccountStatePath(path))
+  }
   const configValue = config.exists ? config.value : createEmptyStorage()
   return normalizeStorage(mergeConfigAndState(configValue, state.value))
+}
+
+// ---------------------------------------------------------------------------
+// One-time migration of host-held OAuth tokens into the shared store
+// ---------------------------------------------------------------------------
+
+/**
+ * `${statePath}#${accountId}` for entries whose import failed transiently.
+ * Their tokens stay on disk until a later load retries; every other token is
+ * scrubbed on the next write.
+ */
+const pendingTokenImports = new Set<string>()
+
+/** Earliest next attempt per state file after a failed import. */
+const tokenImportRetryAt = new Map<string, number>()
+const TOKEN_IMPORT_RETRY_MS = 60_000
+
+function entryCarriesToken(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    ((typeof value.refresh === 'string' && value.refresh.trim() !== '') ||
+      (typeof value.access === 'string' && value.access.trim() !== ''))
+  )
+}
+
+/** Whether a host config (`accounts: []`) or state (`accounts: {}`) holds tokens. */
+function hostFileCarriesTokens(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  if (Array.isArray(value.accounts)) {
+    return value.accounts.some(entryCarriesToken)
+  }
+  if (!isRecord(value.accounts)) return false
+  return Object.values(value.accounts).some(entryCarriesToken)
+}
+
+export type LegacyTokenMigrationEntry = {
+  hostId: string
+  status: 'added' | 'already_present' | 'kept' | 'invalid' | 'orphan' | 'retry'
+  accountId?: string
+}
+
+/**
+ * Older versions kept a copy of every fallback account's access and refresh
+ * token in the host files (`anthropic-auth-state.json`, and before that
+ * `anthropic-auth.json`). Move each one into the shared store once via
+ * `importOAuthAccount` — when the store already holds the login its copy wins
+ * — then rewrite the host files without tokens. Host account ids are
+ * rewritten to the store row that now holds the login.
+ *
+ * A token the store rejects as malformed cannot be used by anything any more
+ * (refresh lives in the store) and is dropped. A transient failure leaves the
+ * entry in place for the next load. State entries for accounts the config no
+ * longer lists are scrubbed without import, so a removed account is not
+ * resurrected.
+ */
+export function migrateLegacyHostTokens(
+  path = getAccountStoragePath(),
+): Promise<LegacyTokenMigrationEntry[]> {
+  const retryAt = tokenImportRetryAt.get(getAccountStatePath(path))
+  if (retryAt && retryAt > Date.now()) return Promise.resolve([])
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        return await migrateLegacyHostTokensLocked(path)
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
+}
+
+async function migrateLegacyHostTokensLocked(
+  path: string,
+): Promise<LegacyTokenMigrationEntry[]> {
+  const statePath = getAccountStatePath(path)
+  const config = await readJsonIfPresent(path)
+  const state = await readJsonIfPresent(statePath)
+  const configValue = isRecord(config.value) ? { ...config.value } : undefined
+  const stateValue = isRecord(state.value) ? { ...state.value } : undefined
+  const configAccounts: Record<string, unknown>[] = Array.isArray(
+    configValue?.accounts,
+  )
+    ? configValue.accounts.filter(isRecord).map((entry) => ({ ...entry }))
+    : []
+  const stateAccounts: Record<string, Record<string, unknown>> = {}
+  if (stateValue && isRecord(stateValue.accounts)) {
+    for (const [id, entry] of Object.entries(stateValue.accounts)) {
+      if (isRecord(entry)) stateAccounts[id] = { ...entry }
+    }
+  }
+
+  const results: LegacyTokenMigrationEntry[] = []
+  const renames = new Map<string, string>()
+  // Host ids of store-backed accounts were materialized from store ids, so a
+  // store row with the same id is this login already: the store's copy wins
+  // and the (possibly spent) host copy is never presented to the store.
+  let storeIds: Set<string>
+  try {
+    storeIds = new Set((await listSharedAccounts()).map((row) => row.id))
+  } catch (error) {
+    logger.warn('accounts.migration', 'store unreadable; import deferred', {
+      path,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    tokenImportRetryAt.set(statePath, Date.now() + TOKEN_IMPORT_RETRY_MS)
+    return []
+  }
+  const configIds = new Set(
+    configAccounts
+      .map((entry) => entry.id)
+      .filter((id): id is string => typeof id === 'string'),
+  )
+
+  for (const entry of configAccounts) {
+    const hostId = typeof entry.id === 'string' ? entry.id : undefined
+    if (!hostId || entry.type !== 'oauth') continue
+    const stateEntry = stateAccounts[hostId]
+    // The state file is the runtime copy; the config copy predates it.
+    const source = entryCarriesToken(stateEntry)
+      ? stateEntry
+      : entryCarriesToken(entry)
+        ? entry
+        : undefined
+    if (!source) continue
+    const refresh =
+      typeof source.refresh === 'string' ? source.refresh.trim() : ''
+    const access = typeof source.access === 'string' ? source.access.trim() : ''
+    let outcome: LegacyTokenMigrationEntry
+    if (storeIds.has(hostId)) {
+      pendingTokenImports.delete(`${statePath}#${hostId}`)
+      results.push({ hostId, status: 'kept', accountId: hostId })
+      continue
+    }
+    try {
+      const imported = await importHostOAuthCredential({
+        label:
+          typeof entry.label === 'string' && entry.label.trim()
+            ? entry.label.trim()
+            : hostId,
+        accessToken: access,
+        refreshToken: refresh,
+        expiresAt:
+          typeof source.expires === 'number' && Number.isFinite(source.expires)
+            ? source.expires
+            : 0,
+        ...(typeof source.refreshExpires === 'number' &&
+        Number.isFinite(source.refreshExpires)
+          ? { refreshExpiresAt: source.refreshExpires }
+          : {}),
+      })
+      outcome =
+        imported.status === 'invalid'
+          ? { hostId, status: 'invalid' }
+          : { hostId, status: imported.status, accountId: imported.accountId }
+    } catch (error) {
+      logger.warn('accounts.migration', 'token import deferred', {
+        hostId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      pendingTokenImports.add(`${statePath}#${hostId}`)
+      tokenImportRetryAt.set(statePath, Date.now() + TOKEN_IMPORT_RETRY_MS)
+      results.push({ hostId, status: 'retry' })
+      continue
+    }
+    pendingTokenImports.delete(`${statePath}#${hostId}`)
+    results.push(outcome)
+    if (outcome.accountId && outcome.accountId !== hostId) {
+      renames.set(hostId, outcome.accountId)
+    }
+  }
+
+  for (const [id, entry] of Object.entries(stateAccounts)) {
+    if (!configIds.has(id) && entryCarriesToken(entry)) {
+      results.push({ hostId: id, status: 'orphan' })
+    }
+  }
+
+  // Rewrite: no tokens anywhere, host ids follow the store row.
+  const seen = new Set<string>()
+  const nextConfigAccounts: Record<string, unknown>[] = []
+  for (const entry of configAccounts) {
+    const hostId = typeof entry.id === 'string' ? entry.id : undefined
+    const pending = hostId && pendingTokenImports.has(`${statePath}#${hostId}`)
+    const nextId = (hostId && renames.get(hostId)) ?? hostId
+    if (nextId && seen.has(nextId)) continue
+    if (nextId) seen.add(nextId)
+    const next = pending ? { ...entry } : stripLegacyTokenFields(entry)
+    if (nextId) next.id = nextId
+    nextConfigAccounts.push(next)
+  }
+  const nextStateAccounts: Record<string, unknown> = {}
+  for (const [id, entry] of Object.entries(stateAccounts)) {
+    const pending = pendingTokenImports.has(`${statePath}#${id}`)
+    const nextId = renames.get(id) ?? id
+    if (nextStateAccounts[nextId] !== undefined) continue
+    nextStateAccounts[nextId] = pending ? entry : stripLegacyTokenFields(entry)
+  }
+
+  if (configValue && config.exists) {
+    await writeJsonAtomic(path, {
+      ...configValue,
+      accounts: nextConfigAccounts,
+    })
+  }
+  if (stateValue && state.exists) {
+    await writeJsonAtomic(
+      statePath,
+      pruneUndefined({ ...stateValue, accounts: nextStateAccounts }),
+    )
+  }
+  if (results.length) {
+    logger.info('accounts.migration', 'host tokens moved into the store', {
+      path,
+      results: results.map((result) => ({
+        hostId: result.hostId,
+        status: result.status,
+        accountId: result.accountId,
+      })),
+    })
+  }
+  return results
 }
 
 async function loadExistingTopLevelFields(path: string) {
@@ -1037,13 +1267,7 @@ function accountRuntimeState(account: FallbackAccount) {
   }
   return objectWithDefinedEntries({
     authLineageId: account.authLineageId,
-    access: account.access,
-    refresh: account.refresh,
-    expires: account.expires,
-    refreshExpires: account.refreshExpires,
     lastUsed: account.lastUsed,
-    lastRefreshedAt: account.lastRefreshedAt,
-    lastRefreshError: account.lastRefreshError,
     lastQuotaRefreshError: account.lastQuotaRefreshError,
     quota: account.quota,
     profile: account.profile,
@@ -1132,18 +1356,8 @@ function mergeAccountRuntimeState(
   incoming: AccountRuntimeEntry,
 ): AccountRuntimeEntry {
   if (!isRecord(existing)) return incoming
-  const existingEntry = existing as AccountRuntimeEntry
-  const tokenChanged = Boolean(
-    (existingEntry.access &&
-      incoming.access &&
-      existingEntry.access !== incoming.access) ||
-      (existingEntry.refresh &&
-        incoming.refresh &&
-        existingEntry.refresh !== incoming.refresh),
-  )
-  const mergesHeaderQuota = Boolean(
-    !tokenChanged && incoming.quota?.source === 'headers',
-  )
+  const existingEntry = stripLegacyTokenFields(existing) as AccountRuntimeEntry
+  const mergesHeaderQuota = incoming.quota?.source === 'headers'
   const effectiveIncoming =
     mergesHeaderQuota && incoming.quota
       ? {
@@ -1167,42 +1381,11 @@ function mergeAccountRuntimeState(
     (existingQuotaCheckedAt > incomingQuotaCheckedAt ||
       existingQuotaWinsEqualTimestamp)
   ) {
-    const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
-    const incomingRefreshAt = effectiveIncoming.lastRefreshedAt ?? 0
-    if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
-      const merged: AccountRuntimeEntry = { ...existingEntry }
-      if (
-        typeof effectiveIncoming.lastUsed === 'number' &&
-        (!(typeof existingEntry.lastUsed === 'number') ||
-          effectiveIncoming.lastUsed > existingEntry.lastUsed)
-      ) {
-        merged.lastUsed = effectiveIncoming.lastUsed
-      }
-      return merged
-    }
-
-    const merged: AccountRuntimeEntry = {
+    // A newer reading already on disk (another process) wins over this
+    // snapshot's older one.
+    return {
       ...existingEntry,
       ...effectiveIncoming,
-    }
-    if (tokenChanged) {
-      if (!('profile' in effectiveIncoming)) delete merged.profile
-      if (effectiveIncoming.quota?.source) {
-        merged.quota = effectiveIncoming.quota
-      } else {
-        delete merged.quota
-      }
-      if (!('lastQuotaRefreshError' in effectiveIncoming)) {
-        delete merged.lastQuotaRefreshError
-      }
-      if (!('lastRefreshError' in effectiveIncoming)) {
-        delete merged.lastRefreshError
-      }
-      return merged
-    }
-
-    return {
-      ...merged,
       quota: existingEntry.quota,
       lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
     }
@@ -1211,17 +1394,19 @@ function mergeAccountRuntimeState(
     ...existingEntry,
     ...effectiveIncoming,
   }
-  if (tokenChanged) {
-    if (!('profile' in effectiveIncoming)) delete merged.profile
-    if (!effectiveIncoming.quota?.source) delete merged.quota
-  }
   if (!('lastQuotaRefreshError' in effectiveIncoming)) {
     delete merged.lastQuotaRefreshError
   }
-  if (!('lastRefreshError' in effectiveIncoming)) {
-    delete merged.lastRefreshError
-  }
   return merged
+}
+
+/** A copy of a persisted account entry without any token-era field. */
+function stripLegacyTokenFields(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  const copy = { ...value }
+  for (const field of LEGACY_TOKEN_FIELDS) delete copy[field]
+  return copy
 }
 
 function configFromStorage(storage: AccountStorage): Record<string, unknown> {
@@ -1420,25 +1605,26 @@ async function saveAccountsLocked(
 ) {
   const lock = await acquireAccountConfigWriteLock(path)
   try {
-    const current = await loadAccounts(path)
-    const nextStorage: AccountStorage = {
-      ...storage,
-      accounts: mergeAccountsForSave(
-        current?.accounts ?? [],
-        storage.accounts,
-        options,
-      ),
-    }
-    const existing = await loadExistingTopLevelFields(path)
-    const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
-    await writeJsonAtomic(path, nextConfig)
     // Config precedes state everywhere both locks are needed; reversing this
-    // order can deadlock profile mutations against full account saves.
+    // order can deadlock profile mutations against full account saves. Both
+    // are held before the read so a pending token migration completes before
+    // anything is rewritten without tokens.
     const stateLock = await acquireAccountStateWriteLock(path)
     try {
+      const current = await loadAccountsLocked(path)
+      const nextStorage: AccountStorage = {
+        ...storage,
+        accounts: mergeAccountsForSave(
+          current?.accounts ?? [],
+          storage.accounts,
+          options,
+        ),
+      }
+      const existing = await loadExistingTopLevelFields(path)
+      const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
+      await writeJsonAtomic(path, nextConfig)
       await saveAccountStateUnlocked(nextStorage, path, {
         mainQuota: true,
-        mainRefresh: true,
         accounts: true,
       })
     } finally {
@@ -1501,17 +1687,6 @@ function applyMainQuotaStatePatch(
   state.main.lastQuotaApiError = storage.quota?.mainLastQuotaApiError
 }
 
-function applyMainRefreshStatePatch(
-  state: AccountRuntimeState,
-  storage: AccountStorage,
-) {
-  state.main = state.main ?? {}
-  state.main.lastRefreshError = storage.refresh?.mainLastRefreshError
-  state.main.refreshLeaseId = storage.refresh?.mainRefreshLeaseId
-  state.main.refreshLeaseUntil = storage.refresh?.mainRefreshLeaseUntil
-  state.main.refreshLeaseTokenHash = storage.refresh?.mainRefreshLeaseTokenHash
-}
-
 function applyMainPrimeStatePatch(
   state: AccountRuntimeState,
   storage: AccountStorage,
@@ -1564,7 +1739,6 @@ export function saveAccountState(
   scope: AccountStateSaveScope = {
     mainProfile: true,
     mainQuota: true,
-    mainRefresh: true,
     accounts: true,
   },
 ): Promise<void> {
@@ -1593,7 +1767,7 @@ export function saveOAuthProfileState(
     try {
       const stateLock = await acquireAccountStateWriteLock(resolvedPath)
       try {
-        const current = await loadAccounts(resolvedPath)
+        const current = await loadAccountsLocked(resolvedPath)
         const statePath = getAccountStatePath(resolvedPath)
         const existing = (await readJsonIfPresent(statePath)).value
         const next: AccountRuntimeState = isRecord(existing)
@@ -1635,16 +1809,14 @@ export function saveOAuthProfileState(
           next.main.profile = profile
           next.main.profileToken = expectedTokenFingerprint
         } else {
+          // The access token is not persisted (the store owns it), so the
+          // profile is bound by the fingerprint the caller observed; readers
+          // compare it with the token they hold.
           const account = current?.accounts.find(
             (candidate): candidate is OAuthAccount =>
               candidate.id === accountId && isOAuthAccount(candidate),
           )
-          if (
-            !account?.access ||
-            tokenFingerprint(account.access) !== expectedTokenFingerprint
-          ) {
-            return false
-          }
+          if (!account) return false
           next.accounts = {
             ...(isRecord(next.accounts) ? next.accounts : {}),
           }
@@ -1695,7 +1867,6 @@ async function saveAccountStateUnlocked(
 
   if (scope.mainProfile) applyMainProfileStatePatch(next, storage)
   if (scope.mainQuota) applyMainQuotaStatePatch(next, storage)
-  if (scope.mainRefresh) applyMainRefreshStatePatch(next, storage)
   if (scope.mainPrime) applyMainPrimeStatePatch(next, storage)
 
   if (scope.accounts) {
@@ -1728,7 +1899,35 @@ async function saveAccountStateUnlocked(
     }
   }
 
+  scrubLegacyTokens(next, statePath)
   await writeJsonAtomic(statePath, pruneUndefined(next))
+}
+
+/**
+ * Remove every token-era field from a state object about to be written, so
+ * no write carries an OAuth token. An entry whose one-time import into the
+ * store failed transiently keeps its tokens until a later load retries it
+ * (see {@link migrateLegacyHostTokens}); dropping them then would lose a
+ * login the store has never seen.
+ */
+function scrubLegacyTokens(state: AccountRuntimeState, statePath: string) {
+  const main = state.main as Record<string, unknown> | undefined
+  if (main) {
+    for (const field of [
+      'lastRefreshError',
+      'refreshLeaseId',
+      'refreshLeaseUntil',
+      'refreshLeaseTokenHash',
+    ]) {
+      delete main[field]
+    }
+  }
+  if (!isRecord(state.accounts)) return
+  for (const [id, entry] of Object.entries(state.accounts)) {
+    if (!isRecord(entry)) continue
+    if (pendingTokenImports.has(`${statePath}#${id}`)) continue
+    state.accounts[id] = stripLegacyTokenFields(entry) as AccountRuntimeEntry
+  }
 }
 
 export async function acquireRefreshFileLock(options: {
@@ -2144,24 +2343,31 @@ export async function setPrimePersistentEnabled(
 
 /**
  * Return the stable prime marker identity for an OAuth account, seeding it in
- * runtime state when older storage has no lineage yet. Main lookups return
- * undefined when the live refresh token is unavailable and no lineage exists.
+ * runtime state when older storage has no lineage yet.
+ *
+ * For `main`, `mainCredentialIdentity` names the credential the host is using
+ * now: `store:<accountId>` for a store-backed main (stable across refreshes,
+ * which happen in the store), or the static credential itself for one that is
+ * not in the store. Only its fingerprint is persisted. A different identity
+ * than the bound one is a re-login/replacement and mints a new lineage; the
+ * same identity keeps the lineage. Main lookups return undefined when no
+ * identity is known and no lineage exists.
  */
 export async function getOrCreatePrimeAuthLineageId(
   accountId: 'main' | string,
   path = getAccountStoragePath(),
-  mainRefreshToken?: string,
+  mainCredentialIdentity?: string,
 ): Promise<string | undefined> {
   return enqueueSave(async () => {
     const configLock = await acquireAccountConfigWriteLock(path)
     try {
       const stateLock = await acquireAccountStateWriteLock(path)
       try {
-        const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+        const storage = (await loadAccountsLocked(path)) ?? createEmptyStorage()
         if (accountId === 'main') {
           const existing = storage.prime?.mainAuthLineageId
-          const observedFingerprint = mainRefreshToken
-            ? tokenFingerprint(mainRefreshToken)
+          const observedFingerprint = mainCredentialIdentity
+            ? tokenFingerprint(mainCredentialIdentity)
             : undefined
           const boundFingerprint =
             storage.prime?.mainAuthLineageRefreshTokenFingerprint
@@ -2172,29 +2378,8 @@ export async function getOrCreatePrimeAuthLineageId(
             )
               return existing
 
-            // The rotation rebinds before the host publishes, so an
-            // observation of the token we just rotated away from is the
-            // pre-publish side of our own handoff — not a re-login.
-            if (
-              storage.prime?.mainAuthLineagePreviousRefreshTokenFingerprint ===
-              observedFingerprint
-            ) {
-              return existing
-            }
-
-            if (
-              boundFingerprint &&
-              storage.refresh?.mainRefreshLeaseUntil &&
-              storage.refresh.mainRefreshLeaseUntil > Date.now()
-            ) {
-              // The owner binds before publishing its rotated credential. An
-              // active lease makes either side of that handoff ambiguous, so
-              // suppress this tick instead of classifying it as a re-login.
-              return existing
-            }
-
             if (!boundFingerprint) {
-              // Legacy lineages predate refresh-token binding. The first
+              // Legacy lineages predate credential binding. The first
               // observation attaches the credential without changing markers.
               storage.prime = {
                 ...(storage.prime ?? {}),
@@ -2207,45 +2392,20 @@ export async function getOrCreatePrimeAuthLineageId(
             }
           }
 
-          // Without the live host credential there is no safe way to bind a
-          // new identity. Skip this tick rather than creating an unbound
-          // namespace that could churn or suppress another account.
-          if (!observedFingerprint) {
-            console.error(
-              'DEBUG lineage undefined: no observedFingerprint; existing=',
-              existing,
-              'mainRefreshTokenFp=',
-              mainRefreshToken
-                ? tokenFingerprint(mainRefreshToken).slice(0, 8)
-                : undefined,
-            )
-            return undefined
-          }
-          console.error(
-            'DEBUG lineage main: existing=',
-            existing,
-            'observedFp=',
-            observedFingerprint?.slice(0, 6),
-            'boundFp=',
-            boundFingerprint?.slice(0, 6),
-            'leaseUntil=',
-            storage.refresh?.mainRefreshLeaseUntil,
-            'now=',
-            Date.now(),
-            'leaseActive=',
-            (storage.refresh?.mainRefreshLeaseUntil ?? 0) > Date.now(),
-            'refreshBlock=',
-            JSON.stringify(storage.refresh),
-          )
+          // Without an identity there is no safe way to bind a new lineage.
+          // Skip this tick rather than creating an unbound namespace that
+          // could churn or suppress another account.
+          if (!observedFingerprint) return undefined
 
-          // A bound mismatch that did not pass through the owned refresh path
-          // is a host credential replacement and needs a fresh marker identity.
+          // A different credential identity is a host credential replacement
+          // and needs a fresh marker identity.
           const authLineageId = randomUUID()
           storage.prime = {
             ...(storage.prime ?? {}),
             mainAuthLineageId: authLineageId,
-            ...(observedFingerprint && {
-              mainAuthLineageRefreshTokenFingerprint: observedFingerprint,
+            mainAuthLineageRefreshTokenFingerprint: observedFingerprint,
+            ...(boundFingerprint && {
+              mainAuthLineagePreviousRefreshTokenFingerprint: boundFingerprint,
             }),
           }
           await saveAccountStateUnlocked(storage, path, { mainPrime: true })
@@ -2281,56 +2441,9 @@ export async function getOrCreatePrimeAuthLineageId(
   })
 }
 
-/** Advance a main lineage across a refresh performed by this plugin. */
-export async function continueMainPrimeAuthLineageAfterRefresh(
-  input: {
-    previousRefreshToken: string
-    currentRefreshToken: string
-  },
-  path = getAccountStoragePath(),
-): Promise<void> {
-  console.error(
-    'DEBUG continueLineage: prev=',
-    tokenFingerprint(input.previousRefreshToken).slice(0, 6),
-    'cur=',
-    tokenFingerprint(input.currentRefreshToken).slice(0, 6),
-  )
-  return enqueueSave(async () => {
-    const configLock = await acquireAccountConfigWriteLock(path)
-    try {
-      const stateLock = await acquireAccountStateWriteLock(path)
-      try {
-        const storage = (await loadAccounts(path)) ?? createEmptyStorage()
-        const authLineageId = storage.prime?.mainAuthLineageId
-        if (!authLineageId) return
-
-        const previousFingerprint = tokenFingerprint(input.previousRefreshToken)
-        const currentFingerprint = tokenFingerprint(input.currentRefreshToken)
-        const boundFingerprint =
-          storage.prime?.mainAuthLineageRefreshTokenFingerprint
-        if (
-          boundFingerprint &&
-          boundFingerprint !== previousFingerprint &&
-          boundFingerprint !== currentFingerprint
-        ) {
-          // Another process observed a host replacement after this refresh
-          // started; the stale rotation must not rebind that newer lineage.
-          return
-        }
-
-        storage.prime = {
-          ...(storage.prime ?? {}),
-          mainAuthLineageRefreshTokenFingerprint: currentFingerprint,
-          mainAuthLineagePreviousRefreshTokenFingerprint: previousFingerprint,
-        }
-        await saveAccountStateUnlocked(storage, path, { mainPrime: true })
-      } finally {
-        await stateLock.release()
-      }
-    } finally {
-      await configLock.release()
-    }
-  })
+/** The prime lineage identity of a store-backed main account. */
+export function storeCredentialIdentity(accountId: string) {
+  return `store:${accountId}`
 }
 
 /**
@@ -2362,7 +2475,7 @@ export async function incrementPrimeUsagePersistent(
     try {
       const stateLock = await acquireAccountStateWriteLock(path)
       try {
-        const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+        const storage = (await loadAccountsLocked(path)) ?? createEmptyStorage()
 
         if (accountId === 'main') {
           const existing = storage.prime?.main
@@ -2438,7 +2551,7 @@ function quotaEnabled(storage: AccountStorage | null) {
   return storage?.quota?.enabled !== false
 }
 
-function refreshEnabled(storage: AccountStorage | null) {
+function keepAliveEnabled(storage: AccountStorage | null) {
   return storage?.refresh?.enabled !== false
 }
 
@@ -2446,47 +2559,15 @@ function jitterMs(maxMs: number) {
   return Math.floor(Math.random() * Math.max(0, maxMs))
 }
 
-function refreshBeforeExpiryMs(storage: AccountStorage | null) {
-  const minutes =
-    storage?.refresh?.refreshBeforeExpiryMinutes ??
-    DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES
-  return Math.max(MIN_REFRESH_BEFORE_EXPIRY_MINUTES, minutes) * 60_000
-}
-
+/** The store keep-alive cadence (`refresh.intervalMinutes`, default 10). */
 export function getRefreshIntervalMs(storage: AccountStorage | null) {
   const minutes =
     storage?.refresh?.intervalMinutes ?? DEFAULT_REFRESH_INTERVAL_MINUTES
   return Math.max(1, minutes) * 60_000
 }
 
-export function hashRefreshToken(refreshToken: string) {
-  return createHash('sha256').update(refreshToken).digest('hex')
-}
-
-// Mirrors Claude Code's `sie` (reset-like) and `gde` (connect-like) sets.
-const TRANSIENT_NETWORK_ERROR_CODES = new Set([
-  'ECONNRESET',
-  'EPIPE',
-  'ConnectionClosed',
-  'ETIMEDOUT',
-  'ECONNABORTED',
-  'ERR_SOCKET_CLOSED',
-  'StreamSuspended',
-  'ECONNREFUSED',
-  'ConnectionRefused',
-  'ENOTFOUND',
-  'ENETUNREACH',
-  'ENETDOWN',
-  'EHOSTUNREACH',
-  'EHOSTDOWN',
-  'EAI_AGAIN',
-  'FailedToOpenSocket',
-  'ERR_PROXY_TUNNEL',
-  'UND_ERR_CONNECT_TIMEOUT',
-])
-
 // Mirrors Claude Code's `M8b`: credential/request failures that retrying can
-// never resolve, so they must not consume refresh attempts.
+// never resolve.
 const PERMANENT_ERROR_MESSAGES = new Set([
   'OAuth access token has expired. Re-authenticate to continue.',
   'OAuth access token has been revoked.',
@@ -2501,77 +2582,34 @@ export function isPermanentProviderError(error: unknown): boolean {
   return PERMANENT_ERROR_MESSAGES.has(error.message.trim())
 }
 
-function isTransientRefreshError(error: unknown) {
-  if (isPermanentProviderError(error)) return false
-  const status = (error as { status?: unknown }).status
-  if (typeof status === 'number' && Number.isFinite(status)) {
-    return status === 408 || status === 429 || status >= 500
+/**
+ * The store's refresh verdict for one row as an {@link AccountOperationError}.
+ * `refreshDead` means the store holds a refresh token Anthropic rejected with
+ * `invalid_grant` (re-login required); `lastError` is reported only while it
+ * still describes the row's current token, so a verdict never outlives the
+ * token it was about.
+ */
+export function refreshErrorFromSharedAccount(
+  account: Pick<
+    SharedAnthropicAccount,
+    'refreshDead' | 'lastError' | 'lastRefreshedAt'
+  >,
+  now = Date.now(),
+): AccountOperationError | undefined {
+  if (account.refreshDead) {
+    return {
+      message:
+        account.lastError ??
+        'invalid_grant: the refresh token is dead; log in again',
+      checkedAt: now,
+      status: 400,
+      permanent: true,
+    }
   }
-  if (!(error instanceof Error)) return false
-  return (
-    error.message.includes('fetch failed') ||
-    ('code' in error &&
-      typeof error.code === 'string' &&
-      TRANSIENT_NETWORK_ERROR_CODES.has(error.code))
-  )
-}
-
-export function buildRefreshOperationError(input: {
-  error: unknown
-  now: number
-  refreshToken: string
-  previous?: AccountOperationError
-}): AccountOperationError {
-  const tokenHash = hashRefreshToken(input.refreshToken)
-  const previousRetryCount =
-    input.previous?.tokenHash === tokenHash
-      ? (input.previous.retryCount ?? 0)
-      : 0
-  const retryCount = previousRetryCount + 1
-  const retryAfterFromError = (input.error as { retryAfter?: unknown })
-    .retryAfter
-  let delay: number
-  if (typeof retryAfterFromError === 'number' && retryAfterFromError > 0) {
-    delay = retryAfterFromError * 1000
-  } else if (isTransientRefreshError(input.error)) {
-    delay = Math.min(
-      MAX_REFRESH_RETRY_DELAY_MS,
-      MIN_REFRESH_RETRY_DELAY_MS * 2 ** Math.min(retryCount - 1, 6),
-    )
-  } else {
-    delay = NON_TRANSIENT_REFRESH_RETRY_DELAY_MS
+  if (account.lastError) {
+    return { message: account.lastError, checkedAt: now, permanent: false }
   }
-  const statusFromError = (input.error as { status?: unknown }).status
-  const status =
-    typeof statusFromError === 'number' && Number.isFinite(statusFromError)
-      ? statusFromError
-      : undefined
-  const message = formatErrorMessage(input.error)
-  // A token is permanently dead ONLY on 400 invalid_grant. The OAuth spec allows
-  // other 400s (invalid_client / invalid_request / unsupported_grant_type) that
-  // re-login does NOT fix — those, like a retry-exhausted / network / 429 / 5xx
-  // error, get a long backoff but must stay permanent=false so they are not
-  // falsely flagged "needs re-login". ClaudeOAuthRefreshError carries the raw
-  // OAuth body, and its message embeds it (`...: 400 — <body>`), so check both.
-  const body =
-    typeof (input.error as { body?: unknown }).body === 'string'
-      ? (input.error as { body: string }).body
-      : ''
-  const isInvalidGrant =
-    body.includes('invalid_grant') || message.includes('invalid_grant')
-  const explicitPermanent = (input.error as { permanent?: unknown }).permanent
-  return {
-    message,
-    checkedAt: input.now,
-    nextRetryAt: input.now + delay,
-    retryCount,
-    tokenHash,
-    status,
-    permanent:
-      typeof explicitPermanent === 'boolean'
-        ? explicitPermanent
-        : status === 400 && isInvalidGrant,
-  }
+  return undefined
 }
 
 /**
@@ -2597,54 +2635,10 @@ export function isPermanentRefreshError(
   if (typeof error.status === 'number') return error.status === 400
   if (typeof error.nextRetryAt === 'number') {
     return (
-      error.nextRetryAt - error.checkedAt >=
-      NON_TRANSIENT_REFRESH_RETRY_DELAY_MS
+      error.nextRetryAt - error.checkedAt >= LEGACY_PERMANENT_REFRESH_DELAY_MS
     )
   }
   return false
-}
-
-export function refreshBackoffActive(
-  error: AccountOperationError | undefined,
-  refreshToken: string | undefined,
-  now: number,
-) {
-  if (!error?.nextRetryAt || error.nextRetryAt <= now) return false
-  if (!refreshToken) return true
-  return error.tokenHash === hashRefreshToken(refreshToken)
-}
-
-export function formatRefreshBackoffMessage(
-  error: AccountOperationError,
-  now: number,
-) {
-  const seconds = Math.max(
-    1,
-    Math.ceil(((error.nextRetryAt ?? now) - now) / 1000),
-  )
-  return `Claude OAuth refresh is backed off for ${seconds}s after: ${error.message}`
-}
-
-type RefreshBackoffActiveError = Error & {
-  refreshBackoffError: AccountOperationError
-}
-
-function createRefreshBackoffActiveError(
-  error: AccountOperationError,
-  now: number,
-): RefreshBackoffActiveError {
-  return Object.assign(new Error(formatRefreshBackoffMessage(error, now)), {
-    refreshBackoffError: error,
-  })
-}
-
-function existingRefreshBackoffError(
-  error: unknown,
-): AccountOperationError | undefined {
-  if (!error || typeof error !== 'object') return undefined
-  const existing = (error as Partial<RefreshBackoffActiveError>)
-    .refreshBackoffError
-  return existing && typeof existing.message === 'string' ? existing : undefined
 }
 
 export function getFallbackReauthLabels(
@@ -3077,15 +3071,12 @@ export function getQuotaNextRefreshAt(
   return capAtOldestWindow(Math.min(...blockedResetTimes) + 60_000)
 }
 
-function tokenNeedsRefresh(
-  account: OAuthAccount,
-  storage: AccountStorage | null,
-  now: number,
-) {
-  return (
-    !account.access ||
-    !account.expires ||
-    account.expires - now <= refreshBeforeExpiryMs(storage)
+/** Whether the hydrated access token can be sent without asking the store. */
+function accessTokenIsUsable(account: OAuthAccount, now: number) {
+  return Boolean(
+    account.access &&
+      typeof account.expires === 'number' &&
+      account.expires - now > ACCESS_TOKEN_EXPIRY_MARGIN_MS,
   )
 }
 
@@ -3416,63 +3407,83 @@ function formatErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
-function recordRefreshError(
-  account: OAuthAccount,
-  error: unknown,
-  now: number,
-) {
-  const existing = existingRefreshBackoffError(error)
-  if (existing) {
-    account.lastRefreshError = existing
-    return
-  }
-  account.lastRefreshError = buildRefreshOperationError({
-    error,
-    now,
-    refreshToken: account.refresh,
-    previous: account.lastRefreshError,
-  })
-}
-
 function recordQuotaRefreshError(
   account: OAuthAccount,
   error: unknown,
   now: number,
 ) {
-  if (isQuotaPolicyAuthError(error) || existingRefreshBackoffError(error))
-    return
+  if (isQuotaPolicyAuthError(error) || accessBackoffError(error)) return
   account.lastQuotaRefreshError = buildQuotaOperationError({
     error,
     now,
     previous: account.lastQuotaRefreshError,
   })
-  if ((error as { isRefreshError?: boolean }).isRefreshError) {
-    recordRefreshError(account, error, now)
+}
+
+type AccessBackoffError = Error & { accessBackoff: AccountOperationError }
+
+function accessBackoffError(error: unknown): AccountOperationError | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const backoff = (error as Partial<AccessBackoffError>).accessBackoff
+  return backoff && typeof backoff.message === 'string' ? backoff : undefined
+}
+
+/**
+ * The store's refusal to hand out an access token, as the account's refresh
+ * error. `invalid_grant` is terminal (re-login); everything else recovers.
+ */
+function refreshErrorFromAccessFailure(
+  error: unknown,
+  now: number,
+  previous: AccountOperationError | undefined,
+): AccountOperationError {
+  const message = formatErrorMessage(error)
+  // Binding errors (and re-authorization failures) carry the class on `code`.
+  const code = (error as { code?: unknown } | null)?.code
+  if (code === 'invalid_grant') {
+    return { message, checkedAt: now, status: 400, permanent: true }
+  }
+  const retryCount = (previous?.permanent ? 0 : (previous?.retryCount ?? 0)) + 1
+  const delay =
+    code === 'transient'
+      ? Math.min(
+          MAX_ACCESS_RETRY_DELAY_MS,
+          MIN_ACCESS_RETRY_DELAY_MS * 2 ** Math.min(retryCount - 1, 6),
+        )
+      : MIN_ACCESS_RETRY_DELAY_MS
+  return {
+    message,
+    checkedAt: now,
+    nextRetryAt: now + delay,
+    retryCount,
+    permanent: false,
   }
 }
 
-function fallbackRefreshLockName(accountId: string) {
-  return `fallback-oauth-refresh-${createHash('sha256')
-    .update(accountId)
-    .digest('hex')
-    .slice(0, 16)}`
-}
-
+/**
+ * Routes over the fallback OAuth accounts of one host.
+ *
+ * Credentials come from the shared store: {@link ensureAccessToken} asks the
+ * Rust binding for a live bearer just before an account is used, and the
+ * binding refreshes (claimed, compare-and-swap, fail-closed) when the stored
+ * one has expired. Nothing here presents a refresh token or writes the store
+ * file. The periodic task ({@link startKeepAlive}) calls the store's
+ * machine-wide `keepAliveOnce()` — which refreshes only idle accounts whose
+ * refresh token is about to lapse — and polls quota for accounts whose access
+ * token is already live; it never refreshes an account just because its
+ * access token expired.
+ */
 export class FallbackAccountManager {
   private readonly now: () => number
   private readonly fetchImpl: typeof fetch
   private readonly configPath: string
-  private readonly refreshPromises = new Map<string, Promise<OAuthAccount>>()
-  private refreshTimer: ReturnType<typeof setInterval> | null = null
-  private quotaTimer: ReturnType<typeof setInterval> | null = null
+  private readonly store: SharedAccountAccess
+  private readonly accessPromises = new Map<string, Promise<OAuthAccount>>()
+  /** Process-local backoff after the store failed to produce a token. */
+  private readonly accessBackoff = new Map<string, AccountOperationError>()
+  private keepAliveTimer: ReturnType<typeof setInterval> | null = null
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
   private readonly onFallbackStorageChanged: (() => void) | undefined
-  private readonly onFallbackCredentialChanged:
-    | ((
-        account: OAuthAccount,
-        expectedRefresh: string,
-      ) => FallbackCredentialSyncResult | Promise<FallbackCredentialSyncResult>)
-    | undefined
   private readonly setIntervalImpl: typeof globalThis.setInterval
   private readonly clearIntervalImpl: typeof globalThis.clearInterval
 
@@ -3480,9 +3491,9 @@ export class FallbackAccountManager {
     this.now = options.now ?? Date.now
     this.fetchImpl = options.fetchImpl ?? fetch
     this.configPath = options.configPath ?? getAccountStoragePath()
+    this.store = { ...defaultSharedAccountAccess, ...options.store }
     this.quotaManager = options.quotaManager ?? null
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
-    this.onFallbackCredentialChanged = options.onFallbackCredentialChanged
     this.setIntervalImpl = options.setIntervalImpl ?? globalThis.setInterval
     this.clearIntervalImpl =
       options.clearIntervalImpl ?? globalThis.clearInterval
@@ -3524,25 +3535,142 @@ export class FallbackAccountManager {
     })
   }
 
-  startBackgroundRefresh() {
+  /**
+   * Start the periodic store keep-alive (default every 10 minutes, jittered).
+   * Replaces the old background refresh, which rotated every idle fallback
+   * account's token about every 8 h whether or not anything used it.
+   */
+  startKeepAlive() {
     const run = async () => {
-      await this.refreshDueAccounts()
-      await this.refreshQuotaForDueAccounts()
+      await this.keepAliveTick()
     }
     void run().catch(() => {})
-    if (!this.refreshTimer) {
-      this.refreshTimer = this.setIntervalImpl(() => {
+    if (!this.keepAliveTimer) {
+      this.keepAliveTimer = this.setIntervalImpl(() => {
         void run().catch(() => {})
-      }, BACKGROUND_TICK_MS + jitterMs(BACKGROUND_TICK_JITTER_MS))
-      if ('unref' in this.refreshTimer) this.refreshTimer.unref()
+      }, getRefreshIntervalMs(null) + jitterMs(KEEPALIVE_TICK_JITTER_MS))
+      if ('unref' in this.keepAliveTimer) this.keepAliveTimer.unref()
     }
   }
 
-  stopBackgroundRefresh() {
-    if (this.refreshTimer) this.clearIntervalImpl(this.refreshTimer)
-    if (this.quotaTimer) this.clearIntervalImpl(this.quotaTimer)
-    this.refreshTimer = null
-    this.quotaTimer = null
+  stopKeepAlive() {
+    if (this.keepAliveTimer) this.clearIntervalImpl(this.keepAliveTimer)
+    this.keepAliveTimer = null
+  }
+
+  /** One keep-alive pass plus a quota poll of the already-live accounts. */
+  async keepAliveTick(): Promise<KeepAliveResult | undefined> {
+    const storage = await this.load()
+    let report: KeepAliveResult | undefined
+    if (keepAliveEnabled(storage)) {
+      try {
+        report = await this.store.keepAliveOnce()
+        if (report.refreshed.length || report.failed.length) {
+          logger.info('keepalive', 'store keep-alive pass', {
+            lease: report.lease,
+            refreshed: report.refreshed.map((entry) => entry.accountId),
+            failed: report.failed.map((entry) => ({
+              accountId: entry.accountId,
+              reason: entry.reason,
+            })),
+          })
+        }
+      } catch (error) {
+        logger.warn('keepalive', 'store keep-alive pass failed', {
+          error: formatErrorMessage(error),
+        })
+      }
+    }
+    await this.refreshQuotaForDueAccounts()
+    return report
+  }
+
+  /**
+   * Hydrate `account.access`/`expires` from the store. The binding refreshes
+   * (claimed, through the store) only when the stored token has expired. With
+   * `force`, the current bearer is treated as rejected (an upstream 401) and
+   * the store performs one claimed refresh of it.
+   */
+  async ensureAccessToken(
+    account: OAuthAccount,
+    options: { force?: boolean } = {},
+  ): Promise<OAuthAccount> {
+    if (!options.force && accessTokenIsUsable(account, this.now())) {
+      return account
+    }
+    const inflight = this.accessPromises.get(account.id)
+    if (inflight) {
+      const hydrated = await inflight
+      account.access = hydrated.access
+      account.expires = hydrated.expires
+      account.lastRefreshError = hydrated.lastRefreshError
+      return account
+    }
+    const promise = this.hydrate(account, options).finally(() => {
+      this.accessPromises.delete(account.id)
+    })
+    this.accessPromises.set(account.id, promise)
+    return promise
+  }
+
+  private async hydrate(
+    account: OAuthAccount,
+    options: { force?: boolean },
+  ): Promise<OAuthAccount> {
+    const now = this.now()
+    const backoff = this.accessBackoff.get(account.id)
+    if (!options.force && backoff?.nextRetryAt && backoff.nextRetryAt > now) {
+      account.lastRefreshError = backoff
+      throw Object.assign(
+        new Error(
+          `Claude OAuth access for ${account.id} is backed off for ${Math.ceil((backoff.nextRetryAt - now) / 1000)}s after: ${backoff.message}`,
+        ),
+        { accessBackoff: backoff },
+      )
+    }
+    try {
+      let token: AccessToken | undefined
+      if (options.force && account.access) {
+        const recovery = await this.store.handleUnauthorized(account.access)
+        if (!recovery.retry || !recovery.token) {
+          throw Object.assign(
+            new Error(
+              `Claude OAuth account ${account.id} could not be re-authorized (${recovery.reason})`,
+            ),
+            { code: recovery.failureCode ?? 'transient' },
+          )
+        }
+        token = recovery.token
+      } else {
+        token = await this.store.getAccessToken(account.id)
+      }
+      account.access = token.accessToken
+      account.expires = token.expiresAt
+      account.lastRefreshError = undefined
+      this.accessBackoff.delete(account.id)
+      if (token.source !== 'store') {
+        log('[refresh] fallback oauth token from store', {
+          accountId: account.id,
+          source: token.source,
+          expiresInMs: token.expiresAt - this.now(),
+        })
+      }
+      return account
+    } catch (error) {
+      const verdict = refreshErrorFromAccessFailure(
+        error,
+        this.now(),
+        this.accessBackoff.get(account.id),
+      )
+      account.lastRefreshError = verdict
+      if (!verdict.permanent) this.accessBackoff.set(account.id, verdict)
+      logger.warn('refresh', 'fallback oauth token unavailable', {
+        accountId: account.id,
+        permanent: verdict.permanent,
+        error: verdict.message,
+      })
+      throw error
+    }
   }
 
   async getUsableFallbackAccounts(
@@ -3564,19 +3692,15 @@ export class FallbackAccountManager {
         })
         continue
       }
+      if (isPermanentRefreshError(account.lastRefreshError)) {
+        logger.debug('accounts.fallback', 'candidate excluded', {
+          id: account.id,
+          reason: 'refresh token is dead; re-login required',
+        })
+        continue
+      }
       try {
-        let next = account
-        if (tokenNeedsRefresh(next, storage, this.now())) {
-          const refreshError = next.lastRefreshError
-          if (
-            refreshError &&
-            refreshBackoffActive(refreshError, next.refresh, this.now())
-          ) {
-            throw createRefreshBackoffActiveError(refreshError, this.now())
-          }
-          next = await this.refreshAccount(next, storage)
-          changed = true
-        }
+        let next = await this.ensureAccessToken(account)
         this.seedFallbackQuota(next, storage)
         const stale = this.quotaManager
           ? this.quotaManager.isFallbackStale(
@@ -3587,8 +3711,7 @@ export class FallbackAccountManager {
           : quotaIsStale(next, storage, this.now(), options.modelId)
         // Skip the request-time refresh when this account's quota API is
         // backed off (recent 429/5xx). Hitting it again would extend the
-        // backoff; evaluate policy on the cached/seeded quota instead. Mirrors
-        // the background refreshQuotaForDueAccounts() guard.
+        // backoff; evaluate policy on the cached/seeded quota instead.
         if (
           stale &&
           !quotaBackoffActive(next.lastQuotaRefreshError, this.now())
@@ -3604,10 +3727,9 @@ export class FallbackAccountManager {
           storage,
           { modelId: options.modelId },
         )
-        // The single most consequential verdict in routing, and previously
-        // silent in both directions: an account rejected here never appears in
-        // the pool, so a log that only shows the survivors cannot explain why
-        // the request went where it did.
+        // The single most consequential verdict in routing: an account
+        // rejected here never appears in the pool, so a log that only shows
+        // the survivors cannot explain why the request went where it did.
         logger.debug('accounts.fallback', 'quota policy verdict', {
           id: next.id,
           passes,
@@ -3619,6 +3741,7 @@ export class FallbackAccountManager {
         if (passes) usable.push(next)
       } catch (error) {
         if (
+          account.access &&
           canUseCachedQuotaAfterRefreshError(
             account,
             storage,
@@ -3626,25 +3749,21 @@ export class FallbackAccountManager {
             this.now(),
           )
         ) {
-          log(
-            '[refresh] fallback quota using cached quota after refresh error',
-            {
-              accountId: account.id,
-              error: formatErrorMessage(error),
-            },
-          )
+          log('[refresh] fallback quota using cached quota after error', {
+            accountId: account.id,
+            error: formatErrorMessage(error),
+          })
           if (
             this.accountPassesQuotaPolicy(
               this.quotaPolicyAccount(account),
               storage,
-              {
-                modelId: options.modelId,
-              },
+              { modelId: options.modelId },
             )
           ) {
             usable.push(account)
           }
         } else if (
+          account.access &&
           !failClosedOnUnknownQuota(storage) &&
           quotaSnapshotPassesModelScope(account.quota, options.modelId)
         ) {
@@ -3658,7 +3777,7 @@ export class FallbackAccountManager {
         } else {
           logger.debug('accounts.fallback', 'candidate excluded', {
             id: account.id,
-            reason: 'refresh or quota lookup failed',
+            reason: 'access token or quota lookup failed',
             error: formatErrorMessage(error),
           })
         }
@@ -3676,6 +3795,14 @@ export class FallbackAccountManager {
   }
 
   async markUsed(account: FallbackAccount) {
+    if (isOAuthAccount(account)) {
+      await this.store.markUsed(account.id).catch((error) => {
+        logger.debug('accounts.fallback', 'store markUsed failed', {
+          id: account.id,
+          error: formatErrorMessage(error),
+        })
+      })
+    }
     const storage = await this.load()
     if (!storage) return
     const stored = storage.accounts.find(
@@ -3712,74 +3839,42 @@ export class FallbackAccountManager {
     return cached ? { ...account, quota: cached } : account
   }
 
-  async refreshDueAccounts() {
-    const storage = await this.load()
-    if (!storage || !refreshEnabled(storage)) return
-    let changed = false
-    for (const account of storage.accounts) {
-      if (account.enabled === false || !isOAuthAccount(account)) continue
-      if (!tokenNeedsRefresh(account, storage, this.now())) continue
-      if (
-        refreshBackoffActive(
-          account.lastRefreshError,
-          account.refresh,
-          this.now(),
+  /**
+   * The store rows whose access token is live right now (well before its
+   * expiry). Background quota polling uses only these, so polling never makes
+   * the store refresh an idle account.
+   */
+  private async liveStoreAccountIds(): Promise<Set<string>> {
+    const now = this.now()
+    const rows = await this.store.listAccounts().catch(() => [])
+    return new Set(
+      rows
+        .filter(
+          (row) =>
+            row.enabled &&
+            row.accessLive &&
+            typeof row.expiresAt === 'number' &&
+            row.expiresAt - now > ACCESS_TOKEN_EXPIRY_MARGIN_MS,
         )
-      ) {
-        // Backoff skips are steady-state while a fallback account is waiting for
-        // its next retry. Logging every background tick from every OpenCode
-        // process creates noise without adding new diagnostic signal; the
-        // failure/backoff itself is recorded when the refresh attempt fails and
-        // shown by /claude-quota.
-        continue
-      }
-      try {
-        log('[refresh] fallback oauth background due', {
-          accountId: account.id,
-          expiresInMs: account.expires
-            ? account.expires - this.now()
-            : undefined,
-        })
-        await this.refreshAccount(account, storage)
-        changed = true
-      } catch (error) {
-        logger.warn('refresh', 'fallback oauth background failed', {
-          accountId: account.id,
-          error: error instanceof Error ? error.message : String(error),
-        })
-        recordRefreshError(account, error, this.now())
-        updateStoredAccount(storage, account)
-        changed = true
-        // Background refresh must not break the plugin request path.
-      }
-    }
-    if (changed) await this.save(storage)
+        .map((row) => row.id),
+    )
   }
 
+  /** Quota poll of the fallback accounts whose access token is live. */
   async refreshQuotaForDueAccounts() {
     const storage = await this.load()
     if (!storage || !quotaEnabled(storage)) return
+    const live = await this.liveStoreAccountIds()
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (!live.has(account.id)) continue
       let next = account
       try {
-        if (tokenNeedsRefresh(next, storage, this.now())) {
-          if (
-            refreshBackoffActive(
-              next.lastRefreshError,
-              next.refresh,
-              this.now(),
-            )
-          ) {
-            continue
-          }
-          next = await this.refreshAccount(next, storage)
-          changed = true
-        }
         if (quotaBackoffActive(next.lastQuotaRefreshError, this.now())) {
           continue
         }
+        next = await this.ensureAccessToken(next)
         this.seedFallbackQuota(next, storage)
         // Use QuotaManager staleness when available (shared cache);
         // fall back to per-account on-disk staleness otherwise.
@@ -3802,27 +3897,25 @@ export class FallbackAccountManager {
     }
   }
 
+  /**
+   * Quota for every enabled fallback account whose access token is live (the
+   * `/claude-quota` view). An idle account whose token has expired keeps its
+   * last reading: fetching a fresh one would spend a refresh token, and only
+   * use (or the keep-alive) should do that.
+   */
   async refreshQuotaForAllAccounts(options: { force?: boolean } = {}) {
     const storage = await this.load()
     const errors: AccountRefreshError[] = []
     if (!storage || !quotaEnabled(storage)) return { storage, errors }
     const force = options.force ?? false
+    const live = await this.liveStoreAccountIds()
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (!live.has(account.id)) continue
       let next = account
       try {
-        if (tokenNeedsRefresh(next, storage, this.now())) {
-          const refreshError = next.lastRefreshError
-          if (
-            refreshError &&
-            refreshBackoffActive(refreshError, next.refresh, this.now())
-          ) {
-            throw createRefreshBackoffActiveError(refreshError, this.now())
-          }
-          next = await this.refreshAccount(next, storage)
-          changed = true
-        }
+        next = await this.ensureAccessToken(next)
         // force (manual /claude-quota) bypasses the staleness skip to fetch
         // fresh numbers on demand. refreshAccountQuota still respects 429
         // backoff via QuotaManager.refreshFallback.
@@ -3850,267 +3943,6 @@ export class FallbackAccountManager {
     return { storage, errors }
   }
 
-  async refreshAccount(
-    account: OAuthAccount,
-    storage: AccountStorage,
-    options: { force?: boolean } = {},
-  ): Promise<OAuthAccount> {
-    const existing = this.refreshPromises.get(account.id)
-    if (existing) {
-      const refreshed = await existing
-      updateStoredAccount(storage, refreshed)
-      return refreshed
-    }
-
-    const promise = this.refreshAccountNow(account, storage, options).finally(
-      () => {
-        this.refreshPromises.delete(account.id)
-      },
-    )
-    this.refreshPromises.set(account.id, promise)
-    const refreshed = await promise
-    updateStoredAccount(storage, refreshed)
-    return refreshed
-  }
-
-  private async waitForConcurrentFallbackRefresh(
-    account: OAuthAccount,
-    storage: AccountStorage,
-    previous: OAuthAccount,
-    options: { force?: boolean },
-  ): Promise<OAuthAccount | null> {
-    const deadline = Date.now() + FALLBACK_REFRESH_JOIN_WAIT_MS
-    while (Date.now() < deadline) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, FALLBACK_REFRESH_JOIN_POLL_MS),
-      )
-      const latestStorage = await this.load()
-      const latestAccount = latestStorage?.accounts.find(
-        (candidate): candidate is OAuthAccount =>
-          candidate.id === account.id && isOAuthAccount(candidate),
-      )
-      if (!latestAccount) continue
-
-      const changed =
-        latestAccount.access !== previous.access ||
-        latestAccount.refresh !== previous.refresh ||
-        (latestAccount.expires ?? 0) > (previous.expires ?? 0) + 60_000
-      if (
-        changed &&
-        (options.force ||
-          !tokenNeedsRefresh(latestAccount, latestStorage, this.now()))
-      ) {
-        updateStoredAccount(storage, latestAccount)
-        log('[refresh] fallback oauth joined concurrent refresh', {
-          accountId: latestAccount.id,
-          expiresInMs: latestAccount.expires
-            ? latestAccount.expires - this.now()
-            : undefined,
-        })
-        return latestAccount
-      }
-
-      const refreshError = latestAccount.lastRefreshError
-      if (
-        refreshError &&
-        refreshBackoffActive(refreshError, latestAccount.refresh, this.now())
-      ) {
-        updateStoredAccount(storage, latestAccount)
-        throw createRefreshBackoffActiveError(refreshError, this.now())
-      }
-    }
-    return null
-  }
-
-  private async refreshAccountNow(
-    account: OAuthAccount,
-    storage: AccountStorage,
-    options: { force?: boolean },
-  ): Promise<OAuthAccount> {
-    let latestStorage = await this.load()
-    let latestAccount = latestStorage?.accounts.find(
-      (candidate): candidate is OAuthAccount =>
-        candidate.id === account.id && isOAuthAccount(candidate),
-    )
-    if (
-      latestAccount &&
-      !options.force &&
-      !tokenNeedsRefresh(latestAccount, latestStorage, this.now())
-    ) {
-      updateStoredAccount(storage, latestAccount)
-      return latestAccount
-    }
-
-    let sourceAccount = latestAccount ?? account
-    // Held across the try so the `finally` can release a claim taken inside it.
-    let sharedLeaseIdForRelease: string | undefined
-    const fileLock = await acquireRefreshFileLock({
-      name: fallbackRefreshLockName(sourceAccount.id),
-      ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
-      path: this.configPath,
-      now: this.now,
-      renew: true,
-    })
-    if (!fileLock) {
-      log('[refresh] fallback oauth refresh skipped file lock', {
-        accountId: sourceAccount.id,
-      })
-      const concurrent = await this.waitForConcurrentFallbackRefresh(
-        account,
-        storage,
-        sourceAccount,
-        options,
-      )
-      if (concurrent) return concurrent
-      throw new Error('Fallback OAuth refresh is already in progress')
-    }
-
-    try {
-      latestStorage = await this.load()
-      latestAccount = latestStorage?.accounts.find(
-        (candidate): candidate is OAuthAccount =>
-          candidate.id === account.id && isOAuthAccount(candidate),
-      )
-      if (
-        latestAccount &&
-        !options.force &&
-        !tokenNeedsRefresh(latestAccount, latestStorage, this.now())
-      ) {
-        updateStoredAccount(storage, latestAccount)
-        return latestAccount
-      }
-
-      sourceAccount = latestAccount ?? sourceAccount
-      const refreshToken = sourceAccount.refresh
-
-      // The file lock above is scoped to this app's config path, but the
-      // credential is machine-wide: Pi locks under ~/.pi/agent and OpenCode
-      // under ~/.config/opencode, so both can reach the token endpoint with the
-      // same refresh token at once. Anthropic revokes the whole family when a
-      // refresh token is presented twice, so take the shared-store claim too —
-      // it is keyed on the store the credential actually lives in.
-      //
-      // An account the shared store does not know reports `unknown-account`
-      // and proceeds exactly as before.
-      const sharedClaim = await claimSharedAccountRefresh(
-        sourceAccount.id,
-        refreshToken,
-        {},
-      ).catch(() => undefined)
-      if (sharedClaim?.status === 'dead-token') {
-        // Anthropic already rejected this exact token; the family is gone and
-        // no retry recovers it. Fail here rather than spending a round trip.
-        log('[refresh] fallback oauth refresh skipped known-dead token', {
-          accountId: sourceAccount.id,
-        })
-        throw new Error(
-          `Fallback OAuth account ${sourceAccount.id} has a revoked refresh token; re-login is required`,
-        )
-      }
-      if (sharedClaim?.status === 'already-refreshed') {
-        // A peer spent this token first. Adopting its result is the only safe
-        // move: presenting the superseded token would revoke the family.
-        log('[refresh] fallback oauth refresh adopted a peer rotation', {
-          accountId: sourceAccount.id,
-        })
-        sourceAccount.access = sharedClaim.credential.access
-        sourceAccount.refresh = sharedClaim.credential.refresh
-        sourceAccount.expires = sharedClaim.credential.expires_at
-        sourceAccount.refreshExpires =
-          sharedClaim.credential.refresh_expires_at ??
-          sourceAccount.refreshExpires
-        sourceAccount.lastRefreshError = undefined
-        updateStoredAccount(storage, sourceAccount)
-        await this.save(storage)
-        return sourceAccount
-      }
-      sharedLeaseIdForRelease =
-        sharedClaim?.status === 'claimed' ? sharedClaim.leaseId : undefined
-
-      log('[refresh] fallback oauth refresh request start', {
-        accountId: sourceAccount.id,
-        force: options.force === true,
-        sharedClaim: sharedClaim?.status,
-        expiresInMs: sourceAccount.expires
-          ? sourceAccount.expires - this.now()
-          : undefined,
-      })
-      let refreshed: Awaited<ReturnType<typeof refreshClaudeOAuthToken>>
-      try {
-        refreshed = await refreshClaudeOAuthToken({
-          refreshToken,
-          refreshTokenExpiresAt: sourceAccount.refreshExpires,
-          authLineageId: sourceAccount.authLineageId,
-          fetchImpl: this.fetchImpl,
-          now: this.now,
-        })
-      } catch (error) {
-        // Remember the verdict so the next pass short-circuits instead of
-        // asking again.
-        if (error instanceof Error && error.message.includes('invalid_grant')) {
-          await markSharedRefreshTokenDead(
-            sourceAccount.id,
-            refreshToken,
-          ).catch(() => {})
-        }
-        throw error
-      }
-      sourceAccount.access = refreshed.access
-      sourceAccount.refresh = refreshed.refresh
-      sourceAccount.authLineageId =
-        refreshed.authLineageId ?? sourceAccount.authLineageId
-      sourceAccount.expires = refreshed.expires
-      sourceAccount.refreshExpires =
-        refreshed.refreshTokenExpiresAt ?? sourceAccount.refreshExpires
-      sourceAccount.lastRefreshedAt =
-        refreshed.expires - refreshed.expiresIn * 1000
-      sourceAccount.lastRefreshError = undefined
-      updateStoredAccount(storage, sourceAccount)
-      await this.save(storage)
-      let syncResult: FallbackCredentialSyncResult | undefined
-      try {
-        syncResult = await this.onFallbackCredentialChanged?.(
-          sourceAccount,
-          refreshToken,
-        )
-      } catch (error) {
-        syncResult = undefined
-        logger.warn('refresh', 'failed to sync refreshed fallback credential', {
-          accountId: sourceAccount.id,
-          error: error instanceof Error ? error.message : String(error),
-        })
-      }
-      if (syncResult?.status === 'superseded') {
-        updateStoredAccount(storage, syncResult.account)
-        await this.save(storage)
-        return syncResult.account
-      }
-      if (syncResult?.status === 'rejected') {
-        sourceAccount.enabled = false
-        updateStoredAccount(storage, sourceAccount)
-        await this.save(storage)
-        throw new Error(
-          `Fallback OAuth account ${sourceAccount.id} was removed or disabled during refresh`,
-        )
-      }
-      log('[refresh] fallback oauth refresh succeeded', {
-        accountId: sourceAccount.id,
-        expiresInMs: sourceAccount.expires
-          ? sourceAccount.expires - this.now()
-          : undefined,
-      })
-      return sourceAccount
-    } finally {
-      if (sharedLeaseIdForRelease) {
-        await releaseSharedAccountRefresh(
-          account.id,
-          sharedLeaseIdForRelease,
-        ).catch(() => {})
-      }
-      await fileLock.release()
-    }
-  }
-
   async refreshAccountQuota(account: OAuthAccount, storage: AccountStorage) {
     let target = account
     if (!target.access) {
@@ -4127,7 +3959,6 @@ export class FallbackAccountManager {
             fetchImpl: this.fetchImpl,
             now: this.now,
           }).then((quota) => ({ quota, fetched: true }))
-    const fetchStartedAt = this.now()
     let fetched = false
     try {
       const result = await fetchSnapshot(target.access)
@@ -4136,40 +3967,13 @@ export class FallbackAccountManager {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (!message.includes('Claude quota check failed: 401')) throw error
-      target = await this.refreshAccount(account, storage, {
-        force: true,
-      })
+      // The bearer was rejected: one claimed refresh in the store.
+      target = await this.ensureAccessToken(account, { force: true })
       if (!target.access) throw error
       // 401 does not arm QuotaManager backoff, so this retry proceeds.
       const result = await fetchSnapshot(target.access)
       target.quota = result.quota
       fetched = result.fetched
-    }
-
-    const latestStorage = await this.load()
-    const latestAccount = latestStorage?.accounts.find(
-      (candidate): candidate is OAuthAccount =>
-        candidate.id === target.id && isOAuthAccount(candidate),
-    )
-    if (
-      latestStorage &&
-      latestAccount &&
-      latestAccount.access !== target.access
-    ) {
-      this.seedFallbackQuota(latestAccount, latestStorage)
-      updateStoredAccount(storage, latestAccount)
-      return { account: latestAccount, fetched: false }
-    }
-    if (
-      latestStorage &&
-      latestAccount?.access === target.access &&
-      latestAccount.quota &&
-      quotaSnapshotCheckedAt(latestAccount.quota) >= fetchStartedAt &&
-      quotaSnapshotIsFresh(latestAccount.quota, latestStorage, this.now())
-    ) {
-      this.seedFallbackQuota(latestAccount, latestStorage)
-      updateStoredAccount(storage, latestAccount)
-      return { account: latestAccount, fetched }
     }
 
     target.lastQuotaRefreshError = undefined

@@ -10,7 +10,6 @@
     "doctor": "bun scripts/doctor-install.ts",
     "doctor:fix": "bun scripts/doctor-install.ts --fix",
     "repair:accounts": "bun scripts/repair-accounts.ts",
-    "repair:accounts:fix": "bun scripts/repair-accounts.ts --fix",
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "extract": "bun scripts/extract-system-prompt.ts",

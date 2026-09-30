@@ -20,8 +20,9 @@
     },
     "packages/core": {
       "name": "@cortexkit/anthropic-auth-core",
-      "version": "1.19.1",
+      "version": "999.0.0-dev.20260825",
       "dependencies": {
+        "@coleleavitt/anthropic-napi": "file:../../../../../RustProjects/active/anthropic/anthropic-napi",
         "xxhash-wasm": "^1.1.0",
       },
     },
@@ -33,12 +34,13 @@
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-anthropic-auth",
-      "version": "1.19.1",
+      "version": "999.0.0-dev.20260825",
       "bin": {
         "opencode-anthropic-auth": "dist/cli.js",
       },
       "dependencies": {
-        "@cortexkit/anthropic-auth-core": "1.19.1",
+        "@coleleavitt/anthropic-napi": "file:../../../../../RustProjects/active/anthropic/anthropic-napi",
+        "@cortexkit/anthropic-auth-core": "999.0.0-dev.20260825",
         "@opentui/core": "0.5.6",
         "@opentui/solid": "0.5.6",
         "jsonc-parser": "^3.3.1",
@@ -50,9 +52,9 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-anthropic-auth",
-      "version": "1.19.1",
+      "version": "999.0.0-dev.20260825",
       "dependencies": {
-        "@cortexkit/anthropic-auth-core": "1.1.3",
+        "@cortexkit/anthropic-auth-core": "999.0.0-dev.20260825",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
@@ -847,6 +849,10 @@
     "@babel/helper-compilation-targets/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
     "@babel/helper-create-class-features-plugin/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
+
+    "@cortexkit/anthropic-auth-core/@coleleavitt/anthropic-napi": ["@coleleavitt/anthropic-napi@file:../../../RustProjects/active/anthropic/anthropic-napi", {}],
+
+    "@cortexkit/opencode-anthropic-auth/@coleleavitt/anthropic-napi": ["@coleleavitt/anthropic-napi@file:../../../RustProjects/active/anthropic/anthropic-napi", {}],
 
     "@google/genai/ws": ["ws@8.20.0", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA=="],
 

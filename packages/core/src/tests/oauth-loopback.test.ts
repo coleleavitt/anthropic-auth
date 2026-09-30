@@ -5,6 +5,7 @@ import {
   OAuthLoopbackError,
   startOAuthLoopbackSession,
 } from '../oauth-loopback.ts'
+import { startSharedLoginWithLoopback } from '../shared-login.ts'
 
 function connectURL(redirectUri: string, query = '') {
   return `${redirectUri.replace('localhost', '127.0.0.1')}${query}`
@@ -227,6 +228,44 @@ describe('OAuth loopback session', () => {
       await overallSession.closed
     } finally {
       await closeQuietly(overallSession)
+    }
+  })
+})
+
+describe('OAuth loopback session bound to a store login', () => {
+  test('adopts the state the Rust login generated', async () => {
+    const session = await startOAuthLoopbackSession({ state: 'throwaway' })
+    try {
+      session.expectState('state-from-binding')
+      expect(session.state).toBe('state-from-binding')
+      expect(() =>
+        session.submitManualCallback({ code: 'code', state: 'throwaway' }),
+      ).toThrow(OAuthLoopbackError)
+      expect(
+        session.submitManualCallback({
+          code: 'code',
+          state: 'state-from-binding',
+        }),
+      ).toMatchObject({ code: 'code', state: 'state-from-binding' })
+    } finally {
+      await session.close().catch(() => {})
+    }
+  })
+
+  test('startSharedLoginWithLoopback advertises the loopback redirect and state', async () => {
+    const { login, loopback } = await startSharedLoginWithLoopback({
+      mode: 'max',
+    })
+    try {
+      expect(loopback).not.toBeNull()
+      const url = new URL(login.url)
+      expect(url.searchParams.get('redirect_uri')).toBe(
+        loopback?.redirectUri ?? 'missing',
+      )
+      expect(url.searchParams.get('state')).toBe(login.state)
+      expect(loopback?.state).toBe(login.state)
+    } finally {
+      await loopback?.close().catch(() => {})
     }
   })
 })

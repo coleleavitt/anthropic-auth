@@ -29,7 +29,12 @@ import type {
   ExecFileInvocationOptions,
   ExecFileLike,
 } from '../secure-secret-store.ts'
-import { loadSharedAccountStore } from '../shared-account-store.ts'
+import { listSharedAccounts } from '../shared-account-store.ts'
+import {
+  fakeAccessToken,
+  fakeRefreshToken,
+  useTempStore,
+} from './support/store-fixture.ts'
 
 const tempDirectories: string[] = []
 
@@ -330,36 +335,76 @@ describe('native Claude credential fallback precedence', () => {
     ).toBe(join(home, '.claude', '.credentials.json'))
   })
 
-  test('explicitly imports OAuth only into the shared schema', async () => {
+  test('explicitly imports OAuth into the shared store through the binding', async () => {
     const root = await temporaryDirectory()
     const home = join(root, 'home')
-    await writeCredential(join(home, '.claude'), 'imported')
-    const sharedPath = join(root, 'shared', 'accounts.json')
-    const imported = await importNativeClaudeAccount({
-      platform: 'linux',
-      environment: {},
-      homeDirectory: home,
-      id: 'native',
-      label: 'Imported Claude',
-      sharedStore: { path: sharedPath, legacyPaths: [] },
-      now: () => 1_700_000_000_000,
-    })
-    expect(imported?.trustedDeviceToken).toBe('device-imported')
-    const loaded = await loadSharedAccountStore({
-      path: sharedPath,
-      legacyPaths: [],
-    })
-    expect(loaded.store.current).toBe('native')
-    expect(loaded.store.accounts[0]?.credential).toMatchObject({
-      type: 'oauth',
-      access: 'access-imported',
-      refresh: 'refresh-imported',
-      refresh_expires_at: 2_100_000_000_000,
-    })
-    const persisted = await readFile(sharedPath, 'utf8')
-    expect(persisted).not.toContain('device-imported')
-    expect(persisted).not.toContain('api-imported')
-    expect(persisted).not.toContain('mcp-imported')
+    const store = useTempStore()
+    try {
+      await mkdir(join(home, '.claude'), { recursive: true })
+      const payload = credentialPayload('imported')
+      payload.claudeAiOauth.accessToken = fakeAccessToken('nativeimported')
+      payload.claudeAiOauth.refreshToken = fakeRefreshToken('nativeimported')
+      await writeFile(
+        join(home, '.claude', '.credentials.json'),
+        `${JSON.stringify(payload)}\n`,
+        { mode: 0o600 },
+      )
+      const imported = await importNativeClaudeAccount({
+        platform: 'linux',
+        environment: {},
+        homeDirectory: home,
+        label: 'Imported Claude',
+      })
+      expect(imported?.status).toBe('added')
+      expect(imported?.trustedDeviceToken).toBe('device-imported')
+      const accounts = await listSharedAccounts()
+      expect(accounts).toHaveLength(1)
+      expect(accounts[0]).toMatchObject({
+        id: imported?.account.id,
+        label: 'Imported Claude',
+        kind: 'oauth',
+        current: true,
+        refreshExpiresAt: 2_100_000_000_000,
+      })
+      // Neither the returned value nor the listing carries a token.
+      expect(JSON.stringify(imported)).not.toContain('sk-ant-')
+      expect(JSON.stringify(accounts)).not.toContain('sk-ant-')
+      const persisted = await readFile(store.path, 'utf8')
+      expect(persisted).not.toContain('device-imported')
+      expect(persisted).not.toContain('api-imported')
+      expect(persisted).not.toContain('mcp-imported')
+
+      // A second import of the same login keeps the store's copy.
+      const again = await importNativeClaudeAccount({
+        platform: 'linux',
+        environment: {},
+        homeDirectory: home,
+        label: 'Imported Claude',
+      })
+      expect(again?.status).toBe('already_present')
+      expect(await listSharedAccounts()).toHaveLength(1)
+    } finally {
+      store.dispose()
+    }
+  })
+
+  test('refuses a native credential the store cannot parse', async () => {
+    const root = await temporaryDirectory()
+    const home = join(root, 'home')
+    const store = useTempStore()
+    try {
+      await writeCredential(join(home, '.claude'), 'malformed')
+      await expect(
+        importNativeClaudeAccount({
+          platform: 'linux',
+          environment: {},
+          homeDirectory: home,
+        }),
+      ).rejects.toThrow(/rejected by the account store/)
+      expect(await listSharedAccounts()).toHaveLength(0)
+    } finally {
+      store.dispose()
+    }
   })
 
   test('never modifies the selected plaintext source', async () => {

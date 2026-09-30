@@ -60,7 +60,6 @@ function storage(): AccountStorage {
       {
         id: 'work-alt',
         type: 'oauth',
-        refresh: 'r',
         enabled: true,
         quota: {
           five_hour: {
@@ -154,7 +153,6 @@ describe('buildPrimeAccountStatuses', () => {
     s.accounts.push({
       id: 'disabled-fb',
       type: 'oauth',
-      refresh: 'r',
       enabled: false,
     })
     const statuses = buildPrimeAccountStatuses(s, { now: STORAGE_TS })
@@ -1183,7 +1181,6 @@ describe('PrimeManager — eligibility', () => {
     fixture.storage.accounts.push({
       id: 'main',
       type: 'oauth',
-      refresh: 'r',
       quota: {
         five_hour: {
           usedPercent: 0,
@@ -2126,7 +2123,6 @@ describe('PrimeManager — logging', () => {
     fixture.storage.accounts.push({
       id: 'work-alt',
       type: 'oauth',
-      refresh: 'r',
       quota: {
         five_hour: {
           usedPercent: 0,
@@ -2201,7 +2197,6 @@ describe('PrimeManager — logging', () => {
     fixture.storage.accounts.push({
       id: 'work-alt',
       type: 'oauth',
-      refresh: 'r',
       quota: {
         five_hour: {
           usedPercent: 0,
@@ -2218,7 +2213,6 @@ describe('PrimeManager — logging', () => {
     fixture.storage.accounts.push({
       id: 'work-future',
       type: 'oauth',
-      refresh: 'r',
       quota: {
         five_hour: {
           usedPercent: 0,
