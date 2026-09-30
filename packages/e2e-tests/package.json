@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test tests"
+    "test": "bun ../../scripts/test-isolated.ts tests"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.21"

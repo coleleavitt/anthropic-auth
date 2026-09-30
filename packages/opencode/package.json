@@ -58,7 +58,7 @@
     "dev": "bun ../../scripts/dev.ts",
     "dev:clean": "bun ../../scripts/dev-clean.ts",
     "extract": "bun ../../scripts/extract-system-prompt.ts",
-    "test": "bun test src/tests",
+    "test": "bun ../../scripts/test-isolated.ts src/tests",
     "typecheck": "tsc && tsc -p tsconfig.scripts.json",
     "types": "tsc && tsc -p tsconfig.scripts.json",
     "prepublishOnly": "bun run build"

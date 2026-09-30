@@ -1,2 +1,2 @@
 [test]
-preload = ["./packages/opencode/src/tests/setup.ts"]
+preload = ["./scripts/test-isolation-preload.ts", "./packages/opencode/src/tests/setup.ts"]
