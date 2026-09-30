@@ -390,18 +390,52 @@ describe('CLI login', () => {
 })
 
 describe('CLI OAuth revocation', () => {
-  test('refuses remote revocation (no refresh token in TS) and changes nothing', async () => {
-    const store = useTempStore()
+  let tokenServer: MockTokenServer
+  let store: TempStore
+  beforeEach(() => {
+    store = useTempStore()
+    tokenServer = startMockTokenServer()
+  })
+  afterEach(() => {
+    tokenServer.stop()
+    store.dispose()
+  })
+
+  async function quietly<T>(fn: () => Promise<T>) {
+    const original = console.log
+    console.log = () => {}
     try {
-      const seeded = await seedStoreAccount({ label: 'revoked-account' })
-      await expect(revokeAccount(seeded.id)).rejects.toThrow(
-        /Remote revocation .* is unavailable/,
-      )
-      const rows = await listSharedAccounts()
-      expect(rows.find((row) => row.id === seeded.id)?.enabled).toBe(true)
+      return await fn()
     } finally {
-      store.dispose()
+      console.log = original
     }
+  }
+
+  test('requires confirmation and changes nothing when cancelled', async () => {
+    const seeded = await seedStoreAccount({ label: 'revoked-account' })
+    await expect(
+      revokeAccount(seeded.id, { prompt: async () => 'no' }),
+    ).rejects.toThrow(/cancelled/)
+    expect(tokenServer.revoked).toEqual([])
+    const rows = await listSharedAccounts()
+    expect(rows.find((row) => row.id === seeded.id)?.enabled).toBe(true)
+  })
+
+  test('revokes the stored token in Rust and disables the account', async () => {
+    const seeded = await seedStoreAccount({ label: 'revoked-account' })
+    await quietly(() =>
+      revokeAccount(seeded.id, { prompt: async () => 'revoke' }),
+    )
+    // The refresh token went from the store to the revoke endpoint without
+    // passing through JavaScript.
+    expect(tokenServer.revoked).toEqual([seeded.refresh])
+    const row = (await listSharedAccounts()).find(
+      (entry) => entry.id === seeded.id,
+    )
+    expect(row).toMatchObject({ enabled: false, refreshDead: true })
+    await expect(
+      revokeAccount('missing', { prompt: async () => 'revoke' }),
+    ).rejects.toThrow(/not found/)
   })
 })
 

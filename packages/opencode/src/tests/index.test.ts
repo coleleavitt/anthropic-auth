@@ -12,6 +12,7 @@ import {
   getAccountStatePath,
   getClaudeCodeIdentity,
   type LogTestRecord,
+  listSharedAccounts,
   loadAccounts,
   type OAuthAccount,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
@@ -26,6 +27,10 @@ import {
   storeCredentialIdentity,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  startMockTokenServer,
+  useTempStore,
+} from '../../../core/src/tests/support/store-fixture.ts'
 import { AnthropicAuthPlugin, primeQuotaSnapshotIsFreshSince } from '../index'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
@@ -519,6 +524,76 @@ describe('auth.methods', () => {
     expect(method.label).toBe('Create an API Key')
     expect(method.type).toBe('oauth')
     expect(method.authorize).toBeFunction()
+  })
+
+  test('Create an API Key: exchanged in Rust, nothing stored, key minted with the access token', async () => {
+    const store = useTempStore()
+    const server = startMockTokenServer()
+    const minted: string[] = []
+    const previousFetch = globalThis.fetch
+    globalThis.fetch = Object.assign(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (
+          extractUrl(input).endsWith('/api/oauth/claude_cli/create_api_key')
+        ) {
+          minted.push(new Headers(init?.headers).get('authorization') ?? '')
+          return Promise.resolve(
+            Response.json({ raw_key: 'sk-ant-api03-mintedmintedmintedminted' }),
+          )
+        }
+        return previousFetch(input, init)
+      },
+      previousFetch,
+    ) as typeof fetch
+    try {
+      server.codes.set('console-code', {
+        email: 'console@example.com',
+        accountUuid: 'uuid-console',
+        tag: 'console',
+      })
+      const plugin = await getPlugin()
+      const flow = await plugin.auth.methods[1].authorize()
+      const state = new URL(flow.url).searchParams.get('state')
+      expect(state).toBeTruthy()
+      const result = await flow.callback(`console-code#${state}`)
+      expect(result).toEqual({
+        type: 'success',
+        key: 'sk-ant-api03-mintedmintedmintedminted',
+      })
+      expect(minted).toEqual([`Bearer ${server.loginAccess('console')}`])
+      expect(server.codeExchanges).toHaveLength(1)
+      // The grant is used once and never becomes a store account.
+      expect(
+        (await listSharedAccounts()).filter(
+          (row) => row.email === 'console@example.com',
+        ),
+      ).toEqual([])
+    } finally {
+      globalThis.fetch = previousFetch
+      server.stop()
+      store.dispose()
+    }
+  })
+
+  test('Create an API Key: a forged state fails before any exchange or mint', async () => {
+    const store = useTempStore()
+    const server = startMockTokenServer()
+    try {
+      server.codes.set('console-code', {
+        email: 'console@example.com',
+        accountUuid: 'uuid-console',
+        tag: 'console',
+      })
+      const plugin = await getPlugin()
+      const flow = await plugin.auth.methods[1].authorize()
+      expect(await flow.callback('console-code#forged-state')).toEqual({
+        type: 'failed',
+      })
+      expect(server.codeExchanges).toHaveLength(0)
+    } finally {
+      server.stop()
+      store.dispose()
+    }
   })
 
   test('third method is manual API key', async () => {

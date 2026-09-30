@@ -4,7 +4,6 @@ import {
   type AccountStorage,
   type ApiKeyAccount,
   addAccountPersistent,
-  authorize,
   buildAccountList,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
@@ -43,7 +42,6 @@ import {
   decideStickyQuotaFailure,
   dumpDirectRequest,
   dumpResponseArtifact,
-  exchange,
   executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
@@ -108,6 +106,7 @@ import {
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
+  listSharedAccounts,
   loadAccounts as loadHostAccounts,
   log,
   logContentFilterOutcome,
@@ -152,6 +151,7 @@ import {
   requiredClaudeCodeVersion,
   resolveClaudeCodeIdentity,
   resolveClaudeFableMythos5Pricing,
+  revokeSharedAccount,
   type SharedAnthropicAccount,
   type SharedLogin,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
@@ -3003,13 +3003,51 @@ const anthropicAuthPlugin = async (
 
     // -- remote revoke -----------------------------------------------------
     if (action.type === 'revoke') {
-      // Remote revocation needs the refresh token, which lives only in the
-      // Rust store; the binding exposes no revoke call.
+      const storage =
+        (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+      if (!action.confirmed) {
+        return {
+          text: 'Remote revocation cannot be undone. Re-run with --confirm.',
+          accounts: buildAccountList(storage),
+        }
+      }
+      const account = (await listSharedAccounts()).find(
+        (entry) => entry.id === action.id,
+      )
+      if (!account) {
+        return {
+          text: `Account "${action.id}" not found.`,
+          accounts: buildAccountList(storage),
+        }
+      }
+      if (account.kind !== 'oauth') {
+        return {
+          text: 'Only OAuth accounts can be remotely revoked.',
+          accounts: buildAccountList(storage),
+        }
+      }
+      let revoked: Awaited<ReturnType<typeof revokeSharedAccount>>
+      try {
+        // In Rust: claimed, revoked at Anthropic, then the store row is kept
+        // disabled with its token recorded dead (never routable again).
+        revoked = await revokeSharedAccount(account.id, { disable: true })
+      } catch (error) {
+        return {
+          text: `Remote revocation failed; nothing was changed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          accounts: buildAccountList(storage),
+        }
+      }
+      await removeAccountPersistent(account.id, accountStoragePath).catch(
+        () => {},
+      )
+      const updatedStorage =
+        (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+      await refreshSidebarAfterMutation(updatedStorage)
       return {
-        text: 'Remote revocation is unavailable: the refresh token lives only in the account store and the store binding has no revoke. Use disable or remove to stop using the account locally.',
-        accounts: buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
-        ),
+        text: `OAuth token ${revoked.outcome === 'revoked' ? 'was revoked' : 'was already inactive'}; account "${account.label ?? account.id}" is disabled locally.`,
+        accounts: buildAccountList(updatedStorage),
       }
     }
 
@@ -6459,31 +6497,36 @@ const anthropicAuthPlugin = async (
           label: 'Create an API Key',
           type: 'oauth',
           authorize: async () => {
-            const result = await authorize('console')
+            // The PKCE verifier and the code exchange stay in Rust; the
+            // grant is not stored (its refresh token is dropped in Rust) and
+            // only its access token is used, once, to mint the key.
+            const login = startSharedLogin({ mode: 'console' })
             return {
-              url: result.url,
+              url: login.url,
               instructions: 'Paste the authorization code here:',
               method: 'code',
               callback: async (code: string) => {
-                const credentials = await exchange(
-                  code,
-                  result.verifier,
-                  result.redirectUri,
-                  result.state,
-                )
-                if (credentials.type === 'failed') return credentials
+                let access: string
+                try {
+                  access = (await login.exchange(code)).accessToken
+                } catch (error) {
+                  logger.warn('auth', 'console login failed', {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  })
+                  return { type: 'failed' as const }
+                }
                 const apiKey = await fetch(
                   `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
                   {
                     method: 'POST',
                     headers: {
                       'Content-Type': 'application/json',
-                      authorization: `Bearer ${credentials.access}`,
+                      authorization: `Bearer ${access}`,
                     },
                   },
                 ).then((r) => r.json() as Promise<{ raw_key: string }>)
-                // OpenCode stores the key in its own auth.json; the store
-                // binding cannot hold API keys (binding gap).
+                // OpenCode keeps the minted key in its own auth.json.
                 return { type: 'success' as const, key: apiKey.raw_key }
               },
             }

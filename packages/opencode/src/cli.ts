@@ -12,8 +12,12 @@ import {
   importNativeClaudeAccount,
   isOAuthAccount,
   isValidApiBaseURL,
+  listSharedAccounts,
   loadAccounts,
   type OAuthAccount,
+  readNativeClaudeStatus,
+  removeAccountPersistent,
+  revokeSharedAccount,
   saveAccounts,
   saveTrustedDeviceToken,
   setSharedAccountEnabled,
@@ -449,6 +453,18 @@ export async function importNative(
     discovered.source.type === 'keychain'
       ? `secure storage (${discovered.source.service})`
       : discovered.source.path
+  if (discovered.source.type === 'plaintext') {
+    // Non-secret metadata from the binding: whether the store already holds
+    // this token (then its refreshes are published back to Claude Code).
+    const status = await readNativeClaudeStatus(discovered.source.path).catch(
+      () => null,
+    )
+    if (status?.storeAccountId) {
+      console.log(
+        `The account store already holds this credential as "${status.storeAccountId}".`,
+      )
+    }
+  }
   const confirmation = await ask(
     `Import native Claude OAuth from ${source} into the project-neutral account store? Type IMPORT to continue: `,
   )
@@ -471,14 +487,33 @@ export async function importNative(
 }
 
 /**
- * Remote revocation needs the refresh token, which now lives only in the Rust
- * account store; the binding exposes no revoke call. Disable or remove the
- * account locally instead.
+ * Revoke an OAuth account's refresh token at Anthropic. The token never
+ * leaves the Rust store: the binding claims the row, revokes, and keeps the
+ * row disabled with the token recorded dead. A failed request changes
+ * nothing. The host sidecar entry is removed afterwards.
  */
-export async function revokeAccount(accountIdArg: string | undefined) {
+export async function revokeAccount(
+  accountIdArg: string | undefined,
+  deps: { prompt?: (message: string) => Promise<string> } = {},
+) {
   const accountId = requireText(accountIdArg, 'Account id')
-  throw new Error(
-    `Remote revocation of "${accountId}" is unavailable: the refresh token lives only in the account store and its binding has no revoke. Use \`disable\` or \`remove\` instead.`,
+  const account = (await listSharedAccounts()).find(
+    (entry) => entry.id === accountId,
+  )
+  if (!account) throw new Error(`Account "${accountId}" not found`)
+  if (account.kind !== 'oauth') {
+    throw new Error('Only OAuth accounts can be remotely revoked')
+  }
+  const ask = deps.prompt ?? prompt
+  const confirmation = await ask(
+    `Remote revocation cannot be undone. Type revoke to revoke "${account.label ?? account.id}": `,
+  )
+  if (confirmation !== 'revoke') throw new Error('OAuth revocation cancelled')
+
+  const revoked = await revokeSharedAccount(account.id, { disable: true })
+  await removeAccountPersistent(account.id).catch(() => {})
+  console.log(
+    `OAuth token ${revoked.outcome === 'revoked' ? 'was revoked' : 'was already inactive'}; account "${account.label ?? account.id}" is disabled locally.`,
   )
 }
 
