@@ -10,6 +10,7 @@
  */
 import { expect, test } from 'bun:test'
 import { existsSync, writeFileSync } from 'node:fs'
+import { connect } from 'node:net'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -35,4 +36,25 @@ test('probe: write under a real protected path (overlay only)', () => {
   writeFileSync(target, '{"probe":true}\n', { flag: 'wx' })
   // Inside the overlay the file exists in the sandboxed copy only.
   expect(existsSync(target)).toBe(true)
+})
+
+test('probe: request an Anthropic host (blocked in-process, aborted anyway)', async () => {
+  // The signal is already aborted, so even a broken guard sends nothing.
+  const error = await fetch('https://api.anthropic.com/__guard_probe__', {
+    signal: AbortSignal.abort(),
+  }).catch((caught: unknown) => caught)
+  expect((error as Error).name).toBe('TestNetworkGuardError')
+})
+
+test('probe: connect to a non-loopback address (TEST-NET-1, never routed)', async () => {
+  await new Promise<void>((resolve) => {
+    const socket = connect({ host: '192.0.2.1', port: 443, timeout: 500 })
+    const done = () => {
+      socket.destroy()
+      resolve()
+    }
+    socket.once('error', done)
+    socket.once('timeout', done)
+    socket.once('connect', done)
+  })
 })

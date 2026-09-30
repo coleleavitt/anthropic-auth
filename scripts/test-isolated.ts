@@ -21,6 +21,14 @@
  *    write — is a violation.
  * 4. **Backstop.** Paths, sizes and mtimes of the protected directories are
  *    snapshotted before and after the run and must match.
+ * 5. **No network.** The Rust binding talks to the OAuth token endpoint
+ *    itself, so JS fetch mocks do not intercept it: with no token URL set it
+ *    would POST fixture refresh tokens to production. Every OAuth URL is set
+ *    to a dead loopback address (tests that need a token server start their
+ *    own mock), the test process runs in a network namespace with loopback
+ *    only (bubblewrap `--unshare-net`), the audit flags every connect() to a
+ *    non-loopback address, and the preload fails closed on a non-loopback
+ *    binding token URL or a request to an Anthropic/Claude host.
  *
  * Any violation fails the run, even when every test passed. The per-package
  * preload (`test-isolation-preload.ts`) refuses to run tests that were not
@@ -42,6 +50,8 @@ import { dirname, join, resolve } from 'node:path'
 export const ISOLATION_ENV = 'ANTHROPIC_AUTH_TEST_ISOLATED'
 export const REAL_HOME_ENV = 'ANTHROPIC_AUTH_TEST_REAL_HOME'
 export const OVERLAY_ENV = 'ANTHROPIC_AUTH_TEST_GUARD_OVERLAY'
+export const NETNS_ENV = 'ANTHROPIC_AUTH_TEST_NETNS'
+const DEAD_OAUTH_BASE = 'http://127.0.0.1:9'
 
 /**
  * Relative to the real home. `depth` bounds the backstop snapshot; `null`
@@ -172,11 +182,29 @@ function sandboxEnv(runDir: string, home: string): NodeJS.ProcessEnv {
   )
   env[ISOLATION_ENV] = runDir
   env[REAL_HOME_ENV] = home
+  // Dead loopback endpoints: a refresh nobody mocked fails with a connect
+  // error instead of reaching platform.claude.com.
+  env.ANTHROPIC_OAUTH_TOKEN_URL = `${DEAD_OAUTH_BASE}/v1/oauth/token`
+  env.ANTHROPIC_OAUTH_AUTHORIZE_URL = `${DEAD_OAUTH_BASE}/oauth/authorize`
+  env.ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL = `${DEAD_OAUTH_BASE}/oauth/authorize`
+  env.ANTHROPIC_AUTH_TEST_MODE = '1'
   // Bun keeps its install cache under HOME; point it back at the real one so
   // a test run never re-downloads packages (read-only use, outside the
   // protected set).
   env.BUN_INSTALL_CACHE_DIR ??= join(home, '.bun', 'install', 'cache')
   return env
+}
+
+/** A connect() to anything but loopback (or a local socket). */
+function nonLoopbackConnect(line: string): boolean {
+  if (!/\bconnect\(/.test(line)) return false
+  const v4 = /sin_addr=inet_addr\("([^"]+)"\)/.exec(line)?.[1]
+  if (v4) return !v4.startsWith('127.') && v4 !== '0.0.0.0'
+  const v6 = /inet_pton\(AF_INET6, "([^"]+)"/.exec(line)?.[1]
+  if (v6) {
+    return !(v6 === '::1' || v6 === '::' || v6.startsWith('::ffff:127.'))
+  }
+  return false
 }
 
 function auditViolations(auditLog: string, home: string): string[] {
@@ -191,11 +219,24 @@ function auditViolations(auditLog: string, home: string): string[] {
   )
   const found = new Set<string>()
   for (const line of lines.slice(Math.max(bunExec, 0))) {
+    if (nonLoopbackConnect(line)) {
+      found.add(`network: ${line.replace(/^\d+\s+/, '').trim()}`)
+      continue
+    }
     if (!prefixes.some((prefix) => line.includes(prefix))) continue
     if (/\b(u?mount2?|pivot_root)\(/.test(line)) continue
     found.add(line.replace(/^\d+\s+/, '').trim())
   }
   return [...found]
+}
+
+function guardLogViolations(runDir: string): string[] {
+  const path = join(runDir, 'network-violations.log')
+  if (!existsSync(path)) return []
+  return readFileSync(path, 'utf8')
+    .split('\n')
+    .filter((line) => line.trim() && !line.startsWith('    at '))
+    .map((line) => `network guard: ${line.trim()}`)
 }
 
 function overlayViolations(guardRoot: string): string[] {
@@ -218,6 +259,7 @@ export type IsolatedRunResult = {
   testExitCode: number
   violations: string[]
   overlay: boolean
+  netns: boolean
   audited: boolean
 }
 
@@ -235,6 +277,17 @@ export function runIsolated(
     process.platform === 'linux' &&
     process.env.ANTHROPIC_AUTH_TEST_NO_OVERLAY !== '1' &&
     commandWorks(['bwrap', '--dev-bind', '/', '/', '--', 'true'])
+  const useNetns =
+    useOverlay &&
+    commandWorks([
+      'bwrap',
+      '--dev-bind',
+      '/',
+      '/',
+      '--unshare-net',
+      '--',
+      'true',
+    ])
   const useAudit =
     process.platform === 'linux' &&
     process.env.ANTHROPIC_AUTH_TEST_NO_AUDIT !== '1' &&
@@ -253,7 +306,17 @@ export function runIsolated(
       binds.push('--bind', overlay, target)
     }
     env[OVERLAY_ENV] = '1'
-    argv = ['bwrap', '--dev-bind', '/', '/', ...binds, '--', ...argv]
+    if (useNetns) env[NETNS_ENV] = '1'
+    argv = [
+      'bwrap',
+      '--dev-bind',
+      '/',
+      '/',
+      ...(useNetns ? ['--unshare-net'] : []),
+      ...binds,
+      '--',
+      ...argv,
+    ]
   }
   if (useAudit) {
     argv = [
@@ -261,7 +324,7 @@ export function runIsolated(
       '-f',
       '-qq',
       '-e',
-      'trace=%file',
+      'trace=%file,connect',
       '-e',
       'signal=none',
       '-o',
@@ -284,18 +347,20 @@ export function runIsolated(
     ...overlayViolations(guardRoot).map(
       (path) => `wrote into a protected directory (sandboxed copy): ${path}`,
     ),
+    ...guardLogViolations(runDir),
     ...diffSnapshots(before, after).map((change) => `snapshot: ${change}`),
   ]
   const testExitCode = result.status ?? 1
   if (!options.quiet) {
     const mode = [
       useOverlay ? 'overlay' : 'no overlay (bwrap unavailable)',
+      useNetns ? 'no network' : 'network NOT isolated',
       useAudit ? 'audit' : 'no audit (strace unavailable)',
     ].join(', ')
     console.error(`[test-isolated] HOME=${env.HOME} (${mode})`)
     if (violations.length) {
       console.error(
-        `[test-isolated] FAIL: the run touched the real ${PROTECTED.map(({ rel }) => `~/${rel}`).join(', ')}:`,
+        `[test-isolated] FAIL: the run touched the real ${PROTECTED.map(({ rel }) => `~/${rel}`).join(', ')} or the network:`,
       )
       for (const violation of violations.slice(0, 50)) {
         console.error(`  ${violation}`)
@@ -311,6 +376,7 @@ export function runIsolated(
     testExitCode,
     violations,
     overlay: useOverlay,
+    netns: useNetns,
     audited: useAudit,
   }
 }
@@ -337,7 +403,20 @@ function selfTest(): number {
   const caughtWrite = result.violations.some((violation) =>
     violation.includes('guard-probe-write.json'),
   )
+  const caughtGuard = result.violations.some((violation) =>
+    violation.startsWith('network guard:'),
+  )
+  const caughtConnect = result.violations.some(
+    (violation) =>
+      violation.startsWith('audit: network:') &&
+      violation.includes('192.0.2.1'),
+  )
   const checks: Array<[string, boolean]> = [
+    ['in-process guard flagged the Anthropic-host request', caughtGuard],
+    [
+      'audit flagged the non-loopback connect',
+      !result.audited || caughtConnect,
+    ],
     ['probe tests themselves ran and passed', result.testExitCode === 0],
     ['runner failed the run', result.exitCode !== 0],
     ['audit flagged the real-path access', !result.audited || caughtAudit],
