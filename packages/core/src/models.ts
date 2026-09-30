@@ -165,8 +165,6 @@ export const CLAUDE_SONNET_5_5_PRICING = {
   cacheWrite1h: 4,
 } as const
 
-// Sonnet 5.5 shares this adaptive shape with Sonnet 5; host adapters handle
-// its distinct explicit opt-out (`between_tools`) separately.
 export const CLAUDE_SONNET_5_5_ADAPTIVE_THINKING =
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
 

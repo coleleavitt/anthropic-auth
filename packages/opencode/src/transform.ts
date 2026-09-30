@@ -1040,7 +1040,8 @@ function normalizeFableMythosRequest(
 /**
  * Sonnet 5 accepts disabled thinking, but Sonnet 5.5 instead requires the
  * bare between_tools mode for an explicit opt-out (at effort high or below).
- * Both default to omitted thinking text, so adaptive requests request summaries.
+ * Neither model returns readable thinking by default. Request summaries so
+ * the host can display adaptive reasoning.
  */
 function normalizeSonnet5FamilyRequest(parsed: Record<string, unknown>): {
   replacedExisting: boolean
@@ -1054,8 +1055,9 @@ function normalizeSonnet5FamilyRequest(parsed: Record<string, unknown>): {
       isRecord(thinking) &&
       (thinking.type === 'disabled' || thinking.type === 'between_tools')
     ) {
-      // Sonnet 5.5 rejects disabled, and between_tools rejects display,
-      // block_binding, and xhigh/max effort. Keep the user's opt-out intent.
+      // Sonnet 5.5 rejects `disabled`. Convert either opt-out to bare
+      // `between_tools`, which rejects display and block_binding fields,
+      // and cap unsupported xhigh/max effort at high.
       parsed.thinking = { type: 'between_tools' }
       const outputConfig = parsed.output_config
       if (

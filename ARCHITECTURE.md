@@ -167,7 +167,7 @@
 **ThinkingBindingControls:**
 - Purpose: Controls how Fable 5.1, Opus 5.5, and Sonnet 5.5 handle replayed thinking whose original conversation prefix changed after host compaction or prompt transformation
 - Location: `packages/core/src/thinking-binding.ts`
-- Pattern: Shared outgoing-body inspection recognizes non-empty signed `thinking` and `redacted_thinking` blocks. OAuth Fable 5.1, Opus 5.5, and Sonnet 5.5 continuations with adaptive thinking use `thinkingBinding.prefixMismatchBehavior`: `account-default` sends no override, while `error` or `drop_block` adds `thinking.block_binding.prefix_mismatch_behavior` and beta `thinking-binding-controls-2026-08-01`. Sonnet 5.5's `between_tools` mode rejects this field and does not receive it. First turns, Mythos 5.1, older models, and API-key routes remain unchanged.
+- Pattern: Shared outgoing-body inspection recognizes non-empty signed `thinking` and `redacted_thinking` blocks. OAuth Fable 5.1, Opus 5.5, and Sonnet 5.5 continuations with adaptive thinking use `thinkingBinding.prefixMismatchBehavior`: `account-default` sends no override and leaves the behavior to Anthropic, while `error` or `drop_block` adds `thinking.block_binding.prefix_mismatch_behavior` and beta `thinking-binding-controls-2026-08-01`. Sonnet 5.5's `between_tools` mode rejects this field and does not receive it. First turns, Mythos 5.1, older models, and API-key routes remain unchanged.
 
 **MidConversationOutputConfig:**
 - Purpose: Preserves Fable 5.1 prompt-cache prefixes while users change reasoning effort between turns

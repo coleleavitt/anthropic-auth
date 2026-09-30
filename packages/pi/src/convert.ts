@@ -659,13 +659,10 @@ export async function buildAnthropicRequest(
   const isSonnet55 = isClaudeSonnet55Model(modelId)
   const isOpus5 = isClaudeOpus5Model(modelId)
   const isOpus55 = isClaudeOpus55Model(modelId)
-  // Sonnet 5/5.5 and Opus 5/5.5 use adaptive-summarized thinking: make
-  // adaptive thinking visible (display defaults to "omitted") and map reasoning
-  // to output_config effort. Pi's typed options cannot express
-  // thinking-disabled, so there is no disable case here (see transform.ts for
-  // the raw-body path). Each model refs its own per-family constant —
-  // families can diverge, so the constant rather than a shared alias keeps
-  // the call sites explicit.
+  // Request summaries so the host can display adaptive reasoning.
+  // Pi's typed options cannot express the disabled-thinking setting;
+  // OpenCode handles it by transforming the raw request body. Separate model
+  // constants let each model's thinking configuration change independently.
   if (isFableOrMythos5) {
     body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
   } else if (isSonnet55) {
