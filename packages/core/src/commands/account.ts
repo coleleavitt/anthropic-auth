@@ -181,7 +181,7 @@ const USAGE_TEXT = [
   '  /claude-account disable <id>          Disable a fallback account',
   '  /claude-account remove <id>           Remove a fallback account locally',
   '  /claude-account revoke <id> --confirm Remote-revoke and disable OAuth',
-  '  /claude-account import-native [label] --confirm  Import native Claude OAuth',
+  "  /claude-account import-native [label] --confirm  Link the store to Claude Code's login",
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
   '  /claude-account add-apikey <key>      Add an API key fallback account',
@@ -244,7 +244,7 @@ export function executeAccountCommand(input: {
     return {
       text: action.confirmed
         ? 'import-native'
-        : 'Importing may copy a keychain-protected credential into the project-neutral store. Re-run with --confirm.',
+        : "Linking shares Claude Code's login with the project-neutral store (one login per account). Re-run with --confirm.",
     }
   }
 

@@ -21,6 +21,7 @@ import {
   addSharedApiKey,
   anthropicAuthConfig,
   backfillSharedIdentities,
+  claudeCodeLoginNotice,
   getSharedAccessToken,
   getSharedAccountStorePath,
   getSharedApiKey,
@@ -387,6 +388,80 @@ describe('login', () => {
     expect(mock.codeExchanges[0]?.code_verifier).toBeTruthy()
     const token = await getSharedAccessToken(account.id)
     expect(token.accessToken).toBe(mock.loginAccess('new'))
+  })
+
+  test("a login of the account Claude Code is logged into replaces Claude Code's and is published to it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-code-login-'))
+    try {
+      // Claude Code is logged into uuid-cc / org-cc with an older login.
+      const native = join(dir, '.credentials.json')
+      const nativeDocument = (accountUuid: string) => {
+        writeFileSync(
+          native,
+          JSON.stringify({
+            claudeAiOauth: {
+              accessToken: fakeAccessToken('claudecodeold'),
+              refreshToken: fakeRefreshToken('claudecodeold'),
+              expiresAt: Date.now() + HOUR,
+              scopes: ['user:inference'],
+              subscriptionType: 'max',
+            },
+          }),
+          { mode: 0o600 },
+        )
+        writeFileSync(
+          join(dir, '.claude.json'),
+          JSON.stringify({
+            oauthAccount: { accountUuid, organizationUuid: 'org-cc' },
+          }),
+          { mode: 0o600 },
+        )
+      }
+      nativeDocument('uuid-cc')
+      mock.codes.set('cc-code', {
+        email: 'cc@example.com',
+        accountUuid: 'uuid-cc',
+        tag: 'cc',
+      })
+      const auth = new AnthropicAuth({
+        ...anthropicAuthConfig(),
+        nativeCredentialsPath: native,
+      })
+      const login = auth.startLogin({ mode: 'max' })
+      const account = await auth.completeLogin({
+        loginId: login.loginId,
+        callback: `cc-code#${login.state}`,
+      })
+      expect(claudeCodeLoginNotice(account)).toContain(
+        "this login replaces Claude Code's",
+      )
+      expect(account).toMatchObject({
+        claudeCodeLinked: true,
+        claudeCodePublish: 'written',
+      })
+      expect(JSON.stringify(account)).not.toContain('sk-ant-')
+      const written = JSON.parse(readFileSync(native, 'utf8'))
+      expect(written.claudeAiOauth.accessToken).toBe(mock.loginAccess('cc'))
+      expect(written.claudeAiOauth.subscriptionType).toBe('max')
+
+      // Claude Code on another account: no notice, its file untouched.
+      nativeDocument('uuid-someone-else')
+      const before = readFileSync(native, 'utf8')
+      mock.codes.set('other-code', {
+        email: 'other@example.com',
+        accountUuid: 'uuid-other',
+        tag: 'other',
+      })
+      const other = auth.startLogin({ mode: 'max' })
+      const otherAccount = await auth.completeLogin({
+        loginId: other.loginId,
+        callback: `other-code#${other.state}`,
+      })
+      expect(claudeCodeLoginNotice(otherAccount)).toBeUndefined()
+      expect(readFileSync(native, 'utf8')).toBe(before)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test('a callback with a foreign state is refused before any exchange', async () => {

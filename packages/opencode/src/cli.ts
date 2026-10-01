@@ -6,6 +6,7 @@ import {
   type AccountStorage,
   type ApiKeyAccount,
   addAccountPersistent,
+  claudeCodeLoginNotice,
   discoverNativeClaudeCredentials,
   generateRelayToken,
   getAccountStoragePath,
@@ -359,6 +360,11 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     )
   }
 
+  // One login per account: a login of the account Claude Code is logged into
+  // replaced Claude Code's (the binding published it to Claude Code's file).
+  const notice = claudeCodeLoginNotice(added)
+  if (notice) console.warn(`\n${notice}`)
+
   // A credential that cannot run inference is useless for routing, and the
   // failure would otherwise surface much later as an opaque 403.
   if (added.scopes.length && !added.scopes.includes('user:inference')) {
@@ -459,14 +465,18 @@ export async function importNative(
     const status = await readNativeClaudeStatus(discovered.source.path).catch(
       () => null,
     )
-    if (status?.storeAccountId) {
+    if (status?.linkedAccountId) {
+      console.log(
+        `Claude Code is logged into ${status.email ?? status.accountUuid}; the store row "${status.linkedAccountId}" is that account and will share Claude Code's login.`,
+      )
+    } else if (status?.storeAccountId) {
       console.log(
         `The account store already holds this credential as "${status.storeAccountId}".`,
       )
     }
   }
   const confirmation = await ask(
-    `Import native Claude OAuth from ${source} into the project-neutral account store? Type IMPORT to continue: `,
+    `Link the project-neutral account store to Claude Code's login from ${source}? An account has one login at a time: the store and Claude Code will share it. Type IMPORT to continue: `,
   )
   if (confirmation !== 'IMPORT')
     throw new Error('Native credential import cancelled')
@@ -482,7 +492,9 @@ export async function importNative(
     })
   }
   console.log(
-    `Imported native Claude OAuth as "${imported.account.label ?? imported.account.id}".`,
+    imported.status === 'linked'
+      ? `Linked "${imported.account.id}" to Claude Code's login: the store borrows Claude Code's live token and publishes its refreshes back.`
+      : `Imported native Claude OAuth as "${imported.account.label ?? imported.account.id}".`,
   )
 }
 

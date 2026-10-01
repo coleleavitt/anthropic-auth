@@ -7,6 +7,7 @@ import {
   CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
   CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
   CLAUDE_OPUS_5_5_MODEL_ID,
+  claudeCodeLoginNotice,
   getClaudeCodeVersion,
   getSharedAccessToken,
   listSharedAccounts,
@@ -69,6 +70,10 @@ export async function loginAnthropic(
     callback = await manualCallback
   }
   const account = await login.complete({ callback, setCurrent: true })
+  // One login per account: a login of the account Claude Code is logged into
+  // replaced Claude Code's (the binding published it to Claude Code's file).
+  const notice = claudeCodeLoginNotice(account)
+  if (notice) callbacks.onProgress?.(notice)
   return hostCredentialsFor(await getSharedAccessToken(account.id))
 }
 

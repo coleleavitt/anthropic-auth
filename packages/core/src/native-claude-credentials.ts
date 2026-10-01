@@ -17,6 +17,7 @@ import {
   importHostOAuthCredential,
   importNativeClaudeFile,
   isAnthropicAuthError,
+  type NativeImportResult,
 } from './shared-account-store.ts'
 
 export const NATIVE_CLAUDE_KEYCHAIN_SERVICE = 'Claude Code'
@@ -524,19 +525,22 @@ export async function loadNativeClaudeCredentials(
 export const readNativeClaudeCredentials = loadNativeClaudeCredentials
 
 /**
- * Explicitly import native Claude OAuth into the shared account store (through
+ * Explicitly link the shared account store to Claude Code's login (through
  * the Rust binding). Discovery itself remains read-only; only this opt-in
- * operation copies the credential, and when the store already holds this
- * login its copy wins. Trusted-device state is returned to the caller and
- * never written into accounts.json.
+ * operation touches the store. Trusted-device state is returned to the caller
+ * and never written into accounts.json.
  *
- * The import creates shared custody of one token family: Claude Code keeps
- * rotating its own copy. For the plaintext `.credentials.json` source the
- * binding reads and stores the tokens itself, and every later store refresh
- * of that token is published back into the file (only while the file still
- * holds the spent token, under Claude Code's own write lock), so Claude
- * Code's login survives. A keychain-backed credential cannot be published
- * back; prefer a separate login for the store there.
+ * One login per account: logging into an Anthropic account revokes its older
+ * login, so the store and Claude Code cannot each hold their own. For the
+ * plaintext `.credentials.json` source whose `.claude.json` names the account,
+ * the binding links the store row of that account to Claude Code's login
+ * (status `linked`; the newest copy wins: Claude Code's newer login is adopted
+ * into the row, keeping its id, label and quota, or the store's newer one is
+ * published to Claude Code). From then on the store borrows Claude Code's live
+ * access token, refreshes only under Claude Code's own refresh lock, and
+ * publishes every rotation back. Without an identity it is the one-time copy
+ * (`added` / `already_present` / `kept`). A keychain-backed credential cannot
+ * be published back; prefer a separate login for the store there.
  */
 export async function importNativeClaudeAccount(
   options: NativeClaudeCredentialOptions & {
@@ -544,7 +548,7 @@ export async function importNativeClaudeAccount(
   } = {},
 ): Promise<{
   account: { id: string; label: string }
-  status: Exclude<ImportHostCredentialResult['status'], 'invalid'>
+  status: NativeImportResult['status']
   source: NativeClaudeCredentialSource
   trustedDeviceToken?: string
 } | null> {
@@ -552,7 +556,7 @@ export async function importNativeClaudeAccount(
   if (!loaded) return null
   const oauth = loaded.credentials.claudeAiOauth
   const label = options.label?.trim() || 'Native Claude'
-  let imported: ImportHostCredentialResult
+  let imported: ImportHostCredentialResult | NativeImportResult
   if (loaded.source.type === 'plaintext') {
     try {
       imported = await importNativeClaudeFile({

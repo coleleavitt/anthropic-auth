@@ -388,6 +388,61 @@ describe('native Claude credential fallback precedence', () => {
     }
   })
 
+  test("links the store to Claude Code's login when .claude.json names the account", async () => {
+    const root = await temporaryDirectory()
+    const home = join(root, 'home')
+    const store = useTempStore()
+    try {
+      await mkdir(join(home, '.claude'), { recursive: true })
+      const payload = credentialPayload('linked')
+      payload.claudeAiOauth.accessToken = fakeAccessToken('nativelinked')
+      payload.claudeAiOauth.refreshToken = fakeRefreshToken('nativelinked')
+      await writeFile(
+        join(home, '.claude', '.credentials.json'),
+        `${JSON.stringify(payload)}\n`,
+        { mode: 0o600 },
+      )
+      // Claude Code's global config (the default layout: ~/.claude.json).
+      await writeFile(
+        join(home, '.claude.json'),
+        JSON.stringify({
+          oauthAccount: {
+            accountUuid: 'uuid-linked',
+            organizationUuid: 'org-linked',
+            emailAddress: 'linked@example.com',
+          },
+        }),
+        { mode: 0o600 },
+      )
+      const linked = await importNativeClaudeAccount({
+        platform: 'linux',
+        environment: {},
+        homeDirectory: home,
+        label: 'Claude Code',
+      })
+      expect(linked?.status).toBe('linked')
+      const [row] = await listSharedAccounts()
+      expect(row).toMatchObject({
+        id: linked?.account.id,
+        accountUuid: 'uuid-linked',
+        organizationUuid: 'org-linked',
+        email: 'linked@example.com',
+      })
+      expect(JSON.stringify(row)).not.toContain('sk-ant-')
+      // Linking again keeps one row: the same login, already in step.
+      const again = await importNativeClaudeAccount({
+        platform: 'linux',
+        environment: {},
+        homeDirectory: home,
+      })
+      expect(again?.status).toBe('linked')
+      expect(again?.account.id).toBe(linked?.account.id)
+      expect(await listSharedAccounts()).toHaveLength(1)
+    } finally {
+      store.dispose()
+    }
+  })
+
   test('refuses a native credential the store cannot parse', async () => {
     const root = await temporaryDirectory()
     const home = join(root, 'home')

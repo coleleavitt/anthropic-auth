@@ -90,6 +90,7 @@ export class FixtureStore {
       refreshDead: row.refreshDead === true,
       ...(row.lastError ? { lastError: row.lastError } : {}),
       scopes: ['user:inference'],
+      claudeCodeLinked: false,
     }
   }
 

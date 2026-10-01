@@ -125,6 +125,7 @@ function storeFrom(storage: AccountStorage): Partial<SharedAccountAccess> {
         expiresAt: account.expires ?? Number.MAX_SAFE_INTEGER,
         refreshDead: false,
         scopes: [],
+        claudeCodeLinked: false,
       })),
     markUsed: async () => true,
   }

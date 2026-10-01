@@ -34,6 +34,7 @@ import {
   CLAUDE_USAGE_COMMAND_NAME,
   type ContentFilterSummary,
   classifyProviderBlock,
+  claudeCodeLoginNotice,
   computeXxhash64Hex,
   createEmptyStorage,
   createStickyNoRouteResponse,
@@ -2970,7 +2971,7 @@ const anthropicAuthPlugin = async (
           (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return {
-          text: 'Importing may copy a keychain-protected credential into the project-neutral store. Re-run with --confirm.',
+          text: "Linking shares Claude Code's login with the project-neutral store (one login per account). Re-run with --confirm.",
           accounts,
         }
       }
@@ -2994,7 +2995,10 @@ const anthropicAuthPlugin = async (
       }
       await refreshSidebarAfterMutation(await loadAccounts(accountStoragePath))
       return {
-        text: `Imported native Claude OAuth as "${imported.account.label ?? imported.account.id}".`,
+        text:
+          imported.status === 'linked'
+            ? `Linked "${imported.account.id}" to Claude Code's login: the store borrows Claude Code's live token and publishes its refreshes back.`
+            : `Imported native Claude OAuth as "${imported.account.label ?? imported.account.id}".`,
         accounts: buildAccountList(
           (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         ),
@@ -3187,7 +3191,13 @@ const anthropicAuthPlugin = async (
         const accounts = buildAccountList(
           updatedStorage ?? createEmptyStorage(),
         )
-        return { text: `OAuth account added.`, accounts }
+        const notice = claudeCodeLoginNotice(added)
+        return {
+          text: notice
+            ? `OAuth account added. ${notice}`
+            : 'OAuth account added.',
+          accounts,
+        }
       } catch (error) {
         const accounts = buildAccountList(
           (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
@@ -6475,6 +6485,8 @@ const anthropicAuthPlugin = async (
                     callback: code,
                     setCurrent: true,
                   })
+                  const notice = claudeCodeLoginNotice(added)
+                  if (notice) logger.warn('auth', notice, { id: added.id })
                   const token = await getSharedAccessToken(added.id)
                   return {
                     type: 'success' as const,

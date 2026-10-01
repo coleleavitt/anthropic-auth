@@ -38,6 +38,7 @@ import type {
   KeepAliveOnceOptions,
   KeepAliveResult,
   NativeClaudeInfo,
+  NativeImportResult,
   RevokeAccountResult,
   UnauthorizedResult,
 } from '@coleleavitt/anthropic-napi'
@@ -62,6 +63,7 @@ export type {
   KeepAliveOnceOptions,
   KeepAliveResult,
   NativeClaudeInfo,
+  NativeImportResult,
   RevokeAccountResult,
   UnauthorizedResult,
 }
@@ -359,6 +361,19 @@ export function recordSharedQuotaHeaders(
   return getAnthropicAuth().recordQuotaHeaders({ accessToken, headers })
 }
 
+/**
+ * One login per account. Logging into an Anthropic account revokes that
+ * account's older login, so a login of the account Claude Code is logged into
+ * replaces Claude Code's. The binding publishes the new login to Claude Code's
+ * credential file and returns a notice on the row (`warning`); hosts show it
+ * to the user. `undefined` for any other login.
+ */
+export function claudeCodeLoginNotice(
+  account: Pick<SharedAnthropicAccount, 'warning'>,
+): string | undefined {
+  return account.warning?.trim() || undefined
+}
+
 export type ImportHostCredentialResult =
   | ImportResult
   | { status: 'invalid'; message: string }
@@ -415,14 +430,16 @@ export function readNativeClaudeStatus(
 }
 
 /**
- * Import Claude Code's plaintext credential file into the store. The tokens
- * are read and stored by the binding and never reach JavaScript; from then on
- * a store refresh of that token is published back to the file.
+ * Link the store to Claude Code's plaintext credential file (one login per
+ * account; status `linked` when `.claude.json` names the account, else the
+ * one-time copy). The tokens are read and stored by the binding and never
+ * reach JavaScript; from then on the store borrows Claude Code's live token
+ * and publishes its refreshes back to the file.
  */
 export function importNativeClaudeFile(input: {
   path: string
   label?: string
-}): Promise<ImportResult> {
+}): Promise<NativeImportResult> {
   return getAnthropicAuth().importNativeClaudeAccount({
     path: input.path,
     ...(input.label ? { label: input.label } : {}),
