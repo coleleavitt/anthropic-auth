@@ -9,6 +9,8 @@ import {
   REQUIRED_BETAS,
   selectClaudeCodeBetas,
   THINKING_BINDING_CONTROLS_BETA,
+  TRAILING_ASSISTANT_HISTORY_MESSAGE,
+  TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
 import {
@@ -43,8 +45,6 @@ import {
   sanitizeSystemText,
   setOAuthHeaders,
   stripToolPrefix,
-  TRAILING_ASSISTANT_HISTORY_MESSAGE,
-  TrailingAssistantHistoryError,
 } from '../transform'
 
 const sse = (event: string, data: unknown) =>

@@ -204,6 +204,7 @@ import {
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
+  TrailingAssistantHistoryError,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
@@ -300,7 +301,6 @@ import {
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
-  TrailingAssistantHistoryError,
 } from './transform.ts'
 
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
@@ -310,8 +310,10 @@ const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
 const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
 const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 
+const localInvalidRequestResponses = new WeakSet<Response>()
+
 function localInvalidRequestResponse(message: string): Response {
-  return new Response(
+  const response = new Response(
     JSON.stringify({
       type: 'error',
       error: {
@@ -323,6 +325,20 @@ function localInvalidRequestResponse(message: string): Response {
       status: 400,
       headers: { 'content-type': 'application/json' },
     },
+  )
+  localInvalidRequestResponses.add(response)
+  return response
+}
+
+// Upstream status policy cannot repair a locally invalid conversation by
+// selecting another account. Keep genuine provider 400s configurable.
+function shouldFallbackResponse(
+  response: Response,
+  storage: AccountStorage | null,
+): boolean {
+  return (
+    (response.status !== 400 || !localInvalidRequestResponses.has(response)) &&
+    shouldFallbackStatus(response.status, storage)
   )
 }
 
@@ -6845,7 +6861,7 @@ const anthropicAuthPlugin = async (
                 )
               } else continue
               lastResponse = response
-              let fallbackAgain = shouldFallbackStatus(response.status, storage)
+              let fallbackAgain = shouldFallbackResponse(response, storage)
               if (!fallbackAgain) {
                 const inspected = await inspectStreamingRateLimit(
                   response,
@@ -6930,8 +6946,8 @@ const anthropicAuthPlugin = async (
             if (!hasPotentialFallbackRoute) return mainResponse
 
             let currentResponse = mainResponse
-            let shouldFallback = shouldFallbackStatus(
-              currentResponse.status,
+            let shouldFallback = shouldFallbackResponse(
+              currentResponse,
               storage,
             )
             let mainQuotaExhaustedByResponse = responseShowsMainQuotaExhausted(
@@ -7547,8 +7563,8 @@ const anthropicAuthPlugin = async (
                     }
                     const inspectResponse = async (response: Response) => {
                       let inspectedResponse = response
-                      let routeFailure = shouldFallbackStatus(
-                        response.status,
+                      let routeFailure = shouldFallbackResponse(
+                        response,
                         stickyRoutes.storage,
                       )
                       let streamingRateLimit = false

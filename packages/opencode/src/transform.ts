@@ -37,10 +37,12 @@ import {
   selectClaudeCodeBetas,
   signRequestBody,
   stripBillingLineageFromBody,
+  stripEmptyTrailingAssistantMessages,
   TEXT_REPLACEMENTS,
   THINKING_BINDING_CONTROLS_BETA,
   type ThinkingPrefixMismatchBehavior,
   TOOL_PREFIX,
+  TrailingAssistantHistoryError,
   usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -1172,123 +1174,6 @@ function applyCache1hStrategy(
   return {}
 }
 
-export const TRAILING_ASSISTANT_HISTORY_MESSAGE =
-  'Refused to send this request: the conversation history ends with an ' +
-  'assistant message that has content instead of a user message. The ' +
-  'Anthropic auth plugin will not drop that assistant turn, because doing ' +
-  'so could discard a completed answer and resend the earlier question. ' +
-  'Send a new message to continue the conversation.'
-
-/**
- * Raised when the request history ends with an assistant message that is not
- * provably empty. The message is fixed and the details carry only shape
- * information, never conversation text, so the error is safe to log and to
- * return to the client.
- */
-export class TrailingAssistantHistoryError extends Error {
-  readonly check = 'meaningful_trailing_assistant'
-
-  constructor(
-    readonly details: {
-      messageCount: number
-      trailingMessageIndex: number
-      // Provably empty assistant messages that follow the refused one.
-      emptyMessagesAfter: number
-      contentShape: 'string' | 'array' | 'missing' | 'other'
-      contentBlockCount?: number
-      contentBlockTypes?: string[]
-    },
-  ) {
-    super(TRAILING_ASSISTANT_HISTORY_MESSAGE)
-    this.name = 'TrailingAssistantHistoryError'
-  }
-}
-
-const TRAILING_ASSISTANT_REPORTED_BLOCK_TYPES = new Set([
-  'text',
-  'thinking',
-  'redacted_thinking',
-  'tool_use',
-  'server_tool_use',
-  'image',
-  'document',
-])
-
-const EMPTY_TEXT_BLOCK_KEYS = new Set(['type', 'text', 'cache_control'])
-
-/**
- * True only when assistant content carries nothing the model produced: an
- * empty or whitespace-only string, an empty array, or an array made solely of
- * plain text blocks whose text is empty or whitespace. Anything else, including
- * missing content, unknown block types, reasoning, signatures, tool calls and
- * text blocks with extra fields such as citations, counts as meaningful.
- */
-function isProvablyEmptyAssistantContent(content: unknown) {
-  if (typeof content === 'string') return content.trim() === ''
-  if (!Array.isArray(content)) return false
-  return content.every(
-    (block) =>
-      isRecord(block) &&
-      block.type === 'text' &&
-      typeof block.text === 'string' &&
-      block.text.trim() === '' &&
-      Object.keys(block).every((key) => EMPTY_TEXT_BLOCK_KEYS.has(key)),
-  )
-}
-
-function describeTrailingAssistantContent(content: unknown) {
-  if (Array.isArray(content)) {
-    return {
-      contentShape: 'array' as const,
-      contentBlockCount: content.length,
-      // Only well-known type names are recorded so arbitrary strings from the
-      // request body never reach the logs.
-      contentBlockTypes: content.map((block) =>
-        isRecord(block) &&
-        typeof block.type === 'string' &&
-        TRAILING_ASSISTANT_REPORTED_BLOCK_TYPES.has(block.type)
-          ? block.type
-          : 'other',
-      ),
-    }
-  }
-  if (typeof content === 'string') return { contentShape: 'string' as const }
-  if (content === undefined) return { contentShape: 'missing' as const }
-  return { contentShape: 'other' as const }
-}
-
-/**
- * Anthropic rejects requests that end on an assistant message ("assistant
- * message prefill") on Claude Code OAuth models. Trailing assistant messages
- * that are provably empty are safe to drop. Anything else is refused: the wire
- * format does not say whether an assistant turn finished, so dropping it could
- * discard a completed answer and resend the question that produced it.
- *
- * For ordinary requests, which end on a user message, this checks only the
- * last element.
- */
-function stripEmptyTrailingAssistantMessages(parsed: Record<string, unknown>) {
-  if (!Array.isArray(parsed.messages)) return 0
-  const messages = parsed.messages
-  let end = messages.length
-  while (end > 0) {
-    const last = messages[end - 1]
-    if (!isRecord(last) || last.role !== 'assistant') break
-    if (!isProvablyEmptyAssistantContent(last.content)) {
-      throw new TrailingAssistantHistoryError({
-        messageCount: messages.length,
-        trailingMessageIndex: end - 1,
-        emptyMessagesAfter: messages.length - end,
-        ...describeTrailingAssistantContent(last.content),
-      })
-    }
-    end--
-  }
-  const removed = messages.length - end
-  if (removed) messages.length = end
-  return removed
-}
-
 /**
  * Anthropic can classify whitespace-only text after the latest assistant
  * tool_use as assistant prefill on a later tool continuation, even when the
@@ -1433,7 +1318,7 @@ export async function rewriteRequestBody(
     const messagesBeforeStrip = Array.isArray(parsed.messages)
       ? parsed.messages.length
       : undefined
-    stripEmptyTrailingAssistantMessages(parsed)
+    stripEmptyTrailingAssistantMessages(parsed.messages)
     const removedWhitespaceBlocks =
       stripLatestAssistantToolUseTrailingWhitespace(parsed)
     const messagesAfterStrip = Array.isArray(parsed.messages)

@@ -5,6 +5,7 @@ import {
   describe,
   expect,
   mock,
+  spyOn,
   test,
 } from 'bun:test'
 import { randomUUID } from 'node:crypto'
@@ -30,6 +31,7 @@ import {
   CustodyTombstoneRefreshError,
   custodyTombstoneOAuth,
   extractBillingHeaderCCH,
+  FallbackAccountManager,
   getAccountStatePath,
   getClaudeCodeIdentity,
   getOrCreatePrimeAuthLineageId,
@@ -49,6 +51,7 @@ import {
   saveAccountState,
   saveAccounts,
   setLogLevel,
+  TRAILING_ASSISTANT_HISTORY_MESSAGE,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { EFFORT_MARKER_PREFIX } from '../effort-history'
@@ -72,10 +75,7 @@ import {
   resolveActiveAccount,
   setSidebarState,
 } from '../sidebar-state'
-import {
-  rewriteRequestBody,
-  TRAILING_ASSISTANT_HISTORY_MESSAGE,
-} from '../transform.ts'
+import { rewriteRequestBody } from '../transform.ts'
 import {
   extractUrl,
   installDefaultFetchMock,
@@ -4456,8 +4456,11 @@ describe('Fable 5.1 request-scoped effort history', () => {
 
 describe('meaningful trailing assistant history', () => {
   const originalFetch = globalThis.fetch
+  let restoreFallbackSelection: (() => void) | undefined
 
   afterEach(async () => {
+    restoreFallbackSelection?.()
+    restoreFallbackSelection = undefined
     globalThis.fetch = originalFetch
     __setLogTestSink(null)
     await drainSidebarWrites()
@@ -4491,6 +4494,7 @@ describe('meaningful trailing assistant history', () => {
   test('OAuth route refuses locally without model dispatch or fallback', async () => {
     await useTempAccountFile(
       createFallbackStorage({
+        fallbackOn: [400, 429],
         refresh: {
           enabled: false,
           intervalMinutes: 10,
@@ -4518,14 +4522,20 @@ describe('meaningful trailing assistant history', () => {
         if (url.includes('/v1/messages')) {
           const authorization = new Headers(init?.headers).get('authorization')
           modelDispatches.push(authorization ?? '')
-          // The main account is rate limited, so any request that reaches the
-          // model would be retried on the fallback account.
+          // An actual provider 400 remains eligible under the explicit policy,
+          // even when its error body matches the plugin's local refusal.
           if (authorization === 'Bearer main-access') {
             return Promise.resolve(
-              new Response('{}', {
-                status: 429,
-                headers: { 'retry-after': '1' },
-              }),
+              Response.json(
+                {
+                  type: 'error',
+                  error: {
+                    type: 'invalid_request_error',
+                    message: TRAILING_ASSISTANT_HISTORY_MESSAGE,
+                  },
+                },
+                { status: 400 },
+              ),
             )
           }
           return Promise.resolve(new Response('{}', { status: 200 }))
@@ -4548,6 +4558,11 @@ describe('meaningful trailing assistant history', () => {
       { models: {} },
     )
 
+    const fallbackSelection = spyOn(
+      FallbackAccountManager.prototype,
+      'getUsableFallbackAccounts',
+    )
+    restoreFallbackSelection = () => fallbackSelection.mockRestore()
     await expectLocalRefusal(
       await auth.fetch(MESSAGES_URL, {
         method: 'POST',
@@ -4556,6 +4571,7 @@ describe('meaningful trailing assistant history', () => {
       }),
     )
     expect(modelDispatches).toEqual([])
+    expect(fallbackSelection).not.toHaveBeenCalled()
     await drainSidebarWrites()
     expect((await getSidebarState()).activeId).not.toBe('fallback-1')
     expect(logs).toContainEqual({
@@ -4585,11 +4601,13 @@ describe('meaningful trailing assistant history', () => {
       'Bearer main-access',
       'Bearer fallback-access',
     ])
+    expect(fallbackSelection).toHaveBeenCalled()
   })
 
   test('API-key route refuses locally without model dispatch', async () => {
     await useTempAccountFile(
       createFallbackStorage({
+        fallbackOn: [400, 429],
         routing: { mode: 'fallback-first' },
         refresh: {
           enabled: false,
