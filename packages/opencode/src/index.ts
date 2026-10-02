@@ -300,6 +300,7 @@ import {
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
+  TrailingAssistantHistoryError,
 } from './transform.ts'
 
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
@@ -309,19 +310,13 @@ const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
 const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
 const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 
-function effortMarkerFailureResponse(
-  error: EffortMarkerCorrelationError,
-): Response {
-  logger.warn('effort-history', 'refused uncorrelated Fable 5.1 request', {
-    check: error.check,
-    ...error.details,
-  })
+function localInvalidRequestResponse(message: string): Response {
   return new Response(
     JSON.stringify({
       type: 'error',
       error: {
         type: 'invalid_request_error',
-        message: error.message,
+        message,
       },
     }),
     {
@@ -329,6 +324,29 @@ function effortMarkerFailureResponse(
       headers: { 'content-type': 'application/json' },
     },
   )
+}
+
+function effortMarkerFailureResponse(
+  error: EffortMarkerCorrelationError,
+): Response {
+  logger.warn('effort-history', 'refused uncorrelated Fable 5.1 request', {
+    check: error.check,
+    ...error.details,
+  })
+  return localInvalidRequestResponse(error.message)
+}
+
+// A request whose history ends on a meaningful assistant message is answered
+// locally with a terminal 400 so the client shows the error instead of
+// retrying, falling back to another account, or reaching the model.
+function trailingAssistantHistoryFailureResponse(
+  error: TrailingAssistantHistoryError,
+): Response {
+  logger.warn('transform', 'refused request ending on assistant history', {
+    check: error.check,
+    ...error.details,
+  })
+  return localInvalidRequestResponse(error.message)
 }
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
@@ -5631,6 +5649,9 @@ const anthropicAuthPlugin = async (
                 if (error instanceof EffortMarkerCorrelationError) {
                   return effortMarkerFailureResponse(error)
                 }
+                if (error instanceof TrailingAssistantHistoryError) {
+                  return trailingAssistantHistoryFailureResponse(error)
+                }
                 throw error
               }
               configureApiRouteHeaders(requestHeaders, account)
@@ -5882,6 +5903,9 @@ const anthropicAuthPlugin = async (
               } catch (error) {
                 if (error instanceof EffortMarkerCorrelationError) {
                   return effortMarkerFailureResponse(error)
+                }
+                if (error instanceof TrailingAssistantHistoryError) {
+                  return trailingAssistantHistoryFailureResponse(error)
                 }
                 throw error
               }
