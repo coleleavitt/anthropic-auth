@@ -15,9 +15,16 @@
  * when `auth.json` already holds something to refresh. A cold, empty
  * `auth.json` is therefore the single case nothing covered.
  *
- * Adoption is a seed, not a sync: it never overwrites an entry Pi already has.
+ * Adoption is a seed, not a sync: it never replaces an entry Pi already has.
  * The seed carries the store placeholder, never a real refresh token; once
  * seeded, `refreshAnthropicToken` answers every refresh from the store.
+ *
+ * The one exception is an entry still carrying a real refresh token (written
+ * by Pi's built-in login or an older version of this extension). That token
+ * is moved into the store and the entry keeps only the placeholder: left in
+ * place, Pi's built-in Anthropic refresh (any session started without this
+ * extension) and the store would both spend one rotating refresh token, and
+ * whichever rotated first would leave the other with a dead one.
  */
 import {
   existsSync,
@@ -30,6 +37,8 @@ import { dirname, join } from 'node:path'
 
 import {
   getSharedAccessToken,
+  importHostOAuthCredential,
+  isStoreManagedRefreshPlaceholder,
   listSharedAccounts,
   logger,
   type SharedAnthropicAccount,
@@ -54,6 +63,8 @@ export type AdoptionOutcome =
   | 'no-usable-account'
   /** A credential was written into Pi's `auth.json`. */
   | 'adopted'
+  /** Pi's real refresh token was moved into the store and replaced. */
+  | 'migrated'
 
 export interface AdoptionResult {
   outcome: AdoptionOutcome
@@ -85,6 +96,75 @@ function readHostAuth(path: string): Record<string, unknown> {
 function hasHostAnthropicEntry(auth: Record<string, unknown>): boolean {
   const entry = auth.anthropic
   return Boolean(entry) && typeof entry === 'object'
+}
+
+type HostOAuthEntry = {
+  type: 'oauth'
+  access?: unknown
+  refresh: string
+  expires?: unknown
+}
+
+/** The host's Anthropic entry when it still holds a real refresh token. */
+function hostRealRefreshEntry(
+  auth: Record<string, unknown>,
+): HostOAuthEntry | undefined {
+  const entry = auth.anthropic as Record<string, unknown> | undefined
+  if (!entry || typeof entry !== 'object' || entry.type !== 'oauth') return
+  const refresh = typeof entry.refresh === 'string' ? entry.refresh.trim() : ''
+  if (!refresh || isStoreManagedRefreshPlaceholder(refresh)) return
+  return { ...entry, type: 'oauth', refresh }
+}
+
+/**
+ * Move a real refresh token out of Pi's `auth.json` into the store, leaving
+ * the placeholder behind. A token the store rejects is left untouched: it is
+ * not ours to discard, and `/login anthropic` replaces it.
+ */
+async function migrateHostRefreshToken(
+  path: string,
+  entry: HostOAuthEntry,
+): Promise<AdoptionResult> {
+  const expires =
+    typeof entry.expires === 'number' && Number.isFinite(entry.expires)
+      ? entry.expires
+      : 0
+  const imported = await importHostOAuthCredential({
+    accessToken: typeof entry.access === 'string' ? entry.access : '',
+    refreshToken: entry.refresh,
+    expiresAt: expires,
+  }).catch((error: unknown) => {
+    logger.debug('pi-auth', 'host refresh token migration failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return null
+  })
+  if (!imported || imported.status === 'invalid') {
+    return { outcome: 'already-present' }
+  }
+
+  // Re-read: replace only the exact token we imported, never a newer login.
+  const current = readHostAuth(path)
+  if (hostRealRefreshEntry(current)?.refresh !== entry.refresh) {
+    return { outcome: 'already-present' }
+  }
+  current.anthropic = {
+    ...(current.anthropic as Record<string, unknown>),
+    refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+  }
+  try {
+    writeHostAuth(path, current)
+  } catch (error) {
+    logger.warn('pi-auth', 'failed to replace host refresh token', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return { outcome: 'already-present' }
+  }
+  logger.info('pi-auth', 'moved the host refresh token into the store', {
+    accountId: imported.accountId,
+    status: imported.status,
+  })
+  return { outcome: 'migrated', account: imported.accountId }
 }
 
 /**
@@ -153,9 +233,10 @@ export async function adoptSharedCredentialIntoHostAuth(
 ): Promise<AdoptionResult> {
   const path = getHostAuthPath()
 
-  if (hasHostAnthropicEntry(readHostAuth(path))) {
-    return { outcome: 'already-present' }
-  }
+  const host = readHostAuth(path)
+  const realRefresh = hostRealRefreshEntry(host)
+  if (realRefresh) return migrateHostRefreshToken(path, realRefresh)
+  if (hasHostAnthropicEntry(host)) return { outcome: 'already-present' }
 
   const accounts = await listSharedAccounts().catch((error: unknown) => {
     logger.debug('pi-auth', 'shared account store unreadable during adoption', {

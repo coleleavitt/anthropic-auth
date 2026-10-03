@@ -222,7 +222,30 @@ async function resolveFromStore(
     accountId = currentSharedAccount(await listSharedAccounts())?.id
   }
   options.signal?.throwIfAborted()
-  const token = await getSharedAccessToken(accountId)
+  const token = await getSharedAccessToken(accountId).catch(
+    async (error: unknown) => {
+      // The imported login is the store's to judge: when its token family is
+      // dead, the store's own pick still serves, as it does for the stream.
+      if (
+        accountId === undefined ||
+        !(
+          isAnthropicAuthError(error, 'invalid_grant') ||
+          isAnthropicAuthError(error, 'auth_required')
+        )
+      ) {
+        throw error
+      }
+      const fallback = currentSharedAccount(await listSharedAccounts())
+      if (!fallback || fallback.id === accountId) throw error
+      logger.warn('pi-auth', 'host account unusable; using the store pick', {
+        accountId: accountSpanId(accountId),
+        fallback: accountSpanId(fallback.id),
+      })
+      span.setAttributes({ 'auth.fallback': true })
+      options.signal?.throwIfAborted()
+      return getSharedAccessToken(fallback.id)
+    },
+  )
   span.setAttributes({
     'auth.account': accountSpanId(token.accountId),
     'auth.source': span.attrs['auth.source'] ?? `store-${token.source}`,

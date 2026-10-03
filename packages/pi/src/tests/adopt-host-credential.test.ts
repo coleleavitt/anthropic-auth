@@ -7,7 +7,11 @@ import {
   setSharedAccountEnabled,
 } from '@cortexkit/anthropic-auth-core'
 
-import { seedStoreAccount } from '../../../core/src/tests/support/store-fixture.ts'
+import {
+  fakeAccessToken,
+  fakeRefreshToken,
+  seedStoreAccount,
+} from '../../../core/src/tests/support/store-fixture.ts'
 
 import {
   adoptSharedCredentialIntoHostAuth,
@@ -92,6 +96,71 @@ describe('adoptSharedCredentialIntoHostAuth', () => {
 
     expect(result.outcome).toBe('already-present')
     expect((await readAuth(authPath)).anthropic.access).toBe('host')
+  })
+
+  test('moves a real host refresh token into the store', async () => {
+    const { authPath } = await setupEnvironment()
+    const access = fakeAccessToken('hostlegacy')
+    const refresh = fakeRefreshToken('hostlegacy')
+    const expires = Date.now() + 3_600_000
+    await writeFile(
+      authPath,
+      JSON.stringify({
+        anthropic: { type: 'oauth', access, refresh, expires },
+        openai: { type: 'api_key', key: 'sk-other' },
+      }),
+    )
+
+    const result = await adoptSharedCredentialIntoHostAuth()
+
+    expect(result.outcome).toBe('migrated')
+    const auth = await readAuth(authPath)
+    expect(auth.anthropic).toEqual({
+      type: 'oauth',
+      access,
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires,
+    })
+    expect(auth.openai).toEqual({ type: 'api_key', key: 'sk-other' })
+    expect(await readFile(authPath, 'utf8')).not.toContain(refresh)
+  })
+
+  test('replaces a host refresh token the store already holds', async () => {
+    const { authPath } = await setupEnvironment()
+    const main = await oauthAccount('main', Date.now() + 3_600_000)
+    await writeFile(
+      authPath,
+      JSON.stringify({
+        anthropic: {
+          type: 'oauth',
+          access: main.access,
+          refresh: main.refresh,
+          expires: 1,
+        },
+      }),
+    )
+
+    expect((await adoptSharedCredentialIntoHostAuth()).outcome).toBe('migrated')
+    expect((await readAuth(authPath)).anthropic.refresh).toBe(
+      STORE_MANAGED_REFRESH_PLACEHOLDER,
+    )
+  })
+
+  test('leaves a placeholder entry alone', async () => {
+    const { authPath } = await setupEnvironment()
+    const entry = {
+      type: 'oauth',
+      access: 'host',
+      refresh: STORE_MANAGED_REFRESH_PLACEHOLDER,
+      expires: 1,
+    }
+    await writeFile(authPath, JSON.stringify({ anthropic: entry }))
+    await oauthAccount('main', Date.now() + 3_600_000)
+
+    expect((await adoptSharedCredentialIntoHostAuth()).outcome).toBe(
+      'already-present',
+    )
+    expect((await readAuth(authPath)).anthropic).toEqual(entry)
   })
 
   test('adopts an expired account so the host can refresh it', async () => {

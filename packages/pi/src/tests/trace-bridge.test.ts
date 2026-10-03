@@ -317,6 +317,36 @@ describe('auth.refresh spans', () => {
     })
   })
 
+  test('falls back to the store pick when the host login is dead', async () => {
+    const legacy = await seedStoreAccount({
+      label: 'legacy',
+      email: 'legacy@example.test',
+      expiresAt: Date.now() - 1_000,
+    })
+    const healthy = await seedStoreAccount({
+      label: 'healthy',
+      email: 'healthy@example.test',
+      expiresAt: Date.now() + 3_600_000,
+    })
+    mock.dead.add(legacy.refresh)
+    const host = fakeTraceApi()
+    setTraceApiForTests(host.api)
+
+    const refreshed = await refreshAnthropicToken({
+      access: legacy.access,
+      refresh: legacy.refresh,
+      expires: Date.now() - 1_000,
+    })
+
+    expect(refreshed.access).toBe(healthy.access)
+    expect(refreshed.refresh).toBe(STORE_MANAGED_REFRESH_PLACEHOLDER)
+    const refreshes = host.spans.filter((span) => span.name === 'auth.refresh')
+    expect(refreshes[0]).toMatchObject({
+      status: 'ok',
+      attrs: { 'auth.outcome': 'ok', 'auth.fallback': true },
+    })
+  })
+
   test('marks a credential the store refuses to import as refused', async () => {
     const host = fakeTraceApi()
     setTraceApiForTests(host.api)
