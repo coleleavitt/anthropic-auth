@@ -875,6 +875,39 @@ describe('convertMessages — signed thinking blocks', () => {
     expect(current[1]?.type).toBe('tool_use')
   })
 
+  test('keeps signatures on thinking from an Anthropic api', async () => {
+    for (const api of ['anthropic-messages', 'cortexkit-anthropic-messages']) {
+      const messages = await buildMessages([
+        userMsg('q1'),
+        { ...thinkingToolMsg('reason', 'sig-A', 'tool_1'), api } as Message,
+        toolResultMsg('tool_1', 'out1'),
+      ])
+      const content = messages[1]?.content as Array<Record<string, unknown>>
+      expect(content[0]).toEqual({
+        type: 'thinking',
+        thinking: 'reason',
+        signature: 'sig-A',
+      })
+    }
+  })
+
+  test('downgrades thinking signed by an OpenAI-compatible provider to text', async () => {
+    // openai-completions (llama.cpp, vLLM) stores the reasoning field name in
+    // thinkingSignature; replayed as a signature it is a 400.
+    const messages = await buildMessages([
+      userMsg('q1'),
+      {
+        ...thinkingToolMsg('local reasoning', 'reasoning_content', 'tool_1'),
+        api: 'openai-completions',
+        provider: 'llamacpp',
+      } as Message,
+      toolResultMsg('tool_1', 'out1'),
+    ])
+    const content = messages[1]?.content as Array<Record<string, unknown>>
+    expect(content[0]).toEqual({ type: 'text', text: 'local reasoning' })
+    expect(JSON.stringify(messages)).not.toContain('reasoning_content')
+  })
+
   test('drops OpenAI encrypted reasoning before sending to Anthropic', async () => {
     const messages = await buildMessages([
       userMsg('q1'),

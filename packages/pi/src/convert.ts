@@ -19,6 +19,7 @@ import {
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import type {
+  AssistantMessage,
   Context,
   ImageContent,
   Message,
@@ -186,6 +187,31 @@ function convertTextAndImages(
   return blocks
 }
 
+/**
+ * APIs whose thinking signatures Anthropic issued. Other providers reuse
+ * `thinkingSignature` for their own state: OpenAI Responses keep encrypted
+ * reasoning there, and OpenAI-compatible completions (llama.cpp, vLLM, ...)
+ * keep the name of the field the reasoning streamed in, such as
+ * `reasoning_content`. Sent as `thinking.signature`, either is a 400.
+ */
+const ANTHROPIC_SIGNATURE_APIS = new Set([
+  'anthropic-messages',
+  'cortexkit-anthropic-messages',
+])
+
+function anthropicThinkingSignature(
+  message: AssistantMessage,
+  thinking: ThinkingContent,
+): string | undefined {
+  const signature = thinking.thinkingSignature
+  if (!signature || isOpenAIReasoningSignature(signature)) return undefined
+  // A message recorded without its api predates the field; keep the old
+  // behaviour for it rather than dropping a valid signature.
+  if (message.api !== undefined && !ANTHROPIC_SIGNATURE_APIS.has(message.api))
+    return undefined
+  return signature
+}
+
 function convertMessages(
   messages: Message[],
 ): AnthropicRequestBody['messages'] {
@@ -235,10 +261,8 @@ function convertMessages(
             // `thinking.signature` makes Anthropic reject the request.
             continue
           }
-          if (
-            thinking.thinkingSignature &&
-            !hasLoneSurrogate(thinking.thinking)
-          ) {
+          const signature = anthropicThinkingSignature(message, thinking)
+          if (signature && !hasLoneSurrogate(thinking.thinking)) {
             // Signed thinking blocks are sent back verbatim. A live test on
             // 2026-09-23 (haiku-4-5, opus-4-8, opus-5-5) showed that Anthropic
             // accepts edited or emptied text on a signed block, both in the
@@ -250,13 +274,14 @@ function convertMessages(
             blocks.push({
               type: 'thinking',
               thinking: thinking.thinking,
-              signature: thinking.thinkingSignature,
+              signature,
             })
           } else {
-            // Either unsigned, or signed-but-contains a lone surrogate. In the
-            // latter case we cannot keep the signature: sanitizing breaks it and
-            // sending the raw lone surrogate is an invalid-UTF8 400. Drop the
-            // signature and downgrade to sanitized text.
+            // Unsigned, signed by another provider, or signed but containing a
+            // lone surrogate. In the last case we cannot keep the signature:
+            // sanitizing breaks it and sending the raw lone surrogate is an
+            // invalid-UTF8 400. Drop the signature and downgrade to sanitized
+            // text.
             blocks.push({ type: 'text', text: sanitize(thinking.thinking) })
           }
         } else if (block.type === 'toolCall') {
