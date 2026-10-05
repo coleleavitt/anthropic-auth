@@ -74,6 +74,20 @@ const DEAD_OAUTH_URLS: Record<string, string> = {
 for (const [key, value] of Object.entries(DEAD_OAUTH_URLS)) {
   process.env[key] ||= value
 }
+// Config-location overrides inherited from the user's shell would point the
+// plugins' anthropic-auth.json resolution (pi falls back to opencode's path)
+// at their real files: drop any that leave the run directory.
+for (const key of [
+  'XDG_CONFIG_HOME',
+  'OPENCODE_CONFIG_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_FILE',
+  'PI_AGENT_DIR',
+  'PI_ANTHROPIC_AUTH_FILE',
+]) {
+  const value = process.env[key]?.trim()
+  if (value && !resolve(value).startsWith(resolve(runDir)))
+    delete process.env[key]
+}
 process.env.ANTHROPIC_AUTH_TEST_MODE = '1'
 // Bun's process.env writes never reach the addon's getenv; the binding's
 // loader forwards a snapshot of these keys to Rust at construction.
