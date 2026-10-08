@@ -1106,6 +1106,19 @@ describe('account storage', () => {
     await expect(loadAccounts()).rejects.toThrow('corrupt or unreadable')
   })
 
+  test('refresh file lock is acquired when its directory does not exist yet', async () => {
+    const missingDir = join(tempDir, 'not-created', 'opencode')
+    const lock = await acquireRefreshFileLock({
+      name: 'test-refresh',
+      ttlMs: 60_000,
+      path: join(missingDir, 'anthropic-auth.json'),
+    })
+
+    expect(lock).not.toBeNull()
+    expect((await stat(missingDir)).mode & 0o777).toBe(0o700)
+    await lock?.release()
+  })
+
   test('refresh file lock allows only one holder', async () => {
     let now = 1_000
     const first = await acquireRefreshFileLock({

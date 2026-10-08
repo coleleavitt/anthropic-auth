@@ -1981,7 +1981,7 @@ export async function acquireRefreshFileLock(options: {
     )
   }
 
-  async function tryAcquire() {
+  async function tryAcquire(directoryCreated = false): Promise<boolean> {
     try {
       await writeFile(
         lockPath,
@@ -1992,6 +1992,13 @@ export async function acquireRefreshFileLock(options: {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       if (code === 'EEXIST' || code === 'EISDIR') return false
+      // The settings file's directory does not exist yet (a pi-only install
+      // has no ~/.config/opencode until a settings write creates it): the
+      // lock still has to work, or every quota poll behind it fails.
+      if (code === 'ENOENT' && !directoryCreated) {
+        await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 })
+        return tryAcquire(true)
+      }
       throw error
     }
   }
