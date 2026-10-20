@@ -1157,38 +1157,6 @@ broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
 
 [[control]]
-id = "vault-insula-cold-skips-usage-poll"
-guards = "A cold insula cache must defer background usage polling without changing stored quota, its due time or poll bookkeeping."
-file = "packages/core/src/native-vault-runtime.ts"
-old = "if (swept.miss === 'cold' || swept.miss === 'upstream-failed') {"
-new = "if (swept.miss === 'upstream-failed') { // NON-VACUITY BREAK: restore cold fallback polling"
-test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
-runner = "command"
-command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
-test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["background cold defers without a usage GET or poll bookkeeping"]
-expect_message = "error: expect(received).toEqual(expected)"
-broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
-broad_report = "tmp/mutations/core.xml"
-broad_id = "{name}"
-
-[[control]]
-id = "vault-insula-upstream-failed-skips-usage-poll"
-guards = "An insula upstream failure must defer background usage polling without changing stored quota, its due time or poll bookkeeping."
-file = "packages/core/src/native-vault-runtime.ts"
-old = "if (swept.miss === 'cold' || swept.miss === 'upstream-failed') {"
-new = "if (swept.miss === 'cold') { // NON-VACUITY BREAK: restore upstream-failed fallback polling"
-test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
-runner = "command"
-command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
-test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["background upstream-failed defers without a usage GET or poll bookkeeping"]
-expect_message = "error: expect(received).toEqual(expected)"
-broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
-broad_report = "tmp/mutations/core.xml"
-broad_id = "{name}"
-
-[[control]]
 id = "vault-insula-source-released-on-close"
 guards = "Closing a vault runtime must release its reference to the shared insula source, so the source is dropped once its last holder closes."
 file = "packages/core/src/native-vault-runtime.ts"
@@ -1469,6 +1437,38 @@ command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/sticky
 test_count_pattern = "CKDEV executed {count} tests"
 expect_red = ["sticky routing decisions read published pins without waiting and publish after the writer releases"]
 expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-insula-cold-skips-usage-poll"
+guards = "A cold insula cache must defer background usage polling without changing stored quota, its due time or poll bookkeeping."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "if (swept.miss === 'cold' || swept.miss === 'upstream-failed') {"
+new = "if (swept.miss === 'upstream-failed') { // NON-VACUITY BREAK: restore cold fallback polling"
+test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["background cold defers without a usage GET or poll bookkeeping"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-insula-upstream-failed-skips-usage-poll"
+guards = "An insula upstream failure must defer background usage polling without changing stored quota, its due time or poll bookkeeping."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "if (swept.miss === 'cold' || swept.miss === 'upstream-failed') {"
+new = "if (swept.miss === 'cold') { // NON-VACUITY BREAK: restore upstream-failed fallback polling"
+test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["background upstream-failed defers without a usage GET or poll bookkeeping"]
+expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"

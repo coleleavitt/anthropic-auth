@@ -4,8 +4,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- Vault quota sweeps no longer duplicate Anthropic usage polls while insula is starting or its upstream fetch has failed; requests also avoid polling after an upstream failure.
-
 ### Sidebar
 
 - OpenCode 2 now shows the CLAUDE quota sidebar too, without opening `/claude`. It is the same panel as OpenCode 1 (per-account 5h, 7d and model bars with pacing, collapsed rows, routing, cache, Prime and health), drawn from one shared component in the active OpenCode 2 theme's colors and configured by the same `anthropic-auth` entry in `tui-preferences.jsonc`. The OpenCode 2 server answers it through the native RPC (`sidebar` method) from the account pool, with no file and no credential; the active account is the one that last served the sidebar's session. Turned-off vault accounts stay listed, as on OpenCode 1, and reset countdowns, reading ages and pacing keep advancing between server changes. A TUI talking to an older server shows "Waiting for quota…".
@@ -18,6 +16,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ### Dependencies
 
 - OpenTUI core and solid move to 0.6.6 together and the OpenCode 2 plugin SDK packages to 2.0.32, so each installs once. solid-js stays at 1.9.12, the exact version OpenTUI Solid 0.6.6 requires.
+- Update common-auth to 0.22.0 so vault quota sweeps skip duplicate usage polls while insula starts or its upstream fetch has failed; requests also skip polls after an upstream failure.
 
 ## 2.1.2
 
