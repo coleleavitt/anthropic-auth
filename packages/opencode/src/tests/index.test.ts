@@ -7623,6 +7623,7 @@ describe('auth.loader', () => {
     // Establish the plugin's actual route before testing a quota-only write.
     const response = await loaded.fetch(MESSAGES_URL, EMPTY_POST)
     expect(response.status).toBe(200)
+    await plugin.__fallbackRefreshReady
     await drainSidebarWrites()
     expect((await getSidebarState()).activeId).toBe('fallback-1')
     if (clearExistingRouting) {
@@ -7663,6 +7664,9 @@ describe('auth.loader', () => {
         actionId: 'quota-refresh',
       })
       expect(refreshed.ok).toBe(true)
+      // Quota polls return before publishing to the pool config. Drain those
+      // writes so a pending rename cannot recreate the file during the swap.
+      await plugin.__scopedRuntime.drainQuotaPublications()
       // Replace the shared pool config JSON file with a directory so later
       // account reads fail instead of returning an outdated snapshot.
       const accountFile = migratedPool?.paths.config
