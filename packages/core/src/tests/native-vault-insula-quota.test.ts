@@ -1,8 +1,10 @@
-import { expect } from 'bun:test'
+import { expect, spyOn } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  acquireInsulaQuotaSource,
+  type InsulaQuotaLookup,
   type InsulaUsageEntry,
   projectVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
@@ -32,6 +34,7 @@ import { nativeVaultPaths } from '../native-vault-paths.ts'
 import { createNativeVaultRuntime } from '../native-vault-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
+import { QuotaManager, QuotaRefreshDeferred } from '../quota-manager.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
@@ -107,7 +110,10 @@ const usageBody = {
   seven_day: { utilization: 20, resets_at: '1970-01-08T00:00:00.000Z' },
 }
 
-async function fixture(entries: () => unknown[]) {
+async function fixture(
+  entries: () => unknown[],
+  completeProviders = ['claude'],
+) {
   const root = await mkdtemp(join(tmpdir(), 'native-vault-insula-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(join(root, 'anthropic-auth.json'))
@@ -183,7 +189,7 @@ async function fixture(entries: () => unknown[]) {
       connectionFile: join(root, 'daemon.json'),
       getUsage: async () => {
         counts.insula++
-        return { result: entries() }
+        return { result: entries(), completeProviders }
       },
     },
   }
@@ -219,7 +225,16 @@ async function fixture(entries: () => unknown[]) {
     if (!id) throw new Error('Missing fixture route')
     return id
   }
-  return { runtime, make, counts, usage, vaultPaths, routeOf, clock }
+  const source = () => {
+    if (!client.insula) throw new Error('Missing fixture insula transport')
+    const lease = acquireInsulaQuotaSource(
+      client.insula,
+      env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+    )
+    deferCleanup(() => lease.release())
+    return lease.source
+  }
+  return { runtime, make, counts, usage, vaultPaths, routeOf, clock, source }
 }
 
 const bearer = (credentialId: string) =>
@@ -297,22 +312,131 @@ test('the primary account is looked up in insula by its roster row account id, n
   expect(quota.five_hour?.checkedAt).toBe(fetchedAt)
 })
 
-test('a stale, missing or failed insula entry falls back to one usage GET for that account only', async () => {
-  for (const work of [
-    entry(uuid2, { stale: true }),
-    entry(uuid2, { errorClass: 'rate_limited' }),
-    entry(uuid2, { fetchedAt: new Date(now - 5 * 60_000).toISOString() }),
-    undefined,
-  ]) {
-    const f = await fixture(() => [entry(uuid), ...(work ? [work] : [])])
-    await f.runtime.fetchQuota(
-      f.routeOf(uuid),
-      f.usage,
-      undefined,
-      undefined,
-      'background',
+for (const [miss, entries] of [
+  ['cold', () => []],
+  ['upstream-failed', () => [entry(uuid2, { errorClass: 'upstream_failed' })]],
+] as const) {
+  test(`background ${miss} defers without a usage GET or poll bookkeeping`, async () => {
+    const records = captureLogs()
+    const f = await fixture(entries, miss === 'cold' ? [] : ['claude'])
+    const route = f.routeOf(uuid2)
+    const stored = {
+      checkedAt: fetchedAt,
+      five_hour: {
+        usedPercent: 40,
+        remainingPercent: 60,
+        checkedAt: fetchedAt,
+      },
+    }
+    await f.runtime.fetchQuota(route, f.usage)
+    await f.runtime.drainQuotaPublications()
+    const before = await readNativeRuntime(
+      f.vaultPaths.runtime,
+      f.vaultPaths.storageId,
     )
+    f.counts.usage.length = 0
+    const fetched: unknown[] = []
+    const failed: unknown[] = []
+    const manager = new QuotaManager({
+      storage: null,
+      now: () => f.clock.now,
+      fetchQuotaSnapshot: (request, dispatch) =>
+        f.runtime.fetchQuota(
+          request.accountId ?? 'main',
+          f.usage,
+          undefined,
+          dispatch,
+          request.purpose,
+        ),
+      onMainQuotaFetched: (...args) => {
+        fetched.push(args)
+      },
+      onFallbackQuotaFetched: (...args) => {
+        fetched.push(args)
+      },
+      onApiError: (...args) => {
+        failed.push(args)
+      },
+      onFallbackApiError: (...args) => {
+        failed.push(args)
+      },
+    })
+    deferCleanup(() => manager.close())
+    const cached = {
+      quota: stored,
+      checkedAt: fetchedAt,
+      refreshAfter: now - 1,
+    }
+    manager.setMain(route, cached)
+    manager.setFallback(route, cached, undefined)
+    for (let tick = 0; tick < 2; tick++) {
+      expect(
+        await manager.refreshMainWithMetadata(
+          route,
+          '',
+          undefined,
+          'background',
+        ),
+      ).toEqual({ quota: stored, fetched: false })
+      expect(
+        await manager.refreshFallbackWithMetadata(
+          route,
+          '',
+          undefined,
+          'background',
+        ),
+      ).toEqual({ quota: stored, fetched: false })
+      expect(manager.getMain(route)).toEqual(cached)
+      expect(manager.getFallback(route)).toEqual(cached)
+      expect(manager.isBackedOff()).toBe(false)
+      expect(manager.isFallbackBackedOff(route)).toBe(false)
+      expect(manager.isMainStale()).toBe(true)
+      expect(manager.isFallbackStale(route)).toBe(true)
+    }
+    await expect(
+      f.runtime.fetchQuota(route, f.usage, undefined, undefined, 'background'),
+    ).rejects.toThrow(QuotaRefreshDeferred)
     expect(f.counts.usage).toEqual([])
+    expect(fetched).toEqual([])
+    expect(failed).toEqual([])
+    await f.runtime.drainQuotaPublications()
+    expect(
+      await readNativeRuntime(f.vaultPaths.runtime, f.vaultPaths.storageId),
+    ).toEqual(before)
+    expect(
+      records
+        .filter((record) => record.message === 'vault quota source changed')
+        .map((record) => record.payload),
+    ).toEqual([{ source: 'skipped', reason: miss }])
+    if (miss === 'cold') {
+      // Insula's cold miss becomes unreachable after two minutes, allowing a
+      // fallback GET without a plugin-side backoff or a successful poll.
+      f.clock.now += 120_000
+      await f.runtime.fetchQuota(
+        route,
+        f.usage,
+        undefined,
+        undefined,
+        'background',
+      )
+      expect(f.counts.usage).toEqual([bearer(workRow.id)])
+    }
+  })
+}
+
+for (const [miss, entries] of [
+  ['stale', () => [entry(uuid2, { stale: true })]],
+  ['credential', () => [entry(uuid2, { errorClass: 'credential_rejected' })]],
+  ['absent', () => [entry(uuid)]],
+  [
+    'unreachable',
+    () => {
+      throw new Error('insula unavailable')
+    },
+  ],
+] as const) {
+  test(`background ${miss} falls back to one usage GET for that account only`, async () => {
+    const f = await fixture(entries)
     const quota = await f.runtime.fetchQuota(
       f.routeOf(uuid2),
       f.usage,
@@ -322,8 +446,127 @@ test('a stale, missing or failed insula entry falls back to one usage GET for th
     )
     expect(f.counts.usage).toEqual([bearer(workRow.id)])
     expect(quota.five_hour).toMatchObject({ usedPercent: 10, checkedAt: now })
-  }
+    expect(quota.scoped).toEqual([])
+  })
+}
+
+test('admission upstream-failed without a reading uses unknown quota without a usage GET', async () => {
+  const f = await fixture(() => [
+    entry(uuid),
+    entry(uuid2, { errorClass: 'upstream_failed' }),
+  ])
+  await f.runtime.fetchQuota(
+    f.routeOf(uuid),
+    f.usage,
+    undefined,
+    undefined,
+    'background',
+  )
+  const manager = new QuotaManager({
+    storage: null,
+    now: () => f.clock.now,
+    fetchQuotaSnapshot: (request, dispatch) =>
+      f.runtime.fetchQuota(
+        request.accountId ?? 'main',
+        f.usage,
+        undefined,
+        dispatch,
+        request.purpose,
+      ),
+  })
+  deferCleanup(() => manager.close())
+  const result = await manager.refreshFallbackWithMetadata(
+    f.routeOf(uuid2),
+    '',
+    undefined,
+    'admission',
+  )
+  expect(f.counts.usage).toEqual([])
+  expect(result.fetched).toBe(false)
+  expect(result.quota.five_hour).toBeUndefined()
+  expect(
+    killswitchPassesPolicy(result.quota, {
+      version: 1,
+      accounts: [],
+      killswitch: { enabled: true, main: { five_hour: 5, seven_day: 0 } },
+    }),
+  ).toBe(false)
+  expect(manager.isFallbackBackedOff(f.routeOf(uuid2))).toBe(false)
 })
+
+test('admission upstream-failed uses an attached dated reading without a usage GET', async () => {
+  const f = await fixture(() => [entry(uuid)])
+  await f.runtime.fetchQuota(
+    f.routeOf(uuid),
+    f.usage,
+    undefined,
+    undefined,
+    'background',
+  )
+  const lookup = spyOn(f.source(), 'lookup').mockReturnValue({
+    miss: 'upstream-failed',
+    reading: { entry: entry(uuid2), context: { fetchedAt } },
+  })
+  deferCleanup(() => lookup.mockRestore())
+  const quota = await f.runtime.fetchQuota(
+    f.routeOf(uuid2),
+    f.usage,
+    undefined,
+    undefined,
+    'admission',
+  )
+  expect(f.counts.usage).toEqual([])
+  expect(quota.five_hour).toMatchObject({
+    remainingPercent: 60,
+    checkedAt: fetchedAt,
+  })
+  const policy: AccountStorage = {
+    version: 1,
+    accounts: [],
+    killswitch: { enabled: true, main: { five_hour: 5, seven_day: 0 } },
+  }
+  expect(killswitchPassesPolicy(quota, policy)).toBe(true)
+  expect(
+    killswitchPassesPolicy(quota, {
+      ...policy,
+      killswitch: { enabled: true, main: { five_hour: 65, seven_day: 0 } },
+    }),
+  ).toBe(false)
+})
+
+for (const miss of [
+  'cold',
+  'stale',
+  'credential',
+  'absent',
+  'unreachable',
+] as const) {
+  test(`admission ${miss} retains one usage GET fallback`, async () => {
+    const f = await fixture(() => [entry(uuid)])
+    await f.runtime.fetchQuota(
+      f.routeOf(uuid),
+      f.usage,
+      undefined,
+      undefined,
+      'background',
+    )
+    const lookup = spyOn(f.source(), 'lookup').mockReturnValue({
+      miss,
+      reading: { entry: entry(uuid2), context: { fetchedAt } },
+    })
+    deferCleanup(() => lookup.mockRestore())
+    const quota = await f.runtime.fetchQuota(
+      f.routeOf(uuid2),
+      f.usage,
+      undefined,
+      undefined,
+      'admission',
+    )
+    expect(f.counts.usage).toEqual([bearer(workRow.id)])
+    expect(quota.five_hour).toMatchObject({ usedPercent: 10, checkedAt: now })
+    expect(quota.scoped).toEqual([])
+  })
+}
 
 test('an insula entry for a different account never applies', async () => {
   const f = await fixture(() => [
@@ -587,7 +830,7 @@ test('the source switch is logged once per change with fixed codes and no identi
   expect(f.counts.usage).toEqual([bearer(workRow.id), bearer(workRow.id)])
   expect(switches()).toEqual([
     { source: 'insula', reason: 'insula-reading' },
-    { source: 'fallback', reason: 'no-insula-reading' },
+    { source: 'fallback', reason: 'absent' },
   ])
   const after = records.filter(
     (record) => record.message === 'vault quota source changed',
@@ -602,6 +845,45 @@ test('the source switch is logged once per change with fixed codes and no identi
     f.routeOf(uuid2),
   ])
     expect(text).not.toContain(secret)
+})
+
+test('miss reason transitions each log one source-change line per account', async () => {
+  const records = captureLogs()
+  const f = await fixture(() => [entry(uuid)])
+  let result: InsulaQuotaLookup = { miss: 'stale' }
+  const lookup = spyOn(f.source(), 'lookup').mockImplementation(() => result)
+  deferCleanup(() => lookup.mockRestore())
+  for (const miss of [
+    'stale',
+    'credential',
+    'absent',
+    'unreachable',
+  ] as const) {
+    result = { miss, reading: { entry: entry(uuid2), context: { fetchedAt } } }
+    for (const account of [uuid, uuid2]) {
+      for (let repeat = 0; repeat < 2; repeat++) {
+        await f.runtime.fetchQuota(
+          f.routeOf(account),
+          f.usage,
+          undefined,
+          undefined,
+          'background',
+        )
+      }
+    }
+  }
+  expect(
+    records
+      .filter((record) => record.message === 'vault quota source changed')
+      .map((record) => record.payload),
+  ).toEqual(
+    ['stale', 'credential', 'absent', 'unreachable'].flatMap((reason) =>
+      Array.from({ length: 2 }, () => ({
+        source: 'fallback',
+        reason,
+      })),
+    ),
+  )
 })
 
 test('normalizer: unknown shapes return undefined so the poll stays in charge', () => {

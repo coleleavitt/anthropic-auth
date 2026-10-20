@@ -6,6 +6,8 @@ import {
   ClaustrumConsumerError,
   connectClaustrumScopedClient,
   declineAccount,
+  type InsulaQuotaMiss,
+  type InsulaQuotaResult,
   type InsulaQuotaSource,
   mutateVaultRoster,
   readClaustrumEnrollmentToken,
@@ -94,9 +96,10 @@ import { fetchOAuthAccountProfile } from './oauth-profile.ts'
 import { NativeAuthorityError } from './pool-authority.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore } from './pool-store.ts'
-import type {
-  QuotaReadingPurpose,
-  QuotaRequestDispatch,
+import {
+  type QuotaReadingPurpose,
+  QuotaRefreshDeferred,
+  type QuotaRequestDispatch,
 } from './quota-manager.ts'
 
 export interface NativeVaultRuntimeOptions {
@@ -131,10 +134,12 @@ export interface NativeVaultRuntimeOptions {
  * background quota cache may answer instead of Anthropic's usage endpoint.
  * - 'background': a periodic sweep. Refresh insula's cache (at most once a
  *   minute per daemon and enrollment), look the route's account up in it,
- *   and skip the usage GET when it holds a current reading.
+ *   and skip the usage GET for a current reading, a cold cache or an upstream
+ *   failure. Skipped misses leave the account due for the next sweep.
  * - 'admission': a request needs a reading. Look the served credential's
  *   account up in insula's cache only, never refreshing it, then poll on a
- *   miss.
+ *   miss except an upstream failure, which uses a dated reading if attached
+ *   and otherwise leaves quota unknown.
  * Omitted: poll Anthropic directly (explicit user refreshes and other
  *   callers that must see the provider's own reading).
  */
@@ -517,27 +522,31 @@ export function createNativeVaultRuntime(
   /**
    * Cache-only lookup by the vault's account id for this account (the
    * list_scoped or get_scoped account_id), never an email or label.
-   * common-auth returns only a current entry; anything we cannot map is a miss.
+   * Preserve insula's miss reason, even when the lookup also contains a dated reading.
    */
-  function insulaReading(
+  function insulaLookup(
     accountId: string | undefined,
-  ): InsulaClaudeQuota | undefined {
-    if (!insula || !accountId || shutdown.signal.aborted) return undefined
-    const current = insula.source.current('claude', accountId, clock())
-    return current
-      ? normalizeInsulaClaudeQuota(current.entry, current.context)
-      : undefined
+  ): InsulaQuotaResult<InsulaClaudeQuota> {
+    if (!insula || !accountId || shutdown.signal.aborted)
+      return { miss: 'unreachable' }
+    const result = insula.source.lookup('claude', accountId, clock())
+    const reading =
+      result.reading &&
+      normalizeInsulaClaudeQuota(result.reading.entry, result.reading.context)
+    if (result.miss) return { miss: result.miss, ...(reading && { reading }) }
+    return reading ? { reading } : { miss: 'unreachable' }
   }
   // The last source each route's guided quota reading came from, so a change
   // is logged once rather than on every sweep.
-  const quotaSources = new Map<string, 'insula' | 'fallback'>()
+  const quotaSources = new Map<string, string>()
   function noteQuotaSource(
     routeId: string,
-    source: 'insula' | 'fallback',
-    reason: 'insula-reading' | 'no-insula-reading' | 'account-changed',
+    source: 'insula' | 'fallback' | 'skipped',
+    reason: 'insula-reading' | 'account-changed' | InsulaQuotaMiss,
   ) {
-    if (quotaSources.get(routeId) === source) return
-    quotaSources.set(routeId, source)
+    const transition = `${source}:${reason}`
+    if (quotaSources.get(routeId) === transition) return
+    quotaSources.set(routeId, transition)
     if (quotaSources.size > 1000) {
       const oldest = quotaSources.keys().next().value
       if (oldest !== undefined) quotaSources.delete(oldest)
@@ -1050,11 +1059,15 @@ export function createNativeVaultRuntime(
       const row = await rowFor(await runtime.read(), routeId)
       // A background sweep asks insula about the roster row's account (its
       // list_scoped account_id) before any credential is fetched.
-      let swept: InsulaClaudeQuota | undefined
+      let swept: InsulaQuotaResult<InsulaClaudeQuota> | undefined
       if (purpose === 'background' && row) {
         await refreshInsula()
         check(signal)
-        swept = insulaReading(row.accountIdentity)
+        swept = insulaLookup(row.accountIdentity)
+        if (swept.miss === 'cold' || swept.miss === 'upstream-failed') {
+          noteQuotaSource(row.routeId, 'skipped', swept.miss)
+          throw new QuotaRefreshDeferred()
+        }
       }
       const state = await readNativeRuntime(paths.runtime, paths.storageId)
       const before =
@@ -1082,8 +1095,10 @@ export function createNativeVaultRuntime(
           // A served receipt is still needed with an insula reading: the
           // reading is published bound to this credential version.
           let reading: InsulaClaudeQuota | undefined
-          let miss: 'no-insula-reading' | 'account-changed' =
-            'no-insula-reading'
+          let lookup: InsulaQuotaResult<InsulaClaudeQuota> = {
+            miss: 'unreachable',
+          }
+          let accountChanged = false
           if (purpose === 'background') {
             // The sweep joined the roster row's account; publish it only for
             // a credential served for that same account.
@@ -1092,17 +1107,30 @@ export function createNativeVaultRuntime(
               row?.accountIdentity &&
               receipt.assertedAccountIdentity === row.accountIdentity
             )
-              reading = swept
-            else if (swept) miss = 'account-changed'
+              lookup = swept
+            else if (swept) accountChanged = true
           } else if (purpose === 'admission') {
             // Only the account id the vault asserted for this credential.
-            reading = insulaReading(receipt.assertedAccountIdentity)
+            lookup = insulaLookup(receipt.assertedAccountIdentity)
           }
+          // Admission polls on every miss except an upstream failure. A dated
+          // reading attached to that failure avoids another GET to a refusing account.
+          reading =
+            !lookup.miss ||
+            (purpose === 'admission' && lookup.miss === 'upstream-failed')
+              ? lookup.reading
+              : undefined
           if (purpose)
             noteQuotaSource(
-              routeId,
-              reading ? 'insula' : 'fallback',
-              reading ? 'insula-reading' : miss,
+              row?.routeId ?? routeId,
+              reading
+                ? 'insula'
+                : lookup.miss === 'upstream-failed'
+                  ? 'skipped'
+                  : 'fallback',
+              accountChanged
+                ? 'account-changed'
+                : (lookup.miss ?? 'insula-reading'),
             )
           if (reading) {
             const stored = matchingBefore(receipt)?.quota
@@ -1111,6 +1139,8 @@ export function createNativeVaultRuntime(
               stored ? fromNativeQuotaMap(stored) : undefined,
             )
           }
+          if (purpose === 'admission' && lookup.miss === 'upstream-failed')
+            return undefined
           return fetchOAuthQuotaSnapshot({
             accessToken: receipt.accessToken,
             fetchImpl: transport,
@@ -1133,6 +1163,7 @@ export function createNativeVaultRuntime(
         },
         dispatch,
       )
+      if (!result.value) throw new QuotaRefreshDeferred()
       const quota = {
         ...result.value,
         accountIdentity: result.receipt.assertedAccountIdentity,

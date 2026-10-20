@@ -75,6 +75,9 @@ export type QuotaRefreshResult = {
  */
 export type QuotaReadingPurpose = 'background' | 'admission'
 
+/** Insula is still fetching or its upstream failed; preserve quota without recording a poll. */
+export class QuotaRefreshDeferred extends Error {}
+
 /** Pace a physical usage GET and verify the selected credential is still eligible before sending. */
 export type QuotaRequestDispatch = (
   send: () => Promise<Response>,
@@ -1171,6 +1174,14 @@ export class QuotaManager {
           )
           return { quota: completedQuota, fetched: true }
         } catch (error) {
+          if (error instanceof QuotaRefreshDeferred) {
+            return {
+              quota: this.getMain(mainAccountId)?.quota ?? {
+                accountIdentity: mainAccountId,
+              },
+              fetched: false,
+            }
+          }
           this._handleMainFetchError(error, generation)
           throw error
         } finally {
@@ -1292,6 +1303,14 @@ export class QuotaManager {
           await fileLock.release()
         }
       } catch (error) {
+        if (error instanceof QuotaRefreshDeferred) {
+          return {
+            quota: this.getFallback(accountId, account)?.quota ?? {
+              accountIdentity: accountId,
+            },
+            fetched: false,
+          }
+        }
         this._handleFallbackFetchError(accountId, error, generation)
         throw error
       }
