@@ -13,13 +13,13 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - Valid tokens no longer wait for proactive refreshes; requests waiting for a rejected-token refresh fail retryably after two seconds while the refresh continues.
 
-## 2.1.2
-
-- Requests no longer wait on relay or session-pin bookkeeping locks; relay settings and tokens are checked together before sending.
-
 ### Dependencies
 
 - OpenTUI core and solid move to 0.6.6 together and the OpenCode 2 plugin SDK packages to 2.0.32, so each installs once. solid-js stays at 1.9.12, the exact version OpenTUI Solid 0.6.6 requires.
+
+## 2.1.2
+
+- Requests no longer wait on relay or session-pin bookkeeping locks; relay settings and tokens are checked together before sending.
 
 ## 2.1.1
 
