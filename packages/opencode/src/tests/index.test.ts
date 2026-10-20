@@ -5398,9 +5398,14 @@ describe('quota header feed extended integration', () => {
         )
       } else {
         expect(response.status).toBe(200)
-        expect(messageAuthorizations).toContain(
-          'Bearer sk-ant-oat01-refreshed-fallback-access',
-        )
+        expect(messageAuthorizations.length).toBeGreaterThan(0)
+        // The original bearer is still valid, so dispatch need not wait for
+        // proactive rotation. Both bearers belong to the admitted fallback.
+        for (const authorization of messageAuthorizations)
+          expect([
+            'Bearer sk-ant-oat01-unknown-fallback-access',
+            'Bearer sk-ant-oat01-refreshed-fallback-access',
+          ]).toContain(authorization)
       }
     }
   })

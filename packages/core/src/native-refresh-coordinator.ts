@@ -630,8 +630,6 @@ export function createNativeRefreshCoordinator(
       credential.expires <= now()
     )
       return refuse('access-unavailable')
-    if (credential.access === request.rejectedAccessToken)
-      return refuse('rejected-access-unchanged')
     const subject: NativeKnownCredentialSubject = copySubject({
       binding: { ...expected, identity: expected.identity },
       credentialFingerprint: fingerprintOf(credential),
@@ -647,7 +645,18 @@ export function createNativeRefreshCoordinator(
     } catch (cause) {
       throw new Error('Native admission callback failed', { cause })
     }
-    if (admission.status === 'blocked') return refuse(admission.reason)
+    // A validation retry delays another identity lookup, not replacement of an
+    // access token the caller already received a 401 for. Other exclusions still win.
+    if (
+      admission.status === 'blocked' &&
+      !(
+        admission.reason === 'validation-backoff' &&
+        credential.access === request.rejectedAccessToken
+      )
+    )
+      return refuse(admission.reason)
+    if (credential.access === request.rejectedAccessToken)
+      return refuse('rejected-access-unchanged')
     if (admission.status !== 'proven') return refuse('proof-missing')
     if (
       !nativeLocalCredentialValidationMatches(
@@ -1332,30 +1341,30 @@ export function createNativeRefreshCoordinator(
         const row = await rowFor(request.binding)
         job = jobs.get(key) ?? job
         recordRejection()
-        if (!jobRejectsAccess(job, row)) {
-          const current = await admit(
-            request,
-            request.binding,
-            row,
-            'current',
-            false,
-          )
-          if (
-            current.status !== 'refused' ||
-            ![
-              'proof-missing',
-              'identity-unproven',
-              'access-unavailable',
-              'rejected-access-unchanged',
-            ].includes(current.reason)
-          ) {
-            // Admission yields to other callers. A 401 recorded during that
-            // read must prevent dispatch of the token it rejected.
-            job = jobs.get(key) ?? job
-            recordRejection()
-            if (current.status !== 'usable' || !jobRejectsAccess(job, row))
-              return current
-          }
+        // A pending recovery cannot override custody, quota or refresh-error
+        // exclusions. Check admission before deciding whether a token must wait.
+        const current = await admit(
+          request,
+          request.binding,
+          row,
+          'current',
+          false,
+        )
+        if (
+          current.status !== 'refused' ||
+          ![
+            'proof-missing',
+            'identity-unproven',
+            'access-unavailable',
+            'rejected-access-unchanged',
+          ].includes(current.reason)
+        ) {
+          // Admission yields to other callers. A 401 recorded during that
+          // read must prevent dispatch of the token it rejected.
+          job = jobs.get(key) ?? job
+          recordRejection()
+          if (current.status !== 'usable' || !jobRejectsAccess(job, row))
+            return current
         }
       } catch (caught) {
         return {
@@ -1413,19 +1422,20 @@ export function createNativeRefreshCoordinator(
             }
           : request.binding
       const row = await rowFor(request.binding)
-      if (jobRejectsAccess(job, row))
-        return {
-          status: 'refused',
-          reason: 'rejected-access-unchanged',
-          persisted: result.persisted,
-        }
-      return await admit(
+      const current = await admit(
         request,
         expected,
         row,
         result.source,
         result.persisted,
       )
+      if (current.status === 'usable' && jobRejectsAccess(job, row))
+        return {
+          status: 'refused',
+          reason: 'rejected-access-unchanged',
+          persisted: result.persisted,
+        }
+      return current
     } catch (error) {
       return {
         status: 'failed',

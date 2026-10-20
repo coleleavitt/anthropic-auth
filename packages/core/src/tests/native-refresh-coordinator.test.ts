@@ -3180,6 +3180,117 @@ for (const echo of ['captured', 'newer'] as const) {
   })
 }
 
+for (const cause of ['proactive', '401'] as const) {
+  test(`cause-keyed fast path refuses active refresh backoff during ${cause} refresh`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    const proof = await f.seedProof('a')
+    const binding = await f.binding('a')
+    const entered = barrier()
+    const finish = barrier()
+    let backoff = false
+    let exchanges = 0
+    const c = f.coordinator({
+      readRestrictions: async (subject) =>
+        backoff
+          ? {
+              status: 'blocked',
+              reason: 'refresh-backoff',
+              credentialFingerprint: subject.credentialFingerprint,
+            }
+          : allowed,
+      readAdmission: async () =>
+        backoff
+          ? { status: 'blocked', reason: 'refresh-backoff' }
+          : { status: 'proven', validation: proof },
+      refreshToken: async () => {
+        exchanges++
+        entered.release()
+        await finish.promise
+        return { ...credential('new'), expiresIn: 3600 }
+      },
+    })
+    const owner = c.refresh({
+      mode: 'local',
+      binding,
+      ...(cause === '401' ? { rejectedAccessToken: 'access-a' } : {}),
+    })
+    void owner.catch(() => {})
+    try {
+      await entered.promise
+      backoff = true
+      expect(
+        await observeRefreshJoin(
+          c.authorize({ intent: 'serve', mode: 'local', binding }),
+        ),
+      ).toMatchObject({
+        status: 'fulfilled',
+        value: { status: 'refused', reason: 'refresh-backoff' },
+      })
+      expect(exchanges).toBe(1)
+    } finally {
+      finish.release()
+      await owner
+    }
+  })
+}
+
+for (const reason of [
+  'invalid-grant',
+  'quota-ineligible',
+  'account-disabled',
+  'local-mode-unavailable',
+] as const) {
+  test(`pending 401 refresh never bypasses ${reason} serving exclusion`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    const proof = await f.seedProof('a')
+    const binding = await f.binding('a')
+    const entered = barrier()
+    const finish = barrier()
+    let blocked = false
+    const c = f.coordinator({
+      readAdmission: async () =>
+        blocked
+          ? { status: 'blocked', reason }
+          : { status: 'proven', validation: proof },
+      refreshToken: async () => {
+        entered.release()
+        await finish.promise
+        return { ...credential('new'), expiresIn: 3600 }
+      },
+    })
+    const owner = c.refresh({
+      mode: 'local',
+      binding,
+      rejectedAccessToken: 'access-a',
+    })
+    void owner.catch(() => {})
+    try {
+      await entered.promise
+      blocked = true
+      for (const rejectedAccessToken of [undefined, 'access-a']) {
+        expect(
+          await observeRefreshJoin(
+            c.authorize({
+              intent: 'serve',
+              mode: 'local',
+              binding,
+              rejectedAccessToken,
+            }),
+          ),
+        ).toMatchObject({
+          status: 'fulfilled',
+          value: { status: 'refused', reason },
+        })
+      }
+    } finally {
+      finish.release()
+      await owner
+    }
+  })
+}
+
 test('401 recovery admits a proven different access version before the shared job completes', async () => {
   const f = await fixture()
   await f.add('a', 'A')
