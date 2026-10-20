@@ -1111,13 +1111,13 @@ broad_id = "{name}"
 id = "vault-insula-joins-vault-account-id"
 guards = "A background insula lookup must join on the roster row's vault account id (list_scoped account_id), never another row field such as the credential id."
 file = "packages/core/src/native-vault-runtime.ts"
-old = "swept = insulaReading(row.accountIdentity)"
-new = "swept = insulaReading(row.credentialId) // NON-VACUITY BREAK: join on the credential id"
+old = "swept = insulaLookup(row.accountIdentity)"
+new = "swept = insulaLookup(row.credentialId) // NON-VACUITY BREAK: join on the credential id"
 test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["background sweep takes a fresh insula reading and sends no usage GET", "the primary account is looked up in insula by its roster row account id, not its logical id", "a stale, missing or failed insula entry falls back to one usage GET for that account only", "runtimes on one connection file and token path share one insula source until all release it", "the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor", "the source switch is logged once per change with fixed codes and no identity"]
+expect_red = ["background sweep takes a fresh insula reading and sends no usage GET", "the primary account is looked up in insula by its roster row account id, not its logical id", "runtimes on one connection file and token path share one insula source until all release it", "the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor", "the source switch is logged once per change with fixed codes and no identity"]
 expect_message = '/error: expect\(received\)\.(toBe|toEqual)\(expected\)/'
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
@@ -1140,7 +1140,7 @@ broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
 [[control]]
 id = "vault-insula-reading-skips-usage-poll"
-guards = "A current insula reading for a vault account must replace that account's usage GET; only a miss polls Anthropic."
+guards = "A current insula reading for a vault account must replace that account's usage GET rather than polling Anthropic."
 file = "packages/core/src/native-vault-runtime.ts"
 old = '''          if (reading) {
             const stored'''
@@ -1150,8 +1150,40 @@ test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["background sweep takes a fresh insula reading and sends no usage GET", "the primary account is looked up in insula by its roster row account id, not its logical id", "a stale, missing or failed insula entry falls back to one usage GET for that account only", "admission reads only the insula cache: never refreshes it, polls on a miss", "runtimes on one connection file and token path share one insula source until all release it", "the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor", "the source switch is logged once per change with fixed codes and no identity"]
+expect_red = ["background sweep takes a fresh insula reading and sends no usage GET", "the primary account is looked up in insula by its roster row account id, not its logical id", "admission reads only the insula cache: never refreshes it, polls on a miss", "runtimes on one connection file and token path share one insula source until all release it", "the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor", "the source switch is logged once per change with fixed codes and no identity"]
 expect_message = '/error: expect\(received\)\.(toBe|toEqual)\(expected\)/'
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-insula-cold-skips-usage-poll"
+guards = "A cold insula cache must defer background usage polling without changing stored quota, its due time or poll bookkeeping."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "if (swept.miss === 'cold' || swept.miss === 'upstream-failed') {"
+new = "if (swept.miss === 'upstream-failed') { // NON-VACUITY BREAK: restore cold fallback polling"
+test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["background cold defers without a usage GET or poll bookkeeping"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-insula-upstream-failed-skips-usage-poll"
+guards = "An insula upstream failure must defer background usage polling without changing stored quota, its due time or poll bookkeeping."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "if (swept.miss === 'cold' || swept.miss === 'upstream-failed') {"
+new = "if (swept.miss === 'cold') { // NON-VACUITY BREAK: restore upstream-failed fallback polling"
+test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["background upstream-failed defers without a usage GET or poll bookkeeping"]
+expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
