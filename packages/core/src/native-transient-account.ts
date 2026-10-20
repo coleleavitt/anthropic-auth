@@ -23,9 +23,9 @@ const TRANSIENT_ACCOUNT_MESSAGE =
 const transientAccountErrors = new WeakSet<object>()
 
 /**
- * A local account could not be authorized because another writer was part
- * way through saving it (for example the refresh that records its first
- * account UUID) and did not finish within the short wait Core allows.
+ * A local account could not be authorized because the caller's short wait for
+ * an account write or a refresh replacing a provider-rejected token expired.
+ * The shared write or refresh may still finish after the caller stops waiting.
  *
  * The request should be retried. `code: 'ECONNRESET'` is how this package
  * marks an error retryable for its hosts. A host must surface it rather than

@@ -7,6 +7,12 @@ import {
   type NativeCustodyClient,
 } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
+import {
+  holdRefreshJoin,
+  observeRefreshJoin,
+  refreshedJoinAccess,
+  refreshJoinMessage,
+} from '../../../core/src/tests/native-refresh-join-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
@@ -49,9 +55,18 @@ const quota = () => ({
     resetsAt: new Date(Date.now() + 86_400_000).toISOString(),
   },
 })
-for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
+for (const scenario of [
+  'local-healthy',
+  'vault-healthy',
+  'refresh',
+  'join-proactive',
+  'join-401',
+  'join-deadline',
+] as const) {
   lifetimes.test(
-    `Pi ${scenario} request observes only required foreground locks`,
+    scenario.startsWith('join-')
+      ? `Pi refresh join ${scenario.slice(5)} preserves valid-token admission`
+      : `Pi ${scenario} request observes only required foreground locks`,
     () =>
       trackPiTestBody(
         (async () => {
@@ -86,6 +101,7 @@ for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
             storagePath,
           )
           const probe = requestLockProbe()
+          const held = holdRefreshJoin(lifetimes)
           const identity = fixtureAccountIdentity('main')
           const client: NativeCustodyClient = {
             async listScoped() {
@@ -139,6 +155,13 @@ for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
               : {}),
             local: {
               onLockEvent: probe.onLockEvent,
+              ...(scenario.startsWith('join-')
+                ? {
+                    refreshToken: held.refreshToken,
+                    resolveIdentity: async () =>
+                      getClaudeCodeIdentityForVerifiedAccount('main', identity),
+                  }
+                : {}),
               ...(scenario === 'refresh'
                 ? {
                     now,
@@ -168,18 +191,85 @@ for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
           }
           await runtime.read()
           await runtime.drainRoutingPublications()
+          const sent: string[] = []
+          const completedAtDispatch: boolean[] = []
           globalThis.fetch = Object.assign(
-            async (input: Parameters<typeof fetch>[0]) => {
+            async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
               const url =
                 input instanceof Request ? input.url : input.toString()
               if (!url.includes('/v1/messages')) return Response.json({})
+              sent.push(new Headers(init?.headers).get('authorization') ?? '')
+              completedAtDispatch.push(held.completed())
               probe.dispatch()
+              if (
+                (scenario === 'join-401' || scenario === 'join-deadline') &&
+                sent.length === 1
+              )
+                return Response.json(
+                  {
+                    type: 'error',
+                    error: {
+                      type: 'authentication_error',
+                      message: 'Rejected fixture credential',
+                    },
+                  },
+                  { status: 401 },
+                )
               return new Response(
                 'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
               )
             },
             { preconnect: originalFetch.preconnect },
           )
+          if (scenario.startsWith('join-')) {
+            const send = (sessionId: string) =>
+              streamCortexKitAnthropic(model, context, { sessionId }).result()
+            const owner =
+              scenario === 'join-proactive'
+                ? runtime.authorizeLocal('main', { intent: 'refresh' })
+                : send('join-owner')
+            void owner.catch(() => {})
+            let waiting: ReturnType<typeof send> | undefined
+            try {
+              await held.entered
+              probe.begin()
+              waiting = send('join-waiter')
+              if (scenario === 'join-proactive') {
+                expect(await observeRefreshJoin(waiting)).toMatchObject({
+                  status: 'fulfilled',
+                  value: { stopReason: 'stop' },
+                })
+                expect(completedAtDispatch).toEqual([false])
+                expect(probe.foreground).toEqual([])
+              } else if (scenario === 'join-401') {
+                expect((await observeRefreshJoin(waiting, 100)).status).toBe(
+                  'pending',
+                )
+                expect(sent).toHaveLength(1)
+                held.release()
+                expect(await waiting).toMatchObject({ stopReason: 'stop' })
+                expect(await owner).toMatchObject({ stopReason: 'stop' })
+                expect(sent.slice(1)).toEqual([
+                  `Bearer ${refreshedJoinAccess}`,
+                  `Bearer ${refreshedJoinAccess}`,
+                ])
+              } else {
+                expect(await observeRefreshJoin(waiting, 3_500)).toMatchObject({
+                  status: 'fulfilled',
+                  value: {
+                    stopReason: 'error',
+                    errorMessage: refreshJoinMessage,
+                  },
+                })
+                expect(held.completed()).toBe(false)
+                expect(sent).toHaveLength(1)
+              }
+            } finally {
+              held.release()
+              await Promise.allSettled([owner, ...(waiting ? [waiting] : [])])
+            }
+            return
+          }
           probe.begin()
           const result = await streamCortexKitAnthropic(model, context, {
             sessionId: `lock-proof-${directory}`,
@@ -210,5 +300,6 @@ for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
             ).toBe(true)
         })(),
       ),
+    scenario.startsWith('join-') ? 8_000 : undefined,
   )
 }

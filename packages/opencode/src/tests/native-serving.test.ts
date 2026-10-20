@@ -19,6 +19,7 @@ import {
   createNativeAccountRuntime,
   createNativePoolStore,
   custodyTombstoneOAuth,
+  getClaudeCodeIdentityForVerifiedAccount,
   getLogLevel,
   type LogTestRecord,
   type NativeCustodyClient,
@@ -41,6 +42,12 @@ import {
   toNativeQuotaMap,
 } from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import {
+  holdRefreshJoin,
+  observeRefreshJoin,
+  refreshedJoinAccess,
+  refreshJoinMessage,
+} from '../../../core/src/tests/native-refresh-join-fixture.ts'
 import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
@@ -1027,6 +1034,108 @@ test('supervised content after real migration refuses foreground and background 
   await expect(sendNative(plugin)).rejects.toThrow('OPENCODE_AUTH_CONTENT')
   expect(fixture.records).toHaveLength(0)
 })
+
+for (const scenario of ['proactive', '401', 'deadline'] as const) {
+  test(`OC1 refresh join ${scenario} preserves valid-token admission`, async () => {
+    const fixture = await migrateServingFixture('local')
+    const warmup = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+    })
+    let initialAccess: string
+    try {
+      const admitted = await warmup.authorizeLocal('main')
+      if (admitted.status !== 'usable')
+        throw new Error('Missing initial authorization')
+      initialAccess = admitted.access
+    } finally {
+      await warmup.close()
+    }
+    const held = holdRefreshJoin(lifetimes)
+    const probe = requestLockProbe()
+    const local = {
+      onLockEvent: probe.onLockEvent,
+      refreshToken: held.refreshToken,
+      resolveIdentity: async () =>
+        getClaudeCodeIdentityForVerifiedAccount(
+          'main',
+          mainIdentity as ProviderAccountUuid,
+        ),
+    }
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+      local,
+    })
+    lifetimes.deferCleanup(() => runtime.close())
+    const sent: string[] = []
+    const completedAtDispatch: boolean[] = []
+    network.mockImplementation((input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (url.includes('/v1/messages')) {
+        const access = new Headers(init?.headers).get('authorization') ?? ''
+        sent.push(access)
+        completedAtDispatch.push(held.completed())
+        probe.dispatch()
+        if (scenario !== 'proactive' && sent.length === 1)
+          return Promise.resolve(Response.json({}, { status: 401 }))
+      }
+      return fixture.fetchProvider(input, init)
+    })
+    const plugin = await createPlugin({ nativeLocal: local })
+    const options = await load(plugin, async () =>
+      custodyTombstoneOAuth('anthropic'),
+    )
+    const send = () =>
+      requestFetch(options)('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 16,
+          messages: [{ role: 'user', content: 'Refresh join probe' }],
+        }),
+      })
+    const owner =
+      scenario === 'proactive'
+        ? runtime.authorizeLocal('main', { intent: 'refresh' })
+        : send()
+    void owner.catch(() => {})
+    let waiting: Promise<Response> | undefined
+    try {
+      await held.entered
+      probe.begin()
+      waiting = send()
+      if (scenario === 'proactive') {
+        expect((await observeRefreshJoin(waiting)).status).toBe('fulfilled')
+        expect(completedAtDispatch).toEqual([false])
+        expect(sent).toEqual([`Bearer ${initialAccess}`])
+        expect(probe.foreground).toEqual([])
+      } else if (scenario === '401') {
+        expect((await observeRefreshJoin(waiting, 100)).status).toBe('pending')
+        expect(sent).toEqual([`Bearer ${initialAccess}`])
+        held.release()
+        expect((await waiting).status).toBe(200)
+        expect(((await owner) as Response).status).toBe(200)
+        expect(sent).toEqual([
+          `Bearer ${initialAccess}`,
+          `Bearer ${refreshedJoinAccess}`,
+          `Bearer ${refreshedJoinAccess}`,
+        ])
+      } else {
+        expect(await observeRefreshJoin(waiting, 3_500)).toMatchObject({
+          status: 'rejected',
+          error: { message: refreshJoinMessage, code: 'ECONNRESET' },
+        })
+        expect(held.completed()).toBe(false)
+        expect(sent).toEqual([`Bearer ${initialAccess}`])
+      }
+    } finally {
+      held.release()
+      await Promise.allSettled([owner, ...(waiting ? [waiting] : [])])
+    }
+  }, 8_000)
+}
 
 for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
   test(`OC1 ${scenario} request observes only required foreground locks`, async () => {

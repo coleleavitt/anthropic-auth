@@ -74,6 +74,7 @@ import {
   nativePoolStoreLocks,
 } from '../pool-store.ts'
 import { tokenFingerprint } from '../token-fingerprint.ts'
+import { observeRefreshJoin } from './native-refresh-join-fixture.ts'
 import { TestLifetime } from './test-lifetime.ts'
 
 const roots: string[] = []
@@ -1360,7 +1361,7 @@ test('stale-token 401 adopts pure-store replacement without a provider call and 
   expect(calls).toBe(0)
 })
 
-test('adoption is per-caller and never serves the access token that caller rejected', async () => {
+test('adoption never serves an access token rejected by any caller in the shared job', async () => {
   const f = await fixture()
   await f.add('a', 'A')
   const binding = await f.binding('a')
@@ -1393,9 +1394,8 @@ test('adoption is per-caller and never serves the access token that caller rejec
   })
   finish.release()
   expect(await first).toMatchObject({
-    status: 'usable',
-    source: 'adopted',
-    access: 'access-new',
+    status: 'refused',
+    reason: 'rejected-access-unchanged',
   })
   expect(await joined).toMatchObject({
     status: 'refused',
@@ -3177,6 +3177,101 @@ for (const echo of ['captured', 'newer'] as const) {
         : { status: 'refused', reason: 'proof-mismatch' },
     )
     expect((await f.row('a')).credential).toMatchObject({ access: 'advanced' })
+  })
+}
+
+test('401 recovery admits a proven different access version before the shared job completes', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const entered = barrier()
+  const finish = barrier()
+  const c = f.coordinator({
+    reconcile: async (event) => {
+      if (event.status === 'persisted') {
+        entered.release()
+        await finish.promise
+      }
+    },
+  })
+  const binding = await f.binding('a')
+  const owner = c.refresh({
+    mode: 'local',
+    binding,
+    rejectedAccessToken: 'access-a',
+  })
+  void owner.catch(() => {})
+  try {
+    await entered.promise
+    await f.seedProof('a')
+    expect(
+      await observeRefreshJoin(
+        c.authorize({ intent: 'serve', mode: 'local', binding }),
+      ),
+    ).toMatchObject({
+      status: 'fulfilled',
+      value: { status: 'usable', access: 'access-new' },
+    })
+  } finally {
+    finish.release()
+    await owner
+  }
+})
+
+for (const duringAdmission of [false, true]) {
+  test(`401 recorded ${duringAdmission ? 'during admission' : 'during proactive refresh'} prevents rejected-token dispatch`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    await f.seedProof('a')
+    const binding = await f.binding('a')
+    const providerEntered = barrier()
+    const finishProvider = barrier()
+    const admissionEntered = barrier()
+    const finishAdmission = barrier()
+    let firstAdmission = true
+    const c = f.coordinator({
+      refreshToken: async () => {
+        providerEntered.release()
+        await finishProvider.promise
+        return { ...credential('new'), expiresIn: 3600 }
+      },
+      readAdmission: async (subject) => {
+        if (duringAdmission && firstAdmission) {
+          firstAdmission = false
+          admissionEntered.release()
+          await finishAdmission.promise
+        }
+        const proof = f.proofs.get(subject.binding.rowId)
+        return proof
+          ? { status: 'proven', validation: proof }
+          : { status: 'unproven' }
+      },
+    })
+    const serve = () => c.authorize({ intent: 'serve', mode: 'local', binding })
+    const first = duringAdmission
+      ? serve()
+      : c.refresh({ mode: 'local', binding })
+    if (duringAdmission) await admissionEntered.promise
+    else await providerEntered.promise
+    const rejected = c.refresh({
+      mode: 'local',
+      binding,
+      rejectedAccessToken: 'access-a',
+    })
+    void rejected.catch(() => {})
+    let waiting: Promise<NativeRefreshResult> | undefined
+    try {
+      await providerEntered.promise
+      finishAdmission.release()
+      waiting = duringAdmission ? first : serve()
+      expect((await observeRefreshJoin(waiting, 100)).status).toBe('pending')
+      finishProvider.release()
+      for (const result of await Promise.all([first, rejected, waiting]))
+        expect(result).toMatchObject({ status: 'usable', access: 'access-new' })
+    } finally {
+      finishAdmission.release()
+      finishProvider.release()
+      await Promise.allSettled([first, rejected, ...(waiting ? [waiting] : [])])
+    }
   })
 }
 

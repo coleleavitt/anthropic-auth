@@ -325,6 +325,40 @@ broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
 
 [[control]]
+id = "refresh-join-checks-cause"
+guards = "A proactive refresh must not delay a proven unexpired access token."
+file = "packages/core/src/native-refresh-coordinator.ts"
+old = "if (!jobRejectsAccess(job, row)) {"
+new = "if (!job) { // NON-VACUITY BREAK: join every existing refresh"
+test_file = "packages/opencode/src/tests/native-serving.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/native-serving.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["OC1 refresh join proactive preserves valid-token admission"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+junit_class = "suites"
+
+[[control]]
+id = "refresh-join-has-overall-deadline"
+guards = "A refresh replacing a rejected token has one bounded request wait across all attempts."
+file = "packages/core/src/native-refresh-coordinator.ts"
+old = "? joinRejectedRefresh(job)"
+new = "? job.promise // NON-VACUITY BREAK: wait without an overall deadline"
+test_file = "packages/opencode/src/tests/native-serving.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/native-serving.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["OC1 refresh join deadline preserves valid-token admission"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+junit_class = "suites"
+
+[[control]]
 id = "native-activation-before-401-refresh"
 guards = "A revoked host activation must not trigger a credential refresh."
 file = "packages/opencode/src/index.ts"

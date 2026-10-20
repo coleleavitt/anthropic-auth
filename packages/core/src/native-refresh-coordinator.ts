@@ -33,6 +33,7 @@ import {
   nativeLocalCredentialValidationMatches,
 } from './native-credential-validation.ts'
 import { nativeLockObserver } from './native-lock-observer.ts'
+import { NativeTransientAccountError } from './native-transient-account.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import {
   isNativeLocalPoolBinding,
@@ -48,6 +49,10 @@ import {
 import { tokenFingerprint } from './token-fingerprint.ts'
 
 export const NATIVE_REFRESH_MAX_ATTEMPTS = 3
+
+// Limit a caller's rejected-token refresh wait to two seconds across all attempts.
+// The shared refresh may continue, just like an account write after a join expires.
+const NATIVE_REFRESH_JOIN_BUDGET_MS = 2_000
 
 /**
  * Jobs distinguish credential replacements. This lock must still serialize
@@ -302,7 +307,7 @@ export interface NativeRefreshRequest {
   intent: 'serve' | 'refresh'
   mode: 'local' | 'claustrum'
   binding: NativeLocalPoolBinding
-  /** A 401's dispatched access token, used only for replacement adoption. */
+  /** The access token dispatched on a 401; it must not be served again. */
   rejectedAccessToken?: string
   signal?: AbortSignal
 }
@@ -348,11 +353,42 @@ type JobResult =
 interface Job {
   keys: Set<string>
   promise: Promise<JobResult>
+  cause: { kind: 'proactive' } | { kind: '401'; accessFingerprint: string }
+  additionalRejections: Set<string>
 }
 
 // Shared by every platform/coordinator instance in this process. Deletion is
 // compare-and-delete: an old job can never dispose a successor registration.
 const jobs = new Map<string, Job>()
+
+function jobRejectsAccess(job: Job | undefined, row: PoolRow | undefined) {
+  if (!job || row?.credential?.type !== 'oauth' || !row.credential.access)
+    return false
+  const fingerprint = tokenFingerprint(row.credential.access)
+  return (
+    (job.cause.kind === '401' && job.cause.accessFingerprint === fingerprint) ||
+    job.additionalRejections.has(fingerprint)
+  )
+}
+
+async function joinRejectedRefresh(job: Job): Promise<JobResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    // Only the caller's wait ends. The shared exchange retains its leases and
+    // must still save any consumed single-use refresh token's successor.
+    return await Promise.race([
+      job.promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new NativeTransientAccountError()),
+          NATIVE_REFRESH_JOIN_BUDGET_MS,
+        )
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 function unregister(job: Job, key: string) {
   if (jobs.get(key) === job) jobs.delete(key)
@@ -1282,25 +1318,45 @@ export function createNativeRefreshCoordinator(
       return { status: 'refused', reason: 'cancelled', persisted: false }
     const key = nativeLocalRefreshJobKey(request.binding)
     let job = jobs.get(key)
-    if (!job && request.intent === 'serve') {
+    const recordRejection = () => {
+      // A 401 can arrive after proactive work started. Record its rejected token
+      // so no caller serves it again, without changing the job's original cause.
+      if (job && request.rejectedAccessToken)
+        job.additionalRejections.add(
+          tokenFingerprint(request.rejectedAccessToken),
+        )
+    }
+    recordRejection()
+    if (request.intent === 'serve') {
       try {
-        const current = await admit(
-          request,
-          request.binding,
-          await rowFor(request.binding),
-          'current',
-          false,
-        )
-        if (
-          current.status !== 'refused' ||
-          ![
-            'proof-missing',
-            'identity-unproven',
-            'access-unavailable',
-            'rejected-access-unchanged',
-          ].includes(current.reason)
-        )
-          return current
+        const row = await rowFor(request.binding)
+        job = jobs.get(key) ?? job
+        recordRejection()
+        if (!jobRejectsAccess(job, row)) {
+          const current = await admit(
+            request,
+            request.binding,
+            row,
+            'current',
+            false,
+          )
+          if (
+            current.status !== 'refused' ||
+            ![
+              'proof-missing',
+              'identity-unproven',
+              'access-unavailable',
+              'rejected-access-unchanged',
+            ].includes(current.reason)
+          ) {
+            // Admission yields to other callers. A 401 recorded during that
+            // read must prevent dispatch of the token it rejected.
+            job = jobs.get(key) ?? job
+            recordRejection()
+            if (current.status !== 'usable' || !jobRejectsAccess(job, row))
+              return current
+          }
+        }
       } catch (caught) {
         return {
           status: 'failed',
@@ -1313,10 +1369,18 @@ export function createNativeRefreshCoordinator(
       // recovery for the same storage, credential epoch and account UUID (or
       // unknown-identity row). Check for that job before starting duplicate work.
       job = jobs.get(key)
+      recordRejection()
     }
     if (!job) {
       job = {
         keys: new Set([key]),
+        cause: request.rejectedAccessToken
+          ? {
+              kind: '401',
+              accessFingerprint: tokenFingerprint(request.rejectedAccessToken),
+            }
+          : { kind: 'proactive' },
+        additionalRejections: new Set(),
         promise: Promise.resolve({
           status: 'refused',
           reason: 'initializing',
@@ -1329,7 +1393,10 @@ export function createNativeRefreshCoordinator(
         for (const ownedKey of owner.keys) unregister(owner, ownedKey)
       })
     }
-    const result = await job.promise
+    const result = await (job.cause.kind === '401' ||
+    job.additionalRejections.size > 0
+      ? joinRejectedRefresh(job)
+      : job.promise)
     if (request.signal?.aborted)
       return {
         status: 'refused',
@@ -1346,6 +1413,12 @@ export function createNativeRefreshCoordinator(
             }
           : request.binding
       const row = await rowFor(request.binding)
+      if (jobRejectsAccess(job, row))
+        return {
+          status: 'refused',
+          reason: 'rejected-access-unchanged',
+          persisted: result.persisted,
+        }
       return await admit(
         request,
         expected,

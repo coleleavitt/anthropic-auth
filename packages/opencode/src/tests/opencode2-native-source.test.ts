@@ -32,6 +32,12 @@ import { fingerprintOf } from '@cortexkit/common-auth/store'
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
+import {
+  holdRefreshJoin,
+  observeRefreshJoin,
+  refreshedJoinAccess,
+  refreshJoinMessage,
+} from '../../../core/src/tests/native-refresh-join-fixture.ts'
 import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
@@ -163,6 +169,105 @@ usageTests.test(
     })
   },
 )
+
+for (const scenario of ['proactive', '401', 'deadline'] as const) {
+  usageTests.test(
+    `OC2 refresh join ${scenario} preserves valid-token admission`,
+    async () => {
+      const owned: Array<() => Promise<void> | void> = []
+      usageTests.deferCleanup(async () => {
+        for (const cleanup of owned.reverse()) await cleanup()
+      })
+      const held = holdRefreshJoin(usageTests)
+      const probe = requestLockProbe()
+      const fixture = await local(
+        {
+          onLockEvent: probe.onLockEvent,
+          refreshToken: held.refreshToken,
+          resolveIdentity: async () => ({
+            accountUuid: identity as ProviderAccountUuid,
+            deviceId: 'fixture',
+            sessionId: 'fixture',
+          }),
+        },
+        owned,
+      )
+      const native = source(fixture.runtime, fixture.paths, owned)
+      const first = await native.authorizeAccount(scope, 'main')
+      if (first?.route !== 'oauth')
+        throw new Error('Missing first authorization')
+      expect(first.accessToken).toBe('sk-ant-oat01-native-only')
+      const owner = Promise.resolve(
+        scenario === 'proactive'
+          ? fixture.runtime.authorizeLocal('main', { intent: 'refresh' })
+          : native.limitFromResponse!({
+              ...context(first.provenance),
+              status: 401,
+              headers: new Headers(),
+              body: async () => '',
+            }),
+      )
+      void owner.catch(() => {})
+      let waiting:
+        | Promise<Awaited<ReturnType<typeof native.authorizeAccount>>>
+        | undefined
+      try {
+        await held.entered
+        probe.begin()
+        waiting = Promise.resolve(
+          native.authorizeAccount(
+            { ...scope, sessionID: 'join-waiter' },
+            'main',
+          ),
+        ).then((auth) => {
+          probe.dispatch()
+          return auth
+        })
+        if (scenario === 'proactive') {
+          expect(await observeRefreshJoin(waiting)).toMatchObject({
+            status: 'fulfilled',
+            value: { accessToken: first.accessToken },
+          })
+          expect(held.completed()).toBe(false)
+          expect(probe.foreground).toEqual([])
+        } else if (scenario === '401') {
+          expect((await observeRefreshJoin(waiting, 100)).status).toBe(
+            'pending',
+          )
+          held.release()
+          expect(await waiting).toMatchObject({
+            accessToken: refreshedJoinAccess,
+          })
+          const limit = await owner
+          expect(limit).toMatchObject({ status: 401 })
+          if (
+            !limit ||
+            typeof limit.status !== 'number' ||
+            !('reason' in limit)
+          )
+            throw new Error('Missing 401 retry')
+          await native.chooseAccount({
+            ...scope,
+            rerouteFrom: { accountId: 'main', limit },
+          })
+          expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
+            accessToken: refreshedJoinAccess,
+          })
+        } else {
+          expect(await observeRefreshJoin(waiting, 3_500)).toMatchObject({
+            status: 'rejected',
+            error: { message: refreshJoinMessage, code: 'ECONNRESET' },
+          })
+          expect(held.completed()).toBe(false)
+          expect(probe.afterDispatch).toEqual([])
+        }
+      } finally {
+        held.release()
+        await Promise.allSettled([owner, ...(waiting ? [waiting] : [])])
+      }
+    },
+  )
+}
 
 for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
   usageTests.test(
