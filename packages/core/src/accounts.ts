@@ -322,7 +322,11 @@ export type AccountStorage = {
   thinkingBinding?: {
     prefixMismatchBehavior?: 'account-default' | 'error' | 'drop_block'
   }
-  /** Host tool names for reply-then-housekeeping notes; absent uses board/ctx_reduce, [] disables. */
+  /**
+   * Tool names (as the host names them) whose calls after a long reply get a
+   * system note telling the model not to repeat that reply. Unset means the
+   * `board` and `ctx_reduce` tools; an empty list turns the note off.
+   */
   turnEndNote?: { tools: string[] }
   /**
    * Zero out Anthropic OAuth model costs in the provider hook. Default: enabled

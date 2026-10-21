@@ -327,7 +327,8 @@ function convertMessages(
         result.push(converted)
         // Converted thinking can become text for replay, but it was never a
         // visible reply. Count only actual text blocks, using the exact outgoing
-        // strings collected above, regardless of the current tool declarations.
+        // strings collected above, so the note decision for this message stays
+        // the same on every later request.
         visibleReplies.set(converted, visibleText)
       }
       continue

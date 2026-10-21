@@ -16,7 +16,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-/** Families enabled for turn-end notes under Claude Code's clear-at beta. */
+/**
+ * Model families that get turn-end notes. The note is a turn-scoped system
+ * message (`clear_at: "next_user_message"`), which needs the
+ * mid-conversation-system-clear-at beta that Claude Code sends for these models.
+ */
 export function supportsTurnEndNote(model: unknown): boolean {
   return (
     isClaudeFable51Model(model) ||
