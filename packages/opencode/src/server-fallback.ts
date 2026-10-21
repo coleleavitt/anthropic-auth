@@ -1,8 +1,5 @@
-import { isClaudeFable51Model } from '@cortexkit/anthropic-auth-core'
-import {
-  isRecoverableRefusalModel,
-  recoverableRefusalFamily,
-} from './fable-fallback'
+import { resolveClaudeModelCapabilities } from '@cortexkit/anthropic-auth-core'
+import { recoverableRefusalFamily } from './fable-fallback'
 
 export const SERVER_SIDE_FALLBACK_BETA = 'server-side-fallback-2026-07-01'
 export const SERVER_FALLBACK_MARKER_TEXT = '\u2060'
@@ -147,7 +144,7 @@ export function applyServerSideFallbackToBody(
 } {
   const enabled =
     requested &&
-    (isRecoverableRefusalModel(body.model) || isClaudeFable51Model(body.model))
+    resolveClaudeModelCapabilities(body.model)?.serverSideFallback === true
   const markerResult = rewriteStoredMarkers(body, enabled)
   if (enabled) {
     body.fallbacks = 'default'

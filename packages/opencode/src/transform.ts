@@ -23,7 +23,6 @@ import {
   createSseFramer,
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
-  isClaudeFableOrMythos51Model,
   isClaudeHaiku55Model,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
@@ -38,6 +37,7 @@ import {
   parseSseFrame,
   REQUIRED_BETAS,
   remapRequestBodyModel,
+  resolveClaudeModelCapabilities,
   SseFrameTooLargeError,
   selectClaudeCodeBetas,
   signRequestBody,
@@ -1242,7 +1242,7 @@ function normalizeFableMythosRequest(
   if (!isClaudeFableOrMythos5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   parsed.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
-  if (isClaudeFableOrMythos51Model(parsed.model)) {
+  if (resolveClaudeModelCapabilities(parsed.model)?.rejectsForcedToolChoice) {
     removeUnsupportedForcedToolChoice(parsed)
   }
   return { replacedExisting: hadThinking }

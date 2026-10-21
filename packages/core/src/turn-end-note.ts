@@ -1,11 +1,9 @@
 import {
-  isClaudeFable51Model,
-  isClaudeHaiku55Model,
-  isClaudeOpus55Model,
-  isClaudeSonnet55Model,
-} from './models.ts'
+  resolveClaudeModelCapabilities,
+  TURN_END_NOTE_BETA,
+} from './model-capabilities.ts'
 
-export const TURN_END_NOTE_BETA = 'mid-conversation-system-clear-at-2026-08-21'
+export { TURN_END_NOTE_BETA }
 export const TURN_END_NOTE_MIN_VISIBLE_CHARACTERS = 350
 export const TURN_END_NOTE_CONTENT =
   'Your reply above has already reached the user. The tool call after it was housekeeping and changed nothing they need to know. Do not repeat, summarize or rewrite that reply. If no new work remains, end the turn without restating anything.'
@@ -17,17 +15,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Model families that get turn-end notes. The note is a turn-scoped system
- * message (`clear_at: "next_user_message"`), which needs the
+ * Models that get turn-end notes (capability `turnEndNote`). The note is a
+ * turn-scoped system message (`clear_at: "next_user_message"`), which needs the
  * mid-conversation-system-clear-at beta that Claude Code sends for these models.
  */
 export function supportsTurnEndNote(model: unknown): boolean {
-  return (
-    isClaudeFable51Model(model) ||
-    isClaudeHaiku55Model(model) ||
-    isClaudeOpus55Model(model) ||
-    isClaudeSonnet55Model(model)
-  )
+  return resolveClaudeModelCapabilities(model)?.turnEndNote === true
 }
 
 /**

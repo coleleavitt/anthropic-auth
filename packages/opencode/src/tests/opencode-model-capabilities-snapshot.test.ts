@@ -162,8 +162,9 @@ const assistant = (id: string) => ({
 function renderEffortMarkers(model: string) {
   const rendered: Record<string, unknown> = {}
   const scenarios = {
-    // One user turn: the plan carries no marker, so only a pinned top-level
-    // effort can change the request.
+    // A single user turn has no effort transition, so no marker is inserted;
+    // these cases record whether that turn's effort is still written to the
+    // request's top-level `output_config`.
     single: [user('msg_1', model, 'low')],
     single_default: [user('msg_1', model)],
     change: [

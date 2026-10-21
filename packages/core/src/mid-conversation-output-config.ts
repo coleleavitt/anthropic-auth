@@ -1,16 +1,15 @@
 import {
-  isClaudeFable51Model,
-  isClaudeHaiku55Model,
-  isClaudeOpus55Model,
-  isClaudeSonnet55Model,
-} from './models.ts'
+  PER_TURN_CONTROL_BETA,
+  pinsEffortOnEveryRequest,
+  resolveClaudeModelCapabilities,
+} from './model-capabilities.ts'
 
 /**
- * Per-turn control beta that Claude Code sends on Opus 5.5, Sonnet 5.5,
- * Fable 5.1 and Haiku 5.5. It enables effort changes carried by empty
+ * Per-turn control beta that Claude Code sends on the models whose
+ * capability rows list it. It enables effort changes carried by empty
  * `role: "system"` messages on the eligible models below.
  */
-export const PER_TURN_CONTROL_BETA = 'per-turn-control-2026-07-01'
+export { PER_TURN_CONTROL_BETA }
 
 export type AdaptiveEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
@@ -41,40 +40,45 @@ export function normalizeAdaptiveEffort(
 }
 
 /**
- * Models that require adaptive thinking for per-message effort: Opus 5.5
- * and Sonnet 5.5, including dated and `[1m]` context-window ids. Header
- * eligibility is separate; `sendsPerTurnControlBeta` follows Claude Code.
+ * Models that require adaptive thinking for per-message effort (capability
+ * `effortMarkers: "with-adaptive-thinking"`: Opus 5.5 and Sonnet 5.5),
+ * including dated and `[1m]` context-window ids. Header eligibility is
+ * separate; `sendsPerTurnControlBeta` follows Claude Code.
  */
 export function usesPerTurnControl(model: unknown): boolean {
-  return isClaudeOpus55Model(model) || isClaudeSonnet55Model(model)
+  return (
+    resolveClaudeModelCapabilities(model)?.effortMarkers ===
+    'with-adaptive-thinking'
+  )
 }
 
 /**
- * Models whose OAuth requests carry `PER_TURN_CONTROL_BETA`: Opus 5.5 and
- * Sonnet 5.5, plus Fable 5.1 and Haiku 5.5, which Claude Code 2.1.302 also
- * sends it on. Sending the beta does not by itself make a model eligible for
- * effort markers; `supportsPerMessageEffort` decides that.
+ * Models whose OAuth requests carry `PER_TURN_CONTROL_BETA`: those whose
+ * Claude Code main beta list includes it (Opus 5.5, Sonnet 5.5, Fable 5.1 and
+ * Haiku 5.5 in Claude Code 2.1.302). Sending the beta does not by itself make
+ * a model eligible for effort markers; `supportsPerMessageEffort` decides that.
  */
 export function sendsPerTurnControlBeta(model: unknown): boolean {
   return (
-    usesPerTurnControl(model) ||
-    isClaudeFable51Model(model) ||
-    isClaudeHaiku55Model(model)
+    resolveClaudeModelCapabilities(model)?.claudeCodeBetas.main.includes(
+      PER_TURN_CONTROL_BETA,
+    ) ?? false
   )
 }
 
 /**
  * Whether a request may move effort changes into empty system messages.
  *
- * Fable 5.1 is always eligible, whatever its thinking field says. Opus 5.5
- * and Sonnet 5.5 qualify only with adaptive thinking: Anthropic rejects a
- * differing per-message effort with HTTP 400 on Sonnet 5.5 `between_tools`,
- * and asks callers to use adaptive thinking to vary effort.
+ * Models with `effortMarkers: "always"` (Fable 5.1) are always eligible,
+ * whatever the thinking field says. Models with `"with-adaptive-thinking"`
+ * (Opus 5.5, Sonnet 5.5) qualify only with adaptive thinking: Anthropic
+ * rejects a differing per-message effort with HTTP 400 on Sonnet 5.5
+ * `between_tools`, and asks callers to use adaptive thinking to vary effort.
  */
 export function supportsPerMessageEffort(
   body: Record<string, unknown>,
 ): boolean {
-  if (isClaudeFable51Model(body.model)) return true
+  if (pinsEffortOnEveryRequest(body.model)) return true
   return (
     usesPerTurnControl(body.model) &&
     isRecord(body.thinking) &&
@@ -84,13 +88,12 @@ export function supportsPerMessageEffort(
 
 /**
  * The effort Anthropic applies when a request sets no `output_config.effort`:
- * `medium` on Opus 5.5 and Haiku 5.5, `high` on the other models.
+ * the capability row's default (`medium` on Opus 5.5 and Haiku 5.5), and
+ * `high` on models without a row.
  * A history entry without a recognized effort level uses this value.
  */
 export function defaultAdaptiveEffort(model: unknown): AdaptiveEffort {
-  return isClaudeOpus55Model(model) || isClaudeHaiku55Model(model)
-    ? 'medium'
-    : 'high'
+  return resolveClaudeModelCapabilities(model)?.efforts.default ?? 'high'
 }
 
 function compactTransitions(
@@ -132,9 +135,10 @@ export function applyMidConversationOutputConfig(
   }
 
   const compacted = compactTransitions(transitions)
-  // Fable 5.1 always pins top-level effort. The other models leave a request
-  // without an effort change exactly as the host built it.
-  const pinsEveryRequest = isClaudeFable51Model(body.model)
+  // Models with `effortMarkers: "always"` (Fable 5.1) always pin top-level
+  // effort. The other models leave a request without an effort change exactly
+  // as the host built it.
+  const pinsEveryRequest = pinsEffortOnEveryRequest(body.model)
   if (!pinsEveryRequest && compacted.length < 2) {
     return { applied: false, inserted: 0 }
   }

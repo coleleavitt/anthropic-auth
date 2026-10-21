@@ -1,9 +1,6 @@
 import {
-  CLAUDE_FABLE_5_1_MODEL_ID,
-  CLAUDE_FABLE_5_MODEL_ID,
-  isClaudeOpus5Model,
-  isClaudeOpus55Model,
-  normalizeAnthropicModelId,
+  type ClaudeRefusalRecoveryFamily,
+  resolveClaudeModelCapabilities,
 } from '@cortexkit/anthropic-auth-core'
 
 export const FABLE_FALLBACK_MODEL_ID = 'claude-opus-4-8'
@@ -48,38 +45,19 @@ type FableFallbackState = {
 
 /**
  * Models whose content-filter refusal we recover from by downgrading to Opus 4.8
- * for a bounded window. Fable 5, Fable 5.1, Opus 5, and Opus 5.5 have separate
- * source family because recovery state must not cross-contaminate distinct
- * requested models. All use Anthropic's `claude-opus-4-8` fallback for
- * the same classifier refusal shape and recovery period. Mythos has no
- * classifiers and Sonnet 5 is not flagged — both stay outside this gate.
+ * for a bounded window: capability rows with a `refusalRecoveryFamily` (Fable 5,
+ * Fable 5.1, Opus 5 and Opus 5.5). Each has a separate source family because
+ * recovery state must not cross-contaminate distinct requested models. All use
+ * Anthropic's `claude-opus-4-8` fallback for the same classifier refusal shape
+ * and recovery period. Mythos has no classifiers and Sonnet 5 is not flagged —
+ * both stay outside this gate.
  */
-export type RecoverableRefusalFamily =
-  | 'fable-5'
-  | 'fable-5-1'
-  | 'opus-5'
-  | 'opus-5-5'
+export type RecoverableRefusalFamily = ClaudeRefusalRecoveryFamily
 
 export function recoverableRefusalFamily(
   model: unknown,
 ): RecoverableRefusalFamily | null {
-  if (typeof model !== 'string') return null
-  const normalized = normalizeAnthropicModelId(model)
-  if (isClaudeOpus55Model(normalized)) return 'opus-5-5'
-  if (isClaudeOpus5Model(normalized)) return 'opus-5'
-  if (
-    normalized === CLAUDE_FABLE_5_1_MODEL_ID ||
-    normalized.startsWith(`${CLAUDE_FABLE_5_1_MODEL_ID}-`)
-  ) {
-    return 'fable-5-1'
-  }
-  if (
-    normalized === CLAUDE_FABLE_5_MODEL_ID ||
-    normalized.startsWith(`${CLAUDE_FABLE_5_MODEL_ID}-`)
-  ) {
-    return 'fable-5'
-  }
-  return null
+  return resolveClaudeModelCapabilities(model)?.refusalRecoveryFamily ?? null
 }
 
 export function isRecoverableRefusalModel(model: unknown): model is string {

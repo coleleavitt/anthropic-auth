@@ -1,9 +1,5 @@
 import {
-  CLAUDE_FABLE_MYTHOS_5_1_PRICING,
-  CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
-  CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
-  CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
   CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING,
   CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD,
@@ -15,7 +11,7 @@ import {
   CLAUDE_SONNET_5_5_MODEL_ID,
   CLAUDE_SONNET_5_5_PRICING,
   defaultAdaptiveEffort,
-  isClaudeFableOrMythos51Model,
+  getClaudeModelCatalogue,
   type MidConversationEffortTransition,
   type NativeAccountSnapshot,
   type NativeCustodyClient,
@@ -128,9 +124,8 @@ export default async function cortexKitPiAnthropicAuth(
     api: 'cortexkit-anthropic-messages',
     models: [
       ...Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((model) => {
-        const pricing = isClaudeFableOrMythos51Model(model.id)
-          ? CLAUDE_FABLE_MYTHOS_5_1_PRICING
-          : CLAUDE_FABLE_MYTHOS_5_PRICING
+        const catalogue = getClaudeModelCatalogue(model.id)
+        const pricing = catalogue.pricing
         return {
           id: model.id,
           name: model.name,
@@ -142,8 +137,8 @@ export default async function cortexKitPiAnthropicAuth(
             cacheRead: pricing.cacheRead,
             cacheWrite: pricing.cacheWrite5m,
           },
-          contextWindow: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
-          maxTokens: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
+          contextWindow: catalogue.contextWindow,
+          maxTokens: catalogue.maxOutputTokens,
         }
       }),
       {

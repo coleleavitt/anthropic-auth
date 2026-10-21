@@ -1,9 +1,4 @@
-import {
-  isClaudeFable51Model,
-  isClaudeHaiku55Model,
-  isClaudeOpus5FamilyModel,
-  isClaudeSonnet55Model,
-} from '@cortexkit/anthropic-auth-core'
+import { resolveClaudeModelCapabilities } from '@cortexkit/anthropic-auth-core'
 import type { Model, Plugin } from '@opencode/plugin'
 
 /** Each model variant supplies request settings for adaptive thinking and its selected reasoning effort. */
@@ -14,17 +9,10 @@ export function createNativeClaudeModelRules() {
       ids.clear()
       for (const candidate of editor.list('anthropic')) {
         ids.set(String(candidate.id), String(candidate.modelID))
-        if (
-          !(
-            isClaudeFable51Model(candidate.modelID) ||
-            isClaudeOpus5FamilyModel(candidate.modelID) ||
-            isClaudeSonnet55Model(candidate.modelID) ||
-            isClaudeHaiku55Model(candidate.modelID)
-          )
-        )
-          continue
+        const efforts = resolveClaudeModelCapabilities(candidate.modelID)
+          ?.efforts.variants
+        if (!efforts) continue
         editor.update('anthropic', String(candidate.id), (model) => {
-          const efforts = ['low', 'medium', 'high', 'xhigh', 'max'] as const
           const retained = model.variants.filter(
             (variant) =>
               !efforts.some((effort) => effort === String(variant.id)),

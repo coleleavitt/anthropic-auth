@@ -1,3 +1,5 @@
+import { resolveClaudeModelCapabilities } from './model-capabilities.ts'
+
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 
 export const AUTHORIZE_URLS = {
@@ -44,10 +46,17 @@ export function mergeAnthropicBetas(
   return [...new Set([...incoming, ...betas])].join(',')
 }
 
+/**
+ * Fast mode is offered on capability rows with `fastMode`, and on any id that
+ * starts with `claude-opus-4-8` or `claude-opus-5`, a looser older rule kept
+ * so ids outside the table (Opus 4.8) keep fast mode.
+ */
 export function isFastModeSupportedModel(model: unknown) {
   return (
     typeof model === 'string' &&
-    (model.startsWith('claude-opus-4-8') || model.startsWith('claude-opus-5'))
+    (model.startsWith('claude-opus-4-8') ||
+      model.startsWith('claude-opus-5') ||
+      resolveClaudeModelCapabilities(model)?.fastMode === true)
   )
 }
 

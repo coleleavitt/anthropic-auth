@@ -9,11 +9,11 @@ import {
   USER_AGENT,
 } from './constants.ts'
 import {
-  PER_TURN_CONTROL_BETA,
-  sendsPerTurnControlBeta,
-} from './mid-conversation-output-config.ts'
-import { isClaudeHaiku55Model } from './models.ts'
-import { TURN_END_NOTE_BETA } from './turn-end-note.ts'
+  CLAUDE_CODE_DEFAULT_BETAS,
+  CLAUDE_CODE_FULL_AGENT_BETAS,
+  resolveClaudeModelCapabilities,
+  TURN_END_NOTE_BETA,
+} from './model-capabilities.ts'
 
 export type ProviderAccountUuid = string & {
   readonly __providerAccountUuid: unique symbol
@@ -385,51 +385,9 @@ export function applyClaudeCodeMetadata(
   return true
 }
 
-// The lists follow Claude Code 2.1.302's main, title and quota requests.
-// Advisor and fallback-credit betas require features these requests do not use.
-// The display-updates beta does not change the body: summarized thinking still
-// streams text, unlike Claude Code's `thinking.display: "updates"`.
-export const CLAUDE_CODE_FULL_AGENT_BETAS = [
-  'claude-code-20250219',
-  'oauth-2025-04-20',
-  'interleaved-thinking-2025-05-14',
-  'thinking-token-count-2026-05-13',
-  'context-management-2025-06-27',
-  'prompt-caching-scope-2026-01-05',
-  'mid-conversation-tool-changes-2026-07-01',
-  'advanced-tool-use-2025-11-20',
-  TURN_END_NOTE_BETA,
-  'effort-2025-11-24',
-  'thinking-binding-controls-2026-08-01',
-  'thinking-display-updates-2026-08-18',
-  'extended-cache-ttl-2025-04-11',
-  'cache-diagnosis-2026-04-07',
-] as const
-
-const CLAUDE_CODE_TITLE_BETAS = [
-  'oauth-2025-04-20',
-  'interleaved-thinking-2025-05-14',
-  'redact-thinking-2026-02-12',
-  'thinking-token-count-2026-05-13',
-  'context-management-2025-06-27',
-  'prompt-caching-scope-2026-01-05',
-  'mid-conversation-tool-changes-2026-07-01',
-  'mid-conversation-system-clear-at-2026-08-21',
-  'effort-2025-11-24',
-  'cache-diagnosis-2026-04-07',
-] as const
-
-const CLAUDE_CODE_QUOTA_BETAS = [
-  'oauth-2025-04-20',
-  'interleaved-thinking-2025-05-14',
-  'redact-thinking-2026-02-12',
-  'thinking-token-count-2026-05-13',
-  'context-management-2025-06-27',
-  'prompt-caching-scope-2026-01-05',
-] as const
-
-const CLAUDE_CODE_BETA = 'claude-code-20250219'
-const PROMPT_CACHING_SCOPE_BETA = 'prompt-caching-scope-2026-01-05'
+// The per-model beta lists live in the capability table in
+// model-capabilities.ts; this is the list for a model without a row.
+export { CLAUDE_CODE_FULL_AGENT_BETAS }
 
 function hasStructuredOutput(body: Record<string, unknown>) {
   const outputConfig = body.output_config as Record<string, unknown> | undefined
@@ -452,14 +410,19 @@ export function selectClaudeCodeBetas(
   extraBetas: string[] = [],
   requestClass: ClaudeCodeRequestClass = 'main',
 ) {
+  // Each model's lists already carry its per-turn control beta and Claude
+  // Code's ordering for that model (see model-capabilities.ts).
+  const lists =
+    (body && resolveClaudeModelCapabilities(body.model)?.claudeCodeBetas) ||
+    CLAUDE_CODE_DEFAULT_BETAS
   // A conversation turn uses the main list even without tools or companion
   // fields. Only auxiliary one-token probes use the smaller quota list.
   const selected: string[] =
     requestClass === 'main'
-      ? [...CLAUDE_CODE_FULL_AGENT_BETAS]
+      ? [...lists.main]
       : body && isQuotaProbe(body)
-        ? [...CLAUDE_CODE_QUOTA_BETAS]
-        : [...CLAUDE_CODE_TITLE_BETAS]
+        ? [...lists.quota]
+        : [...lists.title]
 
   if (
     Array.isArray(body?.messages) &&
@@ -470,30 +433,6 @@ export function selectClaudeCodeBetas(
     !selected.includes(TURN_END_NOTE_BETA)
   )
     selected.push(TURN_END_NOTE_BETA)
-
-  // Claude Code 2.1.302 puts claude-code-20250219 after the prompt-caching
-  // scope beta on Haiku 5.5 requests instead of first.
-  if (body && isClaudeHaiku55Model(body.model)) {
-    const codeIndex = selected.indexOf(CLAUDE_CODE_BETA)
-    if (codeIndex >= 0) {
-      selected.splice(codeIndex, 1)
-      selected.splice(
-        selected.indexOf(PROMPT_CACHING_SCOPE_BETA) + 1,
-        0,
-        CLAUDE_CODE_BETA,
-      )
-    }
-  }
-
-  // Claude Code 2.1.302 sends per-turn control on these models directly after
-  // the prompt-caching scope beta (and after claude-code-20250219 where that
-  // follows it).
-  if (body && sendsPerTurnControlBeta(body.model)) {
-    let index = selected.indexOf(PROMPT_CACHING_SCOPE_BETA)
-    if (index >= 0 && selected[index + 1] === CLAUDE_CODE_BETA) index += 1
-    if (index >= 0) selected.splice(index + 1, 0, PER_TURN_CONTROL_BETA)
-    else selected.push(PER_TURN_CONTROL_BETA)
-  }
 
   if (body && hasStructuredOutput(body)) {
     const index = selected.indexOf('cache-diagnosis-2026-04-07')

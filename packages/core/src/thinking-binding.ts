@@ -1,10 +1,5 @@
 import type { AccountStorage } from './accounts.ts'
-import {
-  isClaudeFable51Model,
-  isClaudeHaiku55Model,
-  isClaudeOpus55Model,
-  isClaudeSonnet55Model,
-} from './models.ts'
+import { resolveClaudeModelCapabilities } from './model-capabilities.ts'
 
 export const THINKING_BINDING_CONTROLS_BETA =
   'thinking-binding-controls-2026-08-01'
@@ -54,12 +49,7 @@ export function applyThinkingBindingControls(
   behavior: ThinkingPrefixMismatchBehavior = 'account-default',
 ) {
   if (behavior === 'account-default') return false
-  if (
-    !isClaudeFable51Model(body.model) &&
-    !isClaudeOpus55Model(body.model) &&
-    !isClaudeSonnet55Model(body.model) &&
-    !isClaudeHaiku55Model(body.model)
-  )
+  if (!resolveClaudeModelCapabilities(body.model)?.thinkingBindingControls)
     return false
   if (!hasReplayableThinkingBlocks(body)) return false
   // block_binding is only defined for adaptive thinking. In particular,

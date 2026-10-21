@@ -2,10 +2,9 @@ import { createHash } from 'node:crypto'
 import {
   type AdaptiveEffort,
   defaultAdaptiveEffort,
-  isClaudeFable51Model,
-  isClaudeOpus55Model,
-  isClaudeSonnet55Model,
   normalizeAdaptiveEffort,
+  pinsEffortOnEveryRequest,
+  resolveClaudeModelCapabilities,
   supportsPerMessageEffort,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -117,10 +116,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * are left out, so a Fable 5.1 timeline never counts Opus 5.5 turns.
  */
 function perMessageEffortFamily(model: unknown): string | undefined {
-  if (isClaudeFable51Model(model)) return 'fable-5-1'
-  if (isClaudeOpus55Model(model)) return 'opus-5-5'
-  if (isClaudeSonnet55Model(model)) return 'sonnet-5-5'
-  return undefined
+  // Models whose capability row allows effort markers; the family is the
+  // row's id without its `claude-` prefix, such as `fable-5-1`.
+  const capabilities = resolveClaudeModelCapabilities(model)
+  if (!capabilities || capabilities.effortMarkers === 'none') return undefined
+  return capabilities.id.replace(/^claude-/, '')
 }
 
 function userEffortFamily(
@@ -706,9 +706,10 @@ export function applyOpenCodeEffortMarkers(
         'Fable 5.1 effort marker request plan mismatch',
       )
     }
-    // Only Fable 5.1 pins top-level effort on a request without surviving
-    // markers; the other models keep the host's request unchanged here.
-    if (enabled && isClaudeFable51Model(body.model)) {
+    // Only models with `effortMarkers: "always"` (Fable 5.1) pin top-level
+    // effort on a request without surviving markers; the other models keep
+    // the host's request unchanged here.
+    if (enabled && pinsEffortOnEveryRequest(body.model)) {
       const outputConfig = isRecord(body.output_config)
         ? { ...body.output_config }
         : {}
@@ -897,9 +898,10 @@ export function applyOpenCodeEffortMarkers(
     rewritten.push(message.value)
   }
   body.messages = rewritten
-  // Fable 5.1 always pins the earliest effort. The other models change
-  // top-level effort only when a marker carries the later effort.
-  if (applyConfig && (inserted > 0 || isClaudeFable51Model(body.model))) {
+  // Models with `effortMarkers: "always"` (Fable 5.1) always pin the earliest
+  // effort. The other models change top-level effort only when a marker
+  // carries the later effort.
+  if (applyConfig && (inserted > 0 || pinsEffortOnEveryRequest(body.model))) {
     const outputConfig = isRecord(body.output_config)
       ? { ...body.output_config }
       : {}

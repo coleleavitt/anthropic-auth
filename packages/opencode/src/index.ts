@@ -16,11 +16,7 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
-  CLAUDE_FABLE_MYTHOS_5_1_PRICING,
-  CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
-  CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
-  CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
   CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING,
@@ -79,7 +75,7 @@ import {
   getCache1hPersistentMode,
   getCacheKeepWindow,
   getClaudeCodeIdentityForVerifiedAccount,
-  getClaudeFableMythos5ReleaseDate,
+  getClaudeModelCatalogue,
   getClaustrumMode,
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
@@ -102,13 +98,9 @@ import {
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   isCacheKeepSubagentsEnabled,
-  isClaudeFable51Model,
   isClaudeFableOrMythos51Model,
-  isClaudeHaiku55Model,
-  isClaudeOpus5FamilyModel,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
-  isClaudeSonnet55Model,
   isCostZeroingEnabled,
   isCustodyTombstoneOAuth,
   isDumpPersistentlyEnabled,
@@ -188,6 +180,7 @@ import {
   refreshBackoffActive,
   remapRequestBodyModel,
   resetClaustrumEnrollmentState,
+  resolveClaudeModelCapabilities,
   resolveNativePoolPaths,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
@@ -933,9 +926,8 @@ function addNativeClaudeModels<
     ...models,
     ...Object.fromEntries(
       Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((spec) => {
-        const pricing = isClaudeFableOrMythos51Model(spec.id)
-          ? CLAUDE_FABLE_MYTHOS_5_1_PRICING
-          : CLAUDE_FABLE_MYTHOS_5_PRICING
+        const catalogue = getClaudeModelCatalogue(spec.id)
+        const pricing = catalogue.pricing
         return [
           spec.id,
           {
@@ -953,8 +945,8 @@ function addNativeClaudeModels<
             },
             limit: {
               ...(base.limit ?? {}),
-              context: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
-              output: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
+              context: catalogue.contextWindow,
+              output: catalogue.maxOutputTokens,
             },
             capabilities: {
               ...(base.capabilities ?? {}),
@@ -962,7 +954,7 @@ function addNativeClaudeModels<
               attachment: true,
               toolcall: true,
             },
-            release_date: getClaudeFableMythos5ReleaseDate(spec.id),
+            release_date: catalogue.releaseDate,
           },
         ]
       }),
@@ -1070,9 +1062,11 @@ const CLAUDE_NATIVE_ADAPTIVE_EFFORTS = [
   'max',
 ] as const
 
-function createNativeAdaptiveEffortVariants() {
+function createNativeAdaptiveEffortVariants(
+  efforts: readonly string[] = CLAUDE_NATIVE_ADAPTIVE_EFFORTS,
+) {
   return Object.fromEntries(
-    CLAUDE_NATIVE_ADAPTIVE_EFFORTS.map((effort) => [
+    efforts.map((effort) => [
       effort,
       {
         thinking: { type: 'adaptive', display: 'summarized' },
@@ -1088,13 +1082,11 @@ function applyNativeAdaptiveEffortVariants<
   return Object.fromEntries(
     Object.entries(models).map(([id, model]) => {
       const modelId = model.api?.id ?? model.id ?? id
+      const efforts = resolveClaudeModelCapabilities(modelId)?.efforts.variants
       return [
         id,
-        isClaudeOpus5FamilyModel(modelId) ||
-        isClaudeFable51Model(modelId) ||
-        isClaudeSonnet55Model(modelId) ||
-        isClaudeHaiku55Model(modelId)
-          ? { ...model, variants: createNativeAdaptiveEffortVariants() }
+        efforts
+          ? { ...model, variants: createNativeAdaptiveEffortVariants(efforts) }
           : model,
       ]
     }),

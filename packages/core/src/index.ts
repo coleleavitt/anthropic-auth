@@ -41,6 +41,24 @@ export * from './killswitch.ts'
 export * from './logger.ts'
 export * from './logging.ts'
 export * from './mid-conversation-output-config.ts'
+export type {
+  ClaudeCodeBetaLists,
+  ClaudeModelCapabilities,
+  ClaudeModelCatalogue,
+  ClaudeModelFamily,
+  ClaudeModelPricing,
+  ClaudeRefusalRecoveryFamily,
+} from './model-capabilities.ts'
+// Named rather than `export *`: the beta constants and the id normalizer are
+// already exported through the modules that have always exported them.
+export {
+  CLAUDE_CODE_DEFAULT_BETAS,
+  CLAUDE_MODEL_CAPABILITIES,
+  getClaudeModelCapabilities,
+  getClaudeModelCatalogue,
+  pinsEffortOnEveryRequest,
+  resolveClaudeModelCapabilities,
+} from './model-capabilities.ts'
 export * from './model-remap.ts'
 export * from './models.ts'
 export type {
