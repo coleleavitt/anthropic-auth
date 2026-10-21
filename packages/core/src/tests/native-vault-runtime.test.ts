@@ -338,30 +338,59 @@ test('vault close interrupts a pending connection and closes its late client exa
   expect(f.counts.closes).toBe(1)
 })
 
-test('shared discovery publishes the primary pin once for concurrent consumers', async () => {
-  const f = await fixture()
-  const a = acquireNativeVaultRuntime(f.options)
-  const b = acquireNativeVaultRuntime(f.options)
-  deferCleanup(() => {
-    a.close()
-    b.close()
-  })
-  const publish = spyOn(vaultRoster, 'mutateVaultRoster')
-  deferCleanup(() => publish.mockRestore())
-  let settingsWrites = 0
-  const originalRename = filesystem.rename
-  const rename = spyOn(filesystem, 'rename').mockImplementation((from, to) => {
-    if (to === f.vaultPaths.config) settingsWrites++
-    return originalRename(from, to)
-  })
-  deferCleanup(() => rename.mockRestore())
-  await Promise.all([a.refresh(), b.refresh()])
-  expect(f.counts.lists).toBe(1)
-  // Only discovery needs a roster transaction. Concurrent consumers still
-  // publish the primary-account settings once, under the settings locks.
-  expect(publish).toHaveBeenCalledTimes(1)
-  expect(settingsWrites).toBe(1)
-})
+for (const alreadyPinned of [false, true])
+  test(
+    alreadyPinned
+      ? 'shared discovery leaves an existing primary pin untouched for concurrent consumers'
+      : 'shared discovery publishes the primary pin once for concurrent consumers',
+    async () => {
+      const f = await fixture()
+      const expectedPin = {
+        mainAccountId: f.primaryRouteId,
+        claustrum: { primaryAccount: { credentialId: id, accountId: uuid } },
+      }
+      const readSettingsBytes = () => readFile(f.vaultPaths.config, 'utf8')
+      expect(JSON.parse(await readSettingsBytes())).toMatchObject(expectedPin)
+      // The fixture already persisted the pin. Remove it for the creation case
+      // so the rename counter measures work these refreshes actually need to do.
+      if (!alreadyPinned) {
+        await f.store.updateSettings((settings) => {
+          delete settings.mainAccountId
+          delete settings.claustrum
+        })
+        const unpinned = JSON.parse(await readSettingsBytes())
+        expect(unpinned).not.toHaveProperty('mainAccountId')
+        expect(unpinned).not.toHaveProperty('claustrum')
+      }
+      const before = await readSettingsBytes()
+      const a = acquireNativeVaultRuntime(f.options)
+      const b = acquireNativeVaultRuntime(f.options)
+      deferCleanup(() => {
+        a.close()
+        b.close()
+      })
+      const publish = spyOn(vaultRoster, 'mutateVaultRoster')
+      deferCleanup(() => publish.mockRestore())
+      let settingsWrites = 0
+      const originalRename = filesystem.rename
+      const rename = spyOn(filesystem, 'rename').mockImplementation(
+        (from, to) => {
+          if (to === f.vaultPaths.config) settingsWrites++
+          return originalRename(from, to)
+        },
+      )
+      deferCleanup(() => rename.mockRestore())
+      await Promise.all([a.refresh(), b.refresh()])
+      const after = await readSettingsBytes()
+      expect(JSON.parse(after)).toMatchObject(expectedPin)
+      expect(f.counts.lists).toBe(1)
+      // Only discovery needs a roster transaction. Settings are written once
+      // for a missing primary pin and left untouched for an already-matching pin.
+      expect(publish).toHaveBeenCalledTimes(1)
+      expect(settingsWrites).toBe(alreadyPinned ? 0 : 1)
+      if (alreadyPinned) expect(after).toBe(before)
+    },
+  )
 
 test('a released observer with a pending notification cannot stop the surviving vault poller', async () => {
   const f = await fixture()

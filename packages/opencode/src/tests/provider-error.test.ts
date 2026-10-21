@@ -1989,7 +1989,7 @@ test('OC1 absorbs real runtime lease loss after serving the intact reply', async
     ),
   ).toMatchObject([
     {
-      level: 'warn',
+      level: 'error',
       payload: { name: 'NativeRuntimeError', code: 'publication-refused' },
     },
   ])
