@@ -38,6 +38,10 @@ import {
   refreshedJoinAccess,
   refreshJoinMessage,
 } from '../../../core/src/tests/native-refresh-join-fixture.ts'
+import {
+  holdQuotaPublicationForRefresh,
+  quotaRefreshAccess,
+} from '../../../core/src/tests/native-refresh-quota-fixture.ts'
 import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
@@ -166,6 +170,53 @@ usageTests.test(
       retryable: false,
       message:
         'request refused: relay configuration is inconsistent; no request was sent',
+    })
+  },
+)
+
+usageTests.test(
+  'OC2 saved refresh serves the successor across a pending quota publication',
+  async () => {
+    const owned: Array<() => Promise<void> | void> = []
+    usageTests.deferCleanup(async () => {
+      for (const cleanup of owned.reverse()) await cleanup()
+    })
+    const held = holdQuotaPublicationForRefresh(usageTests)
+    const fixture = await local(
+      {
+        refreshToken: held.refreshToken,
+        resolveIdentity: async () => ({
+          accountUuid: identity as ProviderAccountUuid,
+          deviceId: 'fixture',
+          sessionId: 'fixture',
+        }),
+      },
+      owned,
+    )
+    const native = source(fixture.runtime, fixture.paths, owned)
+    const first = await native.authorizeAccount(scope, 'main')
+    if (first?.route !== 'oauth') throw new Error('Missing first authorization')
+    await held.poll(fixture.runtime)
+    const limit = await native.limitFromResponse!({
+      ...context(first.provenance),
+      status: 401,
+      headers: new Headers(),
+      body: async () => '',
+    })
+    expect(limit).toMatchObject({ status: 401 })
+    if (!limit) throw new Error('Missing retry limit')
+    await native.chooseAccount({
+      ...scope,
+      rerouteFrom: { accountId: 'main', limit },
+    })
+    expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
+      accessToken: quotaRefreshAccess,
+    })
+    expect(held.exchanges()).toBe(1)
+    expect(await fixture.runtime.authorizeLocal('main')).toMatchObject({
+      status: 'usable',
+      source: 'current',
+      access: quotaRefreshAccess,
     })
   },
 )

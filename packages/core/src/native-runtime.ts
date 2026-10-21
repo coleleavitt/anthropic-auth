@@ -1155,7 +1155,13 @@ function knownValidationEntry(
   publication: LocalValidationPublication,
 ): NativeRuntimeEntry {
   const { context, proof } = publication
-  if (!capturedResetContextMatches(old, context))
+  // Known-account validation replaces only credential proof, not quota state.
+  // A quota poll or reset may advance its markers while the provider is pending;
+  // preserve those current fields without invalidating the checked credentials.
+  // A refresh-error reset still prevents this validation from being published.
+  // First-identity publication checks all reset markers because it also discards
+  // metadata that has not been confirmed to belong to the identified account.
+  if ((old?.refreshErrorClearedAt ?? null) !== context.refreshErrorClearedAt)
     throw new NativeRuntimeError('publication-refused')
   if (!old) {
     if (context.runtimeBinding !== null)

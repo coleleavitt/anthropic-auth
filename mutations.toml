@@ -1472,3 +1472,19 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "known-validation-ignores-quota-only-marker-drift"
+guards = "A saved refresh remains usable when an existing quota writer advances its clear marker before credential validation."
+file = "packages/core/src/native-runtime.ts"
+old = "if ((old?.refreshErrorClearedAt ?? null) !== context.refreshErrorClearedAt)"
+new = "if (!capturedResetContextMatches(old, context)) // NON-VACUITY BREAK: fence credential proof on unrelated quota markers"
+test_file = "packages/core/src/tests/native-account-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["saved refresh remains usable when a pending quota writer clears its error"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

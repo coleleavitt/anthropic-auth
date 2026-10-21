@@ -21,6 +21,7 @@ import {
   createNativeAccountRuntime,
   nativeAccountPolicy,
 } from '../native-account-runtime.ts'
+import { nativeLocalCredentialValidationMatches } from '../native-credential-validation.ts'
 import {
   createNativeLocalCredentialService,
   type NativeLocalCredentialServiceOptions,
@@ -2182,6 +2183,116 @@ test('slow superseded poll publication cannot overwrite newer quota on disk', as
   ).toBe(2)
   expect(await f.store.read()).toEqual(before)
 })
+
+for (const resetRefresh of [false, true]) {
+  test(
+    resetRefresh
+      ? 'saved refresh still refuses a refresh-error reset during provider exchange'
+      : 'saved refresh remains usable when a pending quota writer clears its error',
+    async () => {
+      const held = gate()
+      const arrived = gate()
+      let exchanges = 0
+      const f = await fixture({
+        refreshToken: async () => {
+          exchanges++
+          // Complete the real poll's pending writer after context capture, but
+          // before the coordinator saves and validates the successor.
+          held.open()
+          await f.runtime.drainQuotaPublications()
+          if (resetRefresh) {
+            const subject = await f.runtime.captureLocalSubject('main')
+            expect(
+              await f.runtime.resetBackoff('main', subject, 'refresh'),
+            ).toBe(true)
+          }
+          return {
+            access: 'sk-ant-oat01-synthetic-successor',
+            refresh: 'synthetic-new-refresh',
+            expires: now + 4_000_000,
+            expiresIn: 4000,
+          }
+        },
+      })
+      const publish = f.runtime.publishLocal.bind(f.runtime)
+      const delayed = spyOn(f.runtime, 'publishLocal').mockImplementation(
+        async (subject, patch) => {
+          if (patch.quota) {
+            arrived.open()
+            await held.wait
+          }
+          return publish(subject, patch)
+        },
+      )
+      deferCleanup(() => delayed.mockRestore())
+      await f.runtime.fetchQuota(
+        'main',
+        Object.assign(async () => Response.json({}), {
+          preconnect: fetch.preconnect,
+        }),
+      )
+      await arrived.wait
+      const before = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+      expect(
+        before.status === 'ready' &&
+          before.state.accounts['imported-main']?.quotaErrorClearedAt,
+      ).toBeUndefined()
+      const result = await f.runtime.authorizeLocal('main', {
+        intent: 'refresh',
+      })
+      const pool = await f.store.read()
+      const saved = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+      if (pool.status !== 'ready' || saved.status !== 'ready')
+        throw new Error('Missing saved refresh')
+      const entry = saved.state.accounts['imported-main']!
+      const row = pool.rows.find((row) => row.id === 'imported-main')!
+      if (entry.binding.kind !== 'local')
+        throw new Error('Expected local binding')
+      expect(row.credential).toMatchObject({
+        access: 'sk-ant-oat01-synthetic-successor',
+        refresh: 'synthetic-new-refresh',
+      })
+      expect(entry.quotaErrorClearedAt).toBe(now)
+      expect(entry.lastRefreshError).toBeUndefined()
+      expect(entry.validationRetry).toBeUndefined()
+      if (resetRefresh) {
+        expect(result).toMatchObject({
+          status: 'failed',
+          persisted: true,
+          reconciliationFailed: true,
+        })
+        expect(entry.refreshErrorClearedAt).toBe(now)
+        expect(
+          nativeLocalCredentialValidationMatches(
+            entry.credentialValidation,
+            entry.binding,
+            row.credential,
+          ),
+        ).toBe(false)
+      } else {
+        expect(result).toMatchObject({
+          status: 'usable',
+          source: 'rotated',
+          access: 'sk-ant-oat01-synthetic-successor',
+        })
+        expect(
+          nativeLocalCredentialValidationMatches(
+            entry.credentialValidation,
+            entry.binding,
+            row.credential,
+          ),
+        ).toBe(true)
+      }
+      // A refused publication must not poison the durable successor. The next
+      // serve either uses its proof or validates it without another exchange.
+      expect(await f.runtime.authorizeLocal('main')).toMatchObject({
+        status: 'usable',
+        access: 'sk-ant-oat01-synthetic-successor',
+      })
+      expect(exchanges).toBe(1)
+    },
+  )
+}
 
 test('refused poll publication drops only its own pending reading with a fixed warning', async () => {
   const f = await fixture()

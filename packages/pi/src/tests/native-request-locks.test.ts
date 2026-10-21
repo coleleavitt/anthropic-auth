@@ -13,6 +13,10 @@ import {
   refreshedJoinAccess,
   refreshJoinMessage,
 } from '../../../core/src/tests/native-refresh-join-fixture.ts'
+import {
+  holdQuotaPublicationForRefresh,
+  quotaRefreshAccess,
+} from '../../../core/src/tests/native-refresh-quota-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
@@ -62,11 +66,14 @@ for (const scenario of [
   'join-proactive',
   'join-401',
   'join-deadline',
+  'quota-refresh',
 ] as const) {
   lifetimes.test(
-    scenario.startsWith('join-')
-      ? `Pi refresh join ${scenario.slice(5)} preserves valid-token admission`
-      : `Pi ${scenario} request observes only required foreground locks`,
+    scenario === 'quota-refresh'
+      ? 'Pi saved refresh serves the successor across a pending quota publication'
+      : scenario.startsWith('join-')
+        ? `Pi refresh join ${scenario.slice(5)} preserves valid-token admission`
+        : `Pi ${scenario} request observes only required foreground locks`,
     () =>
       trackPiTestBody(
         (async () => {
@@ -102,6 +109,10 @@ for (const scenario of [
           )
           const probe = requestLockProbe()
           const held = holdRefreshJoin(lifetimes)
+          const quotaRefresh =
+            scenario === 'quota-refresh'
+              ? holdQuotaPublicationForRefresh(lifetimes)
+              : undefined
           const identity = fixtureAccountIdentity('main')
           const client: NativeCustodyClient = {
             async listScoped() {
@@ -155,6 +166,13 @@ for (const scenario of [
               : {}),
             local: {
               onLockEvent: probe.onLockEvent,
+              ...(quotaRefresh
+                ? {
+                    refreshToken: quotaRefresh.refreshToken,
+                    resolveIdentity: async () =>
+                      getClaudeCodeIdentityForVerifiedAccount('main', identity),
+                  }
+                : {}),
               ...(scenario.startsWith('join-')
                 ? {
                     refreshToken: held.refreshToken,
@@ -202,7 +220,9 @@ for (const scenario of [
               completedAtDispatch.push(held.completed())
               probe.dispatch()
               if (
-                (scenario === 'join-401' || scenario === 'join-deadline') &&
+                (scenario === 'join-401' ||
+                  scenario === 'join-deadline' ||
+                  quotaRefresh) &&
                 sent.length === 1
               )
                 return Response.json(
@@ -221,6 +241,22 @@ for (const scenario of [
             },
             { preconnect: originalFetch.preconnect },
           )
+          if (quotaRefresh) {
+            await quotaRefresh.poll(runtime)
+            const result = await streamCortexKitAnthropic(model, context, {
+              sessionId: 'quota-refresh',
+            }).result()
+            expect(result.stopReason).toBe('stop')
+            expect(sent).toHaveLength(2)
+            expect(sent[1]).toBe(`Bearer ${quotaRefreshAccess}`)
+            expect(quotaRefresh.exchanges()).toBe(1)
+            expect(await runtime.authorizeLocal('main')).toMatchObject({
+              status: 'usable',
+              source: 'current',
+              access: quotaRefreshAccess,
+            })
+            return
+          }
           if (scenario.startsWith('join-')) {
             const send = (sessionId: string) =>
               streamCortexKitAnthropic(model, context, { sessionId }).result()

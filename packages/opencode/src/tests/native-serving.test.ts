@@ -48,6 +48,10 @@ import {
   refreshedJoinAccess,
   refreshJoinMessage,
 } from '../../../core/src/tests/native-refresh-join-fixture.ts'
+import {
+  holdQuotaPublicationForRefresh,
+  quotaRefreshAccess,
+} from '../../../core/src/tests/native-refresh-quota-fixture.ts'
 import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
@@ -1033,6 +1037,56 @@ test('supervised content after real migration refuses foreground and background 
   const plugin = await createPlugin()
   await expect(sendNative(plugin)).rejects.toThrow('OPENCODE_AUTH_CONTENT')
   expect(fixture.records).toHaveLength(0)
+})
+
+test('OC1 saved refresh serves the successor across a pending quota publication', async () => {
+  const fixture = await migrateServingFixture('local')
+  const warmup = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  const admitted = await warmup.authorizeLocal('main')
+  await warmup.close()
+  if (admitted.status !== 'usable')
+    throw new Error('Missing initial authorization')
+  const held = holdQuotaPublicationForRefresh(lifetimes)
+  const local = {
+    refreshToken: held.refreshToken,
+    resolveIdentity: async () => ({
+      accountUuid: mainIdentity as ProviderAccountUuid,
+      deviceId: 'fixture',
+      sessionId: 'fixture',
+    }),
+  }
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    local,
+  })
+  lifetimes.deferCleanup(() => runtime.close())
+  await held.poll(runtime)
+  const sent: string[] = []
+  network.mockImplementation((input, init) => {
+    const url = input instanceof Request ? input.url : input.toString()
+    if (url.includes('/v1/messages')) {
+      sent.push(new Headers(init?.headers).get('authorization') ?? '')
+      if (sent.length === 1)
+        return Promise.resolve(Response.json({}, { status: 401 }))
+    }
+    return fixture.fetchProvider(input, init)
+  })
+  const plugin = await createPlugin({ nativeLocal: local })
+  expect((await sendNative(plugin)).status).toBe(200)
+  expect(sent).toEqual([
+    `Bearer ${admitted.access}`,
+    `Bearer ${quotaRefreshAccess}`,
+  ])
+  expect(held.exchanges()).toBe(1)
+  expect(await runtime.authorizeLocal('main')).toMatchObject({
+    status: 'usable',
+    source: 'current',
+    access: quotaRefreshAccess,
+  })
 })
 
 for (const scenario of ['proactive', '401', 'deadline'] as const) {

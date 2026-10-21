@@ -11,6 +11,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Accounts
 
+- A successful token refresh no longer fails a request just because a quota check finished while it was refreshing.
 - Valid tokens no longer wait for proactive refreshes; requests waiting for a rejected-token refresh fail retryably after two seconds while the refresh continues.
 
 ### Dependencies

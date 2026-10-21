@@ -491,17 +491,30 @@ for (const key of [
   'quotaErrorClearedAt',
   'quotaErrorGeneration',
 ]) {
-  test(`known publication keeps null zero and safe ${key} semantics`, async () => {
+  test(`known publication validates ${key} and preserves current reset state`, async () => {
     for (const [captured, current] of [
       [null, 0],
       [0, null],
       [1, 2],
     ]) {
       const f = await fixture(current === null ? {} : { [key]: current })
-      await refused(f, {
+      const event = {
         ...f.event,
         context: { ...f.event.context, [key]: captured },
-      })
+      }
+      if (key === 'refreshErrorClearedAt') {
+        await refused(f, event)
+      } else {
+        const next = await publishNativeLocalCredentialValidation(
+          f.paths,
+          event,
+        )
+        if (!f.runtime.accounts.row) throw new Error('Missing metadata')
+        expect(next.accounts.row).toEqual({
+          ...f.runtime.accounts.row,
+          credentialValidation: f.subject,
+        })
+      }
     }
     for (const invalid of [0.5, -1, Number.MAX_SAFE_INTEGER + 1, undefined]) {
       const f = await fixture()
@@ -511,10 +524,22 @@ for (const key of [
       })
     }
     const missing = await fixture({}, true)
-    await refused(missing, {
+    const event = {
       ...missing.event,
       context: { ...missing.event.context, [key]: 0 },
-    })
+    }
+    if (key === 'refreshErrorClearedAt') {
+      await refused(missing, event)
+    } else {
+      const next = await publishNativeLocalCredentialValidation(
+        missing.paths,
+        event,
+      )
+      expect(next.accounts.row).toEqual({
+        binding: missing.subject.binding,
+        credentialValidation: missing.subject,
+      })
+    }
   })
 }
 test('known publication preserves recorded zero floors and generation', async () => {
