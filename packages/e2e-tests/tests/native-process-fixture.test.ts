@@ -435,7 +435,7 @@ const configDepsInstalled = await lstat(
   () => false,
 )
 
-/** The check OpenCode 1.18.18 makes before skipping its own install (npm.ts Npm.install). */
+/** The check OpenCode 1.19.3 makes before skipping its own install (npm.ts Npm.install). */
 async function opencodeWouldSkipInstall(dir: string) {
   if (!(await exists(join(dir, 'node_modules')))) return false
   const manifest = JSON.parse(await readFile(join(dir, 'package.json'), 'utf8'))
@@ -485,7 +485,7 @@ describe('OpenCode config-directory dependency fixture', () => {
             'utf8',
           ),
         )
-        expect(plugin.version).toBe('1.18.18')
+        expect(plugin.version).toBe('1.19.3')
         expect(
           (
             await lstat(
@@ -506,7 +506,7 @@ describe('OpenCode config-directory dependency fixture', () => {
               'utf8',
             ),
           ).version,
-        ).toBe('1.18.18')
+        ).toBe('1.19.3')
       }
     }),
   )

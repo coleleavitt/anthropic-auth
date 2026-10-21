@@ -30,8 +30,8 @@ type HostRuntimeFixture = {
 
 const hostRuntimeFixtures: [HostRuntimeFixture, HostRuntimeFixture] = [
   {
-    id: 'opencode-1-18-18',
-    label: 'OpenCode 1.18.18 OpenTUI/Solid library pair',
+    id: 'opencode-1-19-3',
+    label: 'OpenCode 1.19.3 OpenTUI/Solid library pair',
     core: '0.4.5',
     keymap: '0.4.5',
     solid: '0.4.5',
