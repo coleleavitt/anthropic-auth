@@ -881,7 +881,9 @@ test('quota poll serves its reading while runtime sync is held and dispose drain
   const f = await startBody({ quotaEnabled: false, fallbackUsed: 20 })
   await f.startupSweep
   const held = lifetimes.gate()
-  const arrived = signal()
+  // A publication may never reach the spy. Release its arrival wait on teardown
+  // so a timed-out body can settle before the lifetime restores fetch and files.
+  const arrived = lifetimes.gate()
   const stallDeadline = () =>
     new Promise<string>((resolve) =>
       setTimeout(() => resolve('blocked on sync'), 250),
@@ -900,7 +902,7 @@ test('quota poll serves its reading while runtime sync is held and dispose drain
             staged.accounts[FALLBACK_ID]?.quotaErrorClearedAt
           ) {
             intercepted = true
-            arrived.resolve()
+            arrived.open()
             await held.wait
           }
           return sync()
@@ -911,7 +913,10 @@ test('quota poll serves its reading while runtime sync is held and dispose drain
   )
   lifetimes.deferCleanup(() => openSpy.mockRestore())
   const request = f.request()
-  await arrived.promise
+  await arrived.wait
+  // Teardown also opens this gate after a timeout and stops the plugin.
+  // Do not continue into its account reads or requests without an interception.
+  if (!intercepted) return
   const result = await Promise.race([
     request.then(() => 'served'),
     stallDeadline(),
