@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.2.0
 
 ### Sidebar
 
@@ -14,7 +14,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - A successful token refresh no longer fails a request just because a quota check finished while it was refreshing.
 - Valid tokens no longer wait for proactive refreshes; requests waiting for a rejected-token refresh fail retryably after two seconds while the refresh continues.
 - Prevent repeated long replies after housekeeping calls on supported OAuth models in OpenCode 1, OpenCode 2 and Pi. Add a turn-scoped reminder after tool results when the reply has at least 350 visible characters and every call is in `turnEndNote.tools` (default `board` and `ctx_reduce`; an empty list disables it). Replay earlier reminders unchanged for prompt caching, except when a reminder would sit directly before a user message; Anthropic rejects that placement. API-key routes are unchanged.
-
 
 ### Dependencies
 
