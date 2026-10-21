@@ -328,12 +328,15 @@ for (const scenario of [
               (event) => event.name === 'native-runtime',
             ),
           ).toBe(true)
+          // Vault bookkeeping after the reply writes runtime state under its own
+          // lock only; it must never take the shared roster lock, which other
+          // processes need for quota readings and discovery.
           if (scenario === 'vault-healthy')
             expect(
               probe.afterDispatch.some(
                 (event) => event.name === 'claustrum-roster-write',
               ),
-            ).toBe(true)
+            ).toBe(false)
         })(),
       ),
     scenario.startsWith('join-') ? 8_000 : undefined,
