@@ -132,6 +132,7 @@ import {
   isQuotaStale,
   logger,
   quotaDisplayProjection,
+  quotaTextParts,
 } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
@@ -949,6 +950,130 @@ export function formatQuotaRowLabel(name: string, width = 10): string {
     label += '…'
   }
   return label + ' '.repeat(Math.max(0, width - Bun.stringWidth(label)))
+}
+
+/**
+ * The short names model-scoped rows read under, in the order of `quota.scoped`:
+ * the names common-auth's narrow one-line form gives them (`Fa` for Fable;
+ * models whose short names would collide are extended until they differ, as
+ * `Fabl` and `Fabr`), so the expanded rows and the collapsed line agree.
+ *
+ * common-auth exposes that short name only inside the narrow text, and the
+ * narrow line shows just one model window (the tightest). So each window's
+ * name is read from a narrow line of a copy of the reading in which that
+ * window alone is spent: every model window stays in, so collisions resolve
+ * exactly as they do in the real line, and the one piece the line shows is
+ * `<short name> 0% left`. The figures in the copy are never displayed.
+ */
+export function scopedQuotaShortNames(
+  quota: Pick<AccountQuota, 'scoped'> | null | undefined,
+  now = Date.now(),
+): string[] {
+  const scoped = quota?.scoped ?? []
+  return scoped.map((window, index) => {
+    const probe = quotaDisplayProjection(
+      {
+        scoped: scoped.map((other, at) => ({
+          ...other,
+          usedPercent: at === index ? 100 : 0,
+          remainingPercent: at === index ? 0 : 100,
+          checkedAt: now,
+        })),
+      },
+      now,
+    )
+    const piece = quotaTextParts(probe, { now, form: 'narrow' })[0]
+    const name = piece?.replace(/ 0% left$/, '')
+    return name && name !== piece ? name : window.title
+  })
+}
+
+/**
+ * The width of the quota rows' label column: the longest label any of these
+ * accounts shows. `5h` and `7d` always show, so it is at least 2.
+ */
+export function quotaLabelColumnWidth(
+  quotas: readonly (AccountQuota | null | undefined)[],
+  now = Date.now(),
+): number {
+  return Math.max(
+    2,
+    ...quotas.flatMap((quota) =>
+      scopedQuotaShortNames(quota, now).map((name) => Bun.stringWidth(name)),
+    ),
+  )
+}
+
+/** The narrowest a quota row's bar shrinks to. */
+export const QUOTA_BAR_MIN_CELLS = 3
+
+export interface QuotaRowFit {
+  /** Bar cells to draw. */
+  barCells: number
+  /** The reset text to draw at the right edge, or undefined for none. */
+  reset?: string
+}
+
+/**
+ * Fits one quota row into `width` cells. The row reads `label bar figure` on
+ * the left and the reset at the right edge, with a one-cell gap before the
+ * reset that the caller always draws. When the full row is too wide, the
+ * reset is dropped first, so the figure (the percent left) is never cut to
+ * keep it; then the bar shrinks, down to `QUOTA_BAR_MIN_CELLS`. A row still
+ * too wide at that point keeps the minimum bar and is cut at the right edge
+ * by the caller's no-wrap text, which cuts the figure's end. Without a
+ * measured width the full row is used.
+ */
+export function fitQuotaRow(input: {
+  width: number | undefined
+  labelWidth: number
+  barWidth: number
+  /** The figure with any binding marker, such as `97% left •`. */
+  figure: string
+  reset?: string
+}): QuotaRowFit {
+  const { width, labelWidth, barWidth, figure, reset } = input
+  const full: QuotaRowFit = { barCells: barWidth, reset: reset || undefined }
+  if (width === undefined) return full
+  const cells = (fit: QuotaRowFit) =>
+    labelWidth +
+    1 +
+    (fit.barCells > 0 ? fit.barCells + 1 : 0) +
+    Bun.stringWidth(figure) +
+    (fit.reset ? 1 + Bun.stringWidth(fit.reset) : 0)
+  const minimum = Math.min(QUOTA_BAR_MIN_CELLS, barWidth)
+  const candidates: QuotaRowFit[] = [full]
+  for (let barCells = barWidth; barCells >= minimum; barCells--) {
+    candidates.push({ barCells })
+  }
+  return candidates.find((fit) => cells(fit) <= width) ?? { barCells: minimum }
+}
+
+/**
+ * The pacing subline for a window that is off pace: `deficit 12% · out in
+ * 1d23h` for a deficit that runs out before the reset, otherwise the delta
+ * and `lasts to reset` (`reserve 4% · lasts to reset`). When it is wider than
+ * `width` cells it is cut to fit and ends in `…` rather than wrapping. Null
+ * when there is no pacing or the window is on pace.
+ */
+export function fitPaceLine(
+  pacing: QuotaPacing | null,
+  width: number | undefined,
+  runsOutIn: string | undefined,
+): string | null {
+  if (!pacing || pacing.state === 'on-pace') return null
+  const head = `${pacing.state} ${Math.round(Math.abs(pacing.deltaPercent))}%`
+  const line = runsOutIn
+    ? `${head} \u00b7 out in ${runsOutIn}`
+    : `${head} \u00b7 lasts to reset`
+  if (width === undefined || Bun.stringWidth(line) <= width) return line
+  if (width <= 0) return ''
+  let cut = ''
+  for (const character of line) {
+    if (Bun.stringWidth(cut + character) > width - 1) break
+    cut += character
+  }
+  return `${cut.trimEnd()}\u2026`
 }
 
 export function getCollapsedQuotaSummary(

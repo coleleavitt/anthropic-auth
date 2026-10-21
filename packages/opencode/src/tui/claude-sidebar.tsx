@@ -29,15 +29,19 @@ import {
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
+  fitPaceLine,
+  fitQuotaRow,
   formatPrimeAccountValue,
   formatQuotaRowLabel,
   getCollapsedAccounts,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   type QuotaPacing,
+  quotaLabelColumnWidth,
   resolveActiveAccount,
   SEVEN_DAY_MS,
   type SidebarState,
+  scopedQuotaShortNames,
 } from '../sidebar-state.js'
 import {
   type AnthropicAuthTuiPrefs,
@@ -131,8 +135,9 @@ function quotaBarSegments(
   usedPct: number,
   appearance: AppearancePrefs,
   pacing: QuotaPacing | null,
+  width: number,
 ): BarSegment[] {
-  const width = appearance.barWidth
+  if (width <= 0) return []
   const cells = (pct: number) =>
     Math.max(0, Math.min(Math.round((pct / 100) * width), width))
   const usedCells = cells(usedPct)
@@ -292,14 +297,35 @@ function CollapsedAccountRow(props: {
   )
 }
 
-// Quota window row: muted label left, tone-colored bar + shared figure right,
-// with an optional muted reset suffix. When pacing data is present, the bar
-// gains a pace segment and an off-pace window adds a muted subline with the
-// reserve/deficit delta and the projected runout.
+// One cell run of a single-line row: drawn at its own width, never shrunk and
+// never wrapped, so the row's layout is exactly what `fitQuotaRow` measured.
+function Cell(props: { fg: SidebarColor; text: string }) {
+  return (
+    <text
+      width={Bun.stringWidth(props.text)}
+      flexShrink={0}
+      wrapMode='none'
+      fg={props.fg}
+    >
+      {props.text}
+    </text>
+  )
+}
+
+// Quota window row: muted label left in a column `labelWidth` wide, then the
+// tone-colored bar and the shared figure, and the muted reset at the right
+// edge. The row is one line: `fitQuotaRow` drops detail to fit `width`
+// instead of letting it wrap. When pacing data is present, the bar gains a
+// pace segment and an off-pace window adds a one-line subline under the bar
+// with the reserve/deficit delta and either the projected runout or
+// `lasts to reset`.
 function QuotaRow(props: {
   theme: SidebarTheme
   appearance: AppearancePrefs
   label: string
+  labelWidth: number
+  /** The row's laid-out width, undefined until the first layout. */
+  width: number | undefined
   part: QuotaWindowPart | undefined
   usedPercent: number | undefined
   pacing: QuotaPacing | null
@@ -307,68 +333,86 @@ function QuotaRow(props: {
   now: number
 }) {
   const used = () => props.usedPercent ?? 0
-  const reset = () => props.part?.resetIn
-  const paceLine = () => {
-    const pacing = props.pacing
-    if (!pacing || pacing.state === 'on-pace') return null
-    const pct = Math.round(Math.abs(pacing.deltaPercent))
-    if (pacing.state === 'reserve') return `reserve ${pct}% \u00b7 lasts`
-    return pacing.runsOutAt
-      ? `deficit ${pct}% \u00b7 out in ${formatResetIn(pacing.runsOutAt, props.now)}`
-      : `deficit ${pct}% \u00b7 lasts`
-  }
+  const labelCell = () =>
+    `${props.label}${' '.repeat(Math.max(0, props.labelWidth - Bun.stringWidth(props.label)))} `
+  const figure = () =>
+    `${props.part?.figure ?? ''}${props.binding ? ' \u2022' : ''}`
+  const fit = () =>
+    fitQuotaRow({
+      width: props.width,
+      labelWidth: props.labelWidth,
+      barWidth: props.appearance.barWidth,
+      figure: figure(),
+      reset: props.part?.resetIn,
+    })
+  const paceLine = () =>
+    fitPaceLine(
+      props.pacing,
+      props.width === undefined
+        ? undefined
+        : props.width - props.labelWidth - 1,
+      props.pacing?.runsOutAt
+        ? formatResetIn(props.pacing.runsOutAt, props.now)
+        : undefined,
+    )
   return (
     <Show
       when={props.part}
       fallback={
-        <box width='100%' flexDirection='row'>
-          <text
-            fg={props.theme.textMuted}
-          >{`${formatQuotaRowLabel(props.label)} `}</text>
-          <text fg={props.theme.textMuted}>{'\u2014'}</text>
+        <box width='100%' height={1} flexDirection='row'>
+          <Cell fg={props.theme.textMuted} text={`${labelCell()}\u2014`} />
         </box>
       }
     >
-      {/* Left group (label · bar · figure) stays left-aligned in fixed columns so
-          bars and figures line up across rows; the reset time is pushed to
-          the right edge so reset times align in their own right column. */}
-      <box width='100%' flexDirection='row' justifyContent='space-between'>
-        <box flexDirection='row'>
-          <text
-            fg={props.theme.textMuted}
-          >{`${formatQuotaRowLabel(props.label)} `}</text>
-          {/* Index: the clock rebuilds the segments, which must not remount. */}
-          <Index
-            each={quotaBarSegments(used(), props.appearance, props.pacing)}
-          >
-            {(segment) => (
-              <text fg={toneColor(props.theme, segment().tone)}>
-                {segment().text}
-              </text>
-            )}
-          </Index>
-          <text
-            fg={toneColor(props.theme, usageTone(used(), props.appearance))}
-          >
-            {` ${props.part?.figure}${props.binding ? ' •' : ''}`}
-          </text>
-        </box>
-        <Show when={reset()}>
-          <text fg={props.theme.textMuted}>{reset()}</text>
+      {/* The label column is the same width in every row, so bars start in
+          one column; a bar shrinks only when its row needs the room. The
+          reset is pushed to the right edge, always at least one space after
+          the figure. */}
+      <box width='100%' height={1} flexDirection='row'>
+        <Cell fg={props.theme.textMuted} text={labelCell()} />
+        {/* Index: the clock rebuilds the segments, which must not remount. */}
+        <Index
+          each={quotaBarSegments(
+            used(),
+            props.appearance,
+            props.pacing,
+            fit().barCells,
+          )}
+        >
+          {(segment) => (
+            <Cell
+              fg={toneColor(props.theme, segment().tone)}
+              text={segment().text}
+            />
+          )}
+        </Index>
+        <Cell
+          fg={toneColor(props.theme, usageTone(used(), props.appearance))}
+          text={`${fit().barCells > 0 ? ' ' : ''}${figure()}`}
+        />
+        <box flexGrow={1} />
+        <Show when={fit().reset}>
+          {(reset: () => string) => (
+            <Cell fg={props.theme.textMuted} text={` ${reset()}`} />
+          )}
         </Show>
       </box>
       <Show when={paceLine()}>
-        <box width='100%' flexDirection='row'>
-          <text fg={props.theme.textMuted}>{formatQuotaRowLabel('', 11)}</text>
-          <text
-            fg={toneColor(
-              props.theme,
-              props.pacing?.state === 'deficit' ? 'warn' : 'muted',
-            )}
-          >
-            {paceLine()}
-          </text>
-        </box>
+        {(line: () => string) => (
+          <box width='100%' height={1} flexDirection='row'>
+            <Cell
+              fg={props.theme.textMuted}
+              text={' '.repeat(props.labelWidth + 1)}
+            />
+            <Cell
+              fg={toneColor(
+                props.theme,
+                props.pacing?.state === 'deficit' ? 'warn' : 'muted',
+              )}
+              text={line()}
+            />
+          </box>
+        )}
       </Show>
     </Show>
   )
@@ -405,6 +449,11 @@ export function AccountBlock(props: {
   stateLine?: string
   quotaDated?: boolean
   tierLabel?: string
+  /**
+   * The quota rows' label column width, shared across the sidebar's accounts
+   * so their bars line up; defaults to this account's own longest label.
+   */
+  labelWidth?: number
   marginTop?: number
   now: number
 }) {
@@ -439,8 +488,25 @@ export function AccountBlock(props: {
     })
   const partFor = (name: string) =>
     parts().windows.find((part) => part.name === name)
+  const scopedLabels = () => scopedQuotaShortNames(props.quota, props.now)
+  const labelWidth = () =>
+    props.labelWidth ?? quotaLabelColumnWidth([props.quota], props.now)
+  // The block's laid-out width, read when it mounts and on each resize. Quota
+  // rows drop or shrink detail to fit it (and are cut at the edge when even
+  // that is not enough); pacing sublines are cut to fit. Undefined until layout.
+  const [width, setWidth] = createSignal<number>()
+  let block: BoxRenderable | undefined
   return (
-    <box width='100%' flexDirection='column' marginTop={props.marginTop ?? 0}>
+    <box
+      width='100%'
+      flexDirection='column'
+      marginTop={props.marginTop ?? 0}
+      ref={(element: BoxRenderable) => {
+        block = element
+        setWidth(element.width || undefined)
+      }}
+      onSizeChange={() => setWidth(block?.width || undefined)}
+    >
       <box width='100%' flexDirection='row' justifyContent='space-between'>
         <text fg={props.theme.text}>
           <b>{`${props.name}${props.tierLabel ? ` · ${props.tierLabel}` : ''}`}</b>
@@ -460,6 +526,8 @@ export function AccountBlock(props: {
           theme={props.theme}
           appearance={props.appearance}
           label='5h'
+          labelWidth={labelWidth()}
+          width={width()}
           part={partFor('5h')}
           usedPercent={props.quota?.five_hour?.usedPercent}
           pacing={pacingFor(props.quota?.five_hour, FIVE_HOUR_MS)}
@@ -470,6 +538,8 @@ export function AccountBlock(props: {
           theme={props.theme}
           appearance={props.appearance}
           label='7d'
+          labelWidth={labelWidth()}
+          width={width()}
           part={partFor('7d')}
           usedPercent={props.quota?.seven_day?.usedPercent}
           pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
@@ -477,11 +547,13 @@ export function AccountBlock(props: {
           now={props.now}
         />
         <For each={props.quota?.scoped ?? []}>
-          {(window) => (
+          {(window, index) => (
             <QuotaRow
               theme={props.theme}
               appearance={props.appearance}
-              label={partFor(window.title)?.name ?? window.title}
+              label={scopedLabels()[index()] ?? window.title}
+              labelWidth={labelWidth()}
+              width={width()}
               part={partFor(window.title)}
               usedPercent={window.usedPercent}
               pacing={pacingFor(window, SEVEN_DAY_MS)}
@@ -491,40 +563,26 @@ export function AccountBlock(props: {
           )}
         </For>
         <Show when={partFor('credits')}>
-          {(budget: () => QuotaWindowPart) => {
-            // The line box's laid-out width, read when it mounts and on each
-            // resize. It is undefined (amounts keep their cents) until layout.
-            const [width, setWidth] = createSignal<number>()
-            let line: BoxRenderable | undefined
-            return (
-              <box
-                width='100%'
-                ref={(element: BoxRenderable) => {
-                  line = element
-                  setWidth(element.width || undefined)
-                }}
-                onSizeChange={() => setWidth(line?.width || undefined)}
+          {(budget: () => QuotaWindowPart) => (
+            // One line in the block's width: amounts drop their cents rather
+            // than wrap, and keep them until the first layout.
+            <box width='100%' height={1} flexDirection='row'>
+              <text
+                wrapMode='none'
+                fg={toneColor(
+                  props.theme,
+                  props.quota?.extraUsage?.severity === 'critical'
+                    ? 'err'
+                    : props.quota?.extraUsage?.severity === 'warning' ||
+                        props.quota?.extraUsage?.exhausted
+                      ? 'warn'
+                      : 'muted',
+                )}
               >
-                <text
-                  fg={toneColor(
-                    props.theme,
-                    props.quota?.extraUsage?.severity === 'critical'
-                      ? 'err'
-                      : props.quota?.extraUsage?.severity === 'warning' ||
-                          props.quota?.extraUsage?.exhausted
-                        ? 'warn'
-                        : 'muted',
-                  )}
-                >
-                  {creditLine(
-                    budget().figure,
-                    props.quota?.extraUsage,
-                    width(),
-                  )}
-                </text>
-              </box>
-            )
-          }}
+                {creditLine(budget().figure, props.quota?.extraUsage, width())}
+              </text>
+            </box>
+          )}
         </Show>
         <Show when={parts().age}>
           <text fg={props.theme.textMuted}>{parts().age}</text>
@@ -634,6 +692,17 @@ export function ClaudeSidebar(props: {
     state().main?.quota != null ||
     state().main?.stateLine != null ||
     enabledFallbacks().length > 0
+  // One label column for every expanded account, so all their bars line up.
+  const quotaLabelWidth = () =>
+    quotaLabelColumnWidth(
+      [
+        state().main?.quota,
+        ...(prefs().sections.fallbackAccounts
+          ? enabledFallbacks().map((fallback) => fallback.quota)
+          : []),
+      ],
+      now(),
+    )
 
   const headerLabel = () => {
     const name = prefs().header.label
@@ -821,6 +890,7 @@ export function ClaudeSidebar(props: {
               active={state().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
               tierLabel={state().main?.tierLabel}
+              labelWidth={quotaLabelWidth()}
               stateLine={state().main?.stateLine}
               quotaDated={state().main?.quotaDated}
               now={now()}
@@ -836,6 +906,7 @@ export function ClaudeSidebar(props: {
                     active={state().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
                     tierLabel={fb.tierLabel}
+                    labelWidth={quotaLabelWidth()}
                     needsReauth={fb.needsReauth}
                     vaultReauth={fb.vaultReauth}
                     stateLine={fb.stateLine}

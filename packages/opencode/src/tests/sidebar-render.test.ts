@@ -3,6 +3,10 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  expectOneLineQuotaRows,
+  fiveAccountSidebarState,
+} from './fixtures/sidebar-five-accounts'
 
 let child: Bun.Subprocess<'ignore', 'pipe', 'pipe'> | undefined
 let fixture: string | undefined
@@ -26,9 +30,9 @@ async function renderSidebar(
   state: unknown,
   wanted: string[],
   collapsed = false,
-  options: { rewrite?: Rewrite; width?: number } = {},
+  options: { rewrite?: Rewrite; width?: number; height?: number } = {},
 ) {
-  const { rewrite, width = 42 } = options
+  const { rewrite, width = 42, height = 32 } = options
   fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-'))
   const stateFile = join(fixture, 'sidebar.json')
   await writeFile(stateFile, JSON.stringify(state))
@@ -67,7 +71,7 @@ const sidebar = registered.find((value) => value.slots?.sidebar_content)?.slots.
 if (!sidebar) throw new Error('sidebar slot was not registered');
 let destroyed;
 const teardown = new Promise((resolve) => { destroyed = resolve; });
-const setup = await createTestRenderer({ width: ${width}, height: 32, onDestroy() { destroyed(); } });
+const setup = await createTestRenderer({ width: ${width}, height: ${height}, onDestroy() { destroyed(); } });
 let pending;
 const observe = () => {
   if (!pending) return;
@@ -381,7 +385,7 @@ test('collapsed account rows keep their renderables across same-value state upda
   expect(stdout).toContain('5h 88% · 7d 70% left')
 })
 
-test('42-column sidebar renders full scoped names credits and stale fallback rows in aligned columns', async () => {
+test('42-column sidebar renders short scoped names credits and stale fallback rows in aligned columns', async () => {
   const now = Date.now()
   const window = (used: number, checkedAt = now, resetMinutes?: number) => ({
     usedPercent: used,
@@ -431,7 +435,7 @@ test('42-column sidebar renders full scoped names credits and stale fallback row
       lastUpdated: now,
     },
     [
-      'Fable only',
+      'Fa ████████░░ 22% left',
       'credits 75% left · $12.50/$50.00',
       'work',
       'checked 1d6h ago',
@@ -439,7 +443,8 @@ test('42-column sidebar renders full scoped names credits and stale fallback row
   )
   expect(stdout).toContain('38% left')
   expect(stdout).toContain('59% left')
-  expect(stdout).toContain('Fable only ████████░░ 22% left')
+  expect(stdout).toContain('Fa ████████░░ 22% left')
+  expect(stdout).not.toContain('Fable')
   expect(stdout).toContain('credits 75% left · $12.50/$50.00')
   expect(stdout).toContain('92% left')
   expect(stdout).toContain('7% left')
@@ -449,7 +454,7 @@ test('42-column sidebar renders full scoped names credits and stale fallback row
     .filter((line) => /38% left|59% left|22% left|92% left|7% left/.test(line))
   expect(rows).toHaveLength(5)
   expect(new Set(rows.map((line) => line.search(/[█░▓▒]/)))).toEqual(
-    new Set([12]),
+    new Set([4]),
   )
 })
 
@@ -491,4 +496,118 @@ test('a wider sidebar keeps the cents on credit amounts that fit', async () => {
   )
   const line = stdout.split('\n').find((row) => row.includes('credits'))
   expect(line?.trim()).toBe('credits 75% left · $125,000.00/$500,000.00')
+})
+
+const FIVE_ACCOUNTS = ['main', 'work', 'personal', 'team', 'backup']
+
+// OpenCode 1.18's session sidebar is 42 cells with 2 cells of padding each
+// side, and its scrollbox puts a 1-cell scrollbar beside a slot box padded 1
+// on the right, so a plugin gets 36 cells once the sidebar overflows.
+for (const width of [36, 42]) {
+  test(`${width}-column sidebar keeps every quota row and pacing subline of five accounts on one line`, async () => {
+    const stdout = await renderSidebar(
+      fiveAccountSidebarState(),
+      ['backup', 'checked 1d6h ago', 'Routing'],
+      false,
+      { width, height: 70 },
+    )
+    const rows = expectOneLineQuotaRows(stdout, FIVE_ACCOUNTS)
+    expect(rows).toHaveLength(15)
+    expect(rows.map((row) => row.trim().split(' ')[0])).toEqual(
+      FIVE_ACCOUNTS.flatMap(() => ['5h', '7d', 'Fa']),
+    )
+    expect(stdout).not.toContain('Fable')
+    // One label column: every bar starts in the same cell.
+    expect(new Set(rows.map((row) => row.search(/[█░▓▒]/)))).toEqual(
+      new Set([4]),
+    )
+    // Every row here fits whole, so each keeps its reset after a space.
+    for (const row of rows) expect(row).toMatch(/left( •)? +\d+[a-z]/)
+    expect(stdout).toMatch(/deficit \d+% · out in \d+[a-z]/)
+    expect(stdout).toMatch(/reserve \d+% · lasts to reset/)
+    expect(stdout).toContain('credits 75% left · $12.50/$50.00')
+  })
+}
+
+test('a 30-column sidebar drops resets that do not fit instead of wrapping rows or running text together', async () => {
+  const stdout = await renderSidebar(
+    fiveAccountSidebarState(),
+    // The cents drop once the block has a measured width, so this waits for it.
+    ['backup', 'checked 1d6h ago', 'Routing', '$12/$50'],
+    false,
+    { width: 30, height: 70 },
+  )
+  const rows = expectOneLineQuotaRows(stdout, FIVE_ACCOUNTS)
+  expect(rows).toHaveLength(15)
+  for (const row of rows) expect(row).toMatch(/^ \S+ +[█░▓▒]{10} \d+% left/)
+  // `100% left •` leaves no room for ` 4h39m`, so that row has no reset; a
+  // row that fits exactly keeps its one-cell gap.
+  expect(rows).toContain(' 5h ▒░░░░░░░░░ 100% left •')
+  expect(rows.some((row) => / 97% left \d+h\d+m$/.test(row))).toBe(true)
+  expect(stdout).toMatch(/reserve \d+% · lasts to re…/)
+})
+
+test('scoped rows whose models share a short name extend it as the collapsed line does', async () => {
+  const now = Date.now()
+  const window = (used: number) => ({
+    usedPercent: used,
+    remainingPercent: 100 - used,
+    checkedAt: now,
+    resetsAt: new Date(now + 3 * 86_400_000).toISOString(),
+  })
+  const state = {
+    main: {
+      quota: {
+        five_hour: window(10),
+        seven_day: window(20),
+        scoped: [
+          {
+            id: 'fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            ...window(30),
+          },
+          {
+            id: 'fabric',
+            title: 'Fabric only',
+            modelName: 'Fabric',
+            ...window(90),
+          },
+        ],
+      },
+    },
+    fallbacks: [
+      {
+        id: 'work',
+        label: 'work',
+        enabled: true,
+        needsReauth: false,
+        quota: { five_hour: window(5), seven_day: window(6) },
+      },
+    ],
+    activeId: 'main',
+    route: 'main',
+    lastUpdated: now,
+  }
+  const expanded = await renderSidebar(
+    state,
+    ['Fabl', 'Fabr', 'work', 'Routing'],
+    false,
+    { width: 36, height: 40 },
+  )
+  const rows = expectOneLineQuotaRows(expanded, ['main', 'work'])
+  expect(rows.map((row) => row.trim().split(' ')[0])).toEqual([
+    '5h',
+    '7d',
+    'Fabl',
+    'Fabr',
+    '5h',
+    '7d',
+  ])
+  // The column fits the longest label in the sidebar, across accounts.
+  expect(new Set(rows.map((row) => row.search(/[█░▓▒]/)))).toEqual(new Set([6]))
+  const collapsed = await renderSidebar(state, ['Fabr 10% left'], true, {
+    width: 36,
+  })
+  expect(collapsed).toContain('5h 90% · 7d 80% · Fabr 10% left')
 })

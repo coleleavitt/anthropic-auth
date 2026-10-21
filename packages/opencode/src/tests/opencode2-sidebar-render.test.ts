@@ -3,6 +3,10 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  expectOneLineQuotaRows,
+  fiveAccountSidebarState,
+} from './fixtures/sidebar-five-accounts'
 
 let child: Bun.Subprocess<'ignore', 'pipe', 'pipe'> | undefined
 let fixture: string | undefined
@@ -30,6 +34,7 @@ interface Step {
 async function renderOpenCode2Sidebar(
   answers: unknown[],
   steps: Step[],
+  size: { width: number; height: number } = { width: 42, height: 32 },
 ): Promise<{
   frames: string[]
   asked: string[]
@@ -90,7 +95,7 @@ const cleanup = await setup({
 if (claims.length !== 1 || claims[0].append !== 'sidebar.content') throw new Error('sidebar slot was not claimed');
 let destroyed;
 const teardown = new Promise((resolve) => { destroyed = resolve; });
-const setupRenderer = await createTestRenderer({ width: 42, height: 32, onDestroy() { destroyed(); } });
+const setupRenderer = await createTestRenderer({ width: ${size.width}, height: ${size.height}, onDestroy() { destroyed(); } });
 const frames = [];
 try {
   await render(() => claims[0].render({ sessionID: 'ses_oc2' }), setupRenderer.renderer);
@@ -325,3 +330,32 @@ test(
   },
   SUBPROCESS_TIMEOUT_MS,
 )
+
+// OpenCode 2's session sidebar is 42 cells with 2 cells of padding each side;
+// its scrollbar floats over the slot box's 1-cell right padding, so a plugin
+// gets 37 cells.
+for (const width of [37, 42]) {
+  test(
+    `OpenCode 2 sidebar at ${width} columns keeps every quota row of five accounts on one line with short scoped names`,
+    async () => {
+      const result = await renderOpenCode2Sidebar(
+        [fiveAccountSidebarState()],
+        [{ wanted: ['backup', 'checked 1d6h ago', 'Routing'] }],
+        { width, height: 70 },
+      )
+      const [frame] = result.frames
+      const rows = expectOneLineQuotaRows(frame!, [
+        'main',
+        'work',
+        'personal',
+        'team',
+        'backup',
+      ])
+      expect(rows).toHaveLength(15)
+      expect(rows.filter((row) => row.trim().startsWith('Fa '))).toHaveLength(5)
+      expect(frame).not.toContain('Fable')
+      for (const row of rows) expect(row).toMatch(/left( •)? +\d+[a-z]/)
+    },
+    SUBPROCESS_TIMEOUT_MS,
+  )
+}

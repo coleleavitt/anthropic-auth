@@ -12,6 +12,10 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  formatQuota,
+  quotaDisplayProjection,
+} from '@cortexkit/anthropic-auth-core'
+import {
   __acquireSidebarStateLockForTest,
   __setSidebarStateWriteTestHooks,
   type AccountQuota,
@@ -19,6 +23,8 @@ import {
   DEFAULT_SIDEBAR_STATE,
   drainSidebarWrites,
   FIVE_HOUR_MS,
+  fitPaceLine,
+  fitQuotaRow,
   formatFallbackModelLabel,
   formatPrimeAccountValue,
   formatPrimeCost,
@@ -29,9 +35,11 @@ import {
   getFableRecoverySummary,
   getSidebarState,
   normalizeSidebarState,
+  quotaLabelColumnWidth,
   resolveActiveAccount,
   SEVEN_DAY_MS,
   type SidebarState,
+  scopedQuotaShortNames,
   setSidebarState,
 } from '../sidebar-state'
 
@@ -426,6 +434,115 @@ describe('formatQuotaRowLabel', () => {
     const label = formatQuotaRowLabel('模型模型模型 only')
     expect(label).toBe('模型模型… ')
     expect(Bun.stringWidth(label)).toBe(10)
+  })
+})
+
+describe('scopedQuotaShortNames', () => {
+  const scopedWindow = (id: string, modelName: string, modelId?: string) => ({
+    id,
+    title: `${modelName} only`,
+    modelName,
+    ...(modelId ? { modelId } : {}),
+    usedPercent: 10,
+    remainingPercent: 90,
+  })
+
+  test('names a scoped window as the collapsed narrow line does', () => {
+    const quota = { scoped: [scopedWindow('fable', 'Fable')] }
+    expect(scopedQuotaShortNames(quota)).toEqual(['Fa'])
+    expect(
+      formatQuota(quotaDisplayProjection(quota, Date.now()), {
+        now: Date.now(),
+        form: 'narrow',
+      }),
+    ).toBe('Fa 90% left')
+    expect(quotaLabelColumnWidth([quota, null])).toBe(2)
+  })
+
+  test('extends colliding names exactly as the narrow line does', () => {
+    const quota = {
+      scoped: [
+        scopedWindow('a', 'Fable'),
+        scopedWindow('b', 'Fabric'),
+        scopedWindow('c', 'Opus'),
+      ],
+    }
+    expect(scopedQuotaShortNames(quota)).toEqual(['Fabl', 'Fabr', 'Op'])
+    expect(quotaLabelColumnWidth([quota])).toBe(4)
+  })
+
+  test('follows the narrow line in naming a window by its model id', () => {
+    expect(
+      scopedQuotaShortNames({
+        scoped: [scopedWindow('f', 'Other', 'model:fable')],
+      }),
+    ).toEqual(['Fa'])
+  })
+})
+
+describe('fitQuotaRow', () => {
+  const row = { labelWidth: 2, barWidth: 10, figure: '100% left \u2022' }
+  // label 2 + space + bar 10 + space + figure 11 = 25 cells before the reset.
+  test('keeps the whole row when it fits, with a gap before the reset', () => {
+    expect(fitQuotaRow({ ...row, width: 31, reset: '6d23h' })).toEqual({
+      barCells: 10,
+      reset: '6d23h',
+    })
+  })
+
+  test('drops the reset before the bar shrinks, and keeps a minimum bar', () => {
+    const fit = (width: number) =>
+      fitQuotaRow({ ...row, width, reset: '6d23h' })
+    expect(fit(30)).toEqual({ barCells: 10 })
+    expect(fit(25)).toEqual({ barCells: 10 })
+    expect(fit(24)).toEqual({ barCells: 9 })
+    expect(fit(18)).toEqual({ barCells: 3 })
+    // Too narrow even then: the minimum bar stays and the row is cut.
+    expect(fit(17)).toEqual({ barCells: 3 })
+    expect(fit(5)).toEqual({ barCells: 3 })
+  })
+
+  test('keeps the full row before the first layout', () => {
+    expect(fitQuotaRow({ ...row, width: undefined, reset: '6d23h' })).toEqual({
+      barCells: 10,
+      reset: '6d23h',
+    })
+  })
+})
+
+describe('fitPaceLine', () => {
+  const deficit = {
+    pacePercent: 40,
+    deltaPercent: 12,
+    state: 'deficit' as const,
+    runsOutAt: 'x',
+  }
+  const reserve = {
+    pacePercent: 29,
+    deltaPercent: -4.2,
+    state: 'reserve' as const,
+    runsOutAt: null,
+  }
+  test('cuts a subline that does not fit with an ellipsis', () => {
+    expect(fitPaceLine(deficit, 30, '1d23h')).toBe(
+      'deficit 12% \u00b7 out in 1d23h',
+    )
+    expect(fitPaceLine(deficit, 25, '1d23h')).toBe(
+      'deficit 12% \u00b7 out in 1d2\u2026',
+    )
+    expect(Bun.stringWidth(fitPaceLine(deficit, 25, '1d23h') ?? '')).toBe(25)
+  })
+
+  test('a window that lasts says to what', () => {
+    expect(fitPaceLine(reserve, 30, undefined)).toBe(
+      'reserve 4% \u00b7 lasts to reset',
+    )
+    expect(fitPaceLine(reserve, 26, undefined)).toBe(
+      'reserve 4% \u00b7 lasts to res\u2026',
+    )
+    expect(fitPaceLine({ ...reserve, state: 'on-pace' }, 30, undefined)).toBe(
+      null,
+    )
   })
 })
 
