@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Dependencies
+
+- Test and CI dependencies move: the Pi SDK packages (`pi-agent-core`, `pi-ai`, `pi-coding-agent`, `pi-tui`) to 1.3.0 together, the OpenCode plugin and SDK to 1.19.3 together, `@ai-sdk/anthropic` to 4.0.82, `jdx/mise-action` to 5.2.0 and `actions/download-artifact` to v8. The Pi peer range and the OpenCode 1.18.18 host used by the process E2E checks are unchanged.
+
 ## 2.2.2
 
 ### Accounts
