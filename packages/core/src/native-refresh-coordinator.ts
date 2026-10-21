@@ -26,14 +26,21 @@ import {
   CustodyTombstoneRefreshError,
   isCustodyTombstoneValue,
 } from './claustrum.ts'
-import { nativeAccountCanServe } from './native-account-view.ts'
+import {
+  nativeAccountCanServe,
+  nativeLocalRowAwaitsTornWrite,
+} from './native-account-view.ts'
 import {
   type NativeLocalCredentialValidation,
   type NativeLocalCredentialVersion,
   nativeLocalCredentialValidationMatches,
 } from './native-credential-validation.ts'
 import { nativeLockObserver } from './native-lock-observer.ts'
-import { NativeTransientAccountError } from './native-transient-account.ts'
+import {
+  isNativeTransientAccountError,
+  joinNativePoolWrite,
+  NativeTransientAccountError,
+} from './native-transient-account.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import {
   isNativeLocalPoolBinding,
@@ -1325,7 +1332,7 @@ export function createNativeRefreshCoordinator(
     request = { ...request, binding: Object.freeze({ ...request.binding }) }
     if (request.signal?.aborted)
       return { status: 'refused', reason: 'cancelled', persisted: false }
-    const key = nativeLocalRefreshJobKey(request.binding)
+    let key = nativeLocalRefreshJobKey(request.binding)
     let job = jobs.get(key)
     const recordRejection = () => {
       // A 401 can arrive after proactive work started. Record its rejected token
@@ -1338,7 +1345,38 @@ export function createNativeRefreshCoordinator(
     recordRejection()
     if (request.intent === 'serve') {
       try {
-        const row = await rowFor(request.binding)
+        let row = await rowFor(request.binding)
+        if (
+          row &&
+          row.credentialEpoch === request.binding.credentialEpoch &&
+          nativeLocalRowAwaitsTornWrite(options.paths, row)
+        ) {
+          // The host's earlier read can precede a partial state/config write.
+          // Wait for that writer once before deciding this account is ineligible.
+          const joined = await joinNativePoolWrite(
+            options.paths,
+            request.signal ? [request.signal] : [],
+            () => request.signal?.throwIfAborted(),
+            onLockEvent,
+          )
+          if (joined === 'deadline') throw new NativeTransientAccountError()
+          row = await rowFor(request.binding)
+          if (row && nativeLocalRowAwaitsTornWrite(options.paths, row))
+            throw new NativeTransientAccountError()
+        }
+        if (
+          request.binding.identity === undefined &&
+          row?.identity !== undefined
+        ) {
+          const learned = { ...request.binding, identity: row.identity }
+          // First-identity publication can finish after the caller captures its
+          // binding. Use the saved identity only if the row, store and credential
+          // epoch still match; admission still requires permission and exact proof.
+          if (nativeLocalPoolBindingMatches(learned, options.paths, row)) {
+            request = { ...request, binding: Object.freeze(learned) }
+            key = nativeLocalRefreshJobKey(request.binding)
+          }
+        }
         job = jobs.get(key) ?? job
         recordRejection()
         // A pending recovery cannot override custody, quota or refresh-error
@@ -1367,6 +1405,7 @@ export function createNativeRefreshCoordinator(
             return current
         }
       } catch (caught) {
+        if (isNativeTransientAccountError(caught)) throw caught
         return {
           status: 'failed',
           failure: failureOf(asError(caught)),

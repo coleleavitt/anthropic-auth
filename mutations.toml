@@ -373,6 +373,38 @@ broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
 
 [[control]]
+id = "serve-adopts-concurrent-first-identity"
+guards = "A serving caller captured before first identity publication must use the same row's validated credential without bypassing admission."
+file = "packages/core/src/native-refresh-coordinator.ts"
+old = "const learned = { ...request.binding, identity: row.identity }"
+new = "const learned = request.binding // NON-VACUITY BREAK: retain the pre-publication identity-absent binding"
+test_file = "packages/core/src/tests/native-refresh-coordinator.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-refresh-coordinator.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["serve follows first identity published after binding capture without a second exchange"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "serve-joins-concurrent-first-identity-write"
+guards = "A partial first-identity pool write seen after the host's snapshot must be joined rather than silently remove a fallback."
+file = "packages/core/src/native-refresh-coordinator.ts"
+old = "row.credentialEpoch === request.binding.credentialEpoch &&"
+new = "row.credentialEpoch === -1 && // NON-VACUITY BREAK: refuse a partially saved first identity"
+test_file = "packages/core/src/tests/native-refresh-coordinator.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-refresh-coordinator.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["serve joins a first identity write encountered after binding capture"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
 id = "refresh-join-checks-cause"
 guards = "A proactive refresh must not delay a proven unexpired access token."
 file = "packages/core/src/native-refresh-coordinator.ts"

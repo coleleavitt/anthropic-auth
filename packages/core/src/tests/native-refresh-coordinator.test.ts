@@ -62,6 +62,10 @@ import {
   nativeAccountProviderLock,
 } from '../native-refresh-coordinator.ts'
 import {
+  isNativeTransientAccountError,
+  NativeTransientAccountError,
+} from '../native-transient-account.ts'
+import {
   captureNativeLocalPoolBinding,
   nativeLocalPoolBindingMatches,
   nativeLocalRefreshJobKey,
@@ -1231,6 +1235,228 @@ test('callback-end identity alias joins during reconciliation and handoff enclos
   expect(calls).toBe(1)
   expect(bootstraps).toBe(1)
   expect(active.size).toBe(0)
+})
+
+test('serve follows first identity published after binding capture without a second exchange', async () => {
+  const f = await fixture()
+  await f.add('a')
+  const before = await f.binding('a')
+  const publishing = barrier()
+  const finish = barrier()
+  let calls = 0
+  const c = f.coordinator({
+    refreshToken: async () => {
+      calls++
+      return { ...credential('new'), expiresIn: 3600 }
+    },
+    reconcile: async (event) => {
+      if (event.status === 'persisted') {
+        publishing.release()
+        await finish.promise
+      }
+    },
+  })
+  const first = c.authorize({ intent: 'serve', mode: 'local', binding: before })
+  await publishing.promise
+  const learned = await f.binding('a')
+  expect(learned).toEqual({ ...before, identity: 'A' })
+  // This binding was captured before the row had an identity. Saving its first
+  // identity must not make a serving caller treat the account as replaced.
+  const joined = c.authorize({
+    intent: 'serve',
+    mode: 'local',
+    binding: before,
+  })
+  finish.release()
+  expect(await joined).toMatchObject({
+    status: 'usable',
+    binding: learned,
+    access: 'access-new',
+  })
+  expect(await first).toMatchObject({ status: 'usable', binding: learned })
+  expect(
+    await c.authorize({ intent: 'serve', mode: 'local', binding: before }),
+  ).toMatchObject({ status: 'usable', binding: learned, access: 'access-new' })
+  expect(calls).toBe(1)
+})
+
+test('serve joins a first identity write encountered after binding capture', async () => {
+  const stateWritten = barrier()
+  const finishWrite = barrier()
+  const joining = barrier()
+  let held = false
+  let waitForJoin = false
+  const f = await fixture({
+    onStep: async (step, info) => {
+      if (
+        held ||
+        step !== 'after-state-write' ||
+        info.operation !== 'refresh' ||
+        info.rowId !== 'a'
+      )
+        return
+      held = true
+      stateWritten.release()
+      await finishWrite.promise
+    },
+  })
+  await f.add('a')
+  const before = await f.binding('a')
+  let calls = 0
+  const c = f.coordinator({
+    refreshToken: async () => {
+      calls++
+      return { ...credential('new'), expiresIn: 3600 }
+    },
+    onLockEvent: (event) => {
+      if (
+        waitForJoin &&
+        event.type === 'acquiring' &&
+        event.name === 'pool-config'
+      )
+        joining.release()
+    },
+  })
+  const first = c.authorize({ intent: 'serve', mode: 'local', binding: before })
+  await stateWritten.promise
+  expect(await f.row('a')).toMatchObject({
+    torn: true,
+    candidate: false,
+    identity: 'A',
+  })
+  waitForJoin = true
+  const joined = c.authorize({
+    intent: 'serve',
+    mode: 'local',
+    binding: before,
+  })
+  // Release when the reader waits on the lock or returns early; never leave the
+  // writer held after a refusal.
+  await Promise.race([joining.promise, joined.then(() => {})])
+  finishWrite.release()
+  expect(await joined).toMatchObject({ status: 'usable', access: 'access-new' })
+  expect(await first).toMatchObject({ status: 'usable', access: 'access-new' })
+  expect(calls).toBe(1)
+})
+
+test('a first identity write deadline keeps the transient account error brand', async () => {
+  const stateWritten = barrier()
+  const finishWrite = barrier()
+  let held = false
+  const f = await fixture({
+    onStep: async (step, info) => {
+      if (
+        held ||
+        step !== 'after-state-write' ||
+        info.operation !== 'refresh' ||
+        info.rowId !== 'a'
+      )
+        return
+      held = true
+      stateWritten.release()
+      await finishWrite.promise
+    },
+  })
+  await f.add('a')
+  const before = await f.binding('a')
+  const c = f.coordinator()
+  const first = c.authorize({ intent: 'serve', mode: 'local', binding: before })
+  await stateWritten.promise
+  const refused = await c
+    .authorize({ intent: 'serve', mode: 'local', binding: before })
+    .then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    )
+  finishWrite.release()
+  expect(refused).toHaveProperty('error')
+  if (!('error' in refused))
+    throw new Error('Expected a transient account error')
+  expect(isNativeTransientAccountError(refused.error)).toBe(true)
+  expect(refused.error).toBeInstanceOf(NativeTransientAccountError)
+  expect(await first).toMatchObject({ status: 'usable', access: 'access-new' })
+})
+
+for (const reason of [
+  'quota-ineligible',
+  'account-disabled',
+  'local-mode-unavailable',
+  'refresh-backoff',
+  'invalid-grant',
+  'validation-backoff',
+] as const) {
+  test(`first identity publication preserves the ${reason} admission exclusion`, async () => {
+    const f = await fixture()
+    await f.add('a')
+    const before = await f.binding('a')
+    const publishing = barrier()
+    const finish = barrier()
+    let calls = 0
+    const c = f.coordinator({
+      refreshToken: async () => {
+        calls++
+        return { ...credential('new'), expiresIn: 3600 }
+      },
+      readAdmission: async () => ({ status: 'blocked', reason }),
+      reconcile: async (event) => {
+        if (event.status === 'persisted') {
+          publishing.release()
+          await finish.promise
+        }
+      },
+    })
+    const first = c.authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: before,
+    })
+    await publishing.promise
+    const refused = await c.authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: before,
+    })
+    finish.release()
+    expect(refused).toMatchObject({ status: 'refused', reason })
+    expect(await first).toMatchObject({ status: 'refused', reason })
+    expect(calls).toBe(1)
+  })
+}
+
+test('first identity adoption never follows a replaced epoch or a known different identity', async () => {
+  const f = await fixture()
+  await f.add('a')
+  const before = await f.binding('a')
+  let calls = 0
+  const c = f.coordinator({
+    refreshToken: async () => {
+      calls++
+      return { ...credential('new'), expiresIn: 3600 }
+    },
+  })
+  expect(
+    await c.authorize({ intent: 'serve', mode: 'local', binding: before }),
+  ).toMatchObject({ status: 'usable', access: 'access-new' })
+  expect(
+    await c.authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: { ...before, identity: 'B' },
+    }),
+  ).toMatchObject({ status: 'refused', reason: 'row-ineligible' })
+  await f.store.replace('a', credential('replacement'), { identity: 'A' })
+  await f.seedProof('a')
+  expect(
+    await c.authorize({ intent: 'serve', mode: 'local', binding: before }),
+  ).toMatchObject({ status: 'refused', reason: 'row-ineligible' })
+  expect(
+    await c.authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: await f.binding('a'),
+    }),
+  ).toMatchObject({ status: 'usable', access: 'access-replacement' })
+  expect(calls).toBe(1)
 })
 
 test('existing known job retains its alias while unknown handoff waits and both successors persist', async () => {
