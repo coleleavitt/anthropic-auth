@@ -348,11 +348,19 @@ test('shared discovery publishes the primary pin once for concurrent consumers',
   })
   const publish = spyOn(vaultRoster, 'mutateVaultRoster')
   deferCleanup(() => publish.mockRestore())
+  let settingsWrites = 0
+  const originalRename = filesystem.rename
+  const rename = spyOn(filesystem, 'rename').mockImplementation((from, to) => {
+    if (to === f.vaultPaths.config) settingsWrites++
+    return originalRename(from, to)
+  })
+  deferCleanup(() => rename.mockRestore())
   await Promise.all([a.refresh(), b.refresh()])
   expect(f.counts.lists).toBe(1)
-  // Discovery and primary-account settings use two roster transactions in
-  // total, not another settings transaction for each waiting caller.
-  expect(publish).toHaveBeenCalledTimes(2)
+  // Only discovery needs a roster transaction. Concurrent consumers still
+  // publish the primary-account settings once, under the settings locks.
+  expect(publish).toHaveBeenCalledTimes(1)
+  expect(settingsWrites).toBe(1)
 })
 
 test('a released observer with a pending notification cannot stop the surviving vault poller', async () => {
@@ -860,7 +868,7 @@ test('custody runtime seed rejects unowned publication and descriptor callbacks 
   expect(await readFile(f.vaultPaths.runtime)).toEqual(before)
 })
 
-test('vault route disable persists decline and a held roster prevents replaced-account runtime publication', async () => {
+test('vault route disable persists decline and a replaced account prevents runtime publication', async () => {
   const f = await fixture()
   const receipt = await f.runtime.authorize('main')
   await f.runtime.setEnabled('main', false)

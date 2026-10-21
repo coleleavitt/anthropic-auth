@@ -8,6 +8,25 @@ prebuild = [
 ]
 
 [[control]]
+id = "vault-receipt-never-nests-roster-lock"
+guards = "A receipt waiting for the runtime writer must not hold the roster lock and starve another runtime's roster publication."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "const outcome = await updateNativeRuntimeOptional("
+new = """// NON-VACUITY BREAK: restore roster -> runtime lock nesting.
+      const nested = (...args: Parameters<typeof updateNativeRuntimeOptional>) =>
+        mutateVaultRoster(paths.roster, async () => ({ result: await updateNativeRuntimeOptional(...args) }))
+      const outcome = await nested("""
+test_file = "packages/core/src/tests/native-vault-recency.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-recency.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a vault publication waiting for the runtime lock does not delay another runtime roster writer"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
 id = "turn-end-note-replays-earlier-points"
 guards = "Every qualifying history point must retain its turn-scoped note, not just the latest result."
 file = "packages/core/src/turn-end-note.ts"

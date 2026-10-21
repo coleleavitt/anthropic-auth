@@ -22,6 +22,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
 import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
+import { lockPathFor } from '@cortexkit/common-auth/fs'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $, type ServerWebSocket } from 'bun'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
@@ -1907,7 +1908,7 @@ test('OC1 serves first byte and full body while the roster lock is held, then dr
   ).toBe(true)
 })
 
-test('OC1 absorbs the real roster acquisition timeout after serving the intact reply', async () => {
+test('OC1 absorbs real runtime lease loss after serving the intact reply', async () => {
   const { owner, client } = await vaultFixture()
   const plugin = await createPlugin(owner, client)
   const logs = captureLogs()
@@ -1917,11 +1918,6 @@ test('OC1 absorbs the real roster acquisition timeout after serving the intact r
       process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE,
     ),
   )
-  const locked = lifetimes.gate()
-  const release = lifetimes.gate()
-  owner.controller.signal.addEventListener('abort', () => release.open(), {
-    once: true,
-  })
   const unhandled: unknown[] = []
   const observeUnhandled = (error: unknown) => {
     unhandled.push(error)
@@ -1930,29 +1926,62 @@ test('OC1 absorbs the real roster acquisition timeout after serving the intact r
   lifetimes.deferCleanup(() => {
     process.off('unhandledRejection', observeUnhandled)
   })
-  let holder: Promise<unknown> | undefined
-  let released = false
-  const body = healthy('début 🧪 timeout cannot retract these bytes')
+  let armed = false
+  let displaced = false
+  const original = filesystem.open
+  const staging = spyOn(filesystem, 'open').mockImplementation(
+    async (path, flags, mode) => {
+      const file = await original(path, flags, mode)
+      if (
+        typeof path === 'string' &&
+        path.startsWith(`${paths.runtime}.native-runtime.`) &&
+        path.endsWith('.partial')
+      ) {
+        const write = file.writeFile.bind(file)
+        file.writeFile = async (data, options) => {
+          const state = JSON.parse(String(data)) as {
+            accounts: Record<string, { lastUsed?: number }>
+          }
+          // Displace the real runtime lease only for response usage, not a
+          // quota update that happens to stage first after the response.
+          if (
+            armed &&
+            !displaced &&
+            Object.values(state.accounts).some((entry) => entry.lastUsed)
+          ) {
+            const lock = lockPathFor(paths.runtime, 'native-runtime')
+            expect(JSON.parse(await readFile(lock, 'utf8'))).toMatchObject({
+              ownerId: expect.any(String),
+            })
+            await writeFile(
+              lock,
+              JSON.stringify({
+                ownerId: 'synthetic-other-owner',
+                expiresAt: 0,
+              }),
+            )
+            displaced = true
+          }
+          return write(data, options)
+        }
+      }
+      return file
+    },
+  )
+  lifetimes.deferCleanup(() => staging.mockRestore())
+  const body = healthy('début 🧪 lease loss cannot retract these bytes')
   owner.network.current = async () => {
-    holder = mutateVaultRoster(paths.roster, async () => {
-      locked.open()
-      await release.wait
-      released = true
-      return { result: undefined }
-    })
-    lifetimes.trackDetached(holder)
-    await locked.wait
+    armed = true
     return eventStream(body)
   }
-  const response = await sendNative(owner, plugin, 'oc1-lastused-lock-timeout')
+  const response = await sendNative(owner, plugin, 'oc1-lastused-lease-refusal')
   expect(response.status).toBe(200)
   expect(await response.text()).toBe(body)
-  expect(released).toBe(false)
   const draining = Promise.resolve(plugin.dispose?.())
   lifetimes.trackDetached(draining)
   await draining
   await new Promise((resolve) => setTimeout(resolve, 0))
-  expect(released).toBe(false)
+  expect(displaced).toBe(true)
   expect(unhandled).toEqual([])
   expect(
     logs.filter(
@@ -1961,7 +1990,7 @@ test('OC1 absorbs the real roster acquisition timeout after serving the intact r
   ).toMatchObject([
     {
       level: 'warn',
-      payload: { name: 'LockContentionError', code: 'unknown' },
+      payload: { name: 'NativeRuntimeError', code: 'publication-refused' },
     },
   ])
   const diagnostic = JSON.stringify(
@@ -1971,8 +2000,6 @@ test('OC1 absorbs the real roster acquisition timeout after serving the intact r
   )
   expect(diagnostic).not.toContain(owner.directory)
   expect(diagnostic).not.toContain(vaultAccess(1))
-  release.open()
-  await holder
 }, 15_000)
 
 // A paid key with surrounding whitespace would leave without it, because

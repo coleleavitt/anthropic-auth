@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Accounts
+
+- Vault response bookkeeping no longer holds the roster lock while waiting to write runtime state.
+
 ## 2.2.1
 
 ### Sidebar

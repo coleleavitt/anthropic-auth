@@ -330,7 +330,7 @@ export async function publishNativeVaultRosterSeed(
   return published
 }
 
-/** Match imported metadata to the held vault roster before publishing it. The caller's assertOwned fences its captured input; the roster lease separately prevents account replacement during the metadata write. */
+/** Match imported custody metadata to the current roster without blocking roster writers. The optional assertOwned callback separately rechecks the caller's captured input before rename. */
 export async function publishNativeVaultRuntimeSeed(
   paths: Pick<NativeVaultPaths, 'roster' | 'runtime' | 'storageId'>,
   state: NativeRuntimeState,
@@ -340,7 +340,8 @@ export async function publishNativeVaultRuntimeSeed(
     captureNativePlainData(state),
     paths.storageId,
   )
-  await mutateVaultRoster(paths.roster, async (roster, lease) => {
+  const assertPinned = async () => {
+    const roster = await readVaultRoster(paths.roster)
     for (const [id, entry] of Object.entries(imported.accounts)) {
       if (entry.binding.kind !== 'custody') continue
       const binding = entry.binding
@@ -353,13 +354,13 @@ export async function publishNativeVaultRuntimeSeed(
       )
         throw new NativeRuntimeError('publication-refused')
     }
-    await updateNativeRuntime(paths.runtime, paths.storageId, () => imported, {
-      beforeRename: async () => {
-        await options.assertOwned?.()
-        await lease.assertOwned()
-      },
-    })
-    return { result: undefined }
+  }
+  await assertPinned()
+  await updateNativeRuntime(paths.runtime, paths.storageId, () => imported, {
+    beforeRename: async () => {
+      await options.assertOwned?.()
+      await assertPinned()
+    },
   })
 }
 
@@ -434,12 +435,6 @@ export function createNativeVaultRuntime(
     onLockEvent: options.onLockEvent,
   })
   const observeLock = nativeLockObserver(options.onLockEvent)
-  const observeRosterLock = () =>
-    observeLock?.({
-      type: 'acquiring',
-      name: 'claustrum-roster-write',
-      path: paths.roster,
-    })
   // The vault watch for the current custody, opened while a host watches the
   // roster. While it reports `watching`, the list timer below runs only as a
   // slow safety net; in any other mode it keeps the host's own pace.
@@ -717,14 +712,13 @@ export function createNativeVaultRuntime(
     // Existing settings need no initialization. Avoid the shared roster write
     // lock so concurrent plugin starts cannot delay reads of that complete file.
     if (absentOnly && !(await nativeVaultFileAbsent(paths.config))) return
-    observeRosterLock()
-    await mutateVaultRoster(paths.roster, async (roster, lease) => {
-      if (absentOnly && !(await nativeVaultFileAbsent(paths.config)))
-        return { result: undefined }
-      // A default whose sign-in lapsed (needs_reauth, expired, revoked) stays
-      // pinned as main so it is shown once, as main, with its state. Serving
-      // is still refused separately for any vault row that is not active.
-      const primary = roster?.rows.find(
+    const roster = await readVaultRoster(paths.roster)
+    if (absentOnly && !(await nativeVaultFileAbsent(paths.config))) return
+    // A default whose sign-in lapsed (needs_reauth, expired, revoked) stays
+    // pinned as main so it is shown once, as main, with its state. Serving
+    // is still refused separately for any vault row that is not active.
+    const primaryFor = (roster: NativeVaultRosterDocument | undefined) =>
+      roster?.rows.find(
         (row) =>
           (row.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID ||
             row.aliases?.includes(NATIVE_PRIMARY_CREDENTIAL_ID)) &&
@@ -734,52 +728,56 @@ export function createNativeVaultRuntime(
           typeof row.accountIdentity === 'string' &&
           row.accountIdentity.length > 0,
       )
-      const read = await store.readSettings()
-      if (read.status !== 'ready') throw new NativeCustodyError('invalid-state')
-      const previous = nativeVaultPrimaryPin(read.settings)
+    const primary = primaryFor(roster)
+    const read = await store.readSettings()
+    if (read.status !== 'ready') throw new NativeCustodyError('invalid-state')
+    const previous = nativeVaultPrimaryPin(read.settings)
+    if (
+      !absentOnly &&
+      ((!primary && !previous) ||
+        (primary &&
+          previous?.routeId === primary.routeId &&
+          previous.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID &&
+          previous.accountIdentity === primary.accountIdentity))
+    )
+      return
+    const assertPrimary = async () => {
+      await requireActive(signal)
+      const pinned = primaryFor(await readVaultRoster(paths.roster))
       if (
-        !absentOnly &&
-        ((!primary && !previous) ||
-          (primary &&
-            previous?.routeId === primary.routeId &&
-            previous.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID &&
-            previous.accountIdentity === primary.accountIdentity))
+        pinned?.routeId !== primary?.routeId ||
+        pinned?.accountIdentity !== primary?.accountIdentity
       )
-        return { result: undefined }
-      const writer = createNativePoolStore({
-        paths,
-        quota: nativeQuotaCodec,
-        onLockEvent: options.onLockEvent,
-        onStep: async (point) => {
-          if (
-            point === 'before-config-write' ||
-            point === 'before-state-write'
-          ) {
-            await requireActive(signal)
-            await lease.assertOwned()
-          }
-        },
-      })
-      await writer.updateSettings(async (settings) => {
-        // Another writer may have created settings before this writer acquired
-        // the settings-file lock. Initialization must leave that file untouched.
-        if (absentOnly && !(await nativeVaultFileAbsent(paths.config)))
-          return settings
-        if (primary) {
-          settings.mainAccountId = primary.routeId
-          settings.claustrum = {
-            primaryAccount: {
-              credentialId: NATIVE_PRIMARY_CREDENTIAL_ID,
-              accountId: primary.accountIdentity,
-            },
-          }
-        } else {
-          delete settings.mainAccountId
-          delete settings.claustrum
+        throw new NativeRuntimeError('publication-refused')
+    }
+    const writer = createNativePoolStore({
+      paths,
+      quota: nativeQuotaCodec,
+      onLockEvent: options.onLockEvent,
+      onStep: async (point) => {
+        if (point === 'before-config-write' || point === 'before-state-write') {
+          await assertPrimary()
         }
+      },
+    })
+    await writer.updateSettings(async (settings) => {
+      // Another writer may have created settings before this writer acquired
+      // the settings-file lock. Initialization must leave that file untouched.
+      if (absentOnly && !(await nativeVaultFileAbsent(paths.config)))
         return settings
-      })
-      return { result: undefined }
+      if (primary) {
+        settings.mainAccountId = primary.routeId
+        settings.claustrum = {
+          primaryAccount: {
+            credentialId: NATIVE_PRIMARY_CREDENTIAL_ID,
+            accountId: primary.accountIdentity,
+          },
+        }
+      } else {
+        delete settings.mainAccountId
+        delete settings.claustrum
+      }
+      return settings
     })
   }
 
@@ -1326,85 +1324,86 @@ export function createNativeVaultRuntime(
       receipt.assertedAccountIdentity,
     ])
     if ((versions.get(key) ?? 0) > receipt.recordVersion) return false
-    observeRosterLock()
-    return mutateVaultRoster(paths.roster, async (roster, lease) => {
-      const row = await rowFor(roster, route.logicalId)
-      if (
-        !row?.accountIdentity ||
-        row.routeId !== route.routeId ||
-        row.accountIdentity !== receipt.assertedAccountIdentity ||
-        (row.credentialId !== receipt.credentialId &&
-          !row.aliases?.includes(receipt.credentialId))
-      )
-        return { result: false }
-      const accountIdentity = row.accountIdentity
-      let kept = false
-      try {
-        const outcome = await updateNativeRuntimeOptional(
-          paths.runtime,
-          paths.storageId,
-          (current) => {
-            const old = current.accounts[route.routeId]
-            const binding = old?.binding
-            if (
-              binding?.kind === 'custody' &&
-              binding.credentialId === receipt.credentialId &&
-              binding.accountIdentity === receipt.assertedAccountIdentity &&
-              binding.recordVersion > receipt.recordVersion
-            )
-              throw new NativeRuntimeError('runtime-conflict')
-            const same =
-              binding?.kind === 'custody' &&
-              binding.accountIdentity === receipt.assertedAccountIdentity
-            current.accounts[route.routeId] = change({
-              ...(same ? old : {}),
-              binding: {
-                kind: 'custody',
-                storageId: paths.storageId,
-                routeId: route.routeId,
-                credentialId: receipt.credentialId,
-                accountIdentity,
-                recordVersion: receipt.recordVersion,
-              },
-            })
-            kept = true
-            return current
-          },
-          {
-            onLockEvent: options.onLockEvent,
-            beforeRename: async () => {
-              await requireActive()
-              const pinned = await rowFor(roster, route.logicalId)
-              if (
-                !pinned ||
-                pinned.routeId !== route.routeId ||
-                pinned.accountIdentity !== receipt.assertedAccountIdentity
-              )
-                throw new NativeRuntimeError('publication-refused')
-              const superseded =
-                (versions.get(key) ?? 0) > receipt.recordVersion
-              if (superseded && onSuperseded === 'refuse')
-                throw new NativeRuntimeError('runtime-conflict')
-              // The roster lease is held across the runtime write. Check it after
-              // all other work, immediately before the writer's final rename.
-              // A superseded write that will be skipped still checks it, so a
-              // lost lease is reported rather than hidden by the skip.
-              await lease.assertOwned()
-              return superseded ? 'skip' : 'publish'
+    const row = await rowFor(
+      await readVaultRoster(paths.roster),
+      route.logicalId,
+    )
+    if (
+      !row?.accountIdentity ||
+      row.routeId !== route.routeId ||
+      row.accountIdentity !== receipt.assertedAccountIdentity ||
+      (row.credentialId !== receipt.credentialId &&
+        !row.aliases?.includes(receipt.credentialId))
+    )
+      return false
+    const accountIdentity = row.accountIdentity
+    let kept = false
+    try {
+      const outcome = await updateNativeRuntimeOptional(
+        paths.runtime,
+        paths.storageId,
+        (current) => {
+          const old = current.accounts[route.routeId]
+          const binding = old?.binding
+          if (
+            binding?.kind === 'custody' &&
+            binding.credentialId === receipt.credentialId &&
+            binding.accountIdentity === receipt.assertedAccountIdentity &&
+            binding.recordVersion > receipt.recordVersion
+          )
+            throw new NativeRuntimeError('runtime-conflict')
+          const same =
+            binding?.kind === 'custody' &&
+            binding.accountIdentity === receipt.assertedAccountIdentity &&
+            (binding.credentialId === row.credentialId ||
+              row.aliases?.includes(binding.credentialId))
+          current.accounts[route.routeId] = change({
+            ...(same ? old : {}),
+            binding: {
+              kind: 'custody',
+              storageId: paths.storageId,
+              routeId: route.routeId,
+              credentialId: receipt.credentialId,
+              accountIdentity,
+              recordVersion: receipt.recordVersion,
             },
+          })
+          kept = true
+          return current
+        },
+        {
+          onLockEvent: options.onLockEvent,
+          beforeRename: async () => {
+            await requireActive()
+            const pinned = await rowFor(
+              await readVaultRoster(paths.roster),
+              route.logicalId,
+            )
+            if (
+              !pinned ||
+              pinned.routeId !== route.routeId ||
+              pinned.accountIdentity !== receipt.assertedAccountIdentity ||
+              (pinned.credentialId !== receipt.credentialId &&
+                !pinned.aliases?.includes(receipt.credentialId))
+            )
+              throw new NativeRuntimeError('publication-refused')
+            const superseded = (versions.get(key) ?? 0) > receipt.recordVersion
+            if (superseded && onSuperseded === 'refuse')
+              throw new NativeRuntimeError('runtime-conflict')
+            return superseded ? 'skip' : 'publish'
           },
-        )
-        if (outcome.status === 'skipped') return { result: false }
-      } catch (error) {
-        if (
-          error instanceof NativeRuntimeError &&
-          error.code === 'runtime-conflict'
-        )
-          return { result: false }
-        throw error
-      }
-      return { result: kept }
-    })
+        },
+      )
+      if (outcome.status === 'skipped') return false
+    } catch (error) {
+      if (
+        error instanceof NativeRuntimeError &&
+        error.code === 'runtime-conflict'
+      )
+        return false
+      throw error
+    }
+    return kept
   }
   async function fetchReading<T>(
     routeId: string,
