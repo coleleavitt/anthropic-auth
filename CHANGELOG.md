@@ -2,11 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.2.1
 
 ### Sidebar
 
-- The expanded sidebar labels model rows `Fa` again, as the collapsed line does, and keeps every quota row and pacing line on one line in both OpenCode 1 and OpenCode 2, shortening the reset time when space runs out instead of wrapping or running the percent into it.
+- The expanded sidebar labels model rows `Fa` again, as the collapsed line does, and keeps every quota row and pacing line on one line in both OpenCode 1 and OpenCode 2, dropping the reset time when space runs out instead of wrapping or running the percent into it.
 
 ## 2.2.0
 
