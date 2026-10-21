@@ -419,6 +419,7 @@ const settingFields: Readonly<Record<string, readonly string[]>> = {
   logging: ['level'],
   claudeFast: ['enabled'],
   thinkingBinding: ['prefixMismatchBehavior'],
+  turnEndNote: ['tools'],
   costZeroing: ['enabled'],
   cacheKeep: ['enabled', 'always', 'startHour', 'endHour', 'subagents'],
   prime: ['enabled'],

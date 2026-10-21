@@ -311,3 +311,4 @@ export {
 export * from './start.ts'
 export * from './sticky-routing.ts'
 export * from './thinking-binding.ts'
+export * from './turn-end-note.ts'

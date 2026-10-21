@@ -9373,6 +9373,89 @@ describe('auth.loader', () => {
     })
   })
 
+  test('native turnEndNote settings affect OAuth only, not the API-key proxy fallback', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: false,
+          minimumRemaining: { five_hour: 10 },
+          failClosedOnUnknownQuota: true,
+        },
+        accounts: [
+          {
+            id: 'paid',
+            type: 'api',
+            apiKey: 'synthetic-paid',
+            baseURL: 'https://proxy.invalid',
+            authHeader: 'authorization-bearer',
+          },
+        ],
+      }),
+    )
+    await updatePoolSettings((settings) => ({
+      ...settings,
+      turnEndNote: { tools: ['my_cleanup'] },
+    }))
+    const bodies: any[] = []
+    globalThis.fetch = mock(
+      withNativeAdmission((input: any, init: any) => {
+        if (extractUrl(input).includes('/api/oauth/usage'))
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 100 },
+                seven_day: { utilization: 50 },
+              }),
+            ),
+          )
+        bodies.push(JSON.parse(String(init?.body)))
+        return Promise.resolve(
+          new Response(null, { status: bodies.length === 1 ? 429 : 200 }),
+        )
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'sk-ant-oat01-main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-opus-5-5',
+        messages: [
+          { role: 'user', content: 'Question' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'A'.repeat(350) },
+              { type: 'tool_use', name: 'my_cleanup', id: 'a', input: {} },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'a', content: 'Done' },
+            ],
+          },
+        ],
+      }),
+    })
+    expect(bodies).toHaveLength(2)
+    expect(bodies[0].messages.at(-1)).toMatchObject({
+      role: 'system',
+      clear_at: 'next_user_message',
+    })
+    expect(bodies[1].messages).toHaveLength(3)
+    expect(bodies[1].messages.at(-1).role).toBe('user')
+  })
+
   test('routes to API-key fallback after main OAuth returns 429 and strips server fallback fields from the custom provider request', async () => {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await useTempAccountFile(

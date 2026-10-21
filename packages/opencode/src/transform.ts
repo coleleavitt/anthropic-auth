@@ -3,6 +3,7 @@ import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyThinkingBindingControls,
+  applyTurnEndNotes,
   assertNotCustodyTombstone,
   type BillingLineageFields,
   buildBillingHeaderValue,
@@ -985,6 +986,8 @@ function messageContentBlockCount(message: unknown) {
   const content = message.content
   if (Array.isArray(content)) return content.length
   if (content == null) return 0
+  // A turn-end note has string content: it consumes one lookback block, even
+  // though hybrid anchors are placed on user boundaries, never on the note.
   return 1
 }
 
@@ -1519,6 +1522,8 @@ export async function rewriteRequestBody(
     midConversationEffortEnabled?: boolean
     midConversationEffortPlan?: string
     midConversationEffortResolvedPlan?: OpenCodeEffortMarkerPlan
+    turnEndNoteEnabled?: boolean
+    turnEndNote?: { tools: string[] }
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
@@ -1604,6 +1609,10 @@ export async function rewriteRequestBody(
       parsed,
       options.thinkingPrefixMismatchBehavior ?? 'account-default',
     )
+    if (options.turnEndNoteEnabled) {
+      // History still carries host tool names here, before mcp_ wire prefixing.
+      applyTurnEndNotes(parsed, { tools: options.turnEndNote?.tools })
+    }
 
     const billingStart = rewriteNowMs()
     const billingHeader =

@@ -598,6 +598,7 @@ async function sendAnthropicRequest(options: {
     identity,
     {
       effortTransitions: options.apiAccount ? [] : options.effortTransitions,
+      turnEndNote: storage.turnEndNote,
       thinkingPrefixMismatchBehavior: options.apiAccount
         ? 'account-default'
         : getThinkingPrefixMismatchBehavior(storage),

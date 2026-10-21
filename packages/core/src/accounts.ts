@@ -322,6 +322,8 @@ export type AccountStorage = {
   thinkingBinding?: {
     prefixMismatchBehavior?: 'account-default' | 'error' | 'drop_block'
   }
+  /** Host tool names for reply-then-housekeeping notes; absent uses board/ctx_reduce, [] disables. */
+  turnEndNote?: { tools: string[] }
   /**
    * Zero out Anthropic OAuth model costs in the provider hook. Default: enabled
    * (OAuth usage is quota-based, not per-token billed, so costs show as $0).

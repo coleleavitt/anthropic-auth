@@ -8,6 +8,54 @@ prebuild = [
 ]
 
 [[control]]
+id = "turn-end-note-replays-earlier-points"
+guards = "Every qualifying history point must retain its turn-scoped note, not just the latest result."
+file = "packages/core/src/turn-end-note.ts"
+old = "    if (visible.length < TURN_END_NOTE_MIN_VISIBLE_CHARACTERS) continue"
+new = "    if (index !== messages.length - 1) continue // NON-VACUITY BREAK: inject only at the latest point\n    if (visible.length < TURN_END_NOTE_MIN_VISIBLE_CHARACTERS) continue"
+test_file = "packages/core/src/tests/turn-end-note.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/turn-end-note.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["turn-end note history > replays every earlier note with an identical serialized prefix"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "turn-end-note-requires-all-tools"
+guards = "A working tool mixed with housekeeping must prevent the turn-end note."
+file = "packages/core/src/turn-end-note.ts"
+old = "    if (!calls.length || !calls.every((call) => allowed.has(call.name)))\n      continue"
+new = "    if (!calls.length) continue // NON-VACUITY BREAK: drop the all-tools check"
+test_file = "packages/core/src/tests/turn-end-note.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/turn-end-note.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["turn-end note history > requires all tool calls to be housekeeping"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "turn-end-note-requires-long-reply"
+guards = "Short mid-work text must not receive a reply-complete note; the safety margin is 350 visible characters."
+file = "packages/core/src/turn-end-note.ts"
+old = "    if (visible.length < TURN_END_NOTE_MIN_VISIBLE_CHARACTERS) continue"
+new = "    if (visible.length === 0) continue // NON-VACUITY BREAK: drop the 350-character check"
+test_file = "packages/core/src/tests/turn-end-note.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/turn-end-note.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["turn-end note history > requires at least 350 exact outgoing visible characters"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
 id = "gzip-resets-cch-before-compression"
 guards = "The compressed body must carry cch=00000 rather than the identity body's signature."
 file = "packages/core/src/request-gzip.ts"

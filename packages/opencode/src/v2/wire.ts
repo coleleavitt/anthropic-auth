@@ -146,6 +146,8 @@ export function createNativeWirePolicy() {
         // would insert each change twice and alter earlier history, so the
         // cached prompt prefix would stop matching.
         midConversationEffortEnabled: false,
+        turnEndNoteEnabled: true,
+        turnEndNote: snapshot.policyStorage.turnEndNote,
         serverSideFallbackEnabled:
           resolveContentFilterFallbackMode(
             process.env.OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK,

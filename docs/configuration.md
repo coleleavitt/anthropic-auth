@@ -20,10 +20,19 @@ The imported preference fields are listed below. Values such as quota thresholds
 | `dump`, `logging` | `enabled` request dumps; `level`: `error`, `warn`, `info`, `debug`, `trace` |
 | `claudeFast` | `enabled`: supported Opus fast mode |
 | `thinkingBinding` | `prefixMismatchBehavior`: `account-default`, `error`, `drop_block` |
+| `turnEndNote` | `tools`: host tool names for the reply-then-housekeeping note; default `["board", "ctx_reduce"]`, `[]` disables it |
 | `costZeroing` | `enabled`: OpenCode OAuth price display, true by default |
 | `relay` | `enabled`, `url`, `transport` (`http` / `websocket`; when missing, inferred from the URL: `wss://` uses `websocket`, `https://` uses `http`), `fallbackToDirect`; its token is private credential state |
 
 [Cache](cache.md), [models](models.md) and [transports](transports.md) describe the effects. `quota.showToasts: true` opts into OpenCode quota notifications. Local credential state and per-account runtime metadata are separate from preferences; quota, profile, validation and Prime state are not all in the same file.
+
+### Reply-then-housekeeping note
+
+On OAuth routes for Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5, the plugin adds a turn-scoped system note after the results of an assistant's housekeeping calls when its visible reply is at least 350 characters and **all** its calls are in `turnEndNote.tools`. It asks Claude not to repeat the reply it already delivered. The 350-character minimum is a safety margin for short mid-work steps, not a configurable setting. Only non-whitespace text blocks count, joined without extra separators and measured as sent; thinking does not count. API-key routes, including API-key proxies, are unchanged.
+
+Use the tool names the host calls, such as `board`, not the OpenCode wire spelling `mcp_Board`. For a custom list, set `"turnEndNote": { "tools": ["board", "my_cleanup"] }` in the live native settings; there is no menu control. An unset list uses `board` and `ctx_reduce`; an empty list turns the note off. Changing the list can change earlier notes, so keep it stable during a conversation to preserve prompt caching.
+
+The plugin reconstructs every earlier qualifying note with identical text and placement on every request, independently of the current tool declarations. It does not add a cache breakpoint or effort configuration to the note. There is one exception: Anthropic rejects a note immediately followed by a user message, so the plugin omits just that note if the host appends a user message without an intervening assistant message. Bytes change at that point only; earlier notes are not moved or rewritten.
 
 ## Fallback accounts and session affinity
 

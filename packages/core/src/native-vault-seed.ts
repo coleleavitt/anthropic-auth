@@ -48,6 +48,7 @@ const preferenceFields: Record<string, readonly string[]> = {
   // first settings write may not yet know which vault accounts have those UUIDs.
   killswitch: ['enabled', 'main'],
   claudeFast: ['enabled'],
+  turnEndNote: ['tools'],
   prime: ['enabled'],
   logging: ['level'],
   dump: ['enabled'],

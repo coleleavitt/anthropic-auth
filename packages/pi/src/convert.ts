@@ -2,6 +2,7 @@ import {
   applyClaudeCodeMetadata,
   applyMidConversationOutputConfig,
   applyThinkingBindingControls,
+  applyTurnEndNotes,
   assertNoMeaningfulTrailingAssistant,
   buildBillingHeaderValue,
   type Cache1hMode,
@@ -205,6 +206,7 @@ function convertTextAndImages(
 function convertMessages(
   messages: Message[],
   targetModelId: string,
+  visibleReplies: WeakMap<object, string>,
 ): AnthropicRequestBody['messages'] {
   const result: AnthropicRequestBody['messages'] = []
 
@@ -241,9 +243,12 @@ function convertMessages(
       }
 
       const blocks: Array<Record<string, unknown>> = []
+      let visibleText = ''
       for (const block of message.content) {
         if (block.type === 'text' && block.text.trim()) {
-          blocks.push({ type: 'text', text: sanitize(block.text) })
+          const text = sanitize(block.text)
+          blocks.push({ type: 'text', text })
+          visibleText += text
         } else if (block.type === 'thinking') {
           const thinking = block as ThinkingContent
           const signature = thinking.thinkingSignature
@@ -317,7 +322,14 @@ function convertMessages(
           })
         }
       }
-      if (blocks.length) result.push({ role: 'assistant', content: blocks })
+      if (blocks.length) {
+        const converted = { role: 'assistant', content: blocks }
+        result.push(converted)
+        // Converted thinking can become text for replay, but it was never a
+        // visible reply. Count only actual text blocks, using the exact outgoing
+        // strings collected above, regardless of the current tool declarations.
+        visibleReplies.set(converted, visibleText)
+      }
       continue
     }
 
@@ -579,6 +591,7 @@ export async function buildAnthropicRequest(
   controls: {
     effortTransitions?: readonly MidConversationEffortTransition[]
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
+    turnEndNote?: { tools: string[] }
   } = {},
 ): Promise<{
   body: AnthropicRequestBody
@@ -604,7 +617,8 @@ export async function buildAnthropicRequest(
   // first so those losses cannot hide a meaningful final assistant turn. Check
   // the Anthropic messages again after conversion removes empty user messages.
   assertNoMeaningfulTrailingAssistant(context.messages)
-  const messages = convertMessages(context.messages, modelId)
+  const visibleReplies = new WeakMap<object, string>()
+  const messages = convertMessages(context.messages, modelId, visibleReplies)
   stripEmptyTrailingAssistantMessages(messages)
   const system = [
     {
@@ -730,6 +744,13 @@ export async function buildAnthropicRequest(
   }
 
   applyMidConversationOutputConfig(body, controls.effortTransitions ?? [])
+  if (identity) {
+    applyTurnEndNotes(body, {
+      tools: controls.turnEndNote?.tools,
+      mapToolName: toClaudeCodeToolName,
+      visibleText: (message) => visibleReplies.get(message) ?? '',
+    })
+  }
   addEphemeralCacheControl(body)
   applyCacheMode(body, cache.enabled, cache.mode)
   if (identity) {

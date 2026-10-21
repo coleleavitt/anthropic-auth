@@ -13,6 +13,7 @@ import {
   sendsPerTurnControlBeta,
 } from './mid-conversation-output-config.ts'
 import { isClaudeHaiku55Model } from './models.ts'
+import { TURN_END_NOTE_BETA } from './turn-end-note.ts'
 
 export type ProviderAccountUuid = string & {
   readonly __providerAccountUuid: unique symbol
@@ -397,7 +398,7 @@ export const CLAUDE_CODE_FULL_AGENT_BETAS = [
   'prompt-caching-scope-2026-01-05',
   'mid-conversation-tool-changes-2026-07-01',
   'advanced-tool-use-2025-11-20',
-  'mid-conversation-system-clear-at-2026-08-21',
+  TURN_END_NOTE_BETA,
   'effort-2025-11-24',
   'thinking-binding-controls-2026-08-01',
   'thinking-display-updates-2026-08-18',
@@ -459,6 +460,16 @@ export function selectClaudeCodeBetas(
       : body && isQuotaProbe(body)
         ? [...CLAUDE_CODE_QUOTA_BETAS]
         : [...CLAUDE_CODE_TITLE_BETAS]
+
+  if (
+    Array.isArray(body?.messages) &&
+    body.messages.some(
+      (message) =>
+        isRecord(message) && message.clear_at === 'next_user_message',
+    ) &&
+    !selected.includes(TURN_END_NOTE_BETA)
+  )
+    selected.push(TURN_END_NOTE_BETA)
 
   // Claude Code 2.1.302 puts claude-code-20250219 after the prompt-caching
   // scope beta on Haiku 5.5 requests instead of first.

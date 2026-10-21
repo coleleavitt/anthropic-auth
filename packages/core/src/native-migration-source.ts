@@ -123,6 +123,7 @@ const settingFields: Record<string, readonly string[]> = {
   logging: ['level'],
   claudeFast: ['enabled'],
   thinkingBinding: ['prefixMismatchBehavior'],
+  turnEndNote: ['tools'],
   costZeroing: ['enabled'],
   cacheKeep: ['enabled', 'always', 'startHour', 'endHour', 'subagents'],
   prime: ['enabled'],
@@ -176,6 +177,12 @@ export function validateNativeMigrationSettings(
         ].includes(key)
       ) {
         if (typeof value[key] !== 'boolean') refuse()
+      } else if (section === 'turnEndNote' && key === 'tools') {
+        if (
+          !Array.isArray(value[key]) ||
+          !value[key].every((name) => typeof name === 'string')
+        )
+          refuse()
       } else if (key === 'url') {
         if (typeof value[key] !== 'string' || !isValidApiBaseURL(value[key]))
           refuse()

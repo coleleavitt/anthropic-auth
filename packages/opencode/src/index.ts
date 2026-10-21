@@ -7128,6 +7128,8 @@ const anthropicAuthPlugin = async (
                       await getRequestStorage(),
                     ),
                   midConversationEffortEnabled: true,
+                  turnEndNoteEnabled: true,
+                  turnEndNote: (await getRequestStorage())?.turnEndNote,
                   midConversationEffortPlan: effortPlanHeader,
                   midConversationEffortResolvedPlan: resolvedEffortPlan,
                   hybridStandbyAnchor: standbyCacheAnchor,

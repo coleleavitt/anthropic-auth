@@ -51,6 +51,7 @@ import {
   type NativeAnthropicSource,
   NO_ACCOUNT_REFUSAL,
 } from '../v2/adapter'
+import { createNativeWirePolicy } from '../v2/wire'
 
 // A synthetic Core source: every account, credential and policy answer comes
 // from here, and every call the adapter makes into it is recorded.
@@ -429,6 +430,127 @@ const bodyOf = async (request: Request) =>
   JSON.parse(await request.clone().text()) as InspectedBody
 
 describe('OpenCode 2 native Anthropic adapter: request shape', () => {
+  test('qualifying reply histories on an API proxy are byte-identical despite OAuth note settings', async () => {
+    const { source } = makeSource({
+      options: { turnEndNoteEnabled: true },
+      authorize: () =>
+        apiKey(
+          'synthetic-api-key',
+          { custody: 'api', receipt: 'api' },
+          'https://proxy.invalid',
+        ),
+    })
+    const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
+    const payload = {
+      model: 'claude-opus-5-5',
+      messages: [
+        { role: 'user', content: 'Question' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'A'.repeat(350) },
+            { type: 'tool_use', name: 'board', id: 'a', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'a', content: 'Done' }],
+        },
+      ],
+    }
+    const { final } = await host.run(
+      scopeOf({ modelID: payload.model }),
+      hostRequest(payload),
+    )
+    expect(await final.text()).toBe(JSON.stringify(payload))
+  })
+
+  test('turn-end note N N+1 N+2 retain signed history prefixes through the native wire policy', async () => {
+    const wire = createNativeWirePolicy()
+    const { source } = makeSource({
+      requestOptions: (input) =>
+        wire.requestOptions(
+          input as any,
+          {
+            policyStorage: {
+              turnEndNote: { tools: ['board'] },
+              claudeCache: { enabled: true, mode: 'automatic' },
+            },
+          } as any,
+        ),
+    })
+    const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
+    const note = {
+      role: 'system',
+      clear_at: 'next_user_message',
+      content:
+        'Your reply above has already reached the user. The tool call after it was housekeeping and changed nothing they need to know. Do not repeat, summarize or rewrite that reply. If no new work remains, end the turn without restating anything.',
+    }
+    const pair = (id: string) => [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'A'.repeat(350) },
+          { type: 'tool_use', name: 'board', id, input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: id, content: 'Done' }],
+      },
+    ]
+    const messages: unknown[] = [
+      { role: 'user', content: 'Question' },
+      ...pair('a'),
+    ]
+    const outputs: any[] = []
+    for (const id of ['a', 'b', 'c']) {
+      if (id !== 'a')
+        messages.push(
+          { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] },
+          { role: 'user', content: `Next ${id}` },
+          ...pair(id),
+        )
+      const payload = {
+        model: 'claude-opus-5-5',
+        stream: true,
+        max_tokens: 16000,
+        messages,
+        tools:
+          id === 'a'
+            ? [{ name: 'board', input_schema: { type: 'object' } }]
+            : [],
+      }
+      const { final } = await host.run(
+        scopeOf({ modelID: payload.model }),
+        hostRequest(payload),
+      )
+      const text = await final.clone().text()
+      expect(await signRequestBody(text)).toBe(text)
+      const body = JSON.parse(text)
+      expect(body.messages.at(-1)).toEqual(note)
+      expect(final.headers.get('anthropic-beta')?.split(',')).toContain(
+        'mid-conversation-system-clear-at-2026-08-21',
+      )
+      for (const previous of outputs) {
+        expect(
+          JSON.stringify(body.messages.slice(0, previous.messages.length)),
+        ).toBe(JSON.stringify(previous.messages))
+        const { messages: _m, system: _s, tools: _t, ...fields } = body
+        const { messages: _pm, system: _ps, tools: _pt, ...initial } = previous
+        expect(fields).toEqual(initial)
+        expect(body.system.slice(1)).toEqual(previous.system.slice(1))
+        expect(
+          body.system[0].text.replace(/cch=[0-9a-f]{5}/, 'cch=00000'),
+        ).toBe(previous.system[0].text.replace(/cch=[0-9a-f]{5}/, 'cch=00000'))
+      }
+      outputs.push(body)
+    }
+    expect(
+      outputs[2].messages.filter((message: any) => message.clear_at),
+    ).toHaveLength(3)
+  })
+
   test('OAuth send carries the Claude Code wire shape, signed body and betas', async () => {
     const { source } = makeSource()
     const native = createNativeAnthropicAdapter({ source })

@@ -201,6 +201,77 @@ describe('Pi API fallback routing helpers', () => {
     expect(sockets[0]).toStartWith('wss://relay.invalid/ws?')
   })
 
+  test('native turnEndNote settings reach the signed Pi OAuth request and its beta', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-turn-end-note-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        turnEndNote: { tools: ['my_cleanup'] },
+        accounts: [],
+      },
+      storagePath,
+    )
+    let bodyText = ''
+    let headers = new Headers()
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        if (input.toString().includes('/api/claude_cli/bootstrap'))
+          return new Response(
+            JSON.stringify({
+              oauth_account: { account_uuid: 'pi-note-account' },
+            }),
+          )
+        bodyText = String(init?.body)
+        headers = new Headers(init?.headers)
+        return new Response(
+          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+        )
+      },
+    ) as unknown as typeof fetch
+    const stream = streamCortexKitAnthropic(
+      { ...anthropicModel, id: 'claude-opus-5-5' },
+      {
+        tools: [],
+        messages: [
+          { role: 'user', content: 'Question', timestamp: 0 },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'A'.repeat(350) },
+              { type: 'toolCall', id: 'a', name: 'my_cleanup', arguments: {} },
+            ],
+            timestamp: 0,
+          },
+          {
+            role: 'toolResult',
+            toolCallId: 'a',
+            content: [{ type: 'text', text: 'Done' }],
+            isError: false,
+            timestamp: 0,
+          },
+        ],
+      } as any,
+      { apiKey: 'sk-ant-oat-pi-note', sessionId: 'ses_pi_note' },
+    )
+    for await (const _event of stream) {
+      /* Drain the provider stream. */
+    }
+    const body = JSON.parse(bodyText)
+    expect(body.messages.at(-1)).toEqual({
+      role: 'system',
+      clear_at: 'next_user_message',
+      content:
+        'Your reply above has already reached the user. The tool call after it was housekeeping and changed nothing they need to know. Do not repeat, summarize or rewrite that reply. If no new work remains, end the turn without restating anything.',
+    })
+    expect(await signRequestBody(bodyText)).toBe(bodyText)
+    expect(headers.get('anthropic-beta')?.split(',')).toContain(
+      'mid-conversation-system-clear-at-2026-08-21',
+    )
+  })
+
   test('sends Fable 5.1 thinking binding controls after compacted signed history', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-fable-51-binding-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
