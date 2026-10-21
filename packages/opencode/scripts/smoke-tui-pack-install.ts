@@ -590,6 +590,14 @@ try {
   // A fresh install of the packed OpenCode and Pi packages must hold one copy
   // of each shared CortexKit client. Two copies mean two error classes and two
   // connections, and setup's instanceof checks stop recognizing Core's errors.
+  //
+  // This install uses npm, the way users install these packages, not Bun.
+  // `bun install --omit peer` still resolves peer dependency trees, so Pi's
+  // peer dependencies (pi-ai, and the AWS SDK it depends on) made this step
+  // depend on the registry being consistent: a freshly published AWS package
+  // whose own dependencies were not yet published failed the whole install.
+  // npm with --omit=peer installs none of those peers. Core is forced to the
+  // packed tarball through overrides so no copy comes from the registry.
   const piPackStdout = run(
     'npm',
     ['pack', '--json', '--pack-destination', tempRoot],
@@ -616,7 +624,18 @@ try {
       2,
     ),
   )
-  run('bun', ['install', '--production', '--omit', 'peer'], copiesRoot)
+  run(
+    'npm',
+    [
+      'install',
+      '--omit=peer',
+      '--omit=dev',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+    ],
+    copiesRoot,
+  )
   const installedFiles = await readdir(join(copiesRoot, 'node_modules'), {
     recursive: true,
   })
