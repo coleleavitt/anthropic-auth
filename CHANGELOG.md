@@ -7,6 +7,11 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ### Accounts
 
 - Vault response bookkeeping no longer holds the roster lock while waiting to write runtime state.
+- OpenCode 2 now waits for pending quota readings to be saved before it exits, as OpenCode 1 and Pi do, so a reading taken just before exit is no longer lost.
+
+### Dependencies
+
+- Update common-auth to 0.23.0, which saves vault quota readings even while another process holds the account roster lock and gives the sidebar its short quota labels.
 
 ## 2.2.1
 
