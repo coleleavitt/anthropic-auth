@@ -132,7 +132,7 @@ import {
   isQuotaStale,
   logger,
   quotaDisplayProjection,
-  quotaTextParts,
+  quotaWindowParts,
 } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
@@ -954,38 +954,30 @@ export function formatQuotaRowLabel(name: string, width = 10): string {
 
 /**
  * The short names model-scoped rows read under, in the order of `quota.scoped`:
- * the names common-auth's narrow one-line form gives them (`Fa` for Fable;
- * models whose short names would collide are extended until they differ, as
- * `Fabl` and `Fabr`), so the expanded rows and the collapsed line agree.
- *
- * common-auth exposes that short name only inside the narrow text, and the
- * narrow line shows just one model window (the tightest). So each window's
- * name is read from a narrow line of a copy of the reading in which that
- * window alone is spent: every model window stays in, so collisions resolve
- * exactly as they do in the real line, and the one piece the line shows is
- * `<short name> 0% left`. The figures in the copy are never displayed.
+ * each window part's `short`, the same label common-auth's narrow one-line
+ * form uses (`Fa` for Fable; models whose short names would collide are
+ * extended until they differ, as `Fabl` and `Fabr`), so the expanded rows and
+ * the collapsed line agree. Short names are worked out over every model window
+ * in the reading, so all scoped windows are projected together. A part is
+ * matched to its window by the window's title, which is the name a
+ * model-scoped part carries; a window with no part keeps its title.
  */
 export function scopedQuotaShortNames(
   quota: Pick<AccountQuota, 'scoped'> | null | undefined,
   now = Date.now(),
 ): string[] {
   const scoped = quota?.scoped ?? []
-  return scoped.map((window, index) => {
-    const probe = quotaDisplayProjection(
-      {
-        scoped: scoped.map((other, at) => ({
-          ...other,
-          usedPercent: at === index ? 100 : 0,
-          remainingPercent: at === index ? 0 : 100,
-          checkedAt: now,
-        })),
-      },
-      now,
-    )
-    const piece = quotaTextParts(probe, { now, form: 'narrow' })[0]
-    const name = piece?.replace(/ 0% left$/, '')
-    return name && name !== piece ? name : window.title
-  })
+  if (!scoped.length) return []
+  const { windows } = quotaWindowParts(
+    quotaDisplayProjection({ scoped }, now),
+    { now },
+  )
+  return scoped.map(
+    (window) =>
+      windows.find(
+        (part) => part.kind === 'window' && part.name === window.title,
+      )?.short || window.title,
+  )
 }
 
 /**

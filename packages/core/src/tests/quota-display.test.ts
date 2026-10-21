@@ -137,6 +137,7 @@ describe('quota display adapter', () => {
         {
           kind: 'window',
           name: '5h',
+          short: '5h',
           figure: '0% left',
           remainingPercent: 0,
           checkedAt: now - 2 * day,
@@ -145,6 +146,7 @@ describe('quota display adapter', () => {
         {
           kind: 'window',
           name: '7d',
+          short: '7d',
           figure: '80% left',
           remainingPercent: 80,
           checkedAt: now,
