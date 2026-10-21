@@ -98,7 +98,7 @@ lifetimes.test(
     )
     lifetimes.trackDetached(reports)
 
-    // Every runtime has started publishing once its readiness mark exists.
+    // The readiness marks show that every runtime is about to start publishing.
     const readyBy = Date.now() + 20_000
     while ((await readdir(ready)).length < RUNTIMES) {
       if (Date.now() > readyBy || runtimes.some((r) => r.exitCode !== null))

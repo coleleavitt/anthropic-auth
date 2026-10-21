@@ -53,8 +53,9 @@ const rejected = outcomes.flatMap((outcome) =>
     : [],
 )
 
-// An accepted reading is only in this process's mailbox. Stay alive until
-// every accepted reading is in the roster file, as a host would until exit.
+// An accepted reading has only been queued in this process for writing to the
+// roster. Stay alive until every accepted reading is in the roster file, as a
+// host would until exit.
 const landed = async () => {
   const row = (await claustrum.readVaultRoster(path))?.rows.find(
     (entry) => entry.routeId === routeId,
@@ -71,8 +72,9 @@ while (accepted && written < accepted && Date.now() < deadline) {
   await new Promise((resolve) => setTimeout(resolve, 50))
   written = await landed()
 }
-// Releases this process's quota mailbox. Releases without the mailbox have no
-// such export, and their writes are already finished or failed by now.
+// Flush and release this process's queued quota writes. If common-auth does
+// not export `drainVaultQuota`, its quota writes are already finished or have
+// failed by this point.
 const drain = (claustrum as { drainVaultQuota?: (path: string) => unknown })
   .drainVaultQuota
 await drain?.(path)
