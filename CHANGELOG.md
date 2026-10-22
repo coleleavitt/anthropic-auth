@@ -9,6 +9,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Starting an OAuth sign-in from `/claude` now shows the sign-in link in a dialog that stays open until you close it, in both OpenCode 1 and OpenCode 2, instead of a toast (OpenCode 1) or a message with the link mid-sentence (OpenCode 2). The link sits on rows of its own and wraps at any width, so selecting those rows copies it whole. Core's menu result names the checked link in its own `authorizationUrl` field, so the TUI no longer finds it in the text. OpenCode 1's older account dialog shows the link the same way above its Copy option. Neither TUI's plugin API offers a way to open a browser, so the dialog has no "Open in browser" action. Other results and server notifications are unchanged. Addresses #443.
 - When this machine's private-files backend did not load (`@cortexkit/private-files` reports `unsupported-filesystem`), the enrollment refusal now says "Private file support didn't load on this machine (@cortexkit/private-files). Reinstall the plugin; if this persists, report it with your OS and Node version." instead of "Native custody refused: invalid-token". Its error code is still `invalid-token`, so every other behaviour is the same, and every other unreadable enrollment keeps the old message. Addresses #442 (the private-files message).
 
+### Commands
+
+- In OpenCode 1, when no terminal window with the plugin's TUI part picks up the `/claude` menu within two seconds, the text menu it falls back to now starts with a short note on adding the TUI part to `tui.json`, once per session; later calls in that session don't wait. OpenCode Desktop gets the text menu at once with no note. Addresses #398 (tui.json).
+
 ### Dependencies
 
 - Test and CI dependencies move: the Pi SDK packages (`pi-agent-core`, `pi-ai`, `pi-coding-agent`, `pi-tui`) to 1.3.0 together, the OpenCode plugin and SDK to 1.19.3 together, `@ai-sdk/anthropic` to 4.0.82, `jdx/mise-action` to 5.2.0 and `actions/download-artifact` to v8. The Pi peer range and the OpenCode 1.18.18 host used by the process E2E checks are unchanged.

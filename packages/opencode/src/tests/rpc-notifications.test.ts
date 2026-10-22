@@ -3,6 +3,7 @@ import {
   drainNotifications,
   isTuiConnected,
   pushNotification,
+  pushNotificationAwaitingPickup,
   resetNotificationsForTest,
 } from '../rpc/notifications'
 import type { OpenDialogPayload } from '../rpc/protocol'
@@ -111,5 +112,97 @@ describe('notifications', () => {
       // @ts-expect-error drainNotifications requires a session id
       drainNotifications(0)
     }).toThrow('sessionId is required')
+  })
+
+  /** A manual clock for the pickup deadline: nothing fires until `expire`. */
+  function manualTimers() {
+    const pending = new Map<object, () => void>()
+    return {
+      options: {
+        timeoutMs: 2_000,
+        setTimeout: ((handler: () => void) => {
+          const handle = {}
+          pending.set(handle, handler)
+          return handle
+        }) as unknown as typeof setTimeout,
+        clearTimeout: ((handle: object) => {
+          pending.delete(handle)
+        }) as unknown as typeof clearTimeout,
+      },
+      get pending() {
+        return pending.size
+      },
+      expire() {
+        for (const [handle, run] of [...pending]) {
+          pending.delete(handle)
+          run()
+        }
+      },
+    }
+  }
+
+  test('a pickup wait resolves true when its session drains the notification', async () => {
+    const timers = manualTimers()
+    const picked = pushNotificationAwaitingPickup(
+      payload('claude-quota'),
+      's1',
+      timers.options,
+    )
+    // Another session's drain does not count as a pickup.
+    expect(drainNotifications(0, 's2')).toEqual([])
+    expect(timers.pending).toBe(1)
+    const drained = drainNotifications(0, 's1')
+    expect(drained.map((n) => n.payload.command)).toEqual(['claude-quota'])
+    expect(await picked).toBe(true)
+    expect(timers.pending).toBe(0)
+  })
+
+  test('a pickup wait resolves false at the deadline and withdraws the notification', async () => {
+    const timers = manualTimers()
+    const picked = pushNotificationAwaitingPickup(
+      payload('claude-quota'),
+      's1',
+      timers.options,
+    )
+    pushNotification(payload('claude-dump'), 's1')
+    timers.expire()
+    expect(await picked).toBe(false)
+    // Only the expired notification is withdrawn.
+    expect(drainNotifications(0, 's1').map((n) => n.payload.command)).toEqual([
+      'claude-dump',
+    ])
+  })
+
+  test('a deadline that fires at once still withdraws the notification', async () => {
+    const picked = pushNotificationAwaitingPickup(
+      payload('claude-quota'),
+      's1',
+      {
+        timeoutMs: 0,
+        setTimeout: ((handler: () => void) => {
+          handler()
+          return 0
+        }) as unknown as typeof setTimeout,
+        clearTimeout: (() => {}) as unknown as typeof clearTimeout,
+      },
+    )
+    expect(await picked).toBe(false)
+    expect(drainNotifications(0, 's1')).toEqual([])
+  })
+
+  test('resetting cancels outstanding pickup deadlines', async () => {
+    const timers = manualTimers()
+    const picked = pushNotificationAwaitingPickup(
+      payload('claude-quota'),
+      's1',
+      timers.options,
+    )
+    resetNotificationsForTest()
+    expect(await picked).toBe(false)
+    expect(timers.pending).toBe(0)
+    // A notification that reuses the restarted id 1 is not withdrawn.
+    pushNotification(payload('claude-dump'), 's1')
+    timers.expire()
+    expect(drainNotifications(0, 's1')).toHaveLength(1)
   })
 })

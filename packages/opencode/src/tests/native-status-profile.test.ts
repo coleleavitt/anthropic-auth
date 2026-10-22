@@ -290,6 +290,9 @@ async function start(
     {
       scopedRosterPollIntervalMs: 0,
       cacheKeepAggregateRefreshIntervalMs: 0,
+      // readMenu runs /claude without a TUI; reply at once instead of
+      // waiting the real two seconds for a TUI to take the menu.
+      tuiPickupTimeoutMs: 0,
       nativeLocal: nativeLocal(),
       ...(options.claustrumScopedConnect && {
         claustrumScopedConnect: options.claustrumScopedConnect,

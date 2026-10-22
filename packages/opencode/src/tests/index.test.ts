@@ -2081,6 +2081,7 @@ type PluginRuntimeOverrides = Partial<{
   scopedRosterPollIntervalMs: number
   claustrumScopedConnect: () => Promise<NativeCustodyClient>
   cacheKeepAggregateRefreshIntervalMs: number
+  tuiPickupTimeoutMs: number
 }>
 
 function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
@@ -2092,6 +2093,9 @@ function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
     clearInterval: mock(() => {}) as unknown as typeof clearInterval,
     scopedRosterPollIntervalMs: 0,
     cacheKeepAggregateRefreshIntervalMs: 0,
+    // /claude without a polling TUI replies in the chat at once instead of
+    // waiting the real two seconds for a TUI to take the menu.
+    tuiPickupTimeoutMs: 0,
   }
 }
 
@@ -10390,6 +10394,147 @@ describe('auth.loader', () => {
       enabled: true,
       mode: 'explicit',
     })
+  })
+
+  /**
+   * Plugin timers that hold back only the two-second wait /claude makes for a
+   * TUI to take its menu; every other timer runs for real. The test decides
+   * when that wait expires, so no real time has to pass.
+   */
+  function heldTuiPickupTimers() {
+    const held = new Map<object, () => void>()
+    let started = Promise.withResolvers<void>()
+    const setTimeoutImpl = ((
+      handler: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      if (delay !== 2_000) return globalThis.setTimeout(handler, delay, ...args)
+      const handle = {}
+      held.set(handle, () => handler(...args))
+      started.resolve()
+      return handle
+    }) as unknown as typeof setTimeout
+    const clearTimeoutImpl = ((handle: ReturnType<typeof setTimeout>) => {
+      if (!held.delete(handle as unknown as object))
+        globalThis.clearTimeout(handle)
+    }) as unknown as typeof clearTimeout
+    return {
+      // The default wait applies; the shared test overrides set it to zero.
+      overrides: {
+        setTimeout: setTimeoutImpl,
+        clearTimeout: clearTimeoutImpl,
+        tuiPickupTimeoutMs: undefined,
+      } as PluginRuntimeOverrides,
+      /** Resolves once /claude has started waiting for a TUI. */
+      async started() {
+        await started.promise
+        started = Promise.withResolvers<void>()
+      },
+      get waiting() {
+        return held.size
+      },
+      expire() {
+        for (const [handle, run] of [...held]) {
+          held.delete(handle)
+          run()
+        }
+      },
+    }
+  }
+
+  /** Ignored chat replies that carry the missing-TUI notice. */
+  function missingTuiNotices(client: ReturnType<typeof createMockClient>) {
+    const calls = (
+      client.session.promptAsync as unknown as {
+        mock: {
+          calls: Array<[{ body: { parts: Array<{ text: string }> } }]>
+        }
+      }
+    ).mock.calls
+    return calls
+      .map((call) => call[0]?.body.parts[0]?.text ?? '')
+      .filter((text) => text.includes('tui.json'))
+  }
+
+  test('/claude with no TUI taking the menu within two seconds says once how to add the TUI part', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const timers = heldTuiPickupTimers()
+    const plugin = await getPlugin(mockClient, undefined, timers.overrides)
+    const sessionID = 'session-no-tui'
+
+    const handled = plugin['command.execute.before']({
+      command: 'claude',
+      arguments: '',
+      sessionID,
+    })
+    handled.catch(() => {})
+    await timers.started()
+    expect(missingTuiNotices(mockClient)).toEqual([])
+
+    timers.expire()
+    await expectHandledCommandResponse(handled)
+
+    const notices = missingTuiNotices(mockClient)
+    expect(notices).toHaveLength(1)
+    const [notice = ''] = notices
+    expect(latestIgnoredReply(mockClient)).toBe(notice)
+    expect(notice).toContain('"@cortexkit/opencode-anthropic-auth"')
+    expect(notice).toContain('restart OpenCode')
+    // The read-only menu text still follows the notice.
+    expect(notice).toContain('## Cache')
+    // A TUI that starts afterwards does not open the menu that was answered.
+    expect(drainNotifications(0, sessionID)).toEqual([])
+  })
+
+  test('/claude queues its menu for a polling TUI that drains late, with no notice', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const timers = heldTuiPickupTimers()
+    const plugin = await getPlugin(mockClient, undefined, timers.overrides)
+    const sessionID = 'session-busy-tui'
+
+    // The TUI polled this session recently, so it counts as connected even
+    // though it does not take the menu until after the wait would have ended.
+    drainNotifications(0, sessionID)
+    await expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude',
+        arguments: '',
+        sessionID,
+      }),
+    )
+    expect(timers.waiting).toBe(0)
+    timers.expire()
+
+    const notice = drainNotifications(0, sessionID).at(-1)
+    expect(notice?.type).toBe('open-menu')
+    expect(missingTuiNotices(mockClient)).toEqual([])
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+  })
+
+  test('/claude hands its menu to a TUI that first polls during the wait, with no notice', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const timers = heldTuiPickupTimers()
+    const plugin = await getPlugin(mockClient, undefined, timers.overrides)
+    const sessionID = 'session-starting-tui'
+
+    const handled = plugin['command.execute.before']({
+      command: 'claude',
+      arguments: '',
+      sessionID,
+    })
+    handled.catch(() => {})
+    await timers.started()
+    // A TUI that has just started polls before the two seconds are up.
+    const notice = drainNotifications(0, sessionID).at(-1)
+    await expectHandledCommandResponse(handled)
+
+    expect(notice?.type).toBe('open-menu')
+    expect(timers.waiting).toBe(0)
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
   })
 
   test('config hook registers only /claude and retires owned aliases without clobbering foreign commands', async () => {

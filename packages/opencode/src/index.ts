@@ -263,6 +263,7 @@ import {
   drainNotifications,
   isTuiConnected,
   pushNotification,
+  pushNotificationAwaitingPickup,
 } from './rpc/notifications.ts'
 import {
   type AccountDialogKnobs,
@@ -1104,6 +1105,29 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   ) as T
 }
 
+/**
+ * How long /claude waits for an OpenCode 1 TUI to take its menu when that
+ * session's TUI has not polled recently. The plugin's TUI part polls every
+ * 500 ms while a session is open, so a TUI that has just started or just opened
+ * the session answers well within this. No answer means no TUI took the menu
+ * in time: the TUI part is not loaded, or not showing this session.
+ */
+const CLAUDE_MENU_TUI_PICKUP_MS = 2_000
+
+/**
+ * Leads the text reply /claude sends when no TUI took the menu. OpenCode 1
+ * loads a plugin's terminal UI only from tui.json/tui.jsonc, separately from
+ * opencode.json, so a plugin added by editing opencode.json alone has a
+ * working server side and no menu. docs/sidebar.md describes the entry.
+ * Not exported: this module keeps its plugin as its only export, because
+ * OpenCode 1 loads the exports of a plugin's entry module as plugins.
+ */
+const CLAUDE_MENU_NO_TUI_NOTICE = [
+  "The Claude menu did not open: no OpenCode terminal window running this plugin's TUI part (its menu and sidebar) picked it up within two seconds.",
+  'OpenCode 1 loads that part from tui.json, not opencode.json. Add "@cortexkit/opencode-anthropic-auth" to the "plugin" list in tui.json (or tui.jsonc) in your OpenCode config folder, with the same version as in opencode.json, or run setup again, which adds it. Then restart OpenCode.',
+  'Read-only summary:',
+].join('\n')
+
 type PluginRuntimeOverrides = Partial<{
   authorize: typeof authorize
   setTimeout: typeof globalThis.setTimeout
@@ -1116,6 +1140,8 @@ type PluginRuntimeOverrides = Partial<{
   cacheKeepAggregateRefreshIntervalMs: number
   /** Replaces the real-time wait between physical quota usage calls. */
   quotaCallPause: QuotaManagerOptions['pauseBetweenQuotaCalls']
+  /** How long /claude waits for a TUI to take its menu; see CLAUDE_MENU_TUI_PICKUP_MS. */
+  tuiPickupTimeoutMs: number
 }>
 
 function getConfiguredClaustrumConnectionFile(): string | undefined {
@@ -6095,10 +6121,29 @@ const anthropicAuthPlugin = async (
       const payload = await getNativeCommand(input.sessionID).open(
         input.sessionID,
       )
-      if (isTuiConnected(input.sessionID)) {
-        pushNotification(payload, input.sessionID)
-      } else {
+      // A TUI that polled this session within the last few seconds is running
+      // (possibly busy); queue the menu for it and never fall back to text.
+      // Without a recent poll, give a TUI that has just started or just opened
+      // the session a short time to take the menu. Only when none does is the
+      // TUI part missing or not showing this session: reply in the chat, which
+      // OpenCode shows without the plugin's TUI part.
+      let pickedUp = isTuiConnected(input.sessionID)
+      if (pickedUp) pushNotification(payload, input.sessionID)
+      else
+        pickedUp = await pushNotificationAwaitingPickup(
+          payload,
+          input.sessionID,
+          {
+            timeoutMs:
+              runtimeOverrides.tuiPickupTimeoutMs ?? CLAUDE_MENU_TUI_PICKUP_MS,
+            setTimeout: runtimeTimers.setTimeout,
+            clearTimeout: runtimeTimers.clearTimeout,
+          },
+        )
+      if (!pickedUp) {
         const text = [
+          CLAUDE_MENU_NO_TUI_NOTICE,
+          '',
           payload.menu.title,
           ...payload.menu.sections.flatMap((section) => [
             `\n## ${section.title}`,

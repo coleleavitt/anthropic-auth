@@ -4,6 +4,7 @@ export type PluginTimerOverrides = Partial<{
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
   cacheKeepAggregateRefreshIntervalMs: number
+  tuiPickupTimeoutMs: number
 }>
 
 export function createTimerTracking() {
@@ -21,6 +22,9 @@ export function createTimerTracking() {
       }) as unknown as typeof setInterval,
       clearInterval: mock(() => {}) as unknown as typeof clearInterval,
       cacheKeepAggregateRefreshIntervalMs: 0,
+      // /claude without a polling TUI replies in the chat at once instead of
+      // waiting the real two seconds for a TUI to take the menu.
+      tuiPickupTimeoutMs: 0,
     }
   }
 
