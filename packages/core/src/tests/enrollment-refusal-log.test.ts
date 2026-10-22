@@ -122,6 +122,70 @@ test('a private-files backend that did not load gets its own refusal message', a
   expect((error as Error).name).toBe('NativeCustodyError')
 })
 
+test('a Windows private-files addon refusal from newer common-auth gets the same message', async () => {
+  // common-auth 0.24.0 refuses every private-file operation on Windows with
+  // its own ERR_PRIVATE_FILES_UNAVAILABLE error when the addon did not load,
+  // wrapped in PrivateFileError when the failure happened inside a private
+  // operation. The innermost cause is the import or addon failure itself,
+  // which can carry an unrelated code.
+  const unavailable = () =>
+    Object.assign(
+      new Error('Windows private-files native addon is unavailable', {
+        cause: Object.assign(new Error('addon load failed'), {
+          code: 'ENOENT',
+        }),
+      }),
+      {
+        code: 'ERR_PRIVATE_FILES_UNAVAILABLE',
+        reason: 'native-addon-unavailable',
+      },
+    )
+  const failures = [
+    Object.assign(new Error('Private file refused at directory'), {
+      name: 'PrivateFileError',
+      stage: 'directory',
+      code: 'ERR_PRIVATE_FILES_UNAVAILABLE',
+      reason: 'native-addon-unavailable',
+      cause: unavailable(),
+    }),
+    unavailable(),
+    // The private-files package's own error class carries only the code.
+    Object.assign(new Error('Windows private files do not support ia32'), {
+      code: 'ERR_PRIVATE_FILES_UNAVAILABLE',
+    }),
+  ]
+  for (const failure of failures) {
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    let error: unknown
+    try {
+      error = await readNativeEnrollmentMode(
+        'opencode',
+        {},
+        {
+          enrollmentAuthority: async () => 'unreadable',
+          readClaustrumEnrollmentStatus: async () => {
+            throw failure
+          },
+        },
+      ).then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      )
+    } finally {
+      __setLogTestSink(null)
+    }
+    expect(error).toBeInstanceOf(NativePrivateFilesUnavailableError)
+    expect((error as Error).message).toBe(PRIVATE_FILES_UNAVAILABLE_MESSAGE)
+    expect((error as NativeCustodyError).code).toBe('invalid-token')
+    expect(records).toHaveLength(1)
+    expect(records[0]?.payload).toMatchObject({
+      host: 'opencode',
+      reason: 'native-addon-unavailable',
+    })
+  }
+})
+
 test('every other unreadable enrollment keeps the invalid-token refusal', async () => {
   for (const failure of [
     { stage: 'read', reason: 'wrong-owner' },

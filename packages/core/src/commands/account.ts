@@ -195,7 +195,11 @@ export function formatEnrollmentStatus(
     case 'busy':
       return ['- Enrollment: setup is busy']
     case 'unavailable':
-      return ['- Enrollment: temporarily unavailable']
+      // Only an enrollment attempt reports this state, and its one cause is
+      // a vault that cannot enroll plugins at all, so it is not temporary.
+      return [
+        '- Enrollment: this Claustrum vault does not support connecting plugins',
+      ]
     case 'pending':
       return status.requestId && /^[A-Za-z0-9_-]{1,128}$/.test(status.requestId)
         ? [`- Enrollment: pending approval (${status.requestId})`, setup]

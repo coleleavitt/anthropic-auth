@@ -42,7 +42,10 @@ import type {
 } from '@cortexkit/common-auth/setup'
 
 import { NativeVaultActivationError } from './setup/native-activation.ts'
-import { NativeVaultEnrollmentError } from './setup/native-enrollment.ts'
+import {
+  NATIVE_VAULT_HOST_NAMES,
+  NativeVaultEnrollmentError,
+} from './setup/native-enrollment.ts'
 import { ProcessFenceViolationError } from './setup/process-fence.ts'
 
 const STAGE_LABELS = {
@@ -167,6 +170,7 @@ const ERROR_FIELD_VALUES = {
     'NativeVaultActivationError',
     'NativeVaultEnrollmentError',
     'SetupCommandError',
+    'HostNotEnrolledError',
     'ProcessFenceViolationError',
     'ProcessInspectionError',
     'LockOwnershipError',
@@ -251,6 +255,8 @@ const ERROR_FIELD_VALUES = {
     'empty-dacl',
     'reparse-point',
     'unsupported-filesystem',
+    // common-auth's reason when the Windows private-files addon did not load.
+    'native-addon-unavailable',
     'unsafe-ancestor',
     'wrong-kind',
     'io-error',
@@ -317,10 +323,33 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
   'Anthropic runtime storage is unavailable',
   'Anthropic runtime observation is older than persisted state',
   'Anthropic runtime publication was refused',
+  // Shared setup's vault enrollment refusals (HostNotEnrolledError) with
+  // fixed text. common-auth 0.24.0 and later show them as thrown; earlier
+  // releases replaced them with one generic message.
+  'Claustrum connection failed; start ck and rerun setup.',
+  'Claustrum enrollment refused; inspect its status with ck before rerunning setup.',
+  'Invalid enrollment request id.',
+  'This Claustrum vault does not support connecting plugins yet, so setup cannot connect to it. Run setup without --claustrum to use local accounts.',
   // Metadata-read failures without an HTTP status have one fixed message.
   // knownFailureMessage also accepts an appended, validated HTTP status code.
   'OAuth metadata read failed',
 ])
+
+/** Vault names the shared setup runner proposes for each host. */
+const VAULT_HOST_NAMES = Object.values(NATIVE_VAULT_HOST_NAMES).join('|')
+
+/**
+ * Shared setup's HostNotEnrolledError messages that embed vetted values: the
+ * request id setup already printed (letters, digits, `_` and `-`), the host's
+ * vault name, and a snake_case vault error code. Each pattern admits exactly
+ * those shapes, so no other text can reach the screen through them.
+ */
+const HOST_NOT_ENROLLED_PATTERNS = [
+  new RegExp(
+    `^Claustrum approval is still pending\\. In another terminal, run: ck auth enroll approve --request-id [A-Za-z0-9_-]{1,128} --name (?:${VAULT_HOST_NAMES}) and then rerun setup\\.$`,
+  ),
+  /^The vault never created the enrollment request \(last error: [a-z][a-z0-9_]{0,63}\)\. Check that ck is running, then rerun setup\.$/,
+]
 
 /**
  * Executable names ProcessFenceViolationError prints, compared case-
@@ -420,7 +449,8 @@ function closedFenceHosts(
  * refusal, or undefined to fall through to reportThrownFailure. Runner errors
  * cross a bundle boundary, so only own data properties classify them.
  * Display text must be a fixed remedy, the runner's unknown-argument message,
- * an OAuth metadata error matching its own integer HTTP status (100–599), or
+ * an OAuth metadata error matching its own integer HTTP status (100–599),
+ * a shared-setup enrollment refusal matching HOST_NOT_ENROLLED_PATTERNS, or
  * a running-host list rebuilt from validated own host names and PIDs.
  */
 export function knownFailureMessage(error: unknown): string | undefined {
@@ -431,6 +461,16 @@ export function knownFailureMessage(error: unknown): string | undefined {
     if (typeof message !== 'string') return undefined
     if (CLOSED_MESSAGES.has(message)) return message
     if (message.startsWith('Unknown setup argument: ')) return message
+    if (
+      ownData(error, 'name') === 'HostNotEnrolledError' &&
+      HOST_NOT_ENROLLED_PATTERNS.some((pattern) => pattern.test(message))
+    )
+      return message
+    // common-auth 0.24.0 and later refuse every Windows private-file
+    // operation with this code when the native addon did not load. Their
+    // own message names a file path, so show the fixed remedy instead.
+    if (ownData(error, 'code') === 'ERR_PRIVATE_FILES_UNAVAILABLE')
+      return PRIVATE_FILES_UNAVAILABLE_MESSAGE
     const status = ownData(error, 'status')
     if (
       typeof status === 'number' &&

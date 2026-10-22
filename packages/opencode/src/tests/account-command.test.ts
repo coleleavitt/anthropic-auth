@@ -555,6 +555,26 @@ describe('executeAccountCommand status', () => {
     expect(result.text).not.toContain('ck auth enroll approve')
   })
 
+  test('names a vault that cannot enroll plugins instead of calling it temporary', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: '',
+      storage: baseStorage(),
+      statusProjection: {
+        claustrumDetection: 'available',
+        claustrumEnrollment: {
+          state: 'unavailable',
+          proposedName: 'anthropic-auth-opencode',
+          code: 'unknown_method',
+        },
+        accounts: [],
+      },
+    })
+    expect(result.text).toContain(
+      'Enrollment: this Claustrum vault does not support connecting plugins',
+    )
+    expect(result.text).not.toContain('temporarily unavailable')
+  })
+
   test('directs an approved but unconfigured host to explicit setup', async () => {
     const result = await executeAccountCommand({
       argumentsText: '',

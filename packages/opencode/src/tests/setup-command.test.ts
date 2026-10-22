@@ -33,12 +33,14 @@ import {
   runNativeMigration,
   type SetupIO,
 } from '@cortexkit/anthropic-auth-core'
+import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
 import { lockPathFor, withLock } from '@cortexkit/common-auth/fs'
 import type {
   AccountHeadersResult,
   RequestScope,
 } from '@cortexkit/common-auth/opencode2'
 import { registerOpenCode2AuthMethods } from '@cortexkit/common-auth/opencode2'
+import * as commonAuthSetup from '@cortexkit/common-auth/setup'
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
 import { createOpencodeClient } from '@opencode-ai/sdk'
 import { $ } from 'bun'
@@ -837,6 +839,25 @@ describe('setup failure diagnostics', () => {
           ],
         ],
         [
+          // common-auth 0.24.0 and later refuse a Windows private-file
+          // operation like this when the native addon did not load; its own
+          // message names the file, so only the fixed remedy is shown.
+          Object.assign(
+            new Error(
+              `Private file refused at directory: /private/${ECHO_OPAQUE}/state (native-addon-unavailable).`,
+            ),
+            {
+              name: 'PrivateFileError',
+              stage: 'directory',
+              code: 'ERR_PRIVATE_FILES_UNAVAILABLE',
+              reason: 'native-addon-unavailable',
+            },
+          ),
+          [
+            "Private file support didn't load on this machine (@cortexkit/private-files). Reinstall the plugin; if this persists, report it with your OS and Node version.",
+          ],
+        ],
+        [
           new ProcessFenceViolationError([
             {
               pid: 4242,
@@ -1310,6 +1331,107 @@ lifetimes.test(
     expect(screen).not.toContain(ECHO_SK)
   },
 )
+
+// common-auth 0.24.0 and later throw a specific HostNotEnrolledError for each
+// way enrollment can end without a token, where earlier releases threw one
+// generic message. These cases drive the real shared runner, so they run only
+// when the installed common-auth (the copy Core bundles) has that behavior.
+if ('UNSUPPORTED_VAULT_MESSAGE' in commonAuthSetup) {
+  const enrollmentEndings: Array<{
+    name: string
+    client: () => {
+      close(): void
+      enrollPropose(input: { name: string }): Promise<{ requestId: string }>
+      enrollPoll(): Promise<{ status: 'pending' }>
+    }
+    screen: string
+    progress?: string
+  }> = [
+    {
+      name: 'a vault without the enrollment ceremony',
+      client: () => ({
+        close() {},
+        // How claustrum-client before 0.13.0 reports the daemon's answer to
+        // an operation it does not implement.
+        enrollPropose: async () => {
+          throw new ClaustrumCredentialError(
+            'unknown_method',
+            'transient',
+            'retry',
+          )
+        },
+        enrollPoll: async () => ({ status: 'pending' }),
+      }),
+      screen:
+        'This Claustrum vault does not support connecting plugins yet, so setup cannot connect to it. Run setup without --claustrum to use local accounts.',
+    },
+    {
+      name: 'a vault that never creates the request',
+      client: () => ({
+        close() {},
+        enrollPropose: async () => {
+          throw new ClaustrumCredentialError(
+            'pending_queue_full',
+            'transient',
+            'retry',
+          )
+        },
+        enrollPoll: async () => ({ status: 'pending' }),
+      }),
+      screen:
+        'The vault never created the enrollment request (last error: pending_queue_full). Check that ck is running, then rerun setup.',
+      progress:
+        'The vault has not created the request yet (pending_queue_full); retrying.',
+    },
+    {
+      name: 'a request nobody approves',
+      client: () => ({
+        close() {},
+        enrollPropose: async () => ({ requestId: 'fixture-request' }),
+        enrollPoll: async () => ({ status: 'pending' }),
+      }),
+      screen:
+        'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id fixture-request --name anthropic-auth-opencode and then rerun setup.',
+    },
+  ]
+  for (const ending of enrollmentEndings)
+    lifetimes.test(
+      `vault setup against ${ending.name} shows the shared refusal word for word`,
+      async () => {
+        const f = await callbackFixture({
+          opencode: true,
+          pi: false,
+          claustrum: true,
+        })
+        // A fake clock: each wait moves it forward, so the enrollment wait
+        // runs out without real time passing.
+        let clock = 0
+        const clockIO = {
+          now: () => clock,
+          wait: async (ms: number) => {
+            clock += ms
+          },
+        }
+        expect(
+          await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
+            ...f.io,
+            ...clockIO,
+            connect: async () => ending.client(),
+          }),
+        ).toBe(1)
+        const screen = f.screen()
+        expect(occurrences(screen, ending.screen)).toBe(1)
+        if (ending.progress)
+          expect(occurrences(screen, ending.progress)).toBe(1)
+        expect(occurrences(screen, 'OpenCode: not connected')).toBe(1)
+        expect(screen).not.toContain('unexpected-error')
+        expect(screen).not.toContain(STAYS_CONNECTED)
+        // A known refusal is shown, not recorded.
+        await expectNoDiagnostics(f)
+        expect(await readNativeEnrollmentMode('opencode', f.env)).toBe('local')
+      },
+    )
+}
 
 lifetimes.test(
   'a failed two-host vault setup prints each host status once, then the undo steps for the connected host',

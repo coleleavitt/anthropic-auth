@@ -14,6 +14,7 @@ import {
   createProviderErrorRedactor,
   NativeMigrationError,
   NativePiAuthSlotError,
+  PRIVATE_FILES_UNAVAILABLE_MESSAGE,
   runSetup,
   type SetupIO,
   type SetupPlugin,
@@ -216,6 +217,67 @@ test('fixed remedies and validated closed codes are admitted word for word', () 
   ]
   for (const error of closed)
     expect(knownFailureMessage(error)).toBe(error.message)
+})
+
+test('shared setup enrollment refusals are shown word for word and look-alikes are not', () => {
+  const refusal = (message: string, name = 'HostNotEnrolledError') =>
+    Object.assign(new Error(message), { name })
+  for (const message of [
+    'Claustrum connection failed; start ck and rerun setup.',
+    'Claustrum enrollment refused; inspect its status with ck before rerunning setup.',
+    'Invalid enrollment request id.',
+    'This Claustrum vault does not support connecting plugins yet, so setup cannot connect to it. Run setup without --claustrum to use local accounts.',
+    'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id req_01-AB --name anthropic-auth-pi and then rerun setup.',
+    'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id r1 --name anthropic-auth-opencode and then rerun setup.',
+    'The vault never created the enrollment request (last error: transport_error). Check that ck is running, then rerun setup.',
+    'The vault never created the enrollment request (last error: unknown). Check that ck is running, then rerun setup.',
+  ])
+    expect(knownFailureMessage(refusal(message))).toBe(message)
+  for (const error of [
+    // The templated messages need the shared runner's error name.
+    refusal(
+      'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id r1 --name anthropic-auth-pi and then rerun setup.',
+      'Error',
+    ),
+    refusal(
+      'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id r1/../x --name anthropic-auth-pi and then rerun setup.',
+    ),
+    refusal(
+      'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id r1 --name other-plugin-pi and then rerun setup.',
+    ),
+    refusal(
+      `Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id r1 --name anthropic-auth-pi and then rerun setup.\n${OPAQUE}`,
+    ),
+    refusal(
+      `The vault never created the enrollment request (last error: Bearer ${OPAQUE}). Check that ck is running, then rerun setup.`,
+    ),
+  ])
+    expect(knownFailureMessage(error)).toBeUndefined()
+})
+
+test('a private-files addon refusal shows the fixed remedy, not its path or code', () => {
+  const refusal = Object.assign(
+    new Error(
+      `Private file refused at directory: /private/${OPAQUE} (native-addon-unavailable).`,
+    ),
+    {
+      name: 'PrivateFileError',
+      stage: 'directory',
+      code: 'ERR_PRIVATE_FILES_UNAVAILABLE',
+      reason: 'native-addon-unavailable',
+    },
+  )
+  expect(knownFailureMessage(refusal)).toBe(PRIVATE_FILES_UNAVAILABLE_MESSAGE)
+  // A refusal with another code keeps the private diagnostics path.
+  expect(
+    knownFailureMessage(
+      Object.assign(new Error(`Private file refused: /private/${OPAQUE}`), {
+        name: 'PrivateFileError',
+        code: 'ERR_PRIVATE_FILES_SECURITY',
+        reason: 'unsupported-filesystem',
+      }),
+    ),
+  ).toBeUndefined()
 })
 
 test('shared runner plain errors retain their exact display messages', async () => {

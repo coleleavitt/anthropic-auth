@@ -38,6 +38,23 @@ const reasons = new Set([
   'ERR_PRIVATE_FILES_SECURITY',
 ])
 
+/**
+ * Codes and reasons that mean the Windows private-files native addon did not
+ * load. common-auth 0.24.0 and later refuse with code
+ * `ERR_PRIVATE_FILES_UNAVAILABLE` and reason `native-addon-unavailable`
+ * instead of passing through the backend's `unsupported-filesystem`.
+ */
+const addonUnavailable = new Set([
+  'ERR_PRIVATE_FILES_UNAVAILABLE',
+  'native-addon-unavailable',
+])
+
+/** Logged reasons that mean the private-files backend, not the enrollment, failed. */
+const privateFilesUnavailableReasons = new Set([
+  'unsupported-filesystem',
+  'native-addon-unavailable',
+])
+
 async function logRefusal(
   host: 'opencode' | 'pi',
   paths: ReturnType<typeof getHostClaustrumEnrollmentPaths>,
@@ -45,6 +62,7 @@ async function logRefusal(
 ): Promise<string> {
   let stage = 'enrollment'
   let reason = 'unreadable'
+  let unavailable = false
   try {
     // The shared authority intentionally closes errors. A failure-only probe
     // recovers diagnostic codes without changing the authority decision.
@@ -64,11 +82,16 @@ async function logRefusal(
         cause?: unknown
       }
       if (detail.stage && stages.has(detail.stage)) stage = detail.stage
-      for (const value of [detail.kind, detail.code, detail.reason])
+      for (const value of [detail.kind, detail.code, detail.reason]) {
         if (value && reasons.has(value)) reason = value
+        if (value && addonUnavailable.has(value)) unavailable = true
+      }
       current = detail.cause
     }
   }
+  // A missing addon explains every other refusal in the chain (an inner
+  // cause may carry an unrelated code such as ENOENT), so it wins.
+  if (unavailable) reason = 'native-addon-unavailable'
   logger.warn('enrollment', 'Native enrollment authority refused', {
     host,
     stage,
@@ -79,10 +102,12 @@ async function logRefusal(
 
 /**
  * Shown instead of `Native custody refused: invalid-token` when the
- * enrollment files could not be read because the private-files backend
- * reported `unsupported-filesystem`. On Windows that is what every
- * private-file check returns when the @cortexkit/private-files native addon
- * did not load, so the enrollment itself may be fine.
+ * enrollment files could not be read because the private-files backend did
+ * not load. Older common-auth passes on the backend's
+ * `unsupported-filesystem`, which is what every private-file check returns on
+ * Windows when the @cortexkit/private-files native addon did not load; newer
+ * common-auth refuses with `ERR_PRIVATE_FILES_UNAVAILABLE`. Either way the
+ * enrollment itself may be fine.
  */
 export const PRIVATE_FILES_UNAVAILABLE_MESSAGE =
   "Private file support didn't load on this machine (@cortexkit/private-files). Reinstall the plugin; if this persists, report it with your OS and Node version."
@@ -120,7 +145,7 @@ export async function readNativeEnrollmentMode(
       paths,
       dependencies.readClaustrumEnrollmentStatus,
     )
-    if (reason === 'unsupported-filesystem')
+    if (privateFilesUnavailableReasons.has(reason))
       throw new NativePrivateFilesUnavailableError()
     throw new NativeCustodyError('invalid-token')
   }
