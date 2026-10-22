@@ -15,6 +15,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Setup
 
+- Setup against a vault that doesn't support connecting plugins now stops at once with a clear message, never-created and pending-approval requests are told apart, and a missing Windows private-files addon is reported by name (common-auth 0.24.0). Addresses #439 and #442.
 - "Reset host enrollment" no longer answers a pending vault enrollment with a bare `refused-pending`: in OpenCode 1, OpenCode 2 and Pi it now says a request may still be in progress and to quit OpenCode and run setup again, which picks up the same request. The migration-required message now gives `npx @cortexkit/opencode-anthropic-auth setup` without the stale `@2.0.0` version. Addresses #440 and #441.
 
 ### Dependencies
