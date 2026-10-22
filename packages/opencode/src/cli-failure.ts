@@ -338,6 +338,9 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
 /** Vault names the shared setup runner proposes for each host. */
 const VAULT_HOST_NAMES = Object.values(NATIVE_VAULT_HOST_NAMES).join('|')
 
+const INCOMPLETE_ENROLLMENT_MESSAGE =
+  'Claustrum enrollment did not complete. Inspect and approve with ck, then rerun setup.'
+
 /**
  * Shared setup's HostNotEnrolledError messages that embed vetted values: the
  * request id setup already printed (letters, digits, `_` and `-`), the host's
@@ -459,6 +462,11 @@ export function knownFailureMessage(error: unknown): string | undefined {
     if (ownData(error, 'name') === 'ProcessInspectionError') return ''
     const message = ownData(error, 'message')
     if (typeof message !== 'string') return undefined
+    if (
+      ownData(error, 'name') === 'HostNotEnrolledError' &&
+      message === INCOMPLETE_ENROLLMENT_MESSAGE
+    )
+      return message
     if (CLOSED_MESSAGES.has(message)) return message
     if (message.startsWith('Unknown setup argument: ')) return message
     if (

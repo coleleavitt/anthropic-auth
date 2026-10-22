@@ -226,6 +226,7 @@ test('shared setup enrollment refusals are shown word for word and look-alikes a
     'Claustrum connection failed; start ck and rerun setup.',
     'Claustrum enrollment refused; inspect its status with ck before rerunning setup.',
     'Invalid enrollment request id.',
+    'Claustrum enrollment did not complete. Inspect and approve with ck, then rerun setup.',
     'This Claustrum vault does not support connecting plugins yet, so setup cannot connect to it. Run setup without --claustrum to use local accounts.',
     'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id req_01-AB --name anthropic-auth-pi and then rerun setup.',
     'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id r1 --name anthropic-auth-opencode and then rerun setup.',
@@ -234,6 +235,10 @@ test('shared setup enrollment refusals are shown word for word and look-alikes a
   ])
     expect(knownFailureMessage(refusal(message))).toBe(message)
   for (const error of [
+    refusal(
+      'Claustrum enrollment did not complete. Inspect and approve with ck, then rerun setup.',
+      'Error',
+    ),
     // The templated messages need the shared runner's error name.
     refusal(
       'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id r1 --name anthropic-auth-pi and then rerun setup.',

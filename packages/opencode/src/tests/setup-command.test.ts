@@ -1322,9 +1322,18 @@ lifetimes.test(
       }),
     ).toBe(1)
     const screen = f.screen()
-    // runSetup prints the unknown status line once; the command adds no
-    // second line for it and no undo steps for a connection it cannot confirm.
-    expect(occurrences(screen, OPENCODE_UNKNOWN)).toBe(1)
+    if ('UNSUPPORTED_VAULT_MESSAGE' in commonAuthSetup) {
+      expect(occurrences(screen, 'OpenCode: not connected')).toBe(1)
+      expect(screen).toContain(
+        'Claustrum enrollment did not complete. Inspect and approve with ck, then rerun setup.',
+      )
+      expect(screen).not.toContain(OPENCODE_UNKNOWN)
+      await expectNoDiagnostics(f)
+    } else {
+      // Earlier common-auth releases cannot classify this catch-all failure.
+      // They leave the host's outcome unknown because the state is unreadable.
+      expect(occurrences(screen, OPENCODE_UNKNOWN)).toBe(1)
+    }
     expect(screen).not.toContain('may be connected to the vault')
     expect(screen).not.toContain(OPENCODE_CONNECTED)
     expect(screen).not.toContain(STAYS_CONNECTED)
@@ -1384,6 +1393,20 @@ if ('UNSUPPORTED_VAULT_MESSAGE' in commonAuthSetup) {
         'The vault has not created the request yet (pending_queue_full); retrying.',
     },
     {
+      name: 'an enrollment failure after a vetted transport error',
+      client: () => ({
+        close() {},
+        enrollPropose: async () => {
+          throw Object.assign(new Error(ECHO_SK), {
+            code: 'transport_error',
+          })
+        },
+        enrollPoll: async () => ({ status: 'pending' }),
+      }),
+      screen:
+        'Claustrum enrollment did not complete. Inspect and approve with ck, then rerun setup.',
+    },
+    {
       name: 'a request nobody approves',
       client: () => ({
         close() {},
@@ -1426,6 +1449,10 @@ if ('UNSUPPORTED_VAULT_MESSAGE' in commonAuthSetup) {
         expect(occurrences(screen, 'OpenCode: not connected')).toBe(1)
         expect(screen).not.toContain('unexpected-error')
         expect(screen).not.toContain(STAYS_CONNECTED)
+        if (
+          ending.name === 'an enrollment failure after a vetted transport error'
+        )
+          expect(screen).not.toContain('transport_error')
         // A known refusal is shown, not recorded.
         await expectNoDiagnostics(f)
         expect(await readNativeEnrollmentMode('opencode', f.env)).toBe('local')

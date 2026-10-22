@@ -9,7 +9,7 @@ import {
   spyOn,
 } from 'bun:test'
 import { createHash, randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import * as filesystem from 'node:fs/promises'
 import {
   mkdir,
@@ -21,6 +21,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { PassThrough } from 'node:stream'
 import { gunzipSync } from 'node:zlib'
 import type {
   NativeRefreshSubject,
@@ -42,6 +43,7 @@ import {
   getAccountStatePath,
   getClaudeCodeIdentityForVerifiedAccount,
   getDumpDirectory,
+  getHostClaustrumEnrollmentPaths,
   hashRefreshToken,
   isCustodyTombstoneOAuth,
   isDumpEnabled,
@@ -58,11 +60,14 @@ import {
   resetClaudeCodeIdentityCachesForTest,
   resetDumpState,
   resetFastModeState,
+  type SetupIO,
   setLogLevel,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
+import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
 import { withLock } from '@cortexkit/common-auth/fs'
+import * as commonAuthSetup from '@cortexkit/common-auth/setup'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import type { NativeRefreshObservation } from '../../../core/src/native-refresh-coordinator.ts'
 import {
@@ -83,6 +88,7 @@ import {
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
 } from '../server-fallback'
+import { runSetupCommand } from '../setup/command'
 import {
   __setInitialSidebarRoutingTestHooks,
   drainSidebarWrites,
@@ -2148,6 +2154,113 @@ async function getPlugin(
 }
 
 describe('scoped enrollment is explicit', () => {
+  if ('UNSUPPORTED_VAULT_MESSAGE' in commonAuthSetup) {
+    test('unsupported vault setup clears state for /claude status and reset', async () => {
+      const vault = mainOnlyVault()
+      const fixture = await useVaultAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          mainAccountId: 'primary-route',
+          claustrum: {
+            mode: 'claustrum',
+            scopedRoster: true,
+            primaryAccount: {
+              credentialId: 'oauth:anthropic',
+              accountId: syntheticMainIdentity as ProviderAccountUuid,
+              state: 'active',
+            },
+          },
+        }),
+        vault,
+      )
+      const setupEnv: NodeJS.ProcessEnv = {
+        ...fixture.env,
+        HOME: fixture.root,
+      }
+      const enrollment = getHostClaustrumEnrollmentPaths('opencode', setupEnv)
+      // Remove the fixture's enrollment token and state so setup starts a
+      // fresh enrollment ceremony against the unsupported vault.
+      await rm(enrollment.tokenPath, { force: true })
+      await rm(enrollment.statePath, { force: true })
+      const bin = join(fixture.root, 'fixture-bin')
+      const connectionFile =
+        setupEnv.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
+      if (!connectionFile) throw new Error('Missing isolated connection path')
+      setupEnv.PATH = bin
+      const executable = (path: string) =>
+        path === join(bin, 'opencode') || path === join(bin, 'ck')
+      const setupIO: SetupIO = {
+        env: setupEnv,
+        platform: 'linux',
+        fs: {
+          exists: (path) => path === connectionFile || existsSync(path),
+          isDirectory: (path) => {
+            try {
+              return statSync(path).isDirectory()
+            } catch {
+              return false
+            }
+          },
+          isFile: executable,
+          isExecutable: executable,
+          readText: (path) => readFileSync(path, 'utf8'),
+          realpath: (path) => realpathSync(path),
+        },
+        runner: {
+          run: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+        },
+        fence: { listRunningHosts: async () => [] },
+        terminal: { input: process.stdin, output: new PassThrough() },
+        connect: async () => ({
+          close() {},
+          enrollPropose: async () => {
+            throw new ClaustrumCredentialError(
+              'unknown_method',
+              'transient',
+              'retry',
+            )
+          },
+          enrollPoll: async () => ({ status: 'pending' as const }),
+        }),
+      }
+
+      expect(
+        await runSetupCommand(
+          ['--yes', '--claustrum', '--opencode=2'],
+          setupIO,
+        ),
+      ).toBe(1)
+      await expect(
+        readFile(enrollment.statePath, 'utf8'),
+      ).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+
+      const plugin = await getPlugin(createMockClient(), fixture.root, {
+        claustrumScopedConnect: async () => vault,
+      })
+      const menu = await openClaudeMenu(plugin, 'ses_unsupported_vault')
+      const status = (
+        menu.menu.sections.find((section) => section.id === 'Accounts')
+          ?.lines ?? []
+      ).join('\n')
+      expect(status).toContain('- Enrollment: not enrolled')
+      expect(status).not.toContain('request not sent')
+
+      const reset = await applyMenuAction(
+        plugin,
+        'ses_unsupported_vault_reset',
+        {
+          sectionId: 'Accounts',
+          actionId: 'enrollment-reset',
+          confirmed: true,
+        },
+      )
+      expect(reset.text).toContain('No Claustrum enrollment state to reset.')
+      expect(reset.text).not.toContain('request may still be in progress')
+    })
+  }
+
   test('account dialog reports approved enrollment without false setup guidance for a vault-served main', async () => {
     const vault = mainOnlyVault()
     const fixture = await useVaultAccountFile(
