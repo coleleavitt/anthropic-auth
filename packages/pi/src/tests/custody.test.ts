@@ -151,6 +151,27 @@ test('terminal enrollment reset is local, locked and independent of daemon avail
   expect(await f.commands.status()).toEqual({ state: 'idle' })
 })
 
+test('enrollment reset keeps a pending request and tells the user to rerun setup', async () => {
+  const f = await fixture()
+  await rm(f.tokenPath)
+  const paths = getHostClaustrumEnrollmentPaths('pi')
+  // Setup saves the request secret before it proposes, so a pending state
+  // without a request id may still match a request the vault stored.
+  const pending = JSON.stringify({
+    version: 1,
+    phase: 'pending',
+    proposedName: 'anthropic-auth-pi',
+    requestSecret: 'cd'.repeat(32),
+    createdAt: 1,
+    updatedAt: 1,
+  })
+  await writeFile(paths.statePath, pending, { mode: 0o600 })
+  expect((await f.commands.reset()).text).toBe(
+    'Refused: An enrollment request may still be in progress. Quit Pi and run setup again; it picks up the same request.',
+  )
+  expect(await readFile(paths.statePath, 'utf8')).toBe(pending)
+})
+
 import {
   readLegacyJson,
   writeLegacyAccountFiles,

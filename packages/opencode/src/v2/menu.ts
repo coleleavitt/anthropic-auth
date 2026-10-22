@@ -157,7 +157,11 @@ export function createNativeMenuCapabilities(options: {
           text:
             result === 'reset'
               ? 'Terminal enrollment state reset. Run offline setup to reconnect.'
-              : 'Only terminal enrollment state may be reset; active enrollment was left unchanged.',
+              : result === 'refused-pending'
+                ? // A pending state may hold a request the vault already stored
+                  // under this secret; setup replays that secret to resume it.
+                  'An enrollment request may still be in progress. Quit OpenCode and run setup again; it picks up the same request.'
+                : 'Only terminal enrollment state may be reset; active enrollment was left unchanged.',
         }
       }
       case 'quota-refresh': {

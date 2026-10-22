@@ -13,6 +13,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - In OpenCode 1, when no terminal window with the plugin's TUI part picks up the `/claude` menu within two seconds, the text menu it falls back to now starts with a short note on adding the TUI part to `tui.json`, once per session; later calls in that session don't wait. OpenCode Desktop gets the text menu at once with no note. Addresses #398 (tui.json).
 
+### Setup
+
+- "Reset host enrollment" no longer answers a pending vault enrollment with a bare `refused-pending`: in OpenCode 1, OpenCode 2 and Pi it now says a request may still be in progress and to quit OpenCode and run setup again, which picks up the same request. The migration-required message now gives `npx @cortexkit/opencode-anthropic-auth setup` without the stale `@2.0.0` version. Addresses #440 and #441.
+
 ### Dependencies
 
 - Test and CI dependencies move: the Pi SDK packages (`pi-agent-core`, `pi-ai`, `pi-coding-agent`, `pi-tui`) to 1.3.0 together, the OpenCode plugin and SDK to 1.19.3 together, `@ai-sdk/anthropic` to 4.0.82, `jdx/mise-action` to 5.2.0 and `actions/download-artifact` to v8. The Pi peer range and the OpenCode 1.18.18 host used by the process E2E checks are unchanged.

@@ -5282,7 +5282,10 @@ const anthropicAuthPlugin = async (
             }
           case 'refused-pending':
             return {
-              text: 'Claustrum enrollment is still pending. Run setup to resume it or renew an expired request.',
+              // A pending state may hold a request the vault already stored
+              // under this secret, so the menu keeps refusing and points at
+              // setup, which replays the same secret and resumes that request.
+              text: 'An enrollment request may still be in progress. Quit OpenCode and run setup again; it picks up the same request.',
             }
           case 'refused-approved':
             return {

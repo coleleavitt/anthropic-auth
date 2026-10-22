@@ -44,7 +44,11 @@ export function createPiCustodyCommands(): PiCustodyCommands {
         reset:
           'Terminal enrollment state cleared. Run setup to enroll Pi again.',
         idle: 'Pi has no enrollment state to reset.',
-        'refused-pending': 'Refused: Pi enrollment is still pending.',
+        // A pending state may hold a request the vault already stored under
+        // this secret; setup replays that secret to resume it. The "Refused:"
+        // prefix is how the Pi menu marks the action as not done.
+        'refused-pending':
+          'Refused: An enrollment request may still be in progress. Quit Pi and run setup again; it picks up the same request.',
         'refused-approved':
           'Refused: Pi already has an approved enrollment token.',
         busy: 'Pi enrollment is busy in another process.',

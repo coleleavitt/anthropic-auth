@@ -2238,6 +2238,39 @@ describe('scoped enrollment is explicit', () => {
     })
     expect(result.text).toContain('setup')
   })
+
+  test('enrollment-reset keeps a pending request and tells the user to rerun setup', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    if (!tempConfigDir) throw new Error('Missing local fixture directory')
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+      tempConfigDir,
+      'opencode-enrollment.json',
+    )
+    // Setup saves the request secret before it proposes, so a pending state
+    // without a request id may still match a request the vault stored. The
+    // menu must leave it for setup to resume.
+    const stateFile = join(tempConfigDir, 'opencode-enrollment-state.json')
+    const pending = JSON.stringify({
+      version: 1,
+      phase: 'pending',
+      proposedName: 'anthropic-auth-opencode',
+      requestSecret: 'ab'.repeat(32),
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    await writeFile(stateFile, pending, { mode: 0o600 })
+    const plugin = await getPlugin(createMockClient(), tempConfigDir)
+    const result = await applyMenuAction(plugin, 'ses_reset_pending', {
+      sectionId: 'Accounts',
+      actionId: 'enrollment-reset',
+      confirmed: true,
+    })
+    expect(await readFile(stateFile, 'utf8')).toBe(pending)
+    expect(result.text).toContain(
+      'An enrollment request may still be in progress. Quit OpenCode and run setup again; it picks up the same request.',
+    )
+    expect(result.text).not.toContain('refused-pending')
+  })
 })
 describe('desktop notice identity (#230)', () => {
   test('orders repeated notices before the same assistant with bounded IDs', async () => {
