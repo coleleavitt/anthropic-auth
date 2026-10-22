@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
+import { collectUnitCounts } from './ci-unit-tests'
 
 const packageNames = ['core', 'opencode', 'pi'] as const
 // The first release with test floors follows v1.23.0, whose tag had no floor
@@ -34,6 +35,7 @@ type Options = {
   releaseRef?: string
   releaseVersion?: string
   counts?: Floors
+  countsDir?: string
   floorFile: string
 }
 
@@ -145,12 +147,15 @@ function parseOptions(args: string[]): Options {
     else if (flag === '--release-version') options.releaseVersion = value
     else if (flag === '--counts')
       options.counts = parseFloors(value, '--counts', true)
+    else if (flag === '--counts-dir') options.countsDir = value
     else if (flag === '--floor-file') options.floorFile = value
     else fail(`unknown argument: ${flag}`)
     index += 1
   }
   if (isAbsolute(options.floorFile))
     fail('--floor-file must be relative to the repository root')
+  if (options.counts && options.countsDir)
+    fail('choose either --counts or --counts-dir, not both')
   if (options.baseRef !== undefined && options.releaseRef !== undefined) {
     fail('choose either --base-ref (PR) or --release-ref (release), not both')
   }
@@ -572,7 +577,11 @@ async function main() {
     )
   }
 
-  const counts = options.counts ?? measureTests()
+  const counts =
+    options.counts ??
+    (options.countsDir
+      ? await collectUnitCounts(options.countsDir)
+      : measureTests())
   const scope = packageScope(counts)
   const branchFloors = branchDocument.floors
   const failures: string[] = []

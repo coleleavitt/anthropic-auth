@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  fast-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -23,8 +23,6 @@ jobs:
         with:
           minimum_release_age: 0s
       - run: bun install --frozen-lockfile
-      - name: Install the locked OC1 config dependency fixture
-        run: npm ci --prefix packages/e2e-tests/fixtures/opencode1-config-deps --ignore-scripts --no-audit --no-fund
       - run: bun run check:workspace-lock
       - run: bun run types
       - run: bun run build
@@ -67,6 +65,84 @@ jobs:
           fi
           exit "$status"
       - run: bun test scripts/check-test-count-floors.test.ts
+      - run: bun run --cwd packages/opencode smoke:tui
+        env:
+          TUI_SMOKE_SKIP_BUILD: "1"
+      - run: bun run test:pi-host
+      - run: scripts/check-cortexkit-layout.sh
+      - run: bun run format:check
+      - run: bun run lint
+
+  unit:
+    name: Unit (${{ matrix.suite }}, ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: core
+            shard: 1/1
+          - suite: opencode
+            shard: 1/4
+          - suite: opencode
+            shard: 2/4
+          - suite: opencode
+            shard: 3/4
+          - suite: opencode
+            shard: 4/4
+          - suite: pi
+            shard: 1/1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5
+        with:
+          minimum_release_age: 0s
+      - run: bun install --frozen-lockfile
+      # A full rebuild takes 4-8s and avoids another job plus artifact transfer on every test's path.
+      - run: bun run build
+      - run: bun scripts/ci-unit-tests.ts --suite '${{ matrix.suite }}' --shard '${{ matrix.shard }}' --output-dir unit-counts
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unit-count-${{ matrix.suite }}-${{ strategy.job-index }}
+          path: unit-counts/*.json
+          if-no-files-found: error
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5
+        with:
+          minimum_release_age: 0s
+      - run: bun install --frozen-lockfile
+      - name: Install the locked OC1 config dependency fixture
+        run: npm ci --prefix packages/e2e-tests/fixtures/opencode1-config-deps --ignore-scripts --no-audit --no-fund
+      - run: bun run build
+      - run: bun run test:e2e
+        env:
+          ANTHROPIC_AUTH_E2E_OPENCODE_CONFIG_DEPS: ${{ github.workspace }}/packages/e2e-tests/fixtures/opencode1-config-deps
+
+  check:
+    if: always()
+    needs: [fast-checks, unit, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job to pass
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")'
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5
+        with:
+          minimum_release_age: 0s
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: unit-count-*
+          path: unit-counts
+          merge-multiple: true
       # UNCHECKED exits nonzero too: a missing merge target must not look green.
       - name: Verify unit-count floors
         env:
@@ -76,14 +152,4 @@ jobs:
             echo "::error::Unit-count floor verification requires a nonzero event base SHA."
             exit 1
           fi
-          bun scripts/check-test-count-floors.ts --base-ref "$FLOOR_BASE_SHA"
-      - run: bun run --cwd packages/opencode smoke:tui
-        env:
-          TUI_SMOKE_SKIP_BUILD: "1"
-      - run: bun run test:pi-host
-      - run: bun run test:e2e
-        env:
-          ANTHROPIC_AUTH_E2E_OPENCODE_CONFIG_DEPS: ${{ github.workspace }}/packages/e2e-tests/fixtures/opencode1-config-deps
-      - run: scripts/check-cortexkit-layout.sh
-      - run: bun run format:check
-      - run: bun run lint
+          bun scripts/check-test-count-floors.ts --base-ref "$FLOOR_BASE_SHA" --counts-dir unit-counts

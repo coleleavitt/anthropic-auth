@@ -2,6 +2,12 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import {
+  collectUnitCounts,
+  parseTestCount,
+  reportName,
+  unitJobs,
+} from './ci-unit-tests'
 
 const script = resolve(import.meta.dir, 'check-test-count-floors.ts')
 const workspaces: string[] = []
@@ -139,6 +145,30 @@ function runGateWithCounts(cwd: string, counts: string, baseRef = 'main') {
   }
 }
 
+async function writeUnitReports(cwd: string) {
+  const directory = join(cwd, 'unit-counts')
+  await mkdir(directory)
+  for (const job of unitJobs) {
+    const count = job.suite === 'core' ? 10 : job.suite === 'pi' ? 30 : 5
+    await writeFile(
+      join(directory, reportName(job)),
+      JSON.stringify({ ...job, count }),
+    )
+  }
+  return directory
+}
+
+function runCollectedGate(cwd: string) {
+  const result = Bun.spawnSync(
+    ['bun', script, '--base-ref', 'main', '--counts-dir', 'unit-counts'],
+    { cwd, stdout: 'pipe', stderr: 'pipe' },
+  )
+  return {
+    exitCode: result.exitCode,
+    output: `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`,
+  }
+}
+
 afterEach(async () => {
   await Promise.all(
     workspaces.splice(0).map((cwd) => rm(cwd, { recursive: true })),
@@ -173,6 +203,167 @@ test('fails when a measured count falls below its branch floor', async () => {
   expect(result.exitCode).toBe(1)
   expect(result.output).toContain('core measured 9 < branch floor 10')
   expect(result.output).toContain('VERDICT: FAIL packages=core,opencode,pi')
+})
+
+test('per-job collection sums every shard and applies the unchanged floor comparison', async () => {
+  const floors = { core: 10, opencode: 20, pi: 30 }
+  const cwd = await makeStaleBranch(floors, floors)
+  const directory = await writeUnitReports(cwd)
+  expect(await collectUnitCounts(directory)).toEqual(floors)
+  expect(runCollectedGate(cwd).exitCode).toBe(0)
+  await writeFile(
+    join(directory, 'opencode-1-of-4.json'),
+    JSON.stringify({ suite: 'opencode', shard: '1/4', count: 4 }),
+  )
+  const result = runCollectedGate(cwd)
+  expect(result.exitCode).toBe(1)
+  expect(result.output).toContain(
+    'COUNT: opencode measured 19 < branch floor 20',
+  )
+  expect(result.output).toContain(
+    'VERDICT: FAIL packages=core,opencode,pi (test-count floor check failed)',
+  )
+})
+
+test.each([
+  'missing',
+  'empty',
+  'missing count',
+  'null count',
+  'negative',
+  'fractional',
+  'wrong suite',
+  'wrong shard',
+  'extra report',
+])('per-job collection rejects %s reports loudly', async (fault) => {
+  const floors = { core: 10, opencode: 20, pi: 30 }
+  const cwd = await makeStaleBranch(floors, floors)
+  const directory = await writeUnitReports(cwd)
+  const path = join(directory, 'core-1-of-1.json')
+  const report: Record<string, unknown> = {
+    suite: 'core',
+    shard: '1/1',
+    count: 10,
+  }
+  if (fault === 'missing') await rm(path)
+  else if (fault === 'empty') await writeFile(path, '')
+  else if (fault === 'extra report')
+    await writeFile(join(directory, 'duplicate.json'), '{}')
+  else {
+    if (fault === 'missing count') delete report.count
+    if (fault === 'null count') report.count = null
+    if (fault === 'negative') report.count = -1
+    if (fault === 'fractional') report.count = 1.5
+    if (fault === 'wrong suite') report.suite = 'pi'
+    if (fault === 'wrong shard') report.shard = '2/1'
+    await writeFile(path, JSON.stringify(report))
+  }
+  const result = runCollectedGate(cwd)
+  expect(result.exitCode).toBe(1)
+  expect(result.output).toMatch(/unit count report/)
+  expect(result.output).toContain(
+    'VERDICT: FAIL packages=none (test-count floor check rejected invalid input)',
+  )
+})
+
+test('a collected zero is measured and fails the floor rather than becoming a missing count', async () => {
+  const floors = { core: 10, opencode: 20, pi: 30 }
+  const cwd = await makeStaleBranch(floors, floors)
+  const directory = await writeUnitReports(cwd)
+  await writeFile(
+    join(directory, 'core-1-of-1.json'),
+    JSON.stringify({ suite: 'core', shard: '1/1', count: 0 }),
+  )
+  const result = runCollectedGate(cwd)
+  expect(result.exitCode).toBe(1)
+  expect(result.output).toContain('COUNT: core measured 0 < branch floor 10')
+})
+
+test('suite summary parsing rejects absent counts and preserves zero', () => {
+  expect(parseTestCount('core', ' 10 pass\n 0 fail\n')).toBe(10)
+  expect(parseTestCount('core', ' 0 pass\n')).toBe(0)
+  expect(() => parseTestCount('core', '')).toThrow(
+    'could not parse core test count',
+  )
+})
+
+test('Bun file shards execute every discovered test once and emit per-job counts', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'ci-unit-shards-'))
+  workspaces.push(cwd)
+  const tests = join(cwd, 'packages/opencode/src/tests')
+  await mkdir(tests, { recursive: true })
+  for (let index = 0; index < 12; index += 1) {
+    await writeFile(
+      join(tests, `file-${index}.test.ts`),
+      `import { test, expect } from 'bun:test'; test('unique-file-${index}', () => expect(1).toBe(1))`,
+    )
+  }
+  const names: string[] = []
+  let total = 0
+  for (const job of unitJobs.filter((entry) => entry.suite === 'opencode')) {
+    const result = Bun.spawnSync(
+      [
+        'bun',
+        resolve(import.meta.dir, 'ci-unit-tests.ts'),
+        '--suite',
+        job.suite,
+        '--shard',
+        job.shard,
+        '--output-dir',
+        'unit-counts',
+      ],
+      { cwd, stdout: 'pipe', stderr: 'pipe' },
+    )
+    expect(result.exitCode).toBe(0)
+    const output = new TextDecoder().decode(result.stdout)
+    names.push(
+      ...[...output.matchAll(/\(pass\) (unique-file-\d+)/g)].map(
+        (match) => match[1] as string,
+      ),
+    )
+    const report = JSON.parse(
+      await readFile(join(cwd, 'unit-counts', reportName(job)), 'utf8'),
+    )
+    expect(report.suite).toBe(job.suite)
+    expect(report.shard).toBe(job.shard)
+    total += report.count
+  }
+  expect(total).toBe(12)
+  expect(names.length).toBe(12)
+  expect(new Set(names)).toEqual(
+    new Set(Array.from({ length: 12 }, (_, index) => `unique-file-${index}`)),
+  )
+})
+
+test('a failed suite cannot publish a count report', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'ci-unit-fail-'))
+  workspaces.push(cwd)
+  const tests = join(cwd, 'packages/core/src/tests')
+  await mkdir(tests, { recursive: true })
+  await writeFile(
+    join(tests, 'failure.test.ts'),
+    "import { test, expect } from 'bun:test'; test('failure control', () => expect(1).toBe(2))",
+  )
+  const result = Bun.spawnSync(
+    [
+      'bun',
+      resolve(import.meta.dir, 'ci-unit-tests.ts'),
+      '--suite',
+      'core',
+      '--shard',
+      '1/1',
+      '--output-dir',
+      'unit-counts',
+    ],
+    { cwd, stdout: 'pipe', stderr: 'pipe' },
+  )
+  expect(result.exitCode).toBe(1)
+  expect(new TextDecoder().decode(result.stderr)).toContain(
+    'core test command exited 1',
+  )
+  expect(
+    await Bun.file(join(cwd, 'unit-counts/core-1-of-1.json')).exists(),
+  ).toBe(false)
 })
 
 test('fails when the branch floor is lower than the merge target floor', async () => {
@@ -332,7 +523,7 @@ test('CI and release each measure unit suites once and keep UNCHECKED blocking',
   for (const workflow of [ci, release]) {
     expect(workflow).toContain('bun run check:workspace-lock')
     expect(workflow).toContain('bun run check:claustrum-golden')
-    expect(workflow).not.toContain('--counts')
+    expect(workflow).not.toMatch(/--counts(?:\s|=)/)
     expect(workflow).not.toContain('--floor-file')
     expect(workflow).not.toMatch(/run: bun run test\s*\n/)
     expect(workflow).toContain('bun run test:e2e')
@@ -342,6 +533,8 @@ test('CI and release each measure unit suites once and keep UNCHECKED blocking',
     expect(workflow).toContain('bun run test:pi-host')
   }
   expect(ci).toContain('bun scripts/check-test-count-floors.ts --base-ref')
+  expect(ci).toContain('--counts-dir unit-counts')
+  expect(release).not.toContain('--counts-dir')
   expect(release).toContain(
     'bun scripts/check-test-count-floors.ts --release-ref',
   )
@@ -759,6 +952,86 @@ async function capturedCiFloorStep() {
     .join('\n')
 }
 
+test('CI fans out suites and E2E and makes every job required by the final check', async () => {
+  const ci = Bun.YAML.parse(
+    await readFile(
+      resolve(import.meta.dir, '../.github/workflows/ci.yml'),
+      'utf8',
+    ),
+  ) as {
+    name: string
+    jobs: Record<
+      string,
+      {
+        if?: string
+        needs?: string[]
+        strategy?: {
+          'fail-fast': boolean
+          matrix: { include: typeof unitJobs }
+        }
+        steps: {
+          name?: string
+          run?: string
+          uses?: string
+          with?: Record<string, unknown>
+        }[]
+      }
+    >
+  }
+  expect(ci.name).toBe('CI')
+  expect(ci.jobs.check?.if).toBe('always()')
+  expect(ci.jobs.check?.needs?.slice().sort()).toEqual(
+    Object.keys(ci.jobs)
+      .filter((job) => job !== 'check')
+      .sort(),
+  )
+  expect(ci.jobs.unit?.strategy?.['fail-fast']).toBe(false)
+  expect(ci.jobs.unit?.strategy?.matrix.include).toEqual(unitJobs)
+  for (const name of ['unit', 'e2e', 'fast-checks']) {
+    expect(ci.jobs[name]?.needs).toBeUndefined()
+    expect(
+      ci.jobs[name]?.steps.some((step) => step.run === 'bun run build'),
+    ).toBe(true)
+  }
+  const unitSteps = ci.jobs.unit?.steps ?? []
+  expect(
+    unitSteps.filter((step) => step.run?.includes('scripts/ci-unit-tests.ts')),
+  ).toHaveLength(1)
+  expect(
+    unitSteps.find((step) => step.uses?.startsWith('actions/upload-artifact@'))
+      ?.with?.['if-no-files-found'],
+  ).toBe('error')
+  const finalSteps = ci.jobs.check?.steps ?? []
+  expect(
+    finalSteps.find((step) =>
+      step.uses?.startsWith('actions/download-artifact@'),
+    )?.with,
+  ).toEqual({
+    pattern: 'unit-count-*',
+    path: 'unit-counts',
+    'merge-multiple': true,
+  })
+  const requireAll = finalSteps.find(
+    (step) => step.name === 'Require every CI job to pass',
+  )?.run
+  expect(requireAll).toBeDefined()
+  for (const state of ['success', 'failure', 'cancelled', 'skipped']) {
+    const result = Bun.spawnSync(['bash', '-c', requireAll as string], {
+      env: {
+        ...process.env,
+        NEEDS: JSON.stringify({
+          unit: { result: state },
+          e2e: { result: 'success' },
+          'fast-checks': { result: 'success' },
+        }),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(result.exitCode).toBe(state === 'success' ? 0 : 1)
+  }
+})
+
 test('CI floor shell refuses a zero, absent or malformed event base before measuring', async () => {
   const shell = await capturedCiFloorStep()
   for (const base of ['0'.repeat(40), '', 'not-a-commit']) {
@@ -794,7 +1067,7 @@ test('CI floor shell measures against the PR base or previous main tip', async (
     )
     expect(result.exitCode).toBe(0)
     expect(new TextDecoder().decode(result.stdout).trim()).toBe(
-      `scripts/check-test-count-floors.ts --base-ref ${base}`,
+      `scripts/check-test-count-floors.ts --base-ref ${base} --counts-dir unit-counts`,
     )
   }
 })
