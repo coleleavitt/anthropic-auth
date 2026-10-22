@@ -2235,6 +2235,14 @@ describe('scoped enrollment is explicit', () => {
       ).rejects.toMatchObject({
         code: 'ENOENT',
       })
+      const enrollmentStatus = await Core.readClaustrumEnrollmentStatus(
+        enrollment,
+        'anthropic-auth-opencode',
+      )
+      expect(enrollmentStatus.state).toBe('idle')
+      expect(Core.formatEnrollmentStatus(enrollmentStatus)).toEqual([
+        '- Enrollment: not enrolled',
+      ])
 
       const plugin = await getPlugin(createMockClient(), fixture.root, {
         claustrumScopedConnect: async () => vault,
@@ -2244,8 +2252,9 @@ describe('scoped enrollment is explicit', () => {
         menu.menu.sections.find((section) => section.id === 'Accounts')
           ?.lines ?? []
       ).join('\n')
-      expect(status).toContain('- Enrollment: not enrolled')
       expect(status).not.toContain('request not sent')
+      expect(status).not.toContain('Enrollment: pending')
+      expect(status).not.toContain('pending approval')
 
       const reset = await applyMenuAction(
         plugin,

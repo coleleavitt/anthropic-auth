@@ -5746,10 +5746,13 @@ const anthropicAuthPlugin = async (
       const snapshot = await readNativeSnapshotForDisplay(
         AbortSignal.timeout(3_000),
       )
-      const enrollment = await readClaustrumEnrollmentStatus(
-        getHostClaustrumEnrollmentPaths('opencode'),
-        CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
-      )
+      const enrollment =
+        snapshot.mode === 'claustrum'
+          ? await readClaustrumEnrollmentStatus(
+              getHostClaustrumEnrollmentPaths('opencode'),
+              CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+            )
+          : undefined
       return [
         `Custody mode: ${snapshot.mode}`,
         ...(enrollment
