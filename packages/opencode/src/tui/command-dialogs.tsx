@@ -9,6 +9,7 @@ import type {
   MenuAction,
   MenuItem,
   MenuSection,
+  NativeCommandApplyResult,
 } from '@cortexkit/anthropic-auth-core'
 import {
   custodyStatusLabel,
@@ -18,6 +19,7 @@ import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { AccountDialogAccount } from '../rpc/protocol'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import { formatPrimeCost, formatPrimeTime } from '../sidebar-state.js'
+import { SIGN_IN_LINK_TITLE, SignInLink } from './sign-in-link.js'
 
 /** Render menu sections, accounts and action inputs; send changes to the host instead of writing credentials here. */
 export function openNativeMenuDialog(
@@ -128,6 +130,24 @@ export function openNativeMenuDialog(
     ))
   }
 
+  /** The sign-in link stays on screen until the person goes back or closes it. */
+  const showSignIn = (url: string, back: () => void) => {
+    if (!active()) return
+    api.ui.dialog.setSize('xlarge')
+    api.ui.dialog.replace(() => (
+      <box flexDirection='column' paddingTop={1}>
+        <SignInLink url={url} title={SIGN_IN_LINK_TITLE} />
+        <DialogSelect
+          title='Continue'
+          options={[{ title: 'Back', value: '__back' }]}
+          onSelect={() => {
+            if (active()) back()
+          }}
+        />
+      </box>
+    ))
+  }
+
   const collect = (
     section: MenuSection,
     action: MenuAction,
@@ -142,8 +162,12 @@ export function openNativeMenuDialog(
     const submit = async () => {
       if (!active()) return
       inFlight = true
+      // Set after a successful OAuth start: its link is shown in a lasting
+      // dialog instead of a toast, which would vanish before it could be
+      // copied and sit behind the menu.
+      let signInUrl: string | undefined
       try {
-        const result = await apply({
+        const result: NativeCommandApplyResult = await apply({
           command: menu.command,
           sectionId: section.id,
           actionId: action.id,
@@ -153,7 +177,9 @@ export function openNativeMenuDialog(
         })
         if (!isCurrentSession()) return
         menu = result.menu
-        api.ui.toast({ message: result.text })
+        if (typeof result.authorizationUrl === 'string')
+          signInUrl = result.authorizationUrl
+        else api.ui.toast({ message: result.text })
       } catch {
         if (isCurrentSession())
           api.ui.toast({ message: 'Menu apply unavailable; outcome unknown.' })
@@ -164,8 +190,9 @@ export function openNativeMenuDialog(
           const refreshed = menu.sections.find(
             (entry) => entry.id === section.id,
           )
-          if (refreshed) showSection(refreshed)
-          else root()
+          const back = () => (refreshed ? showSection(refreshed) : root())
+          if (signInUrl !== undefined) showSignIn(signInUrl, back)
+          else back()
         }
       }
     }
@@ -1111,43 +1138,50 @@ export function openCommandDialog(
       const DialogSelect = api.ui.DialogSelect<string>
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
-        <DialogSelect
-          title='OAuth sign-in'
-          options={[
-            {
-              title: 'Copy URL to clipboard',
-              value: 'copy',
-              description: oauthUrl,
-            },
-            {
-              title: 'Enter sign-in code',
-              value: 'code',
-              description:
-                'Open the URL in your browser, sign in, then paste the callback URL or code',
-            },
-            { title: 'Cancel', value: 'cancel' },
-          ]}
-          onSelect={(option) => {
-            if (option.value === 'cancel') {
-              buildL1()
-              return
-            }
-            if (option.value === 'copy') {
-              const ok = api.renderer.copyToClipboardOSC52(oauthUrl)
-              if (ok) {
-                api.ui.toast({ message: 'URL copied to clipboard' })
-              } else {
-                api.ui.toast({
-                  message:
-                    'Copy unavailable \u2014 select the URL text above to copy',
-                })
+        <box flexDirection='column' paddingTop={1}>
+          {/* The link sits above the options on rows of its own, so it can
+              be selected and copied whole when the copy option fails. */}
+          <SignInLink
+            url={oauthUrl}
+            instructions='Open this link in your browser and sign in, then choose Enter sign-in code and paste the callback URL or code.'
+          />
+          <DialogSelect
+            title='OAuth sign-in'
+            options={[
+              {
+                title: 'Copy URL to clipboard',
+                value: 'copy',
+              },
+              {
+                title: 'Enter sign-in code',
+                value: 'code',
+                description:
+                  'Open the URL in your browser, sign in, then paste the callback URL or code',
+              },
+              { title: 'Cancel', value: 'cancel' },
+            ]}
+            onSelect={(option) => {
+              if (option.value === 'cancel') {
+                buildL1()
+                return
               }
-              openOAuthUrlScreen(oauthUrl)
-              return
-            }
-            openOAuthCodePrompt(oauthUrl)
-          }}
-        />
+              if (option.value === 'copy') {
+                const ok = api.renderer.copyToClipboardOSC52(oauthUrl)
+                if (ok) {
+                  api.ui.toast({ message: 'URL copied to clipboard' })
+                } else {
+                  api.ui.toast({
+                    message:
+                      'Copy unavailable \u2014 select the URL text above to copy',
+                  })
+                }
+                openOAuthUrlScreen(oauthUrl)
+                return
+              }
+              openOAuthCodePrompt(oauthUrl)
+            }}
+          />
+        </box>
       ))
     }
 

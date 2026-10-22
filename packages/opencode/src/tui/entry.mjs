@@ -48,6 +48,17 @@ async function loadSidebar() {
   return import('../tui-compiled/tui/claude-sidebar.tsx')
 }
 
+// The OAuth sign-in link dialog, loaded the same way as the sidebar.
+async function loadSignInLink() {
+  try {
+    await import(runtimeProbe)
+  } catch (error) {
+    if (!isMissingRuntimeRegistry(error)) throw error
+    return import('./sign-in-link.tsx')
+  }
+  return import('../tui-compiled/tui/sign-in-link.tsx')
+}
+
 let legacyModule
 
 // OpenCode 1 reads id and tui from the default definition; OpenCode 2 reads
@@ -71,6 +82,8 @@ export const setup = async (context) => {
   return setupAnthropicTui(context, {
     mountSidebar: async (ctx, read) =>
       (await loadSidebar()).mountClaudeSidebar(ctx, read),
+    showSignInLink: async (ctx, url, signal) =>
+      (await loadSignInLink()).showSignInLinkDialog(ctx, url, signal),
   })
 }
 

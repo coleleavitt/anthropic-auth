@@ -19,6 +19,20 @@ export type MountSidebar = (
 ) => Promise<() => void>
 
 /**
+ * Shows an OAuth sign-in link in a dialog that stays open until the person
+ * closes it, and settles then or when `signal` aborts. `entry.mjs` passes the
+ * precompiled renderer, as it does for the sidebar.
+ */
+export type ShowSignInLink = (
+  ctx: Tui.Context,
+  url: string,
+  signal: AbortSignal,
+) => Promise<void>
+
+const SIGN_IN_FALLBACK_INSTRUCTIONS =
+  'Open this link in your browser and sign in. Then choose Finish OAuth sign-in in the Accounts menu and paste the code Claude shows you.'
+
+/**
  * Shows the `claude` account menu in OpenCode 2 dialogs. The menu's sections,
  * items and actions come from the plugin server over NATIVE_MENU_RPC, built by
  * the same Core menu code that OpenCode 1 and Pi render, so every host shows
@@ -26,7 +40,10 @@ export type MountSidebar = (
  */
 export async function setupAnthropicTui(
   ctx: Tui.Context,
-  options: { readonly mountSidebar?: MountSidebar } = {},
+  options: {
+    readonly mountSidebar?: MountSidebar
+    readonly showSignInLink?: ShowSignInLink
+  } = {},
 ) {
   const rpc = ctx.client.rpc(NATIVE_MENU_RPC)
   let active = true
@@ -159,6 +176,21 @@ export async function setupAnthropicTui(
     }
     return values
   }
+  async function signIn(url: string) {
+    if (options.showSignInLink) {
+      try {
+        await options.showSignInLink(ctx, url, abort.signal)
+        return
+      } catch {
+        // The sign-in renderer could not load; the alert below still shows
+        // the link on lines of its own.
+      }
+    }
+    await ctx.ui.dialog.alert({
+      title: 'Claude sign-in',
+      message: `${SIGN_IN_FALLBACK_INSTRUCTIONS}\n\n${url}\n`,
+    })
+  }
   async function render(sessionId: string, initial: CommandDialogPayload) {
     if (!active || rendering || currentSession() !== sessionId) return
     rendering = true
@@ -213,10 +245,18 @@ export async function setupAnthropicTui(
           location: ctx.location,
         })
         if (!active || currentSession() !== sessionId) return
-        await ctx.ui.dialog.alert({
-          title: result.ok ? 'Claude' : 'Claude action refused',
-          message: result.text,
-        })
+        // A successful OAuth start names its link in a field of its own and
+        // gets a lasting dialog where the link wraps onto rows of its own, so
+        // it can be selected and copied whole (or, if that dialog cannot
+        // load, an alert with the link on lines of its own). Other results
+        // stay alerts.
+        if (result.authorizationUrl !== undefined)
+          await signIn(result.authorizationUrl)
+        else
+          await ctx.ui.dialog.alert({
+            title: result.ok ? 'Claude' : 'Claude action refused',
+            message: result.text,
+          })
         payload = { command: result.command, menu: result.menu }
       }
     } finally {

@@ -30,6 +30,7 @@ import {
   NativeMigrationError,
   NativePiAuthSlotError,
   type OwnerOnlyOptions,
+  PRIVATE_FILES_UNAVAILABLE_MESSAGE,
   type ProviderErrorRedactor,
   // From Core, not common-auth: Core bundles its own copy of runSetup, and
   // only that copy's setupEnrollment can see the outcomes runSetup recorded.
@@ -281,6 +282,9 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
   ...MIGRATION_CODES.map((code) => new NativeMigrationError(code).message),
   ...PI_SLOT_CODES.map((code) => new NativePiAuthSlotError(code).message),
   ...CUSTODY_CODES.map((code) => `Native custody refused: ${code}`),
+  // An enrollment that could not be read because the private-files native
+  // backend did not load names that cause and its remedy instead.
+  PRIVATE_FILES_UNAVAILABLE_MESSAGE,
   // Local sign-in is forbidden while vault custody remains connected.
   'Disconnect from the vault first.',
   // CLI input validation uses fixed messages rather than error codes.

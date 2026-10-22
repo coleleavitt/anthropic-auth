@@ -26,6 +26,7 @@ import {
 } from '../../../core/src/native-ui.ts'
 import { createNativeCommand } from '../native-command.ts'
 import { openNativeMenuDialog } from '../tui/command-dialogs.tsx'
+import { expectLinkOnOwnRows, SIGN_IN_URL } from './fixtures/sign-in-link'
 
 test('dual TUI entry exposes both default host methods without eagerly loading OC1 TSX', () => {
   const entry = fileURLToPath(new URL('../tui/entry.mjs', import.meta.url))
@@ -134,12 +135,12 @@ async function harness(
     pending = apply(request)
     return pending
   }
-  const draw = async () => {
+  const draw = async (size?: { width: number; height: number }) => {
     select = undefined
     prompt = undefined
     confirm = undefined
     if (!render) throw new Error('No dialog render')
-    const frame = await testRender(render)
+    const frame = await testRender(render, size)
     await frame.flush()
     frame.renderOnce()
     const text = frame
@@ -391,6 +392,46 @@ test('late results after a route change cannot toast or replace another session 
   })
   await h.settle()
   expect(h.toasts).toEqual([])
+})
+
+test('a successful OAuth start shows its link in a lasting dialog, whole at a narrow width', async () => {
+  const h = await harness()
+  h.setApply(async (request) => {
+    h.requests.push(request)
+    return {
+      command: 'claude',
+      ok: true,
+      text: `Open ${SIGN_IN_URL} and paste the returned code using Finish OAuth sign-in.`,
+      authorizationUrl: SIGN_IN_URL,
+      menu: h.payload.menu,
+    } as CommandApplyResult
+  })
+  await h.draw()
+  h.choose('Accounts')
+  await h.draw()
+  h.choose('action:add-oauth-start')
+  await h.settle()
+  // No toast: the link stays on screen in the dialog until Back.
+  expect(h.toasts).toEqual([])
+  const frame = await h.draw({ width: 48, height: 40 })
+  expect(frame).toContain('Claude sign-in')
+  expect(expectLinkOnOwnRows(frame, SIGN_IN_URL)).toBeGreaterThan(1)
+  expect(h.select?.options.map((option) => option.value)).toEqual(['__back'])
+  h.choose('__back')
+  await h.draw()
+  expect(h.select?.title).toBe('Accounts')
+})
+
+test('an ordinary result still toasts', async () => {
+  const h = await harness()
+  await h.draw()
+  h.choose('Cache')
+  await h.draw()
+  h.choose('action:cache-on')
+  await h.settle()
+  expect(h.toasts).toEqual(['Applied'])
+  await h.draw()
+  expect(h.select?.title).toBe('Cache')
 })
 
 test('failed IPC is generic and duplicate clicks do not repeat an effect', async () => {

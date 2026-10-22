@@ -857,6 +857,11 @@ describe('OAuth sign-in link', () => {
       if (!auth) return
       expect(started.ok).toBe(true)
       expect(started.text).toBe(`Open this URL in your browser:\n${auth.url}`)
+      // The same checked link is also its own field, for hosts that show it
+      // in a dialog of its own.
+      expect((started as { authorizationUrl?: string }).authorizationUrl).toBe(
+        auth.url,
+      )
       const shown = new URL(started.text.split('\n')[1] ?? '')
       expect(shown.searchParams.get('state')).toBe(auth.state)
       expect(shown.searchParams.get('code_challenge')).toMatch(
@@ -929,6 +934,9 @@ describe('OAuth sign-in link', () => {
       },
       invocation,
     )
+    // Only a link the text shows verbatim may be named as the sign-in link.
+    const named = (result as { authorizationUrl?: string }).authorizationUrl
+    if (named !== undefined) expect(result.text).toContain(named)
     return result.text
   }
 
@@ -1027,6 +1035,8 @@ describe('OAuth sign-in link', () => {
       'invalid-request',
     ])
     expect(dispatches()).toBe(0)
+    for (const refused of refusals)
+      expect('authorizationUrl' in refused).toBe(false)
     const headless = createNativeUi({
       host: 'opencode',
       interactive: false,

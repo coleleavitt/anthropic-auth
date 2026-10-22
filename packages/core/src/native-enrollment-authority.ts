@@ -42,7 +42,7 @@ async function logRefusal(
   host: 'opencode' | 'pi',
   paths: ReturnType<typeof getHostClaustrumEnrollmentPaths>,
   readStatus: typeof readClaustrumEnrollmentStatus,
-) {
+): Promise<string> {
   let stage = 'enrollment'
   let reason = 'unreadable'
   try {
@@ -74,6 +74,29 @@ async function logRefusal(
     stage,
     reason,
   })
+  return reason
+}
+
+/**
+ * Shown instead of `Native custody refused: invalid-token` when the
+ * enrollment files could not be read because the private-files backend
+ * reported `unsupported-filesystem`. On Windows that is what every
+ * private-file check returns when the @cortexkit/private-files native addon
+ * did not load, so the enrollment itself may be fine.
+ */
+export const PRIVATE_FILES_UNAVAILABLE_MESSAGE =
+  "Private file support didn't load on this machine (@cortexkit/private-files). Reinstall the plugin; if this persists, report it with your OS and Node version."
+
+/**
+ * The enrollment refusal for a private-files backend that did not load. It
+ * keeps the `invalid-token` code, so every caller that branches on the code
+ * treats it exactly as before; only the message names the cause and remedy.
+ */
+export class NativePrivateFilesUnavailableError extends NativeCustodyError {
+  constructor() {
+    super('invalid-token')
+    this.message = PRIVATE_FILES_UNAVAILABLE_MESSAGE
+  }
 }
 
 /** Enrollment files, not account settings, choose the host's credential source. */
@@ -92,7 +115,13 @@ export async function readNativeEnrollmentMode(
       getHostClaustrumEnrollmentPaths(host, env).tokenPath,
     )
   if (authority === 'unreadable') {
-    await logRefusal(host, paths, dependencies.readClaustrumEnrollmentStatus)
+    const reason = await logRefusal(
+      host,
+      paths,
+      dependencies.readClaustrumEnrollmentStatus,
+    )
+    if (reason === 'unsupported-filesystem')
+      throw new NativePrivateFilesUnavailableError()
     throw new NativeCustodyError('invalid-token')
   }
   return authority === 'vault' ? 'claustrum' : 'local'

@@ -1,9 +1,9 @@
 import type {
   CommandApplyRequest,
-  CommandApplyResult,
   CommandDialogPayload,
   CommandInvocation,
   CommandMenu,
+  NativeCommandApplyResult,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
@@ -72,11 +72,13 @@ const dialog = (value: unknown): value is CommandDialogPayload =>
   value.menu.command === 'claude' &&
   typeof value.menu.title === 'string' &&
   Array.isArray(value.menu.sections)
-const result = (value: unknown): value is CommandApplyResult =>
+const result = (value: unknown): value is NativeCommandApplyResult =>
   record(value) &&
   value.command === 'claude' &&
   typeof value.ok === 'boolean' &&
   typeof value.text === 'string' &&
+  (value.authorizationUrl === undefined ||
+    typeof value.authorizationUrl === 'string') &&
   record(value.menu) &&
   Array.isArray(value.menu.sections)
 

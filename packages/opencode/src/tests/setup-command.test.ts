@@ -43,6 +43,7 @@ import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promis
 import { createOpencodeClient } from '@opencode-ai/sdk'
 import { $ } from 'bun'
 import { NativeCustodyError } from '../../../core/src/native-custody.ts'
+import { NativePrivateFilesUnavailableError } from '../../../core/src/native-enrollment-authority.ts'
 import {
   nativeQuotaCodec,
   toNativeQuotaMap,
@@ -828,6 +829,12 @@ describe('setup failure diagnostics', () => {
         [
           new NativeCustodyError('host-slot-placeholder'),
           ['Native custody refused: host-slot-placeholder'],
+        ],
+        [
+          new NativePrivateFilesUnavailableError(),
+          [
+            "Private file support didn't load on this machine (@cortexkit/private-files). Reinstall the plugin; if this persists, report it with your OS and Node version.",
+          ],
         ],
         [
           new ProcessFenceViolationError([

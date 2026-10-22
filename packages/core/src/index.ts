@@ -113,7 +113,11 @@ export {
   NativeCustodyActivationError,
   runNativeCustodyActivation,
 } from './native-custody-activation.ts'
-export { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
+export {
+  NativePrivateFilesUnavailableError,
+  PRIVATE_FILES_UNAVAILABLE_MESSAGE,
+  readNativeEnrollmentMode,
+} from './native-enrollment-authority.ts'
 export {
   inspectNativeHostAuthEntry,
   NativeHostAuthError,
@@ -230,6 +234,7 @@ export type {
   MenuItem,
   MenuKnob,
   MenuSection,
+  NativeCommandApplyResult,
   NativeUiOptions,
   NotifyKind,
   SectionSlot,

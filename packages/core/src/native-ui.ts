@@ -257,16 +257,30 @@ function isSignInLink(candidate: string): boolean {
  * login. The redactor masks the 32-hex-digit state as a possible secret, so
  * exactly one link that passes isSignInLink is kept verbatim and the text
  * around it is still scrubbed. The state and PKCE challenge are public parts
- * of the browser request; the PKCE verifier never appears in the link. Any
- * other text, or more than one distinct link, is scrubbed in full.
+ * of the browser request; the PKCE verifier never appears in the link. When
+ * the text holds no valid sign-in link, or several distinct ones, it is
+ * scrubbed in full and no link is returned.
  */
-function showSignInLink(text: string, scrub: (text: string) => string) {
+function showSignInLink(
+  text: string,
+  scrub: (text: string) => string,
+): { text: string; link?: string } {
   const links = new Set(
     (text.match(/https:\/\/\S+/g) ?? []).filter(isSignInLink),
   )
   const [link] = links
-  if (links.size !== 1 || link === undefined) return scrub(text)
-  return text.split(link).map(scrub).join(link)
+  if (links.size !== 1 || link === undefined) return { text: scrub(text) }
+  return { text: text.split(link).map(scrub).join(link), link }
+}
+
+/**
+ * A menu result as Core returns it. After a successful OAuth start,
+ * `authorizationUrl` carries the one checked sign-in link from `text` as its
+ * own field, so a host can show it in a dialog of its own instead of finding
+ * it in the message text. Every other result leaves it out.
+ */
+export type NativeCommandApplyResult = CommandApplyResult & {
+  readonly authorizationUrl?: string
 }
 
 /** What a person sees for each result of a vault disconnect. */
@@ -538,7 +552,7 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
     async open(invocation) {
       return { command: 'claude', menu: await model(capture(invocation)) }
     },
-    async apply(rawRequest, rawInvocation): Promise<CommandApplyResult> {
+    async apply(rawRequest, rawInvocation): Promise<NativeCommandApplyResult> {
       const invocation = capture(rawInvocation)
       let request: ReturnType<typeof parseApplyRequest>
       const rawValues = ownData(rawRequest, 'values')
@@ -577,16 +591,20 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
       const finish = async (
         result: ReturnType<typeof outcome>,
         signInLink = false,
-      ) => ({
-        command: 'claude',
-        ...result,
-        text: signInLink
+      ): Promise<NativeCommandApplyResult> => {
+        const shown = signInLink
           ? showSignInLink(result.text, scrub)
-          : scrub(result.text),
-        // Without readable data fields there is no safe way to identify a
-        // submitted secret. Do not invoke status callbacks that could echo it.
-        menu: await model(invocation, scrub, readable),
-      })
+          : { text: scrub(result.text) }
+        return {
+          command: 'claude',
+          ...result,
+          text: shown.text,
+          ...(shown.link !== undefined ? { authorizationUrl: shown.link } : {}),
+          // Without readable data fields there is no safe way to identify a
+          // submitted secret. Do not invoke status callbacks that could echo it.
+          menu: await model(invocation, scrub, readable),
+        }
+      }
       if (
         request?.command !== 'claude' ||
         !action ||
