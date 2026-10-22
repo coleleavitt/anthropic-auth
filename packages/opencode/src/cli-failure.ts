@@ -329,7 +329,10 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
   'Claustrum connection failed; start ck and rerun setup.',
   'Claustrum enrollment refused; inspect its status with ck before rerunning setup.',
   'Invalid enrollment request id.',
+  // Keep both fixed remedies admitted while Core builds may bundle either
+  // common-auth release.
   'This Claustrum vault does not support connecting plugins yet, so setup cannot connect to it. Run setup without --claustrum to use local accounts.',
+  'This Claustrum vault is too old to connect plugins. Run ck upgrade to move to Claustrum v0.2.0 or newer (read "Upgrading from v0.1.3" in its release notes first), or run setup without --claustrum to use local accounts.',
   // Metadata-read failures without an HTTP status have one fixed message.
   // knownFailureMessage also accepts an appended, validated HTTP status code.
   'OAuth metadata read failed',

@@ -1371,8 +1371,7 @@ if ('UNSUPPORTED_VAULT_MESSAGE' in commonAuthSetup) {
         },
         enrollPoll: async () => ({ status: 'pending' }),
       }),
-      screen:
-        'This Claustrum vault does not support connecting plugins yet, so setup cannot connect to it. Run setup without --claustrum to use local accounts.',
+      screen: commonAuthSetup.UNSUPPORTED_VAULT_MESSAGE,
     },
     {
       name: 'a vault that never creates the request',

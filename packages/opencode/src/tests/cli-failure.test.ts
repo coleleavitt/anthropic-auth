@@ -228,6 +228,7 @@ test('shared setup enrollment refusals are shown word for word and look-alikes a
     'Invalid enrollment request id.',
     'Claustrum enrollment did not complete. Inspect and approve with ck, then rerun setup.',
     'This Claustrum vault does not support connecting plugins yet, so setup cannot connect to it. Run setup without --claustrum to use local accounts.',
+    'This Claustrum vault is too old to connect plugins. Run ck upgrade to move to Claustrum v0.2.0 or newer (read "Upgrading from v0.1.3" in its release notes first), or run setup without --claustrum to use local accounts.',
     'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id req_01-AB --name anthropic-auth-pi and then rerun setup.',
     'Claustrum approval is still pending. In another terminal, run: ck auth enroll approve --request-id r1 --name anthropic-auth-opencode and then rerun setup.',
     'The vault never created the enrollment request (last error: transport_error). Check that ck is running, then rerun setup.',

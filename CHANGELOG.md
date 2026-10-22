@@ -8,6 +8,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - The vault setup docs now say vault setup needs Claustrum v0.2.0 or newer.
 
+### Setup
+
+- Enrollment status for an old Claustrum vault now directs users to run `ck upgrade` to move to v0.2.0 or newer.
+
 ## 2.2.3
 
 ### Accounts

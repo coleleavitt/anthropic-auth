@@ -198,7 +198,7 @@ export function formatEnrollmentStatus(
       // Only an enrollment attempt reports this state, and its one cause is
       // a vault that cannot enroll plugins at all, so it is not temporary.
       return [
-        '- Enrollment: this Claustrum vault does not support connecting plugins',
+        '- Enrollment: this Claustrum vault is too old to connect plugins. Run `ck upgrade` to move to Claustrum v0.2.0 or newer (read "Upgrading from v0.1.3" in its release notes first).',
       ]
     case 'pending':
       return status.requestId && /^[A-Za-z0-9_-]{1,128}$/.test(status.requestId)

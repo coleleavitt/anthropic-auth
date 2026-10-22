@@ -555,7 +555,7 @@ describe('executeAccountCommand status', () => {
     expect(result.text).not.toContain('ck auth enroll approve')
   })
 
-  test('names a vault that cannot enroll plugins instead of calling it temporary', async () => {
+  test('tells users to upgrade a vault too old to connect plugins', async () => {
     const result = await executeAccountCommand({
       argumentsText: '',
       storage: baseStorage(),
@@ -570,7 +570,10 @@ describe('executeAccountCommand status', () => {
       },
     })
     expect(result.text).toContain(
-      'Enrollment: this Claustrum vault does not support connecting plugins',
+      'Enrollment: this Claustrum vault is too old to connect plugins. Run `ck upgrade` to move to Claustrum v0.2.0 or newer (read "Upgrading from v0.1.3" in its release notes first).',
+    )
+    expect(result.text).not.toContain(
+      'this Claustrum vault does not support connecting plugins',
     )
     expect(result.text).not.toContain('temporarily unavailable')
   })
