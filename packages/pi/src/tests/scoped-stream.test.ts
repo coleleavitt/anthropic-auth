@@ -1849,6 +1849,11 @@ test('Pi vault default UUID replacement re-places the old session without inheri
   const routingPath = await f.native.routingPath()
   const fallbackKey = createHash('sha256').update(fallbackSession).digest('hex')
   const mainKey = createHash('sha256').update(mainSession).digest('hex')
+  // A request chooses its session pin without waiting for that pin's write to
+  // the routing file: the sticky router queues the write and finishes it
+  // later under the routing lock. Wait for those queued writes before reading
+  // the file.
+  await f.native.drainRoutingPublications()
   const beforeText = await readFile(routingPath, 'utf8')
   const fallbackPinBytes = (text: string) => {
     const match = text.match(new RegExp(`"${fallbackKey}":\\s*(\\{[^}]*\\})`))
@@ -1874,6 +1879,7 @@ test('Pi vault default UUID replacement re-places the old session without inheri
       }).result()
     ).stopReason,
   ).toBe('stop')
+  await f.native.drainRoutingPublications()
   const afterText = await readFile(routingPath, 'utf8')
   expect(JSON.parse(afterText).assignments[mainKey].accountIdentity).toBe(
     nextUuid,
