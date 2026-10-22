@@ -149,7 +149,7 @@ async function writeUnitReports(cwd: string) {
   const directory = join(cwd, 'unit-counts')
   await mkdir(directory)
   for (const job of unitJobs) {
-    const count = job.suite === 'core' ? 10 : job.suite === 'pi' ? 30 : 5
+    const count = job.suite === 'core' ? 10 : job.suite === 'pi' ? 30 : 4
     await writeFile(
       join(directory, reportName(job)),
       JSON.stringify({ ...job, count }),
@@ -213,7 +213,7 @@ test('per-job collection sums every shard and applies the unchanged floor compar
   expect(runCollectedGate(cwd).exitCode).toBe(0)
   await writeFile(
     join(directory, 'opencode-1-of-4.json'),
-    JSON.stringify({ suite: 'opencode', shard: '1/4', count: 4 }),
+    JSON.stringify({ suite: 'opencode', shard: '1/4', count: 3 }),
   )
   const result = runCollectedGate(cwd)
   expect(result.exitCode).toBe(1)
@@ -298,6 +298,15 @@ test('Bun file shards execute every discovered test once and emit per-job counts
       `import { test, expect } from 'bun:test'; test('unique-file-${index}', () => expect(1).toBe(1))`,
     )
   }
+  await writeFile(
+    join(tests, 'relay-worker-miniflare.test.ts'),
+    "import { test, expect } from 'bun:test'; test('unique-file-12', () => expect(1).toBe(1))",
+  )
+  await mkdir(join(tests, 'nested'))
+  await writeFile(
+    join(tests, 'nested/relay-worker-miniflare.test.ts'),
+    "import { test, expect } from 'bun:test'; test('unique-file-13', () => expect(1).toBe(1))",
+  )
   const names: string[] = []
   let total = 0
   for (const job of unitJobs.filter((entry) => entry.suite === 'opencode')) {
@@ -328,10 +337,10 @@ test('Bun file shards execute every discovered test once and emit per-job counts
     expect(report.shard).toBe(job.shard)
     total += report.count
   }
-  expect(total).toBe(12)
-  expect(names.length).toBe(12)
+  expect(total).toBe(14)
+  expect(names.length).toBe(14)
   expect(new Set(names)).toEqual(
-    new Set(Array.from({ length: 12 }, (_, index) => `unique-file-${index}`)),
+    new Set(Array.from({ length: 14 }, (_, index) => `unique-file-${index}`)),
   )
 })
 
@@ -992,6 +1001,20 @@ test('CI fans out suites and E2E and makes every job required by the final check
     expect(
       ci.jobs[name]?.steps.some((step) => step.run === 'bun run build'),
     ).toBe(true)
+  }
+  const fixtureInstall =
+    'npm ci --prefix packages/e2e-tests/fixtures/opencode1-config-deps --ignore-scripts --no-audit --no-fund'
+  for (const [name, consumer] of [
+    [
+      'fast-checks',
+      'bun test --cwd packages/opencode scripts/check-bundle-globals.test.ts',
+    ],
+    ['e2e', 'bun run test:e2e'],
+  ]) {
+    const commands = ci.jobs[name as string]?.steps.map((step) => step.run)
+    const install = commands?.indexOf(fixtureInstall) ?? -1
+    expect(install).toBeGreaterThanOrEqual(0)
+    expect(install).toBeLessThan(commands?.indexOf(consumer) ?? -1)
   }
   const unitSteps = ci.jobs.unit?.steps ?? []
   expect(

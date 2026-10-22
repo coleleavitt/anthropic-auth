@@ -8,6 +8,7 @@ export const unitJobs = [
     suite: 'opencode',
     shard,
   })),
+  { suite: 'opencode', shard: 'miniflare' },
   { suite: 'pi', shard: '1/1' },
 ] as const
 
@@ -88,8 +89,18 @@ async function main(args: string[]) {
   if (!job || !directory)
     throw new Error('invalid unit suite/shard or output directory')
 
-  const command = ['bun', 'test', 'src/tests']
-  if (job.shard !== '1/1') command.push(`--shard=${job.shard}`)
+  const miniflare = 'src/tests/relay-worker-miniflare.test.ts'
+  const command = [
+    'bun',
+    'test',
+    job.shard === 'miniflare' ? `./${miniflare}` : 'src/tests',
+  ]
+  if (job.shard !== '1/1' && job.shard !== 'miniflare') {
+    command.push(`--shard=${job.shard}`)
+    // The sidebar rendering tests lost subprocess pipes or hung on child exit
+    // when run alongside Miniflare. Keep Miniflare in a separate process.
+    command.push(`--path-ignore-patterns=${miniflare}`)
+  }
   console.log(`MEASURE: ${job.suite} shard=${job.shard}`)
   const result = Bun.spawnSync(command, {
     cwd: join('packages', job.suite),
