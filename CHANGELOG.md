@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Documentation
+
+- The vault setup docs now say vault setup needs Claustrum v0.2.0 or newer.
+
 ## 2.2.3
 
 ### Accounts

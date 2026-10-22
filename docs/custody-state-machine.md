@@ -72,7 +72,7 @@ All local sign-in paths refuse while the host is enrolled in the vault (`Disconn
 
 ### Vault setup
 
-`setup --claustrum`, or answering yes to the vault question, enrolls each selected host while it is stopped. The Claustrum daemon must be running and `ck` installed. For each host, setup:
+`setup --claustrum`, or answering yes to the vault question, enrolls each selected host while it is stopped. The Claustrum daemon (v0.2.0 or newer) must be running and `ck` installed. For each host, setup:
 
 1. proposes or resumes the `anthropic-auth-<host>` enrollment and approves it with `ck auth enroll approve`;
 2. grants read access to the `anthropic-native` category: `ck auth grant --principal enrolled:anthropic-auth-<host> --selector-kind category --selector anthropic-native --operation read`;

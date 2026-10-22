@@ -4,6 +4,8 @@ Claustrum is a local credential-vault service. Each host explicitly enrolls as `
 
 ## Setup
 
+Vault setup needs [Claustrum v0.2.0](https://github.com/cortexkit/claustrum/releases/tag/v0.2.0) or newer, which needs subc-core 0.20.83 or newer. Older Claustrum versions can't connect plugins, and setup stops with a message saying so.
+
 Stop all OpenCode, LiteCode and Pi processes. With `ck` installed and the Claustrum daemon running, run:
 
 ```sh
