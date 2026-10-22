@@ -281,7 +281,9 @@ test('/claude-quota polls main through scoped custody and persists its scoped wi
   } as any)
   // The retired /claude-quota alias is now the unified /claude menu's
   // "Refresh quota" action, applied the way the TUI applies it: through the
-  // plugin's RPC server. It returns only after the poll was persisted.
+  // plugin's RPC server. The menu reports the poll's reading as soon as the
+  // poll returns; writing it to the pool runtime file is queued behind that
+  // and can still be in flight when the reply arrives.
   const result = await createRpcClient(
     getRpcDir(fixture.root),
     process.pid,
@@ -294,6 +296,9 @@ test('/claude-quota polls main through scoped custody and persists its scoped wi
   expect(result.ok).toBe(true)
   await drainSidebarWrites()
   expect(usageAuthorizations).toContain('Bearer scoped-access-main')
+  // Wait for that queued write itself, then read the file through a fresh
+  // runtime that has none of the plugin's in-memory readings.
+  await (plugin as any).__scopedRuntime.drainQuotaPublications()
   const quota = await readMainQuota(fixture)
   expect(quota?.accountIdentity).toBe(PRIMARY_ACCOUNT_ID)
   expect(quota?.scoped?.map((window) => window.id)).toEqual([
