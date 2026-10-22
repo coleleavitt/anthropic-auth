@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { NativeRefreshFailure } from '@cortexkit/anthropic-auth-core'
 import {
   type AccountCommandStatusProjection,
@@ -262,6 +264,7 @@ import {
 import {
   drainNotifications,
   isTuiConnected,
+  missedTuiPickup,
   pushNotification,
   pushNotificationAwaitingPickup,
 } from './rpc/notifications.ts'
@@ -1115,18 +1118,60 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
 const CLAUDE_MENU_TUI_PICKUP_MS = 2_000
 
 /**
- * Leads the text reply /claude sends when no TUI took the menu. OpenCode 1
- * loads a plugin's terminal UI only from tui.json/tui.jsonc, separately from
- * opencode.json, so a plugin added by editing opencode.json alone has a
- * working server side and no menu. docs/sidebar.md describes the entry.
- * Not exported: this module keeps its plugin as its only export, because
- * OpenCode 1 loads the exports of a plugin's entry module as plugins.
+ * The plugin's own `name@version`, read once from its package.json, which sits
+ * one directory above both src/index.ts and the bundled dist/index.js. When
+ * the file is missing or belongs to another package, the name is used alone.
  */
-const CLAUDE_MENU_NO_TUI_NOTICE = [
-  "The Claude menu did not open: no OpenCode terminal window running this plugin's TUI part (its menu and sidebar) picked it up within two seconds.",
-  'OpenCode 1 loads that part from tui.json, not opencode.json. Add "@cortexkit/opencode-anthropic-auth" to the "plugin" list in tui.json (or tui.jsonc) in your OpenCode config folder, with the same version as in opencode.json, or run setup again, which adds it. Then restart OpenCode.',
-  'Read-only summary:',
-].join('\n')
+const OPENCODE_PACKAGE_NAME = '@cortexkit/opencode-anthropic-auth'
+let pluginPackageEntry: string | undefined
+function readPluginPackageEntry(): string {
+  if (pluginPackageEntry !== undefined) return pluginPackageEntry
+  pluginPackageEntry = OPENCODE_PACKAGE_NAME
+  try {
+    const manifest = JSON.parse(
+      readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'),
+        'utf8',
+      ),
+    ) as { name?: unknown; version?: unknown }
+    if (
+      manifest.name === OPENCODE_PACKAGE_NAME &&
+      typeof manifest.version === 'string' &&
+      manifest.version.trim()
+    )
+      pluginPackageEntry = `${OPENCODE_PACKAGE_NAME}@${manifest.version.trim()}`
+  } catch {
+    // Keep the bare package name.
+  }
+  return pluginPackageEntry
+}
+
+/**
+ * Leads the text reply the first time /claude finds no TUI in a session.
+ * OpenCode 1 loads a plugin's terminal UI only from tui.json/tui.jsonc,
+ * separately from opencode.json, so a plugin added by editing opencode.json
+ * alone has a working server side and no menu; docs/sidebar.md describes the
+ * entry. OpenCode Desktop cannot load TUI plugins at all, so the text has to
+ * be true there too. Not exported: this module keeps its plugin as its only
+ * export, because OpenCode 1 loads the exports of a plugin's entry module as
+ * plugins.
+ */
+function claudeMenuNoTuiNotice(): string {
+  return [
+    "The Claude menu opens in OpenCode's terminal window when the plugin's TUI part is loaded.",
+    `In the terminal, add "${readPluginPackageEntry()}" to the plugin list in tui.json (or rerun setup), then restart OpenCode.`,
+    'In OpenCode Desktop, use the text menu below.',
+  ].join('\n')
+}
+
+/**
+ * OpenCode Desktop starts its server with OPENCODE_CLIENT=desktop, and the
+ * plugin runs in that server process. Desktop cannot load TUI plugins, so
+ * /claude there answers in text at once, without waiting for a TUI.
+ */
+function isOpenCodeDesktop(): boolean {
+  return process.env.OPENCODE_CLIENT === 'desktop'
+}
 
 type PluginRuntimeOverrides = Partial<{
   authorize: typeof authorize
@@ -6123,13 +6168,16 @@ const anthropicAuthPlugin = async (
       )
       // A TUI that polled this session within the last few seconds is running
       // (possibly busy); queue the menu for it and never fall back to text.
-      // Without a recent poll, give a TUI that has just started or just opened
-      // the session a short time to take the menu. Only when none does is the
-      // TUI part missing or not showing this session: reply in the chat, which
-      // OpenCode shows without the plugin's TUI part.
+      // OpenCode Desktop has no TUI to wait for, and a session whose last wait
+      // found none (with no poll since) is not waited on again: both get the
+      // text menu at once. Otherwise give a TUI that has just started or just
+      // opened the session a short time to take the menu. If no TUI takes it
+      // in time, reply in the chat, which OpenCode shows without the plugin's
+      // TUI part, and say how to load that part, once per session.
       let pickedUp = isTuiConnected(input.sessionID)
+      let notice = false
       if (pickedUp) pushNotification(payload, input.sessionID)
-      else
+      else if (!isOpenCodeDesktop() && !missedTuiPickup(input.sessionID)) {
         pickedUp = await pushNotificationAwaitingPickup(
           payload,
           input.sessionID,
@@ -6140,10 +6188,11 @@ const anthropicAuthPlugin = async (
             clearTimeout: runtimeTimers.clearTimeout,
           },
         )
+        notice = !pickedUp
+      }
       if (!pickedUp) {
         const text = [
-          CLAUDE_MENU_NO_TUI_NOTICE,
-          '',
+          ...(notice ? [claudeMenuNoTuiNotice(), ''] : []),
           payload.menu.title,
           ...payload.menu.sections.flatMap((section) => [
             `\n## ${section.title}`,

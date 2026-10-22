@@ -10457,18 +10457,29 @@ describe('auth.loader', () => {
       .filter((text) => text.includes('tui.json'))
   }
 
-  test('/claude with no TUI taking the menu within two seconds says once how to add the TUI part', async () => {
+  test('/claude with no TUI says once per session how to add the TUI part, and a later TUI poll restores the menu', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
     const timers = heldTuiPickupTimers()
     const plugin = await getPlugin(mockClient, undefined, timers.overrides)
     const sessionID = 'session-no-tui'
+    const runClaude = () =>
+      plugin['command.execute.before']({
+        command: 'claude',
+        arguments: '',
+        sessionID,
+      })
+    const textReplies = () =>
+      (
+        mockClient.session.promptAsync as unknown as {
+          mock: { calls: unknown[] }
+        }
+      ).mock.calls.length
+    const { version } = JSON.parse(
+      await readFile(new URL('../../package.json', import.meta.url), 'utf8'),
+    ) as { version: string }
 
-    const handled = plugin['command.execute.before']({
-      command: 'claude',
-      arguments: '',
-      sessionID,
-    })
+    const handled = runClaude()
     handled.catch(() => {})
     await timers.started()
     expect(missingTuiNotices(mockClient)).toEqual([])
@@ -10480,11 +10491,51 @@ describe('auth.loader', () => {
     expect(notices).toHaveLength(1)
     const [notice = ''] = notices
     expect(latestIgnoredReply(mockClient)).toBe(notice)
-    expect(notice).toContain('"@cortexkit/opencode-anthropic-auth"')
+    expect(notice).toContain(`"@cortexkit/opencode-anthropic-auth@${version}"`)
     expect(notice).toContain('restart OpenCode')
+    expect(notice).toContain('In OpenCode Desktop, use the text menu below.')
     // The read-only menu text still follows the notice.
     expect(notice).toContain('## Cache')
-    // A TUI that starts afterwards does not open the menu that was answered.
+
+    // The same session again: no wait and no second notice, only the menu.
+    await expectHandledCommandResponse(runClaude())
+    expect(timers.waiting).toBe(0)
+    expect(textReplies()).toBe(2)
+    expect(missingTuiNotices(mockClient)).toHaveLength(1)
+    expect(latestIgnoredReply(mockClient)).toContain('## Cache')
+
+    // A TUI that starts polling now finds no stale menu from either call...
+    expect(drainNotifications(0, sessionID)).toEqual([])
+    // ...and gets the next /claude as a dialog, with no chat reply.
+    await expectHandledCommandResponse(runClaude())
+    expect(drainNotifications(0, sessionID).at(-1)?.type).toBe('open-menu')
+    expect(textReplies()).toBe(2)
+  })
+
+  test('/claude in OpenCode Desktop replies with the text menu at once, without the TUI notice', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    const timers = heldTuiPickupTimers()
+    const plugin = await getPlugin(mockClient, undefined, timers.overrides)
+    const sessionID = 'session-desktop'
+    const saved = process.env.OPENCODE_CLIENT
+    // OpenCode Desktop starts its server with this variable set.
+    process.env.OPENCODE_CLIENT = 'desktop'
+    try {
+      await expectHandledCommandResponse(
+        plugin['command.execute.before']({
+          command: 'claude',
+          arguments: '',
+          sessionID,
+        }),
+      )
+    } finally {
+      if (saved === undefined) delete process.env.OPENCODE_CLIENT
+      else process.env.OPENCODE_CLIENT = saved
+    }
+    expect(timers.waiting).toBe(0)
+    expect(latestIgnoredReply(mockClient)).toContain('## Cache')
+    expect(missingTuiNotices(mockClient)).toEqual([])
     expect(drainNotifications(0, sessionID)).toEqual([])
   })
 

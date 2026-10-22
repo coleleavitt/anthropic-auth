@@ -17,6 +17,11 @@ const pickupWaiters = new Map<
   number,
   { readonly picked: () => void; readonly cancel: () => void }
 >()
+// Sessions whose last pickup wait ended with no TUI taking the dialog, in
+// insertion order so the oldest can be dropped. A drain for the session
+// removes it: a TUI is showing that session again.
+const missedPickupSessions = new Set<string>()
+const MISSED_PICKUP_CAP = 1_000
 
 export interface PickupWaitOptions {
   /** How long the server waits for a TUI to drain the notification. */
@@ -82,9 +87,23 @@ export function pushNotificationAwaitingPickup(
     timer = options.setTimeout(() => {
       if (!pickupWaiters.delete(id)) return
       queue = queue.filter((notification) => notification.id !== id)
+      missedPickupSessions.delete(sessionId)
+      missedPickupSessions.add(sessionId)
+      if (missedPickupSessions.size > MISSED_PICKUP_CAP) {
+        const oldest = missedPickupSessions.values().next().value
+        if (oldest !== undefined) missedPickupSessions.delete(oldest)
+      }
       resolve(false)
     }, options.timeoutMs)
   })
+}
+
+/**
+ * True when the session's last pickup wait found no TUI and no TUI has
+ * polled that session since, so a caller can answer at once without waiting.
+ */
+export function missedTuiPickup(sessionId: string): boolean {
+  return missedPickupSessions.has(sessionId)
 }
 
 export function drainNotifications(
@@ -93,6 +112,7 @@ export function drainNotifications(
 ): RpcNotification[] {
   assertSessionId(sessionId)
   lastDrainAtBySession.set(sessionId, Date.now())
+  missedPickupSessions.delete(sessionId)
   if (lastReceivedId > 0) {
     queue = queue.filter(
       (notification) =>
@@ -123,6 +143,7 @@ export function resetNotificationsForTest(): void {
   queue = []
   nextId = 1
   lastDrainAtBySession.clear()
+  missedPickupSessions.clear()
   // Cancel outstanding deadlines too: ids restart at 1, so a late deadline
   // would otherwise withdraw a newer notification that reuses its id.
   for (const waiter of pickupWaiters.values()) waiter.cancel()

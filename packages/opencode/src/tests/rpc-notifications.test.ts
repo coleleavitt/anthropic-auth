@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
 import {
   drainNotifications,
   isTuiConnected,
+  missedTuiPickup,
   pushNotification,
   pushNotificationAwaitingPickup,
   resetNotificationsForTest,
@@ -188,6 +189,38 @@ describe('notifications', () => {
     )
     expect(await picked).toBe(false)
     expect(drainNotifications(0, 's1')).toEqual([])
+  })
+
+  test('a session is marked as missing its TUI after a failed wait until a drain for it', async () => {
+    const timers = manualTimers()
+    const picked = pushNotificationAwaitingPickup(
+      payload('claude-quota'),
+      's1',
+      timers.options,
+    )
+    expect(missedTuiPickup('s1')).toBe(false)
+    timers.expire()
+    expect(await picked).toBe(false)
+    expect(missedTuiPickup('s1')).toBe(true)
+    expect(missedTuiPickup('s2')).toBe(false)
+    // Another session's drain leaves the mark; this session's drain clears it.
+    drainNotifications(0, 's2')
+    expect(missedTuiPickup('s1')).toBe(true)
+    drainNotifications(0, 's1')
+    expect(missedTuiPickup('s1')).toBe(false)
+  })
+
+  test('a successful pickup does not mark the session', async () => {
+    const timers = manualTimers()
+    const picked = pushNotificationAwaitingPickup(
+      payload('claude-quota'),
+      's1',
+      timers.options,
+    )
+    drainNotifications(0, 's1')
+    expect(await picked).toBe(true)
+    timers.expire()
+    expect(missedTuiPickup('s1')).toBe(false)
   })
 
   test('resetting cancels outstanding pickup deadlines', async () => {
