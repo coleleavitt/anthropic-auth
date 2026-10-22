@@ -14,3 +14,9 @@
 - The remote runner has no network. The packed-host check (`smoke:tui`, packed OpenCode installs) needs the npm registry; it refuses offline, and GitHub CI runs it.
 - The runner is shared. When it is busy, unrelated tests can time out. Report each first failure as you saw it and say whether it touches your change; do not rerun until green and do not raise deadlines.
 - A worker's local shell is sandboxed and cannot read the parent worktrees folder, so local package builds can fail with `CouldntReadCurrentDirectory`. Prefer the remote runner.
+
+## Which checks to run
+
+- Run the tests that own your change, plus typecheck and lint, on the remote runner. Use `bun test <files>` in the package, after building Core in the same job.
+- Don't run the full Core, OpenCode and Pi suites unless the brief asks for them. GitHub CI runs every suite in parallel jobs in about four minutes on each PR, and its result decides the merge. On the shared runner a full OpenCode run takes several minutes and usually hits unrelated load timeouts.
+- In your report, list what you ran and what you left to CI.
