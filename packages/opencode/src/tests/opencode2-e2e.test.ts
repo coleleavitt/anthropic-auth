@@ -298,13 +298,23 @@ beforeAll(async () => {
     throw error
   }
 }, 180_000)
+/**
+ * The file's last hook removes the scratch tree, which holds both npm-installed
+ * hosts, the OC1 plugin SDK and the packed install (measured at about 2.3 GB in
+ * 16,000 files). Deleting it is bounded work that takes seconds. Measured on
+ * the Linux test runner it took 0.35-1.5 s, and 3.3 s with the CPU and disk
+ * under load. On a GitHub runner this hook once passed Bun's default 5 s hook
+ * limit, and Bun then failed the whole run with an unnamed hook timeout. Allow
+ * three times that 5 s. The hook still waits for the removal to finish.
+ */
+const SCRATCH_REMOVAL_TIMEOUT_MS = 15_000
 afterAll(async () => {
   for (const child of children)
     if (child.exitCode === null) child.kill('SIGKILL')
   await Promise.all([...children].map((child) => child.exited))
   children.clear()
   if (scratch) await rm(scratch, { recursive: true, force: true })
-})
+}, SCRATCH_REMOVAL_TIMEOUT_MS)
 
 /**
  * Seed synthetic accounts without network access. The plugin serves model
