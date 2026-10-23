@@ -770,7 +770,154 @@ test('empty-init imports every unpopulated host slot and absent sources install 
       slot && slot.type === 'api' ? slot : custodyTombstoneOAuth('anthropic'),
     )
     if (slot !== oauth) expect(await f.store.read()).toMatchObject({ rows: [] })
+    else {
+      const pool = await f.store.read()
+      if (pool.status !== 'ready') throw new Error('pool is not ready')
+      expect(pool.rows).toHaveLength(1)
+      expect(pool.rows[0]).toMatchObject({
+        type: 'oauth',
+        enabled: true,
+        credential: { access: oauth.access, refresh: oauth.refresh },
+      })
+    }
   }
+})
+
+// Setups first run on 2.0.2 or earlier with no login left a retired v4 import
+// of nothing instead of empty-init. A later OpenCode login is imported the
+// same way while the pool holds no account data; session pins do not count.
+async function retiredEmptyFixture() {
+  const f = await fixture()
+  for (const path of [
+    f.paths.legacyConfig,
+    f.paths.legacyState,
+    f.input.hostAuthPath,
+  ])
+    await rm(path)
+  expect(await runNativeMigration(f.input)).toMatchObject({
+    version: 4,
+    phase: 'retired',
+    activation: null,
+  })
+  expect(await nativePoolHoldsAccountData(f)).toBe(false)
+  return f
+}
+
+const laterLogin = {
+  ...oauth,
+  access: 'synthetic-later-host-login',
+  refresh: 'synthetic-later-host-refresh',
+}
+
+async function expectLaterLoginImported(
+  f: Awaited<ReturnType<typeof fixture>>,
+) {
+  const pool = await f.store.read()
+  if (pool.status !== 'ready') throw new Error('pool is not ready')
+  expect(pool.rows).toHaveLength(1)
+  expect(pool.rows[0]).toMatchObject({
+    type: 'oauth',
+    enabled: true,
+    credential: { access: laterLogin.access, refresh: laterLogin.refresh },
+  })
+}
+
+test('retired import with no account data imports a later OpenCode login like empty-init', async () => {
+  const f = await retiredEmptyFixture()
+  const pins = {
+    version: 1,
+    updatedAt: 999,
+    assignments: {
+      'session-pinned': {
+        accountId: 'main',
+        family: 'general',
+        assignedAt: 1,
+        lastSeenAt: 1,
+        initialInputBytes: 0,
+        quotaCheckedAt: 1,
+      },
+    },
+  }
+  await writeFile(f.input.routingDestinationPath, JSON.stringify(pins))
+  expect(await nativePoolHoldsAccountData(f)).toBe(false)
+  await writeFile(
+    f.input.hostAuthPath,
+    JSON.stringify({ anthropic: laterLogin }),
+  )
+  const journal = await runNativeMigration(f.input)
+  expect(journal).toMatchObject({
+    version: 5,
+    kind: 'legacy-import',
+    phase: 'retired',
+    activation: null,
+  })
+  expect(await readNativeMigrationJournal(f.paths)).toEqual(journal)
+  await expectLaterLoginImported(f)
+  // The login is moved, not copied: the host slot keeps no live token.
+  const host = await readFile(f.input.hostAuthPath, 'utf8')
+  expect(JSON.parse(host).anthropic).toEqual(custodyTombstoneOAuth('anthropic'))
+  expect(host).not.toContain(laterLogin.refresh)
+  expect(host).not.toContain(laterLogin.access)
+  expect(
+    JSON.parse(await readFile(f.input.routingDestinationPath, 'utf8'))
+      .assignments,
+  ).toEqual(pins.assignments)
+})
+
+// The placeholder replaces the host login only after the imported row is
+// written and recorded in the verified journal. A crash on either side of the
+// host write keeps the login in the pool or in the slot, and a rerun finishes.
+test('retired import of a later OpenCode login survives a crash around the host write', async () => {
+  for (const point of ['before:host', 'after:host']) {
+    const f = await retiredEmptyFixture()
+    await writeFile(
+      f.input.hostAuthPath,
+      JSON.stringify({ anthropic: laterLogin }),
+    )
+    await stopAt(f.input, point)
+    expect(await readNativeMigrationJournal(f.paths)).toMatchObject({
+      version: 5,
+      kind: 'legacy-import',
+      phase: 'verified',
+    })
+    await expectLaterLoginImported(f)
+    expect(
+      JSON.parse(await readFile(f.input.hostAuthPath, 'utf8')).anthropic,
+    ).toEqual(
+      point === 'before:host' ? laterLogin : custodyTombstoneOAuth('anthropic'),
+    )
+    expect(await runNativeMigration(f.input)).toMatchObject({
+      version: 5,
+      kind: 'legacy-import',
+      phase: 'retired',
+    })
+    await expectLaterLoginImported(f)
+    expect(
+      JSON.parse(await readFile(f.input.hostAuthPath, 'utf8')).anthropic,
+    ).toEqual(custodyTombstoneOAuth('anthropic'))
+  }
+})
+
+test('retired import with account data refuses a later OpenCode login without writes', async () => {
+  const f = await retiredEmptyFixture()
+  await f.store.add({ id: 'native', credential: oauth })
+  await writeFile(
+    f.input.hostAuthPath,
+    JSON.stringify({ anthropic: laterLogin }),
+  )
+  const before = await fileBytes(f)
+  let writes = 0
+  await expectRefusal(
+    runNativeMigration(f.input, {
+      onStep: async () => {
+        writes++
+      },
+    }),
+    NativeMigrationError,
+    'host-login-present',
+  )
+  expect(writes).toBe(0)
+  expect(await fileBytes(f)).toEqual(before)
 })
 
 test('v5 crash after account import resumes with exact settings or refuses changed settings without writes', async () => {

@@ -9,6 +9,7 @@ import {
   inspectNativeHostAuthEntry,
   NativeMigrationError,
   type NativeMigrationPreflight,
+  nativeJournalMayAdoptLaterHostLogin,
   nativePoolHoldsAccountData,
   prepareNativeMigration,
   readNativeEnrollmentMode,
@@ -214,8 +215,13 @@ export async function planNativeLocalSetup(
     }
   } else {
     plan.slot = await inspectSetupHostAuth(host, paths.hostAuthPath)
+    // A retired import with an OpenCode login is checked for account data
+    // the same way as empty-init: with none, setup imports the login.
+    const adoptsLogin =
+      nativeJournalMayAdoptLaterHostLogin(journal, host) &&
+      plan.slot.kind === 'oauth'
     plan.poolPopulation =
-      journal?.kind === 'empty-init'
+      journal?.kind === 'empty-init' || adoptsLogin
         ? await nativePoolHoldsAccountData({ paths: paths.paths })
         : 'not-evaluated'
     const populated = plan.poolPopulation === true
@@ -224,6 +230,7 @@ export async function planNativeLocalSetup(
       (populated ||
         (completed &&
           journal?.kind !== 'empty-init' &&
+          !adoptsLogin &&
           plan.slot.kind === 'oauth'))
     ) {
       plan.action = 'skip'

@@ -59,6 +59,7 @@ import {
   type NativeEmptyInitJournal,
   type NativeLegacyMigrationJournal,
   type NativeMigrationJournal,
+  nativeJournalMayAdoptLaterHostLogin,
   readNativeMigrationJournal,
   recordNativeMigrationExpectations,
 } from './pool-authority.ts'
@@ -157,6 +158,12 @@ interface Captured {
   projection?: NativeMigrationProjection
   seedInput?: NativeRosterSeedInput
   journal?: NativeMigrationJournal
+  /**
+   * Set when a retired import with no account data is replaced by a fresh
+   * import, exactly as an empty-init journal is. Holds the retired journal so
+   * the replacement refuses if it changed.
+   */
+  replaces?: NativeLegacyMigrationJournal
   routingDestination?: NativeMigrationSourceSnapshot
   hostAuthPath: string
   routingSourcePath: string
@@ -373,7 +380,7 @@ async function capture(
     if (!isAbsolute(path) || /\p{Cc}/u.test(path)) refuse()
   const current = await readNativeMigrationJournal(input.paths)
   const emptyInit = current?.kind === 'empty-init'
-  const journal = current?.kind === 'empty-init' ? undefined : current
+  let journal = current?.kind === 'empty-init' ? undefined : current
   if (emptyInit) {
     if (
       current.host !== input.host ||
@@ -423,9 +430,24 @@ async function capture(
       journal.routingPaths.destination !== routingDestinationPath)
   )
     refuse()
-  // Once the pool becomes authoritative, requests can update it. Restoring
+  // A retired import whose pool holds no account data (only session pins or
+  // preferences at most) is treated as empty-init: a later OpenCode login is
+  // imported by the fresh import below. With any account data it keeps the
+  // completed path, which refuses the login as host-login-present.
+  let replaces: NativeLegacyMigrationJournal | undefined
+  if (
+    nativeJournalMayAdoptLaterHostLogin(journal, input.host) &&
+    entry.kind === 'oauth' &&
+    !(await nativePoolHoldsAccountData({ paths: input.paths }))
+  ) {
+    replaces = journal
+    journal = undefined
+  }
+  // Once the pool becomes authoritative, requests can update it. A completed
+  // authority with account data is reused and never re-imported: restoring
   // the host’s token-free activation marker must not import credentials from
-  // a later host login or replace the pool’s current tokens.
+  // a later host login or replace the pool’s current tokens. The one exception
+  // is a pool with no account data, handled above.
   if (journal?.phase === 'committed' || journal?.phase === 'retired') {
     const missing = (
       role: 'config' | 'state' | 'routing',
@@ -475,7 +497,7 @@ async function capture(
     input.routingSourcePath,
   )
   const routingDestination =
-    emptyInit || journal?.kind === 'legacy-import'
+    emptyInit || replaces || journal?.kind === 'legacy-import'
       ? await readNativeMigrationSource('routing', input.routingDestinationPath)
       : undefined
   if (routingDestination) owned(routingDestination)
@@ -573,6 +595,7 @@ async function capture(
     routing,
     auth,
     journal: current,
+    ...(replaces ? { replaces } : {}),
     routingDestination,
     projection,
     seedInput,
@@ -877,13 +900,22 @@ export async function runNativeMigration(
                 .digest ||
             previous.hostAuthPath !== captured.hostAuthPath ||
             previous.routingSourcePath !== captured.routingSourcePath ||
-            previous.routingDestinationPath !== captured.routingDestinationPath
+            previous.routingDestinationPath !==
+              captured.routingDestinationPath ||
+            (previous.replaces === undefined) !==
+              (captured.replaces === undefined)
           )
             refuse()
         }
-        const emptyInit = captured.journal?.kind === 'empty-init'
+        // Both an empty-init journal and a retired import with no account data
+        // start a fresh import; the fresh v5 journal replaces either one.
+        const emptyInit =
+          captured.journal?.kind === 'empty-init' ||
+          captured.replaces !== undefined
         let journal =
-          captured.journal?.kind === 'empty-init' ? undefined : captured.journal
+          captured.journal?.kind === 'empty-init' || captured.replaces
+            ? undefined
+            : captured.journal
         const store = createNativePoolStore({
           paths,
           quota: nativeQuotaCodec,
@@ -990,6 +1022,7 @@ export async function runNativeMigration(
                 : {}),
             },
             journalHooks,
+            captured.replaces,
           )
         }
         let bytes: string | undefined

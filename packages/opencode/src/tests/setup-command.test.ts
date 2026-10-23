@@ -3203,6 +3203,181 @@ for (const login of [false, true]) {
   )
 }
 
+// An OpenCode 1 login added after a first setup that found no login. Setups
+// first run on 2.0.2 or earlier left a retired v4 legacy journal; later ones
+// leave empty-init. Either way the rerun imports the login while the pool holds
+// no account data.
+const LATER_HOST_LOGIN = {
+  type: 'oauth' as const,
+  access: 'sk-ant-oat01-later-host-login',
+  refresh: 'later-host-login-refresh',
+  expires: Date.now() + 28_800_000,
+}
+
+async function hostSlotKind(f: Awaited<ReturnType<typeof callbackFixture>>) {
+  return inspectNativeHostAuthEntry(
+    'opencode',
+    JSON.parse(await readFile(f.plan.hostAuthPath, 'utf8')),
+  ).kind
+}
+
+async function setupPoolRows(f: Awaited<ReturnType<typeof callbackFixture>>) {
+  const pool = await createNativePoolStore({
+    paths: f.plan.paths,
+    quota: nativeQuotaCodec,
+  }).read()
+  if (pool.status !== 'ready') throw new Error('Fixture pool is not ready')
+  return pool.rows
+}
+
+for (const authority of ['retired-legacy', 'empty-init'] as const) {
+  lifetimes.test(
+    `S1 ${authority} with no account data imports a later OpenCode login on rerun`,
+    async () => {
+      const f = await callbackFixture()
+      expect(
+        await runSetupCommand(
+          ['--yes', `--opencode=${authority === 'empty-init' ? '2' : '1'}`],
+          f.io,
+        ),
+      ).toBe(0)
+      expect(await readNativeMigrationJournal(f.plan.paths)).toMatchObject(
+        authority === 'empty-init'
+          ? { version: 5, kind: 'empty-init' }
+          : { version: 4, phase: 'retired', activation: null },
+      )
+      expect(await core.nativePoolHoldsAccountData(f.plan)).toBe(false)
+      await writeSetupJson(f.plan.hostAuthPath, { anthropic: LATER_HOST_LOGIN })
+      let migrations = 0
+      expect(
+        await runSetupCommand(['--yes', '--opencode=1'], {
+          ...f.io,
+          migrateLocal: async (host, options) => {
+            migrations++
+            // The login stays in the host slot until the import replaces it.
+            expect(await hostSlotKind(f)).toBe('oauth')
+            await migrateNativeLocalForHost(host, options)
+          },
+        }),
+      ).toBe(0)
+      expect(migrations).toBe(1)
+      expect(await readNativeMigrationJournal(f.plan.paths)).toMatchObject({
+        version: 5,
+        kind: 'legacy-import',
+        phase: 'retired',
+        activation: null,
+      })
+      const rows = await setupPoolRows(f)
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({
+        type: 'oauth',
+        enabled: true,
+        credential: {
+          type: 'oauth',
+          access: LATER_HOST_LOGIN.access,
+          refresh: LATER_HOST_LOGIN.refresh,
+        },
+      })
+      expect(await hostSlotKind(f)).toBe('activation')
+      // Moved, not copied: no live token is left in OpenCode's auth file.
+      const host = await readFile(f.plan.hostAuthPath, 'utf8')
+      expect(host).not.toContain(LATER_HOST_LOGIN.refresh)
+      expect(host).not.toContain(LATER_HOST_LOGIN.access)
+      expect(f.screen()).not.toContain(SEPARATE_HOST_LOGIN_NOTICE)
+    },
+  )
+}
+
+lifetimes.test(
+  'S1 retired-legacy empty pool on a vault-enrolled host neither reads nor imports a later OpenCode login',
+  async () => {
+    const f = await callbackFixture()
+    expect(await runSetupCommand(['--yes', '--opencode=1'], f.io)).toBe(0)
+    expect(await core.nativePoolHoldsAccountData(f.plan)).toBe(false)
+    await writeSetupJson(f.plan.hostAuthPath, { anthropic: LATER_HOST_LOGIN })
+    await writeSetupJson(
+      getHostClaustrumEnrollmentPaths('opencode', f.env).tokenPath,
+      { token: 'c'.repeat(64), token_generation: 1 },
+    )
+    expect(await readNativeEnrollmentMode('opencode', f.env)).toBe('claustrum')
+    const before = await setupBytes(f.plan)
+    let migrations = 0
+    const data = watchDataDirectory(dirname(f.plan.hostAuthPath))
+    try {
+      expect(
+        await runSetupCommand(['--yes', '--no-claustrum', '--opencode=1'], {
+          ...f.io,
+          migrateLocal: async () => {
+            migrations++
+          },
+        }),
+      ).toBe(1)
+      // A direct import call on the enrolled host refuses at its first fence.
+      await expect(
+        migrateNativeLocalForHost('opencode', {
+          env: f.env,
+          paths: f.plan,
+          fence: createTestFence(),
+          removePiAnthropicAuth: false,
+        }),
+      ).rejects.toBeInstanceOf(SetupRefusal)
+      expect(data.accesses).toEqual([])
+    } finally {
+      data.restore()
+    }
+    expect(migrations).toBe(0)
+    expect(f.screen()).toContain('OpenCode is still connected to the vault.')
+    expect(await setupBytes(f.plan)).toEqual(before)
+    expect(await hostSlotKind(f)).toBe('oauth')
+    expect(await readNativeMigrationJournal(f.plan.paths)).toMatchObject({
+      version: 4,
+      phase: 'retired',
+    })
+  },
+)
+
+lifetimes.test(
+  'S1 retired-legacy pool with accounts keeps a later OpenCode login unimported',
+  async () => {
+    const f = await callbackFixture()
+    expect(await runSetupCommand(['--yes', '--opencode=1'], f.io)).toBe(0)
+    const runtime = setupRuntime(f)
+    try {
+      await poolMethodLogin(runtime)
+    } finally {
+      runtime.close()
+    }
+    expect(await core.nativePoolHoldsAccountData(f.plan)).toBe(true)
+    await writeSetupJson(f.plan.hostAuthPath, { anthropic: LATER_HOST_LOGIN })
+    const before = await setupBytes(f.plan)
+    let migrations = 0
+    expect(
+      await runSetupCommand(['--yes', '--opencode=1'], {
+        ...f.io,
+        migrateLocal: async () => {
+          migrations++
+        },
+      }),
+    ).toBe(0)
+    expect(migrations).toBe(0)
+    expect(await setupBytes(f.plan)).toEqual(before)
+    expect(f.screen().split(SEPARATE_HOST_LOGIN_NOTICE).length - 1).toBe(1)
+    await expect(
+      migrateNativeLocalForHost('opencode', {
+        env: f.env,
+        paths: f.plan,
+        fence: createTestFence(),
+        removePiAnthropicAuth: false,
+      }),
+    ).rejects.toMatchObject({ code: 'host-login-present' })
+    expect(await setupBytes(f.plan)).toEqual(before)
+    expect(await readNativeMigrationJournal(f.plan.paths)).toMatchObject({
+      version: 4,
+      phase: 'retired',
+    })
+  },
+)
+
 lifetimes.test(
   'Pi SDK auth path ignores PI_AGENT_DIR while native pool paths keep it',
   async () => {

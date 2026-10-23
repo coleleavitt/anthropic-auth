@@ -292,6 +292,7 @@ export type {
   NativeMigrationJournal,
 } from './pool-authority.ts'
 export {
+  nativeJournalMayAdoptLaterHostLogin,
   nativeMigrationAuthorityPhase,
   readNativeMigrationJournal,
 } from './pool-authority.ts'

@@ -568,6 +568,28 @@ export function nativeMigrationAuthorityPhase(
   return journal.phase
 }
 
+/**
+ * Whether a finished legacy import may be replaced by a fresh import of a
+ * later OpenCode login. Setups first run on 2.0.2 or earlier, with no login,
+ * finished a legacy import of nothing instead of recording empty-init. Such a
+ * journal stands in for empty-init only when it is retired with no requested
+ * or completed vault switch; callers must still prove the pool holds no account
+ * data, so a pool with accounts is never re-imported.
+ */
+export function nativeJournalMayAdoptLaterHostLogin(
+  journal: NativeMigrationJournal | undefined,
+  host: 'opencode' | 'pi',
+): journal is NativeLegacyMigrationJournal {
+  return (
+    host === 'opencode' &&
+    journal !== undefined &&
+    journal.kind !== 'empty-init' &&
+    journal.host === 'opencode' &&
+    journal.phase === 'retired' &&
+    journal.activation === null
+  )
+}
+
 /** An empty or readable store is not proof that the offline authority flip completed. */
 export async function requireNativePoolAuthority(
   paths: NativePoolPaths,
@@ -631,6 +653,11 @@ export async function beginNativeMigration(
   paths: NativePoolPaths,
   input: NativeMigrationInput,
   hooks: JournalHooks = {},
+  /**
+   * The retired journal a fresh v5 import replaces, as read by the caller.
+   * The write refuses unless the journal on disk still equals it exactly.
+   */
+  replaces?: NativeLegacyMigrationJournal,
 ): Promise<NativeLegacyMigrationJournal> {
   try {
     requireNativeMigrationDataObject(input)
@@ -677,6 +704,18 @@ export async function beginNativeMigration(
     },
     async (lock) => {
       const current = await readNativeMigrationJournal(paths)
+      if (replaces) {
+        if (
+          initial.version !== 5 ||
+          !nativeJournalMayAdoptLaterHostLogin(replaces, initial.host) ||
+          !current ||
+          nativeMigrationCanonicalJson(current) !==
+            nativeMigrationCanonicalJson(replaces)
+        )
+          throw new NativeAuthorityError('journal-conflict')
+        await writeJournal(paths, initial, () => lock.assertOwned(), hooks)
+        return initial
+      }
       if (current?.kind === 'empty-init') {
         if (current.host !== initial.host)
           throw new NativeAuthorityError('journal-conflict')

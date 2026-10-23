@@ -1587,3 +1587,20 @@ expect_message = "error: expect(received).toMatchObject(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "retired-empty-pool-imports-later-host-login"
+guards = "A retired legacy import whose pool holds no account data must import a later OpenCode 1 login on setup rerun, as empty-init does, instead of refusing it as host-login-present."
+file = "packages/core/src/native-migration.ts"
+old = "nativeJournalMayAdoptLaterHostLogin(journal, input.host) &&"
+new = "false && /* NON-VACUITY BREAK: never treat a retired empty pool like empty-init */ nativeJournalMayAdoptLaterHostLogin(journal, input.host) &&"
+test_file = "packages/opencode/src/tests/setup-command.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/setup-command.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["S1 retired-legacy with no account data imports a later OpenCode login on rerun"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+junit_class = "suites"
