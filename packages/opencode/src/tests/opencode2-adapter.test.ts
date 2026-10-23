@@ -96,12 +96,13 @@ const IDENTITY: ClaudeCodeIdentity = {
   sessionId: '11111111-2222-4333-8444-555555555555',
 }
 
-const scopeOf = (over: Partial<RequestScope> = {}): RequestScope => ({
+const scopeOf = (over: Partial<RequestScope> = {}) => ({
+  phase: 'request' as const,
   providerID: 'anthropic',
   modelID: 'claude-sonnet-5',
   sessionID: 'ses_alpha',
   agent: 'build',
-  kind: 'primary',
+  kind: 'primary' as const,
   ...over,
 })
 
@@ -225,7 +226,8 @@ class Host {
   constructor(readonly adapter: OpenCode2AuthAdapter<Quota, Data>) {}
 
   async begin(scope: RequestScope) {
-    const accountId = await this.adapter.chooseAccount(scope)
+    const input = { ...scope, phase: 'request' as const }
+    const accountId = await this.adapter.chooseAccount(input)
     if (accountId === undefined) throw new Error('installer: no-account')
     const result = (await this.adapter.accountHeaders({
       ...scope,

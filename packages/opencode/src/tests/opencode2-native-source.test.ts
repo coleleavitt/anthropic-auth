@@ -27,9 +27,14 @@ import {
   runNativeMigration,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
-import { registerOpenCode2AuthMethods } from '@cortexkit/common-auth/opencode2'
+import {
+  type OpenCode2HookContext,
+  placeholderSecret,
+  registerOpenCode2AuthMethods,
+} from '@cortexkit/common-auth/opencode2'
 import { fingerprintOf } from '@cortexkit/common-auth/store'
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
+import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
 import {
@@ -55,6 +60,8 @@ import {
   type NativeAnthropicAttemptContext,
   NativeAnthropicTransportRefusal,
 } from '../v2/adapter'
+import { installNativeAnthropic } from '../v2/install'
+import { preparedAnthropicCredential } from '../v2/ownership'
 import {
   claudeLoginMethods,
   LOCAL_LOGIN_REFUSED_IN_VAULT,
@@ -70,6 +77,7 @@ const identity = '11111111-2222-4333-8444-555555555555'
 const changedIdentity = '99999999-2222-4333-8444-555555555555'
 const fallbackIdentity = '12345678-1234-4234-8234-123456789abc'
 const scope = {
+  phase: 'request' as const,
   providerID: 'anthropic',
   modelID: 'claude-sonnet-5',
   sessionID: 'ses_native_oc2',
@@ -834,6 +842,283 @@ function rawPin(text: string, sessionID: string) {
   if (!match?.[1]) throw new Error('Expected pin is missing')
   return match[1]
 }
+
+/** Drives installNativeAnthropic's hooks with the real adapter and account runtime. */
+async function retryHost(native: ReturnType<typeof source>) {
+  const callbacks = new Map<string, (input: unknown) => unknown>()
+  const hook: OpenCode2HookContext['session']['hook'] = async (name, run) => {
+    callbacks.set(name, (input) => run(input as SessionHooks[typeof name]))
+    return {
+      dispose: async () => {
+        callbacks.delete(name)
+      },
+    }
+  }
+  const installation = await installNativeAnthropic(
+    { session: { hook } },
+    { source: native },
+    { credential: preparedAnthropicCredential },
+  )
+  cleanups.push(() => installation.dispose())
+  async function run<Name extends keyof SessionHooks>(
+    name: Name,
+    input: SessionHooks[Name],
+  ) {
+    const callback = callbacks.get(name)
+    if (!callback) throw new Error(`Missing installed hook ${name}`)
+    await callback(input)
+  }
+  const hostScope = (input = scope) => ({
+    sessionID: input.sessionID as SessionHooks['http.request']['sessionID'],
+    agent: input.agent as SessionHooks['http.request']['agent'],
+    model: {
+      providerID:
+        input.providerID as SessionHooks['http.request']['model']['providerID'],
+      id: input.modelID as SessionHooks['http.request']['model']['id'],
+    },
+    kind: input.kind,
+  })
+  return {
+    installation,
+    async send(input = scope) {
+      const draft = {
+        ...hostScope(input),
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${placeholderSecret('anthropic')}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: input.modelID,
+            max_tokens: 128,
+            messages: [{ role: 'user', content: 'retry contract' }],
+          }),
+        }),
+      }
+      await run('model.request', { ...hostScope(input), headers: {} })
+      await run('http.request', draft)
+      return draft.request
+    },
+    async response(request: Request, status: number, input = scope) {
+      const draft = {
+        ...hostScope(input),
+        request,
+        response: new Response('{}', { status }),
+      }
+      await run('http.response', draft)
+      await draft.response.text()
+    },
+    async retry(retry = true, input = scope) {
+      const draft: SessionHooks['retry'] = {
+        ...hostScope(input),
+        attempt: 1,
+        error: { type: 'unknown', message: 'provider refused the attempt' },
+        decision: retry ? { retry: true, delay: 1234 } : { retry: false },
+      }
+      await run('retry', draft)
+      return draft.decision
+    },
+  }
+}
+
+describe('OC2 installed retry contract (requires common-auth 0.25.0)', () => {
+  test('installed vault-newer retry consumes one committed choice in either phase', async () => {
+    const fixture = await vault([7, 8, 9], () => identity, {
+      mode: 'sticky-balanced',
+    })
+    const native = source(fixture.runtime, fixture.paths)
+    const choose = spyOn(native, 'chooseAccount')
+    const drop = spyOn(native, 'dropChoice')
+    const host = await retryHost(native)
+    const first = await host.send()
+    expect(first.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-vault-7',
+    )
+    await native.drainRoutingPublications()
+    const { routingPath } = await fixture.runtime.read()
+    if (!routingPath) throw new Error('Missing routing path')
+    const pin = await readFile(routingPath, 'utf8')
+    await host.response(first, 401)
+    expect(await host.retry()).toEqual({ retry: true, delay: 1234 })
+    const second = await host.send()
+    expect(second.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-vault-8',
+    )
+    expect(choose).toHaveBeenCalledTimes(2)
+    expect(
+      choose.mock.calls.map(([input]) =>
+        'phase' in input ? input.phase : undefined,
+      ),
+    ).toEqual(['request', 'retry'])
+    await native.drainRoutingPublications()
+    expect(await readFile(routingPath, 'utf8')).toBe(pin)
+    // A used retry choice must leave the queue so a later authorization cannot consume it.
+    expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
+      accessToken: 'sk-ant-oat01-vault-9',
+    })
+    expect(drop).toHaveBeenCalledTimes(0)
+    await host.installation.dispose()
+    expect(drop).toHaveBeenCalledTimes(0)
+  })
+
+  test('installed 429 reroutes once and pins the next attempt to the new account', async () => {
+    const fixture = await vaultWithFallback()
+    const native = source(fixture.runtime, fixture.paths)
+    const choose = spyOn(native, 'chooseAccount')
+    const host = await retryHost(native)
+    const first = await host.send()
+    expect(
+      host.installation.installation.accountFor(scope.sessionID, 'primary'),
+    ).toBe('main')
+    await host.response(first, 429)
+    expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+    const next = await host.send()
+    const selected = host.installation.installation.accountFor(
+      scope.sessionID,
+      'primary',
+    )
+    expect(selected).toBeDefined()
+    expect(selected).not.toBe('main')
+    expect(next.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-oauth:anthropic:work',
+    )
+    expect(choose).toHaveBeenCalledTimes(2)
+    expect(
+      choose.mock.calls.map(([input]) =>
+        'phase' in input ? input.phase : undefined,
+      ),
+    ).toEqual(['request', 'retry'])
+    await native.drainRoutingPublications()
+    const { routingPath } = await fixture.runtime.read()
+    if (!routingPath) throw new Error('Missing routing path')
+    expect(
+      JSON.parse(rawPin(await readFile(routingPath, 'utf8'), scope.sessionID)),
+    ).toMatchObject({ accountId: selected })
+    await host.response(next, 200)
+    await host.send()
+    expect(choose).toHaveBeenCalledTimes(3)
+    expect(
+      host.installation.installation.accountFor(scope.sessionID, 'primary'),
+    ).toBe(selected)
+  })
+
+  test('installed undefined retry preserves the pin and next attempt chooses once without rerouteFrom', async () => {
+    const fixture = await local()
+    await fixture.runtime.updateSettings((settings) => {
+      settings.routing = { mode: 'sticky-balanced' }
+    })
+    const native = source(fixture.runtime, fixture.paths)
+    const choose = spyOn(native, 'chooseAccount')
+    const drop = spyOn(native, 'dropChoice')
+    const host = await retryHost(native)
+    const first = await host.send()
+    await native.drainRoutingPublications()
+    const { routingPath } = await fixture.runtime.read()
+    if (!routingPath) throw new Error('Missing routing path')
+    const pin = await readFile(routingPath, 'utf8')
+    await host.response(first, 429)
+    expect(await host.retry()).toEqual({ retry: true, delay: 1234 })
+    await expect(choose.mock.results[1]?.value).resolves.toBeUndefined()
+    await native.drainRoutingPublications()
+    expect(await readFile(routingPath, 'utf8')).toBe(pin)
+    const next = await host.send()
+    expect(next.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-native-only',
+    )
+    expect(choose).toHaveBeenCalledTimes(3)
+    expect(choose.mock.calls[2]?.[0]).not.toHaveProperty('rerouteFrom')
+    expect(drop).toHaveBeenCalledTimes(0)
+  })
+
+  for (const unused of ['host-no-retry', 'model-change'] as const) {
+    test(`installed ${unused} drops exactly its unused queued choice before the next selection`, async () => {
+      const fixture = await vault([7, 8, 9, 10, 11, 12], () => identity, {
+        mode: 'sticky-balanced',
+      })
+      const native = source(fixture.runtime, fixture.paths)
+      const originalChoose = native.chooseAccount.bind(native)
+      const choose = spyOn(native, 'chooseAccount')
+      const entered = Promise.withResolvers<void>()
+      const release = Promise.withResolvers<void>()
+      cleanups.push(() => release.resolve())
+      const events: string[] = []
+      choose.mockImplementation((input) => {
+        events.push(`choose:${input.sessionID}`)
+        return originalChoose(input)
+      })
+      const originalDrop = native.dropChoice?.bind(native)
+      const drop = spyOn(native, 'dropChoice').mockImplementation(
+        async (input) => {
+          events.push('drop:start')
+          entered.resolve()
+          await release.promise
+          await originalDrop?.(input)
+          events.push('drop:end')
+        },
+      )
+      const host = await retryHost(native)
+      const other = { ...scope, sessionID: 'ses_other_pending' }
+      const first = await host.send()
+      await host.response(first, 401)
+      const otherFirst = await host.send(other)
+      await host.response(otherFirst, 401, other)
+      await host.retry(true, other)
+      await native.drainRoutingPublications()
+      const { routingPath } = await fixture.runtime.read()
+      if (!routingPath) throw new Error('Missing routing path')
+      const pin = rawPin(await readFile(routingPath, 'utf8'), scope.sessionID)
+      const nextScope =
+        unused === 'model-change'
+          ? { ...scope, modelID: 'claude-opus-4-6' }
+          : scope
+      const retry = host.retry(unused === 'model-change')
+      let next: Promise<Request>
+      if (unused === 'model-change') {
+        await retry
+        next = host.send(nextScope)
+      } else {
+        // The retry hook is still awaiting cleanup when another request arrives.
+        await Promise.race([entered.promise, retry])
+        expect(drop).toHaveBeenCalledTimes(1)
+        next = host.send(nextScope)
+      }
+      await Promise.race([entered.promise, next])
+      expect(choose).toHaveBeenCalledTimes(4)
+      expect(drop).toHaveBeenCalledTimes(1)
+      const retryInput = choose.mock.calls[3]?.[0]
+      if (!retryInput) throw new Error('Missing retry choice input')
+      expect(drop.mock.calls[0]?.[0]).toEqual({
+        ...retryInput,
+        accountId: 'main',
+      })
+      await native.drainRoutingPublications()
+      expect(rawPin(await readFile(routingPath, 'utf8'), scope.sessionID)).toBe(
+        pin,
+      )
+      release.resolve()
+      await retry
+      expect((await next).headers.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-vault-11',
+      )
+      expect(events.slice(-3)).toEqual([
+        'drop:start',
+        'drop:end',
+        `choose:${scope.sessionID}`,
+      ])
+      expect((await host.send(other)).headers.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-vault-10',
+      )
+      expect(choose).toHaveBeenCalledTimes(5)
+      // Reading the old scope would consume a leaked choice, even after a model change.
+      expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
+        accessToken: 'sk-ant-oat01-vault-12',
+      })
+      await host.installation.dispose()
+      expect(drop).toHaveBeenCalledTimes(1)
+    })
+  }
+})
 
 describe('OC2 source over actual native services', () => {
   usageTests.test(

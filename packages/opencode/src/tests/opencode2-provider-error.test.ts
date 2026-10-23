@@ -90,12 +90,13 @@ const successText = (secret: string) =>
   }) +
   sse({ type: 'message_stop' })
 
-const scopeOf = (sessionID: string): RequestScope => ({
+const scopeOf = (sessionID: string) => ({
+  phase: 'request' as const,
   providerID: 'anthropic',
   modelID: 'claude-sonnet-4-6',
   sessionID,
   agent: 'build',
-  kind: 'primary',
+  kind: 'primary' as const,
 })
 
 function hostRequest(stream = true) {

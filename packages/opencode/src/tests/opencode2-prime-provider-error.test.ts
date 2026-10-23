@@ -727,7 +727,9 @@ async function modelSender(
             message: 'Provider refused the request',
             status: reply.response.status,
           },
-          decision: { retry: false },
+          // Same-account refreshes preserve the host's retry policy. Opt into
+          // one retry here to test publication failures, not a host veto.
+          decision: { retry: true, delay: 0 },
         }
         await run('retry', retry)
         if (!retry.decision.retry)
@@ -865,19 +867,19 @@ test('OC2 attempt end joins a held successful quota publication before a later a
   expect(completed).toBe(false)
   quota.release.open()
   expect(await sending).toMatchObject({ ok: true, status: 200 })
-  expect(
-    await fixture.source.chooseAccount({
-      providerID: 'anthropic',
-      modelID: 'claude-haiku-4-5',
-      sessionID: 'later-saved-quota-choice',
-      agent: 'build',
-      kind: 'primary',
-      rerouteFrom: {
-        accountId: 'main',
-        limit: { reason: 'provider-503', status: 503 },
-      },
-    }),
-  ).toBe('paid')
+  const input = {
+    providerID: 'anthropic',
+    modelID: 'claude-haiku-4-5',
+    sessionID: 'later-saved-quota-choice',
+    agent: 'build',
+    kind: 'primary' as const,
+    phase: 'retry' as const,
+    rerouteFrom: {
+      accountId: 'main',
+      limit: { reason: 'provider-503', status: 503 },
+    },
+  }
+  expect(await fixture.source.chooseAccount(input)).toBe('paid')
   expect(
     (await primeCounters(fixture.runtime))?.quota?.five_hour?.remainingPercent,
   ).toBe(0)

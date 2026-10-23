@@ -130,10 +130,12 @@ export function createNativePrime(options: {
             index < 2
           ) {
             discard(response)
-            const next = await source.chooseAccount({
+            const input = {
               ...scope,
+              phase: 'retry' as const,
               rerouteFrom: { accountId, limit },
-            })
+            }
+            const next = await source.chooseAccount(input)
             if (next !== accountId)
               throw new Error('Native Prime retry changed account')
             continue

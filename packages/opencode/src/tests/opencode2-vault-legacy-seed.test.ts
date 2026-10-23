@@ -160,6 +160,7 @@ async function fixture() {
     }),
   )
   const scope = {
+    phase: 'request' as const,
     providerID: 'anthropic',
     modelID: 'claude-sonnet-5-5',
     sessionID: 'live-session',

@@ -31,6 +31,7 @@ const FALLBACK_UUID =
 const MAIN_ACCESS = 'sk-ant-oat01-oc2-main-access'
 const FALLBACK_ACCESS = 'sk-ant-oat01-oc2-fallback-access'
 const scope = {
+  phase: 'request' as const,
   providerID: 'anthropic',
   modelID: 'claude-sonnet-5',
   sessionID: 'ses_native_oc2_transient',

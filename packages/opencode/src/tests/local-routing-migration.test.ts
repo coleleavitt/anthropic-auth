@@ -314,6 +314,7 @@ async function oc2(f: HostFixture) {
   f.cleanups.push(() => source.close())
   const send = async (sessionID: string) => {
     const scope = {
+      phase: 'request' as const,
       providerID: 'anthropic',
       modelID: 'claude-sonnet-4-6',
       sessionID,

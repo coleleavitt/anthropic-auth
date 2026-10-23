@@ -1666,7 +1666,8 @@ async function sendSetupOc2(
   })
   const adapter = createNativeAnthropicAdapter({ source })
   try {
-    const accountId = await adapter.adapter.chooseAccount(setupScope)
+    const input = { ...setupScope, phase: 'request' as const }
+    const accountId = await adapter.adapter.chooseAccount(input)
     if (!accountId) throw new Error('fixture: no account')
     const headers = await adapter.adapter.accountHeaders({
       ...setupScope,
