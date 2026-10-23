@@ -50,6 +50,7 @@ import {
   createNativeLocalCredentialService,
   type NativeLocalCredentialServiceOptions,
 } from './native-local-credential-service.ts'
+import { acquireNativeLocalPublisher } from './native-local-publication.ts'
 import type { NativeLocalExternalPolicy } from './native-local-runtime-readers.ts'
 import {
   type NativeLockEvent,
@@ -309,11 +310,12 @@ export function acquireNativeAccountRuntime(
   const quotaObservations = use().quotaObservations
   const onLockEvent = use().onLockEvent
   const drainRoutingPublications = use().drainRoutingPublications
+  const drainQuotaPublications = use().drainQuotaPublications
   return {
     onLockEvent,
     vault,
     quotaObservations,
-    drainQuotaPublications: () => quotaObservations.drain(),
+    drainQuotaPublications,
     drainRoutingPublications,
     getRelayConfig: () => use().getRelayConfig(),
     getSettingsPath: () => use().getSettingsPath(),
@@ -346,7 +348,10 @@ export function acquireNativeAccountRuntime(
       use().fetchProfileForDisplay(id, transport, signal),
     close: () => {
       vault.close()
-      return drainRoutingPublications()
+      return Promise.all([
+        drainQuotaPublications(),
+        drainRoutingPublications(),
+      ]).then(() => {})
     },
   }
 }
@@ -407,6 +412,9 @@ export function createNativeAccountRuntime(
     },
   })
   const shutdown = new AbortController()
+  let closing: Promise<void> | undefined
+  const quotaPublications = acquireNativeLocalPublisher(paths.config)
+  const metadataPublications = acquireNativeLocalPublisher(paths.runtime)
   const store = createNativePoolStore({
     paths,
     quota: nativeQuotaCodec,
@@ -587,6 +595,85 @@ export function createNativeAccountRuntime(
           error.code === 'route-unavailable')
       )
         return false
+      throw error
+    }
+  }
+  // Advisory metadata owns only the runtime lock. The credential initialization
+  // and refresh paths retain their existing pool/custody leases.
+  async function localMetadataMatches(
+    subject: NativeRefreshSubject | NativeApiSubject,
+  ): Promise<boolean> {
+    const binding = subject.binding
+    const row = await poolRow(binding.rowId)
+    if (
+      row?.stamp !== 'bound' ||
+      !row.credential ||
+      !nativeLocalPoolBindingMatches(binding, paths, row)
+    )
+      return false
+    if ('kind' in subject)
+      return (
+        row.credential.type === 'api' &&
+        fingerprintOf(row.credential) === subject.credentialFingerprint &&
+        row.credential.baseURL === subject.baseURL &&
+        row.credential.authHeader === subject.authHeader
+      )
+    return (
+      row.credential.type === 'oauth' &&
+      fingerprintOf(row.credential) === subject.credentialFingerprint &&
+      nativeLocalCredentialValidationMatches(subject, binding, row.credential)
+    )
+  }
+  async function localMetadataWrite(
+    subject: NativeRefreshSubject | NativeApiSubject,
+    change: (entry: NativeRuntimeEntry) => NativeRuntimeEntry,
+  ): Promise<boolean> {
+    const binding = subject.binding
+    if ((await authority()) !== 'local') return false
+    const matches = await localMetadataMatches(subject)
+    await localAuthority()
+    if (!matches) return false
+    try {
+      await updateNativeRuntime(
+        paths.runtime,
+        paths.storageId,
+        (current) => {
+          const old = current.accounts[binding.rowId]
+          const previous = old?.binding
+          const same =
+            previous?.kind === 'local' &&
+            previous.rowId === binding.rowId &&
+            previous.identity === binding.identity &&
+            previous.credentialEpoch === binding.credentialEpoch
+          current.accounts[binding.rowId] = change(
+            same && old ? old : { binding },
+          )
+          return current
+        },
+        {
+          onLockEvent: options.local?.onLockEvent,
+          beforeRename: async () => {
+            if (!(await localMetadataMatches(subject)))
+              throw new NativeRuntimeError('publication-refused')
+            await localAuthority()
+          },
+          beforePublish: () => localAuthority(),
+        },
+      )
+      if ((await authority()) !== 'local')
+        throw new NativeRuntimeError('publication-refused')
+      return true
+    } catch (error) {
+      if (
+        error instanceof NativeRuntimeError &&
+        (error.code === 'runtime-conflict' ||
+          error.code === 'publication-refused')
+      ) {
+        // The runtime writer wraps hook failures; custody must be checked again
+        // after that await before an advisory refusal can resolve normally.
+        if ((await authority()) !== 'local') throw error
+        return false
+      }
       throw error
     }
   }
@@ -801,7 +888,13 @@ export function createNativeAccountRuntime(
     onLockEvent,
     vault,
     quotaObservations: vault.quotaObservations,
-    drainQuotaPublications: () => vault.quotaObservations.drain(),
+    drainQuotaPublications: async () => {
+      await vault.quotaObservations.drain()
+      await Promise.all([
+        quotaPublications.drain(),
+        metadataPublications.drain(),
+      ])
+    },
     drainRoutingPublications: () => vaultRouter.drain(),
     async getRelayConfig() {
       const { mode, paths, store } = await selectedStorage()
@@ -1446,58 +1539,78 @@ export function createNativeAccountRuntime(
       }
     },
     async publishLocal(subject, rawPatch) {
-      const patch = captureNativeMetadataPatch(rawPatch)
-      if ((await authority()) !== 'local') return false
-      const { quota, ...metadata } = patch
-      const quotaOnly =
-        quota !== undefined && Object.keys(metadata).length === 0
-      const row = await poolRow(subject.binding.rowId)
-      if (
-        row?.stamp !== 'bound' ||
-        row.credential?.type !== 'oauth' ||
-        !nativeLocalPoolBindingMatches(subject.binding, paths, row) ||
-        (!quotaOnly &&
-          !nativeLocalCredentialValidationMatches(
-            subject,
-            subject.binding,
-            row.credential,
-          ))
-      )
-        return false
-      if (quota) {
-        if (
-          quota.source !== 'headers' &&
-          row.quota &&
-          quotaSnapshotCheckedAt(fromNativeQuotaMap(row.quota)) >
-            quotaSnapshotCheckedAt(quota)
+      const captured = captureNativeMetadataPatch(rawPatch)
+      const { quota: _quota, ...metadata } = captured
+      // Enqueue before awaiting admission so close cannot miss an accepted write.
+      // Mixed patches share one exact-credential check for both destinations.
+      const mixed =
+        captured.quota !== undefined && Object.keys(metadata).length > 0
+      let admission: Promise<boolean> | undefined
+      const admitted = () =>
+        (admission ??= (async () => {
+          if ((await authority()) !== 'local') return false
+          const matches = await localMetadataMatches(subject)
+          await localAuthority()
+          return matches
+        })())
+      const key = JSON.stringify(subject)
+      const writes: Promise<boolean>[] = []
+      if (captured.quota)
+        writes.push(
+          quotaPublications.enqueue(
+            mixed ? `${key}:mixed` : key,
+            { quota: captured.quota },
+            async ({ quota }) => {
+              if (mixed && !(await admitted())) return false
+              if (!quota || (await authority()) !== 'local') return false
+              const row = await poolRow(subject.binding.rowId)
+              if (
+                row?.stamp !== 'bound' ||
+                row.credential?.type !== 'oauth' ||
+                !nativeLocalPoolBindingMatches(subject.binding, paths, row) ||
+                quota.accountIdentity !== subject.binding.identity
+              )
+                return false
+              if (
+                quota.source !== 'headers' &&
+                row.quota &&
+                quotaSnapshotCheckedAt(fromNativeQuotaMap(row.quota)) >
+                  quotaSnapshotCheckedAt(quota)
+              )
+                return false
+              await store.recordQuota(
+                subject.binding.rowId,
+                {
+                  credentialEpoch: subject.binding.credentialEpoch,
+                  identity: subject.binding.identity,
+                },
+                toNativeQuotaMap(quota),
+              )
+              return true
+            },
+          ),
         )
-          return false
-        if (quota.accountIdentity !== subject.binding.identity)
-          throw new NativeRuntimeError('publication-refused')
-        // Pool quota belongs to the account/epoch, not a rotating access token.
-        // The public store fences epoch and UUID and merges observation freshness.
-        await store.recordQuota(
-          subject.binding.rowId,
-          {
-            credentialEpoch: subject.binding.credentialEpoch,
-            identity: subject.binding.identity,
-          },
-          toNativeQuotaMap(quota),
+      if (Object.keys(metadata).length)
+        writes.push(
+          metadataPublications.enqueue(
+            mixed ? `${key}:mixed` : key,
+            metadata,
+            async (patch) => {
+              if (mixed && !(await admitted())) return false
+              return localMetadataWrite(subject, (old) =>
+                applyNativeMetadataPatch(old, patch),
+              )
+            },
+          ),
         )
-      }
-      // Quota remains valid across a same-account refresh. Other metadata
-      // still requires the exact credential version that produced it.
-      return localWrite(
-        subject,
-        (old) => applyNativeMetadataPatch(old, metadata),
-        quotaOnly ? 'binding' : true,
-      )
+      return (await Promise.all(writes)).every(Boolean)
     },
     publishApi: (subject, patch) =>
-      localWrite(subject, (old) => ({
-        ...old,
-        lastUsed: Math.max(old.lastUsed ?? 0, patch.lastUsed),
-      })),
+      metadataPublications.enqueue(JSON.stringify(subject), patch, (merged) =>
+        localMetadataWrite(subject, (old) =>
+          applyNativeMetadataPatch(old, merged),
+        ),
+      ),
     async resetBackoff(routeId, fence, kind = 'all') {
       if ('accessToken' in fence) return vault.resetBackoff(fence, kind)
       if ((await authority()) !== 'local') return false
@@ -1533,15 +1646,17 @@ export function createNativeAccountRuntime(
       if ((await authority()) !== 'local') return undefined
       if ((await physicalId(routeId)) !== fence.binding.rowId) return undefined
       let lineage: string | undefined
-      const kept = await localWrite(fence, (old) => {
-        // The entry's epoch/UUID fence changes on replacement, not ordinary token
-        // rotation. Keep the account's lineage and counters through refresh.
-        lineage = old.authLineageId ?? randomUUID()
-        return {
-          ...old,
-          authLineageId: lineage,
-        }
-      })
+      const kept = await metadataPublications.run(() =>
+        localMetadataWrite(fence, (old) => {
+          // The entry's epoch/UUID fence changes on replacement, not ordinary token
+          // rotation. Keep the account's lineage and counters through refresh.
+          lineage = old.authLineageId ?? randomUUID()
+          return {
+            ...old,
+            authLineageId: lineage,
+          }
+        }),
+      )
       return kept ? lineage : undefined
     },
     async incrementPrimeUsage(routeId, fence, delta = {}) {
@@ -1549,15 +1664,18 @@ export function createNativeAccountRuntime(
       if ((await authority()) !== 'local') return false
       if ((await physicalId(routeId)) !== fence.binding.rowId) return false
       const captured = primeDelta(delta)
-      return localWrite(fence, (old) => ({
-        ...old,
-        prime: {
-          count: (old.prime?.count ?? 0) + 1,
-          inputTokens: (old.prime?.inputTokens ?? 0) + captured.inputTokens,
-          outputTokens: (old.prime?.outputTokens ?? 0) + captured.outputTokens,
-          since: old.prime?.since ?? now(),
-        },
-      }))
+      return metadataPublications.run(() =>
+        localMetadataWrite(fence, (old) => ({
+          ...old,
+          prime: {
+            count: (old.prime?.count ?? 0) + 1,
+            inputTokens: (old.prime?.inputTokens ?? 0) + captured.inputTokens,
+            outputTokens:
+              (old.prime?.outputTokens ?? 0) + captured.outputTokens,
+            since: old.prime?.since ?? now(),
+          },
+        })),
+      )
     },
     async fetchQuota(routeId, fetchImpl = fetch, signal, dispatch, purpose) {
       const snapshot = await runtime.read()
@@ -1674,11 +1792,19 @@ export function createNativeAccountRuntime(
       )
     },
     close() {
-      if (!shutdown.signal.aborted) {
-        shutdown.abort(new NativeCustodyError('closed'))
-        vault.close()
-      }
-      return vaultRouter.drain()
+      if (closing) return closing
+      const draining = runtime.drainQuotaPublications()
+      // Release this vault lease synchronously, as callers of the shared
+      // registry rely on the last close releasing its consumer immediately.
+      vault.close()
+      closing = Promise.all([draining, vaultRouter.drain()])
+        .then(() => {})
+        .finally(() => {
+          shutdown.abort(new NativeCustodyError('closed'))
+          quotaPublications.release()
+          metadataPublications.release()
+        })
+      return closing
     },
   }
   function readLocalProfile(

@@ -742,10 +742,10 @@ function assertTransitions(
 }
 
 /**
- * This file has its own update lock. Account publishers also hold the locks
- * protecting the pool and, for vault accounts, the roster. They verify those
- * locks immediately before replacement. A process paused beyond a lock expiry
- * can overlap a new owner even with normal renewal.
+ * This file has its own update lock. Advisory account publishers recheck the
+ * pool or roster binding without taking its lock immediately before replacement;
+ * readers reject metadata whose binding no longer matches. Credential writers
+ * retain their separate ownership and custody checks.
  */
 export async function updateNativeRuntime(
   path: string,

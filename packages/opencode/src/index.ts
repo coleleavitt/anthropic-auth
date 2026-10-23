@@ -2581,6 +2581,7 @@ const anthropicAuthPlugin = async (
       logger.debug('quota', 'native quota publication refused', {
         accountId: served.accountId,
       })
+      logger.warn('quota', 'Quota publication discarded')
       return null
     }
     // The pool merges quota under its locks. A poll can finish while this

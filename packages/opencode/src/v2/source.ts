@@ -5,6 +5,7 @@ import {
   getQuotaCheckIntervalMs,
   getRoutingMode,
   isQuotaBearingHeaderFrame,
+  logger,
   mergeHeaderQuotaForPersistence,
   type NativeAccountRuntime,
   type NativeAccountSnapshot,
@@ -13,9 +14,12 @@ import {
   type NativeCustodyReceipt,
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativePoolPaths,
+  type NativeQuotaObservation,
   NativeVaultNoAccountError,
   nativeAccountCanServe,
   nativeAccountPolicy,
+  nativeLocalQuotaLineage,
+  nativePollQuotaGenerallyExhausted,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
@@ -252,13 +256,45 @@ export function createNativeAnthropicSource(
     provenance: NativeSourceProvenance,
     state: State,
     patch: { quota?: OAuthQuotaSnapshot; lastUsed?: number },
-  ) {
-    if (provenance.kind === 'local')
-      await runtime.publishLocal(provenance.subject, patch)
-    else if (provenance.kind === 'vault' && state.receipt)
+  ): Promise<boolean> {
+    if (provenance.kind === 'local') {
+      const kept = await runtime.publishLocal(provenance.subject, patch)
+      if (!kept && patch.quota)
+        logger.warn('quota', 'Quota publication discarded')
+      return kept
+    }
+    if (provenance.kind === 'vault' && state.receipt)
       await runtime.vault.publish(state.receipt, patch)
     else if (provenance.kind === 'api' && patch.lastUsed !== undefined)
       await runtime.publishApi(provenance.subject, { lastUsed: patch.lastUsed })
+    return true
+  }
+
+  /**
+   * Local header readings are saved by a detached, lock-taking write. Hold the
+   * reading in the runtime's shared quota observations first, bound to the
+   * serving credential's lineage and account UUID, so a later account choice
+   * in this process routes by it while that save waits. A refused save drops
+   * it again; a later reading for the same account replaces it.
+   */
+  function holdLocalReading(
+    provenance: NativeSourceProvenance,
+    state: State,
+    quota: OAuthQuotaSnapshot,
+  ) {
+    if (provenance.kind !== 'local') return undefined
+    const binding = provenance.subject.binding
+    const checkedAt = quotaSnapshotCheckedAt(quota)
+    const observation: NativeQuotaObservation = {
+      lineage: nativeLocalQuotaLineage(binding),
+      accountUuid: binding.identity,
+      entry: { quota, checkedAt, refreshAfter: checkedAt },
+      generalExhausted: nativePollQuotaGenerallyExhausted(quota),
+      routeBeforeSave: true,
+    }
+    return runtime.quotaObservations.hold(state.account.id, observation)
+      ? observation
+      : undefined
   }
 
   const source: NativeSource = {
@@ -642,17 +678,29 @@ export function createNativeAnthropicSource(
         ...normalizeQuotaHeaders(headers),
         ...(identity ? { accountIdentity: identity } : {}),
       }
-      state.quota = mergeHeaderQuotaForPersistence(state.quota, incoming)
+      const quota = mergeHeaderQuotaForPersistence(state.quota, incoming)
+      state.quota = quota
+      const held = holdLocalReading(input.provenance, state, quota)
       // Publish these headers with the provenance of the send that observed
       // them. The runtime's account and authority fences decide whether to
       // keep the observation. The write is started, not awaited:
-      // streaming never waits on file locks. onAttemptEnd awaits it, so any
-      // account choice after this attempt reads the saved quota. A refused
+      // streaming and attempt completion never wait on file locks. A refused
       // observation is logged and dropped, never a failure of the request.
-      const pending = usagePublications.observe(
-        publish(input.provenance, state, { quota: state.quota }),
+      const accountId = state.account.id
+      const forget = () => {
+        if (held) runtime.quotaObservations.forget(accountId, held)
+      }
+      void usagePublications.observe(
+        publish(input.provenance, state, { quota }).then(
+          (kept) => {
+            if (!kept) forget()
+          },
+          (error: unknown) => {
+            forget()
+            throw error
+          },
+        ),
       )
-      publications.set(input.provenance, pending)
       return incoming
     },
     async limitFromResponse(input) {
@@ -795,7 +843,6 @@ export function createNativeAnthropicSource(
       const state = states.get(input.provenance)
       if (!state) return
       try {
-        await publications.get(input.provenance)
         if (
           outcome.status === 401 &&
           state.receipt &&
@@ -814,7 +861,6 @@ export function createNativeAnthropicSource(
           )
       } finally {
         states.delete(input.provenance)
-        publications.delete(input.provenance)
       }
     },
     forgetSession(sessionID) {
@@ -864,6 +910,5 @@ export function createNativeAnthropicSource(
       ]).then(() => {})
     },
   }
-  const publications = new WeakMap<NativeSourceProvenance, Promise<void>>()
   return source
 }

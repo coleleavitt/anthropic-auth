@@ -8,6 +8,48 @@ prebuild = [
 ]
 
 [[control]]
+id = "local-bookkeeping-never-nests-pool-lock"
+guards = "A held pool writer must not delay independent runtime bookkeeping."
+file = "packages/core/src/native-account-runtime.ts"
+old = """await updateNativeRuntime(
+        paths.runtime,
+        paths.storageId,"""
+new = """// NON-VACUITY BREAK: restore pool-config -> pool-state -> runtime nesting.
+      const [config, state] = nativePoolStoreLocks(paths)
+      const nested = (...args: Parameters<typeof updateNativeRuntime>) =>
+        withLock(config.path, { ...POOL_LOCK_DEFAULTS, name: config.name }, async () =>
+          withLock(state.path, { ...POOL_LOCK_DEFAULTS, name: state.name }, async () => updateNativeRuntime(...args)))
+      await nested(
+        paths.runtime,
+        paths.storageId,"""
+test_file = "packages/core/src/tests/native-account-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["local runtime bookkeeping ignores held pool lock 0"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "oc2-routes-by-held-local-header-reading"
+guards = "A local header reading whose save waits on file locks must already route this process's later account choices."
+file = "packages/opencode/src/v2/source.ts"
+old = "      routeBeforeSave: true,"
+new = "      routeBeforeSave: false, // NON-VACUITY BREAK: keep held header readings out of routing"
+test_file = "packages/opencode/src/tests/opencode2-prime-provider-error.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/opencode2-prime-provider-error.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["OC2 attempt end detaches quota persistence and a later choice routes by the new reading while the save is held", "OC2 Prime retries after a held quota publication is refused after credential retirement"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+junit_class = "suites"
+
+[[control]]
 id = "vault-receipt-never-nests-roster-lock"
 guards = "A receipt waiting for the runtime writer must not hold the roster lock and starve another runtime's roster publication."
 file = "packages/core/src/native-vault-runtime.ts"
@@ -292,8 +334,8 @@ broad_id = "{name}"
 id = "local-quota-survives-token-refresh"
 guards = "Account-owned quota must survive same-account token refresh while stale metadata and mixed writes remain refused."
 file = "packages/core/src/native-account-runtime.ts"
-old = "quota !== undefined && Object.keys(metadata).length === 0"
-new = "false"
+old = "Object.keys(metadata).length > 0"
+new = "true /* NON-VACUITY BREAK: require token freshness even for account-owned quota */"
 test_file = "packages/opencode/src/tests/index.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
@@ -307,15 +349,15 @@ junit_class = "suites"
 
 [[control]]
 id = "local-metadata-requires-token-version"
-guards = "The account-only quota exception must not permit stale metadata or mixed patches after token refresh."
+guards = "A rejected mixed quota/metadata patch must not persist quota after token refresh."
 file = "packages/core/src/native-account-runtime.ts"
-old = "quota !== undefined && Object.keys(metadata).length === 0"
-new = "true"
+old = "Object.keys(metadata).length > 0"
+new = "false /* NON-VACUITY BREAK: publish quota from a stale mixed patch */"
 test_file = "packages/opencode/src/tests/index.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["auth.loader > quota header harvest > quota-only publication survives native token refresh without admitting stale metadata"]
+expect_red = ["auth.loader > quota header harvest > main header push persists after access-token rotation for the same account"]
 expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
@@ -836,7 +878,7 @@ runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-enrollment-await.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
 expect_red = ["local metadata runtime-lease await rechecks custody / enroll=true"]
-expect_message = "error: expect(received).toBe(expected)"
+expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"

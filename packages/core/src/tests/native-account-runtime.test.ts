@@ -3,6 +3,7 @@ import * as filesystem from 'node:fs/promises'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
+import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { ClaudeOAuthRefreshError } from '../auth.ts'
 import {
   type ProviderAccountUuid,
@@ -18,6 +19,7 @@ import {
   setLogLevel,
 } from '../logger.ts'
 import {
+  acquireNativeAccountRuntime,
   createNativeAccountRuntime,
   nativeAccountPolicy,
 } from '../native-account-runtime.ts'
@@ -35,7 +37,7 @@ import * as runtimeWriter from '../native-runtime.ts'
 import { readNativeRuntime } from '../native-runtime.ts'
 import { nativeVaultPaths } from '../native-vault-paths.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
-import { createNativePoolStore } from '../pool-store.ts'
+import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
 import { effectiveRelayStatus, effectiveRelayTransport } from '../relay.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { holdNativeRelayLock } from './native-relay-lock-fixture.ts'
@@ -44,6 +46,305 @@ import { createTestLifetimeSuite } from './test-lifetime.ts'
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 const uuid = '11111111-2222-4333-8444-555555555555' as ProviderAccountUuid
 const now = 1_000_000
+const observeBookkeeping = () =>
+  new Promise((resolve) => setTimeout(resolve, 200))
+async function localSubject(f: Awaited<ReturnType<typeof fixture>>) {
+  const admission = await f.runtime.authorizeLocal('main')
+  if (admission.status !== 'usable')
+    throw new Error('Missing fixture authorization')
+  return admission.subject
+}
+test('local bookkeeping refuses an account replaced immediately before runtime rename', async () => {
+  const f = await fixture()
+  const subject = await localSubject(f)
+  const update = runtimeWriter.updateNativeRuntime
+  const writer = spyOn(runtimeWriter, 'updateNativeRuntime').mockImplementation(
+    (path, storageId, change, hooks) =>
+      update(path, storageId, change, {
+        ...hooks,
+        beforeRename: async () => {
+          await f.store.replace(
+            'imported-main',
+            {
+              type: 'oauth',
+              access: 'sk-ant-oat01-replacement-access',
+              refresh: 'replacement-refresh',
+              expires: now + 3600_000,
+            },
+            { identity: uuid },
+            {
+              attribution: {
+                credentialEpoch: subject.binding.credentialEpoch,
+                identity: uuid,
+              },
+            },
+          )
+          await hooks?.beforeRename?.()
+        },
+      }),
+  )
+  deferCleanup(() => writer.mockRestore())
+  expect(await f.runtime.publishLocal(subject, { lastUsed: now })).toBe(false)
+  const pool = await f.store.read()
+  expect(
+    pool.status === 'ready' && pool.rows[0]?.credentialEpoch,
+  ).toBeGreaterThan(subject.binding.credentialEpoch)
+  const saved = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(
+    saved.status === 'ready' && saved.state.accounts['imported-main']?.lastUsed,
+  ).toBeFalsy()
+})
+
+test('local quota mailbox merges poll-owned fields and keeps observation order and newest lastUsed', async () => {
+  const f = await fixture()
+  const subject = await localSubject(f)
+  const poll = {
+    source: 'poll' as const,
+    accountIdentity: uuid,
+    checkedAt: now,
+    five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: now },
+    scoped: [
+      {
+        id: 'sonnet',
+        title: 'Sonnet',
+        modelName: 'Sonnet',
+        usedPercent: 30,
+        remainingPercent: 70,
+        checkedAt: now,
+      },
+    ],
+    bindingWindow: 'sonnet',
+    bindingWindowSource: 'poll' as const,
+    extraUsage: {
+      used: { amountMinor: 1, currency: 'USD', exponent: 2 },
+      limit: { amountMinor: 100, currency: 'USD', exponent: 2 },
+      exhausted: false,
+    },
+  }
+  const header = {
+    source: 'headers' as const,
+    accountIdentity: uuid,
+    checkedAt: now + 2,
+    five_hour: { usedPercent: 90, remainingPercent: 10, checkedAt: now + 2 },
+  }
+  expect(
+    await Promise.all([
+      f.runtime.publishLocal(subject, { quota: poll, lastUsed: now + 2 }),
+      f.runtime.publishLocal(subject, { quota: header, lastUsed: now + 1 }),
+    ]),
+  ).toEqual([true, true])
+  expect(
+    await f.runtime.publishLocal(subject, {
+      quota: { ...poll, checkedAt: now + 1 },
+    }),
+  ).toBe(false)
+  expect(
+    await f.runtime.publishLocal(subject, {
+      quota: {
+        ...header,
+        checkedAt: now + 1,
+        five_hour: { usedPercent: 5, remainingPercent: 95, checkedAt: now + 1 },
+      },
+    }),
+  ).toBe(true)
+  const account = (await f.runtime.read()).accounts[0]!
+  expect(account.quota).toMatchObject({
+    five_hour: header.five_hour,
+    scoped: poll.scoped,
+    bindingWindow: 'sonnet',
+    bindingWindowSource: 'poll',
+    extraUsage: poll.extraUsage,
+    accountIdentity: uuid,
+  })
+  expect(account.lastUsed).toBe(now + 2)
+  expect(
+    await f.runtime.publishLocal(subject, {
+      quota: {
+        ...header,
+        checkedAt: now + 3,
+        five_hour: { ...header.five_hour, checkedAt: now + 3 },
+      },
+    }),
+  ).toBe(true)
+  expect((await f.runtime.read()).accounts[0]?.quota?.scoped).toEqual(
+    poll.scoped,
+  )
+  expect(
+    await Promise.all([
+      f.runtime.publishLocal(subject, {
+        quota: {
+          ...header,
+          checkedAt: now + 5,
+          five_hour: { ...header.five_hour, checkedAt: now + 5 },
+        },
+      }),
+      f.runtime.publishLocal(subject, {
+        quota: { ...poll, checkedAt: now + 4 },
+      }),
+    ]),
+  ).toEqual([true, false])
+  const scoped = poll.scoped.map((window) => ({
+    ...window,
+    checkedAt: now + 20,
+  }))
+  expect(
+    await f.runtime.publishLocal(subject, {
+      quota: { ...poll, checkedAt: now + 20, scoped },
+    }),
+  ).toBe(true)
+  expect(
+    await f.runtime.publishLocal(subject, {
+      quota: {
+        ...header,
+        checkedAt: now + 10,
+        five_hour: {
+          usedPercent: 50,
+          remainingPercent: 50,
+          checkedAt: now + 10,
+        },
+      },
+    }),
+  ).toBe(true)
+  expect((await f.runtime.read()).accounts[0]?.quota).toMatchObject({
+    scoped,
+    five_hour: { remainingPercent: 50 },
+  })
+})
+
+test('local mailboxes share destinations across runtime handles and acquired close drains both stores', async () => {
+  const locks: string[] = []
+  const onLockEvent = (event: { type: string; name: string }) => {
+    if (event.type === 'acquired') locks.push(event.name)
+  }
+  const f = await fixture({ onLockEvent })
+  const subject = await localSubject(f)
+  const peer = acquireNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    vault: { env: f.env },
+    local: { now: () => now, onLockEvent },
+  })
+  deferCleanup(() => peer.close())
+  locks.length = 0
+  const quota = {
+    source: 'headers' as const,
+    accountIdentity: uuid,
+    checkedAt: now,
+    five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: now },
+  }
+  const writes = [
+    f.runtime.publishLocal(subject, { quota, lastUsed: now }),
+    peer.publishLocal(subject, { quota, lastUsed: now + 1 }),
+  ]
+  await peer.close()
+  expect((await f.runtime.read()).accounts[0]).toMatchObject({
+    lastUsed: now + 1,
+    quota: { five_hour: { remainingPercent: 80 } },
+  })
+  expect(await Promise.all(writes)).toEqual([true, true])
+  expect(locks.filter((name) => name === 'pool-config')).toHaveLength(1)
+  expect(locks.filter((name) => name === 'native-runtime')).toHaveLength(1)
+})
+
+test('local readers reject bookkeeping if replacement lands after the final row check', async () => {
+  const f = await fixture()
+  const subject = await localSubject(f)
+  const update = runtimeWriter.updateNativeRuntime
+  const writer = spyOn(runtimeWriter, 'updateNativeRuntime').mockImplementation(
+    (path, storageId, change, hooks) =>
+      update(path, storageId, change, {
+        ...hooks,
+        beforeRename: async () => {
+          await hooks?.beforeRename?.()
+          await f.store.replace(
+            'imported-main',
+            {
+              type: 'oauth',
+              access: 'sk-ant-oat01-replacement-access',
+              refresh: 'replacement-refresh',
+              expires: now + 3600_000,
+            },
+            { identity: uuid },
+            {
+              attribution: {
+                credentialEpoch: subject.binding.credentialEpoch,
+                identity: uuid,
+              },
+            },
+          )
+        },
+      }),
+  )
+  deferCleanup(() => writer.mockRestore())
+  expect(
+    await f.runtime.publishLocal(subject, {
+      lastUsed: now,
+      profile: {
+        accountIdentity: uuid,
+        checkedAt: now,
+        tier: 'max',
+        orgType: 'claude_max',
+      },
+      lastQuotaRefreshError: {
+        checkedAt: now,
+        message: 'Quota unavailable',
+        accountIdentity: uuid,
+      },
+      quotaErrorClearedAt: now - 1,
+      quotaErrorGeneration: 4,
+      prime: { count: 3, inputTokens: 10, outputTokens: 20, since: now },
+      authLineageId: 'old-lineage',
+    }),
+  ).toBe(true)
+  const saved = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(
+    saved.status === 'ready' && saved.state.accounts['imported-main']?.lastUsed,
+  ).toBe(now)
+  const pool = await f.store.read()
+  expect(
+    pool.status === 'ready' && pool.rows[0]?.credentialEpoch,
+  ).toBeGreaterThan(subject.binding.credentialEpoch)
+  const view = (await f.runtime.read()).accounts[0]!
+  for (const field of [
+    'lastUsed',
+    'profile',
+    'lastQuotaRefreshError',
+    'quotaErrorClearedAt',
+    'quotaErrorGeneration',
+    'prime',
+  ] as const)
+    expect(view[field]).toBeUndefined()
+})
+
+for (const lockIndex of [0, 1]) {
+  test(`local runtime bookkeeping ignores held pool lock ${lockIndex}`, async () => {
+    const f = await fixture()
+    const subject = await localSubject(f)
+    const spec = nativePoolStoreLocks(f.paths)[lockIndex]!
+    const lease = await acquireRefreshFileLock({
+      ...spec,
+      ttlMs: 60_000,
+      renew: true,
+    })
+    if (!lease) throw new Error('Pool fixture lock unavailable')
+    deferCleanup(() => lease.release())
+    let finished = false
+    const write = f.runtime
+      .publishLocal(subject, { lastUsed: now })
+      .then((kept) => {
+        finished = kept
+      })
+    trackDetached(write)
+    try {
+      await observeBookkeeping()
+      expect(finished).toBe(true)
+      await lease.assertOwned()
+    } finally {
+      await lease.release()
+    }
+    await write
+  })
+}
 async function fixture(
   local: Partial<NativeLocalCredentialServiceOptions> = {},
   // Store the main row without an account UUID, as a row whose account was
@@ -2136,6 +2437,55 @@ test('poll overlay leaves committed headers alone without a matching pending pol
     },
   })
   expect(overlay()).toBeUndefined()
+})
+
+test('a held header reading overlays routing before its save only when marked, and an older one never replaces a newer one', () => {
+  const observations = new NativeQuotaObservations()
+  const storage = { version: 1 as const, accounts: [] }
+  const reading = (checkedAt: number, remainingPercent: number) => ({
+    lineage: 'current',
+    accountUuid: uuid,
+    generalExhausted: remainingPercent <= 0,
+    routeBeforeSave: true,
+    entry: {
+      quota: {
+        source: 'headers' as const,
+        checkedAt,
+        accountIdentity: uuid,
+        five_hour: {
+          remainingPercent,
+          usedPercent: 100 - remainingPercent,
+          checkedAt,
+        },
+      },
+      checkedAt,
+      refreshAfter: checkedAt,
+    },
+  })
+  const remaining = () =>
+    observations.quota('current', uuid, undefined, storage, now + 1)?.quota
+      .five_hour?.remainingPercent
+
+  // OpenCode 1 header readings carry no flag and stay host-owned.
+  const { routeBeforeSave: _unmarked, ...hostOwned } = reading(now, 40)
+  expect(observations.hold('main', hostOwned)).toBe(true)
+  expect(remaining()).toBeUndefined()
+
+  const newer = reading(now + 1, 0)
+  expect(observations.hold('main', newer)).toBe(true)
+  expect(remaining()).toBe(0)
+  const older = reading(now, 75)
+  expect(observations.hold('main', older)).toBe(false)
+  expect(remaining()).toBe(0)
+  // Forgetting a stale reading leaves the newer held reading intact.
+  observations.forget('main', older)
+  expect(remaining()).toBe(0)
+  // Another credential's reading is not applied to this one.
+  expect(
+    observations.quota('replaced', uuid, undefined, storage, now + 1),
+  ).toBeUndefined()
+  observations.forget('main', newer)
+  expect(remaining()).toBeUndefined()
 })
 
 test('slow superseded poll publication cannot overwrite newer quota on disk', async () => {

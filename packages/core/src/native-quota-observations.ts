@@ -20,6 +20,14 @@ export type NativeQuotaObservation = {
   entry: QuotaEntry
   generalExhausted: boolean
   quotaErrorClearedAt?: number
+  /**
+   * Set on a response-header reading from a host that routes on native
+   * snapshots (OpenCode 2). The snapshot overlay then applies it while its
+   * detached save is still pending, as it does for poll readings. Header
+   * readings without it stay host-owned: OpenCode 1 applies its own routing
+   * and display rules to them.
+   */
+  routeBeforeSave?: boolean
 }
 
 export function nativePollQuotaGenerallyExhausted(
@@ -77,9 +85,15 @@ export class NativeQuotaObservations extends Map<
     let clearAt: number | undefined
     let matched = false
     for (const observation of this.values()) {
-      // Headers retain host-owned admission and display rules; only polls
-      // replace the quota exposed by native snapshots before publication.
-      if (observation.entry.quota.source === 'headers') continue
+      // Headers retain host-owned admission and display rules unless the
+      // host asked for them to route before their save lands; otherwise
+      // only polls replace the quota exposed by native snapshots before
+      // publication.
+      if (
+        observation.entry.quota.source === 'headers' &&
+        observation.routeBeforeSave !== true
+      )
+        continue
       if (
         observation.lineage !== lineage ||
         observation.accountUuid !== accountUuid ||
@@ -138,6 +152,30 @@ export class NativeQuotaObservations extends Map<
         }
       }),
     )
+  }
+
+  /**
+   * Registers a response-header reading before its detached save starts, so
+   * routing in this process sees it while the save waits on file locks. A
+   * reading older than the one already held for the same credential lineage
+   * is not registered, so an older reading never replaces a newer one.
+   */
+  hold(accountId: string, observation: NativeQuotaObservation): boolean {
+    const current = this.get(accountId)
+    if (
+      current &&
+      current.lineage === observation.lineage &&
+      quotaSnapshotCheckedAt(current.entry.quota) >
+        quotaSnapshotCheckedAt(observation.entry.quota)
+    )
+      return false
+    this.set(accountId, observation)
+    return true
+  }
+
+  /** Forgets a held reading whose save was refused, unless a later reading already replaced it. */
+  forget(accountId: string, observation: NativeQuotaObservation): void {
+    if (this.get(accountId) === observation) this.delete(accountId)
   }
 
   drain(): Promise<void> {

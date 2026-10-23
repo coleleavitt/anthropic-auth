@@ -10,7 +10,6 @@ import {
   type NativeAccountRuntimeOptions,
   type NativeCustodyClient,
   type NativePoolPaths,
-  nativePoolStoreLocks,
   type ProviderAccountUuid,
   resetClaudeCodeIdentityCachesForTest,
   setLogLevel,
@@ -429,18 +428,17 @@ async function seedProfile(
 }
 
 /**
- * Take the pool-config lock that every local metadata save needs and keep it
+ * Take the runtime lock that every local metadata save needs and keep it
  * until `release` resolves. Resolves `held` once the lock is owned.
  */
-function holdPoolConfigLock(paths: NativePoolPaths, release: Promise<void>) {
-  const [config] = nativePoolStoreLocks(paths)
+function holdRuntimeLock(paths: NativePoolPaths, release: Promise<void>) {
   let acquired!: () => void
   const held = new Promise<void>((resolve) => {
     acquired = resolve
   })
   const work = withLock(
-    config.path,
-    { ...POOL_LOCK_DEFAULTS, name: config.name },
+    paths.runtime,
+    { ...POOL_LOCK_DEFAULTS, name: 'native-runtime' },
     async () => {
       acquired()
       await release
@@ -456,7 +454,7 @@ test('menu shows fetched local profiles while their saves are still held', async
     hostAuth: localHostAuth(),
   })
   const release = gate()
-  let hold: ReturnType<typeof holdPoolConfigLock> | undefined
+  let hold: ReturnType<typeof holdRuntimeLock> | undefined
   let bothArrived!: () => void
   const arrived = new Promise<void>((resolve) => {
     bothArrived = resolve
@@ -468,7 +466,7 @@ test('menu shows fetched local profiles while their saves are still held', async
     // holding the lock every local save needs: neither fetched profile can be
     // saved until the test releases it.
     if (s.network.profileAccounts.length === 2) {
-      hold = holdPoolConfigLock(s.paths, release.wait)
+      hold = holdRuntimeLock(s.paths, release.wait)
       await hold.held
       bothArrived()
     }
@@ -617,7 +615,7 @@ test('a profile read for a replaced account is not shown or saved for its succes
   })
   const release = gate()
   const replacementIdentified = gate()
-  let hold: ReturnType<typeof holdPoolConfigLock> | undefined
+  let hold: ReturnType<typeof holdRuntimeLock> | undefined
   let bothArrived!: () => void
   const arrived = new Promise<void>((resolve) => {
     bothArrived = resolve
@@ -651,7 +649,7 @@ test('a profile read for a replaced account is not shown or saved for its succes
         runtime.close()
       }
     }
-    // Taking the config lock before the new login commits would block that
+    // Taking the runtime lock before the new login commits would block that
     // login until after the menu's last display, leaving no successor to fetch.
     await replacementIdentified.wait
     // Hold the lock every local profile save needs while the menu renders.
@@ -660,7 +658,7 @@ test('a profile read for a replaced account is not shown or saved for its succes
     // test checks the outcome (that profile never appears on the replacement
     // account) rather than which of the display's guards stopped it.
     if (s.network.profileAccounts.length >= 2 && !hold) {
-      hold = holdPoolConfigLock(s.paths, release.wait)
+      hold = holdRuntimeLock(s.paths, release.wait)
       await hold.held
       bothArrived()
     }

@@ -23,6 +23,7 @@ import {
   getLogLevel,
   type LogTestRecord,
   type NativeCustodyClient,
+  type NativeLockEvent,
   PrimeManager,
   type ProviderAccountUuid,
   publishNativeEmptyInit,
@@ -919,6 +920,77 @@ async function sendNative(
       ...(stream && { stream: true }),
       messages: [{ role: 'user', content: 'Synthetic native serving probe' }],
     }),
+  })
+}
+
+for (const concurrency of [4, 8]) {
+  test(`OC1 concurrent local sends retain quota and lastUsed N=${concurrency}`, async () => {
+    const fixture = await migrateServingFixture('local')
+    const locks: string[] = []
+    const plugin = await createPlugin({
+      nativeLocal: {
+        onLockEvent: (event: NativeLockEvent) => {
+          if (event.type === 'acquired') locks.push(event.name)
+        },
+      },
+    })
+    await (await sendNative(plugin)).text()
+    network.mockImplementation(async (input, init) => {
+      const response = await fixture.fetchProvider(input, init)
+      const url = input instanceof Request ? input.url : input.toString()
+      if (url.includes('/v1/messages')) {
+        response.headers.set(
+          'anthropic-ratelimit-unified-5h-utilization',
+          '0.25',
+        )
+        response.headers.set(
+          'anthropic-ratelimit-unified-7d-utilization',
+          '0.4',
+        )
+      }
+      return response
+    })
+    const records: LogTestRecord[] = []
+    const previous = getLogLevel()
+    setLogLevel('debug')
+    __setLogTestSink((record) => records.push(record))
+    lifetimes.deferCleanup(() => {
+      __setLogTestSink(null)
+      setLogLevel(previous)
+    })
+    locks.length = 0
+    const start = Date.now()
+    const responses = await Promise.all(
+      Array.from({ length: concurrency }, (_, index) =>
+        sendNative(plugin, 'claude-sonnet-4-6', `parallel-${index}`),
+      ),
+    )
+    await Promise.all(responses.map((response) => response.text()))
+    expect(responses.every((response) => response.status === 200)).toBe(true)
+    await plugin.dispose?.()
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+    })
+    lifetimes.deferCleanup(() => runtime.close())
+    const account = (await runtime.read()).accounts.find(
+      (account) => account.id === 'main',
+    )!
+    const dropped = records.filter(
+      (record) =>
+        record.message === 'Account usage publication unavailable' ||
+        record.message === 'Quota publication discarded',
+    ).length
+    const contention = records.filter((record) =>
+      JSON.stringify(record.payload ?? {}).includes('LockContentionError'),
+    ).length
+    console.log(
+      `local OC1 N=${concurrency}: dropped=${dropped} LockContentionError=${contention} pool-config=${locks.filter((name) => name === 'pool-config').length} native-runtime=${locks.filter((name) => name === 'native-runtime').length}`,
+    )
+    expect(dropped).toBe(0)
+    expect(contention).toBe(0)
+    expect(account.quota?.five_hour?.remainingPercent).toBe(75)
+    expect(account.lastUsed).toBeGreaterThanOrEqual(start)
   })
 }
 

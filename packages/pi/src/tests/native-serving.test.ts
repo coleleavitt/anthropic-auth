@@ -3,16 +3,24 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __setLogTestSink,
   createNativeAccountRuntime,
   getClaudeCodeIdentityForVerifiedAccount,
+  getLogLevel,
   getStickyRoutingStatePath,
+  type LogTestRecord,
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
   runNativeMigration,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
 import { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
-import { closePiNativeRuntime, PiNativeRuntime } from '../native.ts'
+import {
+  closePiNativeRuntime,
+  getPiNativeRuntime,
+  PiNativeRuntime,
+} from '../native.ts'
 import { streamCortexKitAnthropic } from '../stream.ts'
 import {
   fixtureAccountIdentity,
@@ -144,6 +152,73 @@ test('Pi empty-init routing uses the construction-time override or native derive
       }
     })(),
   ))
+
+for (const concurrency of [4, 8]) {
+  test(`Pi concurrent local sends retain lastUsed N=${concurrency}`, () =>
+    trackPiTestBody(
+      (async () => {
+        const locks: string[] = []
+        getPiNativeRuntime(storagePath, {
+          local: {
+            onLockEvent: (event) => {
+              if (event.type === 'acquired') locks.push(event.name)
+            },
+          },
+        })
+        globalThis.fetch = Object.assign(async () => success(), {
+          preconnect: originalFetch.preconnect,
+        })
+        const records: LogTestRecord[] = []
+        const previous = getLogLevel()
+        setLogLevel('debug')
+        __setLogTestSink((record) => records.push(record))
+        try {
+          const start = Date.now()
+          const replies = await Promise.all(
+            Array.from({ length: concurrency }, () =>
+              streamCortexKitAnthropic(model, context, {
+                apiKey: 'synthetic-host-access',
+              }).result(),
+            ),
+          )
+          expect(replies.every((reply) => reply.stopReason === 'stop')).toBe(
+            true,
+          )
+          await closePiNativeRuntime(storagePath)
+          const runtime = createNativeAccountRuntime({
+            paths: await resolveNativePoolPaths(storagePath),
+            host: 'pi',
+          })
+          try {
+            expect(
+              (await runtime.read()).accounts.find(
+                (account) => account.id === 'main',
+              )?.lastUsed,
+            ).toBeGreaterThanOrEqual(start)
+          } finally {
+            await runtime.close()
+          }
+          const dropped = records.filter(
+            (record) =>
+              record.message === 'Account usage publication unavailable',
+          ).length
+          const contention = records.filter((record) =>
+            JSON.stringify(record.payload ?? {}).includes(
+              'LockContentionError',
+            ),
+          ).length
+          console.log(
+            `local Pi N=${concurrency}: dropped=${dropped} LockContentionError=${contention} pool-config=${locks.filter((name) => name === 'pool-config').length} native-runtime=${locks.filter((name) => name === 'native-runtime').length}`,
+          )
+          expect(dropped).toBe(0)
+          expect(contention).toBe(0)
+        } finally {
+          __setLogTestSink(null)
+          setLogLevel(previous)
+        }
+      })(),
+    ))
+}
 
 test('native Pi serving ignores host and legacy OAuth material after committed migration', () =>
   trackPiTestBody(

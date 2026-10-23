@@ -135,8 +135,7 @@ export function createNativeUsagePublisher(channel: string) {
     return work
   }
   return {
-    // Quota writes start at header receipt, but attempt end still joins their
-    // settled outcome so the next account choice can read any saved quota.
+    // Header writes start at receipt; disposal, not attempt end, joins them.
     observe,
     publish(write: () => Promise<unknown>): void {
       // A new event-loop turn gives the host its response before bookkeeping

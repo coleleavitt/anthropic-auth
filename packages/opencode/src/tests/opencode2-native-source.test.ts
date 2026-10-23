@@ -27,6 +27,7 @@ import {
   runNativeMigration,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
+import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
   type OpenCode2HookContext,
   placeholderSecret,
@@ -37,6 +38,7 @@ import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promis
 import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
+import { nativePoolStoreLocks } from '../../../core/src/pool-store'
 import {
   holdRefreshJoin,
   observeRefreshJoin,
@@ -94,6 +96,135 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
 const usageTests = createTestLifetimeSuite()
+
+usageTests.test(
+  'OC2 header bookkeeping never delays attempt end or independent lastUsed under a held pool lock',
+  async () => {
+    const owned: Array<() => Promise<void> | void> = []
+    usageTests.deferCleanup(async () => {
+      for (const cleanup of owned.reverse()) await cleanup()
+    })
+    const fixture = await local(undefined, owned)
+    const native = source(fixture.runtime, fixture.paths, owned)
+    const auth = await native.authorizeAccount(scope, 'main')
+    if (!auth) throw new Error('Missing local authorization')
+    const lease = await acquireRefreshFileLock({
+      ...nativePoolStoreLocks(fixture.paths)[0],
+      ttlMs: 60_000,
+      renew: true,
+    })
+    if (!lease) throw new Error('Pool fixture lock unavailable')
+    owned.push(() => lease.release())
+    const start = Date.now()
+    native.quotaFromHeaders?.(
+      new Headers({ 'anthropic-ratelimit-unified-5h-utilization': '0.25' }),
+      { ...context(auth.provenance), status: 200 },
+    )
+    let ended = false
+    const end = Promise.resolve(
+      native.onAttemptEnd!(context(auth.provenance), {
+        status: 200,
+        outputStarted: true,
+      }),
+    ).then(() => {
+      ended = true
+    })
+    usageTests.trackDetached(end)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      expect(ended).toBe(true)
+      expect(
+        (await fixture.runtime.read()).accounts[0]?.lastUsed,
+      ).toBeGreaterThanOrEqual(start)
+      await lease.assertOwned()
+    } finally {
+      await lease.release()
+    }
+    await end
+    await native.close()
+    expect(
+      (await fixture.runtime.read()).accounts[0]?.quota?.five_hour
+        ?.remainingPercent,
+    ).toBe(75)
+  },
+)
+
+for (const concurrency of [4, 8]) {
+  usageTests.test(
+    `OC2 concurrent local sends retain quota and lastUsed N=${concurrency}`,
+    async () => {
+      const owned: Array<() => Promise<void> | void> = []
+      usageTests.deferCleanup(async () => {
+        for (const cleanup of owned.reverse()) await cleanup()
+      })
+      const locks: string[] = []
+      const fixture = await local(
+        {
+          onLockEvent: (event) => {
+            if (event.type === 'acquired') locks.push(event.name)
+          },
+        },
+        owned,
+      )
+      const native = source(fixture.runtime, fixture.paths, owned)
+      const authorizations = await Promise.all(
+        Array.from({ length: concurrency }, (_, index) =>
+          native.authorizeAccount(
+            { ...scope, sessionID: `parallel-${index}` },
+            'main',
+          ),
+        ),
+      )
+      const records: LogTestRecord[] = []
+      const previous = getLogLevel()
+      setLogLevel('debug')
+      __setLogTestSink((record) => records.push(record))
+      owned.push(() => {
+        __setLogTestSink(null)
+        setLogLevel(previous)
+      })
+      locks.length = 0
+      const start = Date.now()
+      await Promise.all(
+        authorizations.map(async (auth, index) => {
+          if (!auth) throw new Error('Missing local send authorization')
+          const input = context(auth.provenance, `parallel-${index}`)
+          native.quotaFromHeaders?.(
+            new Headers({
+              'anthropic-ratelimit-unified-5h-utilization': '0.25',
+              'anthropic-ratelimit-unified-7d-utilization': '0.4',
+            }),
+            { ...input, status: 200 },
+          )
+          await native.onAttemptEnd?.(input, {
+            status: 200,
+            outputStarted: true,
+          })
+        }),
+      )
+      await native.close()
+      const account = (await fixture.runtime.read()).accounts[0]!
+      const dropped = records.filter(
+        (record) =>
+          record.message === 'Account usage publication unavailable' ||
+          record.message === 'Quota publication discarded',
+      ).length
+      const contention = records.filter((record) =>
+        JSON.stringify(record.payload ?? {}).includes('LockContentionError'),
+      ).length
+      console.log(
+        `local OC2 N=${concurrency}: dropped=${dropped} LockContentionError=${contention} pool-config=${locks.filter((name) => name === 'pool-config').length} native-runtime=${locks.filter((name) => name === 'native-runtime').length}`,
+      )
+      expect(dropped).toBe(0)
+      expect(contention).toBe(0)
+      expect(account.quota?.five_hour?.remainingPercent).toBe(75)
+      expect(account.lastUsed).toBeGreaterThanOrEqual(start)
+      expect(
+        locks.filter((name) => name === 'pool-config').length,
+      ).toBeLessThan(concurrency)
+    },
+  )
+}
 
 usageTests.test(
   'OC2 attempt-end lastUsed refusal is detached and drained without rejecting the completed attempt',
@@ -1685,6 +1816,8 @@ describe('OC2 source over actual native services', () => {
     )
     expect(quota?.five_hour?.remainingPercent).toBe(58)
     await native.onAttemptEnd?.(request, { status: 200, outputStarted: true })
+    // Attempt completion does not wait for storage; disposal owns durability.
+    await native.close()
     const view = await fixture.runtime.read()
     expect(
       view.accounts.find((account) => account.id === 'main')?.quota?.five_hour

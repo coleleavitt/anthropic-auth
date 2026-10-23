@@ -558,12 +558,21 @@ const expectNoCredential = (records: readonly string[]) => {
 const primeCounters = async (runtime: NativeAccountRuntime) =>
   (await runtime.read()).accounts.find((account) => account.id === 'main')
 
+/** The quota saved in the pool file, without the runtime's overlay of readings whose save is still pending. */
+const savedQuota = async (
+  fixture: Awaited<ReturnType<typeof primeFixture>>,
+) => {
+  const read = await fixture.store.read()
+  return read.status === 'ready' ? read.rows[0]?.quota : undefined
+}
+
 /** Hold one quota write without acquiring the credential-file locks needed by refresh. */
 function holdQuota(fixture: Awaited<ReturnType<typeof primeFixture>>) {
   const entered = gate()
   const release = gate()
   const retired = gate()
   const ending = gate()
+  const published = gate()
   const publish = fixture.runtime.publishLocal.bind(fixture.runtime)
   const classify = fixture.source.limitFromResponse?.bind(fixture.source)
   const end = fixture.source.onAttemptEnd?.bind(fixture.source)
@@ -580,7 +589,9 @@ function holdQuota(fixture: Awaited<ReturnType<typeof primeFixture>>) {
         // also checks lock ownership and whether the host still has authority.
         if (refusal) throw refusal
       }
-      return publish(subject, patch)
+      const kept = await publish(subject, patch)
+      if (patch.quota) published.open()
+      return kept
     },
   )
   const classification = spyOn(
@@ -611,6 +622,7 @@ function holdQuota(fixture: Awaited<ReturnType<typeof primeFixture>>) {
     retired,
     ending,
     release,
+    published,
     refuse(error: Error) {
       refusal = error
     },
@@ -801,7 +813,7 @@ test('OC2 Prime retries after a held quota publication is refused after credenti
         status: 401,
         headers: echoHeaders(token, 'req_held_rejected'),
       })
-    quotaAtRetry = (await primeCounters(fixture.runtime))?.quota
+    quotaAtRetry = await savedQuota(fixture)
     return usageReply('req_held_retry')
   })
   const records = publicationRecords()
@@ -814,7 +826,12 @@ test('OC2 Prime retries after a held quota publication is refused after credenti
   await quota.retired.wait
   await quota.ending.wait
   expect(provider.sent).toEqual([FIRST])
-  expect((await primeCounters(fixture.runtime))?.quota).toBeUndefined()
+  // The held reading is not saved, though this process already routes by it
+  // until the refused save drops it.
+  expect(await savedQuota(fixture)).toBeUndefined()
+  expect(
+    (await primeCounters(fixture.runtime))?.quota?.five_hour?.remainingPercent,
+  ).toBe(0)
   quota.release.open()
 
   expect(await sending).toMatchObject({ ok: true, status: 200 })
@@ -838,7 +855,7 @@ test('OC2 Prime retries after a held quota publication is refused after credenti
   ])
 })
 
-test('OC2 attempt end joins a held successful quota publication before a later account choice', async () => {
+test('OC2 attempt end detaches quota persistence and a later choice routes by the new reading while the save is held', async () => {
   const provider = startProvider(suite, () => {
     const response = usageReply('req_saved_quota')
     response.headers.set('anthropic-ratelimit-unified-5h-utilization', '1')
@@ -862,11 +879,14 @@ test('OC2 attempt end joins a held successful quota publication before a later a
   suite.trackDetached(sending)
   await quota.entered.wait
   await quota.ending.wait
-  expect(completed).toBe(false)
-  expect((await primeCounters(fixture.runtime))?.quota).toBeUndefined()
-  expect(completed).toBe(false)
-  quota.release.open()
   expect(await sending).toMatchObject({ ok: true, status: 200 })
+  expect(completed).toBe(true)
+  // The save is still held: the pool file has no quota yet, but the runtime
+  // snapshot already carries the reading this process received.
+  expect(await savedQuota(fixture)).toBeUndefined()
+  expect(
+    (await primeCounters(fixture.runtime))?.quota?.five_hour?.remainingPercent,
+  ).toBe(0)
   const input = {
     providerID: 'anthropic',
     modelID: 'claude-haiku-4-5',
@@ -880,6 +900,9 @@ test('OC2 attempt end joins a held successful quota publication before a later a
     },
   }
   expect(await fixture.source.chooseAccount(input)).toBe('paid')
+  expect(await savedQuota(fixture)).toBeUndefined()
+  quota.release.open()
+  await quota.published.wait
   expect(
     (await primeCounters(fixture.runtime))?.quota?.five_hour?.remainingPercent,
   ).toBe(0)

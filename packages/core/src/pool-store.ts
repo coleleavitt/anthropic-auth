@@ -35,8 +35,9 @@ export interface NativePoolStoreOptions
 }
 
 /**
- * These config/state locks also fence local account metadata against concurrent
- * credential changes. Legacy sidecar writers use different files and locks.
+ * These locks serialize pool transactions, including credential changes and
+ * quota publication. Runtime bookkeeping has its own lock and binding checks.
+ * Legacy sidecar writers use different files and locks.
  */
 export function nativePoolStoreLocks(paths: NativePoolStorePaths) {
   return [

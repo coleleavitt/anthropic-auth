@@ -423,7 +423,7 @@ export class PiNativeRuntime {
         async (runtime) => {
           await runtime.drainQuotaPublications()
           await runtime.drainRoutingPublications()
-          runtime.close()
+          await runtime.close()
         },
         () => {},
       )
