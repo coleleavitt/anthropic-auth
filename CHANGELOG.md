@@ -6,6 +6,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - OpenCode 2: when a request fails and OpenCode retries, the plugin now chooses the retry's account once and keeps it, and an account it chose but OpenCode didn't use is released.
 
+### Documentation
+
+- The docs now say what their home-folder, temp-folder and shell examples mean on Windows (`%USERPROFILE%`, `%TEMP%`, PowerShell), with one shared note in the environment guide.
+
 ### Dependencies
 
 - `@cortexkit/common-auth` moves to 0.25.0.

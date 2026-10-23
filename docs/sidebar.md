@@ -27,7 +27,7 @@ Click `CLAUDE` to collapse or expand. The collapsed view shows one line per visi
 
 ## TUI preferences
 
-The optional `tui-preferences.jsonc` is a user configuration file, not a repository file. Its location is `OPENCODE_TUI_PREFERENCES_FILE` when set; otherwise it is in `OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, or `~/.config/opencode`, in that order. Each plugin owns one nonnumeric top-level key; this plugin uses `anthropic-auth`.
+The optional `tui-preferences.jsonc` is a user configuration file, not a repository file. Its location is `OPENCODE_TUI_PREFERENCES_FILE` when set; otherwise it is in `OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, or `~/.config/opencode` (`%USERPROFILE%\.config\opencode` on Windows; see [paths on each OS](environment.md#paths-on-windows-macos-and-linux)), in that order. Each plugin owns one nonnumeric top-level key; this plugin uses `anthropic-auth`.
 
 The following example retains the defaults. Omitting `collapsed` lets `startCollapsed` decide the initial state:
 

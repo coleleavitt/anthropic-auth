@@ -18,6 +18,8 @@
 | Quota sidebar | OpenCode 1 and OpenCode 2 TUI | Not available |
 | Cloudflare relay | HTTP; OpenCode 1 also supports WebSocket | HTTP or WebSocket |
 
+`~` is your home folder; on Windows it is `%USERPROFILE%`, so the default OpenCode pool is `%USERPROFILE%\.config\opencode\anthropic-auth-pool.json`. See [paths on each OS](environment.md#paths-on-windows-macos-and-linux).
+
 [Setup](installation.md#recommended-setup) prepares the selected hosts and records which credential store they may use before sign-in. OpenCode 2 has its own [login and transport boundaries](opencode-2.md); OpenCode 1's host-local quota-feed publisher and deterministic client safety recovery are not OpenCode 2 features.
 
 ## What CortexKit adds over the original plugin

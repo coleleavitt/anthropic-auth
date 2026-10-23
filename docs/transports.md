@@ -11,6 +11,15 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... \
   npx @cortexkit/opencode-anthropic-auth relay setup
 ```
 
+In PowerShell on Windows:
+
+```powershell
+$env:CLOUDFLARE_API_TOKEN = '...'; $env:CLOUDFLARE_ACCOUNT_ID = '...'
+npx @cortexkit/opencode-anthropic-auth relay setup
+```
+
+If either variable is unset, the command asks for it.
+
 This creates a KV namespace, uploads/enables the Worker, generates a relay shared secret and saves the URL, secret and HTTP transport in OpenCode's local settings. The Cloudflare API token is used for provisioning, not stored by the plugin. Keep it and the relay secret out of reports. This command does not configure Pi: Pi's existing relay settings can be imported from its legacy `anthropic-auth.json` during Pi migration. `/claude` has no relay actions.
 
 `relay.transport` is `http` by default. A missing transport is inferred from the URL: `wss://` (or `ws://`) uses WebSocket, `https://` (or `http://`) uses HTTP. A stored `transport` always wins over the URL. WebSocket is opt-in for OpenCode 1 and Pi, uses protocol v2 on `/ws` and requires the current Worker deployment. Redeploy an existing Worker with the same Worker name when upgrading its protocol. OpenCode 2 supports direct and HTTP only and refuses a selected WebSocket relay before dispatch.
@@ -42,15 +51,21 @@ Only use endpoints you trust: the route receives the request content and its con
 
 ## Diagnostics and dumps
 
-Relay diagnostics are written to a temporary log:
+Relay diagnostics are written to `opencode-anthropic-auth.log` in the [system temp folder](environment.md#paths-on-windows-macos-and-linux). To follow it on macOS or Linux:
 
 ```sh
 tail -f "$(node -p 'require("node:os").tmpdir()')/opencode-anthropic-auth.log"
 ```
 
+In PowerShell on Windows:
+
+```powershell
+Get-Content -Wait "$env:TEMP\opencode-anthropic-auth.log"
+```
+
 Successful entries identify transport/protocol and full-sync/patch use; `falling back direct` indicates direct fallback rather than relay success.
 
-Enable or disable request dumps in `/claude` → **Diagnostics**. Artifacts live under the OS temp directory's `opencode-anthropic-auth-dumps` folder:
+Enable or disable request dumps in `/claude` → **Diagnostics**. Artifacts live in the `opencode-anthropic-auth-dumps` folder inside the [system temp folder](environment.md#paths-on-windows-macos-and-linux):
 
 | Suffix | Contents |
 | --- | --- |

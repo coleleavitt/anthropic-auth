@@ -4,7 +4,7 @@ A native account pool holds the Claude subscription accounts and optional API-ke
 
 ## Local storage
 
-OpenCode defaults to `~/.config/opencode/`; Pi defaults to `~/.pi/agent/`. The directory containing `OPENCODE_ANTHROPIC_AUTH_FILE` or `PI_ANTHROPIC_AUTH_FILE`, when set, determines the corresponding native path set. Files have distinct roles:
+OpenCode defaults to `~/.config/opencode/`; Pi defaults to `~/.pi/agent/`. On Windows these are `%USERPROFILE%\.config\opencode\` and `%USERPROFILE%\.pi\agent\` (see [paths on each OS](environment.md#paths-on-windows-macos-and-linux)). The directory containing `OPENCODE_ANTHROPIC_AUTH_FILE` or `PI_ANTHROPIC_AUTH_FILE`, when set, determines the corresponding native path set. Files have distinct roles:
 
 | File | Contents |
 | --- | --- |

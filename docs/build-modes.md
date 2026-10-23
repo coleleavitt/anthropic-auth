@@ -21,7 +21,7 @@ A disposable OpenCode configuration can point its main plugin entry at the local
 }
 ```
 
-The path is an example: substitute your checkout, keep it separate from a live user's installation, and build before loading it. The root helper provides the local development loop:
+The path is an example: substitute your checkout (on Windows, include the drive letter, such as `file:///C:/path/to/anthropic-auth/packages/opencode`), keep it separate from a live user's installation, and build before loading it. The root helper provides the local development loop:
 
 ```sh
 bun run dev

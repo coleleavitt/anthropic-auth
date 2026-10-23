@@ -10,7 +10,10 @@ assignees: ''
 > [!IMPORTANT]
 >  Did you clear your cache and install the latest version before making this report?
 > 
-> `rm -rf ~/.cache/opencode` and checking your `opencode.json` version pin?
+> Did you delete OpenCode's cache folder and check your `opencode.json` version pin?
+>
+> - macOS and Linux: `rm -rf ~/.cache/opencode`
+> - Windows (PowerShell): `Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode"`
 >
 > Please remove this block to signal that you have tried the above, before posting a bug report.
 

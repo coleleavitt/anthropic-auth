@@ -1,5 +1,14 @@
 # Environment variables
 
+## Paths on Windows, macOS and Linux
+
+The plugin uses the same folder layout on every OS. In these docs:
+
+- `~` is your home folder: `~` on macOS and Linux, `%USERPROFILE%` on Windows (for example `C:\Users\you`). So `~/.config/opencode/` is `%USERPROFILE%\.config\opencode\` on Windows, not `%APPDATA%`, and Pi's `~/.pi/agent/` is `%USERPROFILE%\.pi\agent\`. OpenCode keeps its own config and cache folders under the same rule.
+- `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` are used on every OS when set, Windows included. They are usually unset on Windows and macOS, so the `~` defaults apply.
+- The system temp folder is the one Node's `os.tmpdir()` returns: `$TMPDIR` on macOS, `$TMPDIR` or else `/tmp` on Linux, and `%TEMP%` on Windows. A path written as `$TMPDIR/...` means that folder.
+- To set a variable for one command, a POSIX shell (macOS, Linux, Git Bash) puts it before the command: `NAME=value npx ...`. In PowerShell, set it first with `$env:NAME = 'value'`, then run the command; it stays set until that PowerShell window closes.
+
 ## API endpoint and proxy routes
 
 | Variable | Effect |
@@ -40,7 +49,7 @@ A legacy sidecar is an old migration-source file. The native files beside it sto
 | `PI_CODING_AGENT_DIR`, `PI_AGENT_DIR` | Pi extension default storage directory, in that precedence order |
 | `XDG_CONFIG_HOME` | Base for the default OpenCode config directory |
 | `XDG_DATA_HOME` | Base for OpenCode's data directory used to resolve OC1 `auth.json` during setup |
-| `XDG_STATE_HOME` | Base for default enrollment files, `cortexkit/anthropic-auth/<host>-enrollment.json`; otherwise `~/.local/state` |
+| `XDG_STATE_HOME` | Base for default enrollment files, `cortexkit/anthropic-auth/<host>-enrollment.json`; otherwise `~/.local/state` (`%USERPROFILE%\.local\state` on Windows) |
 
 A completed import records its routing destination in the journal; serving uses that recorded path rather than retroactively relocating it when an override changes. See [local storage](accounts-and-routing.md#local-storage). Pi SDK login-path resolution uses `PI_CODING_AGENT_DIR` (including home expansion), not the extension-only `PI_AGENT_DIR` fallback; the two are not interchangeable for host auth.
 

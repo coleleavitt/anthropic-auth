@@ -58,7 +58,7 @@ Quota routing compares **remaining** percentages. `five_hour` / `seven_day` acce
 
 ## Quota header feed
 
-The OpenCode 1 plugin can publish quota observations from Anthropic model-response headers; the feed does not independently poll the quota API. Enable `quotaHeaderFeed.enabled` and restart. Owner-only files under `$TMPDIR/opencode-anthropic-auth/quota-header-feed` expire after three minutes; `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR` redirects them.
+The OpenCode 1 plugin can publish quota observations from Anthropic model-response headers; the feed does not independently poll the quota API. Enable `quotaHeaderFeed.enabled` and restart. Owner-only files under `opencode-anthropic-auth/quota-header-feed` in the [system temp folder](environment.md#paths-on-windows-macos-and-linux) (`$TMPDIR` or `/tmp` on macOS and Linux, `%TEMP%` on Windows) expire after three minutes; `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR` redirects them.
 
 The allowlisted record contains quota-window values and provenance (which values came from response headers or quota polling), observation time, configured OAuth-account count and account identity references (including a resolved Anthropic account UUID when available). It does not contain tokens, raw headers, request bodies, model IDs or refresh errors. Treat the directory as local account metadata, not an anonymous public telemetry feed.
 

@@ -3,7 +3,7 @@
 ## Installation and startup
 
 - **Setup says a host is running:** stop all OpenCode, LiteCode and Pi processes, not only the current terminal, then rerun setup. Do not bypass the process fence or start a host before setup finishes.
-- **OpenCode still loads an old plugin:** restart after config changes. If it still loads stale package bytes, clear OpenCode's plugin cache at `~/.cache/opencode` and restart. Do not delete account files or the journal as a cache remedy.
+- **OpenCode still loads an old plugin:** restart after config changes. If it still loads stale package bytes, clear OpenCode's plugin cache at `~/.cache/opencode` (`%USERPROFILE%\.cache\opencode` on Windows) and restart. Do not delete account files or the journal as a cache remedy.
 - **Generation-2 `setup --login` refuses:** this is intentional. Run [empty initialization](opencode-2.md#empty-initialization), start OpenCode and choose **Claude Pro / Max (native account pool)**. If Pi is also found, `--yes` selects both; use interactive host deselection for a Pi-only login.
 - **A dry run succeeds but the real run refuses:** previews execute no callbacks. Real-run authority, consent, path-alias and vault-inventory checks can still refuse; see [setup options](installation.md#recommended-setup).
 

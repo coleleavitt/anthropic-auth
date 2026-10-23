@@ -18,13 +18,13 @@ Each host has its own Claustrum enrollment record: a token file and a ceremony s
 
 The ceremony state file records the progress of the enrollment request; `approved` means the request was approved in Claustrum. A valid token file selects the vault even if setup was interrupted before it wrote the ceremony state file. **Disconnect from the vault** removes both files and returns the host to `local`. It refuses, and leaves both files in place, when the state file fails the safety checks (a symbolic link, another owner, or permissions wider than owner-only) or names a different enrollment name.
 
-The record lives at `~/.local/state/cortexkit/anthropic-auth/<host>-enrollment.json` (under `$XDG_STATE_HOME` when set), or at the path named by `OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE` or `PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`. OpenCode and Pi enroll independently, as `anthropic-auth-opencode` and `anthropic-auth-pi`, and can be disconnected or revoked independently.
+The record lives at `~/.local/state/cortexkit/anthropic-auth/<host>-enrollment.json` (under `$XDG_STATE_HOME` when set; on Windows `~` is `%USERPROFILE%`, see [paths on each OS](environment.md#paths-on-windows-macos-and-linux)), or at the path named by `OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE` or `PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`. OpenCode and Pi enroll independently, as `anthropic-auth-opencode` and `anthropic-auth-pi`, and can be disconnected or revoked independently.
 
 An unreadable record never counts as local custody. Requests the plugin would serve refuse: in OpenCode 1, requests through an OAuth-typed Anthropic entry; in OpenCode 2, requests carrying the fixed, non-secret placeholder that the plugin's sign-in stores in OpenCode, which marks a request as one the plugin serves; in Pi, requests to the extension's provider. Local sign-in, local account changes and vault sign-in also refuse until the record is repaired or the host is disconnected. Ordinary API-key authentication that the plugin does not own passes through unchanged in every authority state.
 
 ## Storage
 
-Each host keeps its files next to its old sidecar path (`~/.config/opencode/` for OpenCode, `~/.pi/agent/` for Pi, or the directory of `OPENCODE_ANTHROPIC_AUTH_FILE` / `PI_ANTHROPIC_AUTH_FILE`):
+Each host keeps its files next to its old sidecar path (`~/.config/opencode/` for OpenCode, `~/.pi/agent/` for Pi, with `~` as `%USERPROFILE%` on Windows, or the directory of `OPENCODE_ANTHROPIC_AUTH_FILE` / `PI_ANTHROPIC_AUTH_FILE`):
 
 | File | Role |
 | --- | --- |
