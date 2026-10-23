@@ -203,6 +203,7 @@ test('fixed remedies and validated closed codes are admitted word for word', () 
     new NativeCustodyError('invalid-token'),
     new NativeCustodyError('not-enrolled'),
     new NativeCustodyError('placeholder-refresh'),
+    new NativeCustodyError('invalid-order'),
     // These constructors are not public, so instantiate them here to check
     // that the mapper's literal message list still matches their actual text.
     new NativeAuthorityError('migration-required'),

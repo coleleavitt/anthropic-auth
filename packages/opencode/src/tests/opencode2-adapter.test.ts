@@ -190,6 +190,28 @@ function makeSource(
   return { source, seen }
 }
 
+test('adapter drops an unused choice through the source and tolerates sources without cleanup', async () => {
+  const input = { ...scopeOf(), accountId: 'acct-local' }
+  const dropped: unknown[] = []
+  const { source } = makeSource({
+    dropChoice: (choice) => {
+      dropped.push(choice)
+    },
+  })
+  const native = createNativeAnthropicAdapter({ source })
+  const withoutCleanup = createNativeAnthropicAdapter({
+    source: makeSource().source,
+  })
+  try {
+    await native.adapter.dropChoice(input)
+    expect(dropped).toEqual([input])
+    await withoutCleanup.adapter.dropChoice(input)
+  } finally {
+    native.dispose()
+    withoutCleanup.dispose()
+  }
+})
+
 /**
  * Drives one physical send in the order the common-auth installer does:
  * `chooseAccount`, `accountHeaders`, then in `http.request` the adapter's

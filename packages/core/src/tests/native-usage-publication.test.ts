@@ -22,6 +22,7 @@ test('usage publication classification retains the custody and runtime refusal p
     'route-unavailable',
     'not-enrolled',
     'roster-busy',
+    'invalid-order',
   ] as const)
     expect(usagePublicationRefusalIsFatal(new NativeCustodyError(code))).toBe(
       true,
@@ -60,6 +61,9 @@ test('safe error classification exposes known network, HTTP and native refusal c
   expect(
     classifySafeErrorForLog(new NativeCustodyError('route-unavailable')),
   ).toEqual({ name: 'NativeCustodyError', code: 'route-unavailable' })
+  expect(
+    classifySafeErrorForLog(new NativeCustodyError('invalid-order')),
+  ).toEqual({ name: 'NativeCustodyError', code: 'invalid-order' })
   expect(
     classifySafeErrorForLog(
       Object.assign(new Error('credential secret'), {

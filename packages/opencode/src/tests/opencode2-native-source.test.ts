@@ -1619,6 +1619,123 @@ describe('OC2 source over actual native services', () => {
     expect(fixture.gets).toHaveLength(2)
     expect(fixture.reports).toHaveLength(0)
   })
+  test('an undefined retry choice preserves the pending retry until its account is eligible', async () => {
+    const fixture = await local()
+    await fixture.runtime.updateRelay({
+      enabled: true,
+      transport: 'http',
+      url: 'https://relay.invalid',
+      fallbackToDirect: true,
+      token: 'synthetic-relay-token',
+    })
+    const native = source(fixture.runtime, fixture.paths)
+    const first = await native.authorizeAccount(scope, 'main')
+    if (!first) throw new Error('Local authorization refused')
+    const limit = await native.limitFromRelayFailure?.({
+      ...context(first.provenance),
+      dispatch: 'http-relay',
+      status: 502,
+    })
+    if (!limit) throw new Error('Direct fallback was not offered')
+    const input = { ...scope, rerouteFrom: { accountId: 'main', limit } }
+    const snapshot = await fixture.runtime.read()
+    const read = spyOn(fixture.runtime, 'read').mockResolvedValue({
+      ...snapshot,
+      accounts: [],
+    })
+    try {
+      expect(await native.chooseAccount(input)).toBeUndefined()
+      read.mockResolvedValue({
+        ...snapshot,
+        accounts: snapshot.accounts.map((account) => ({
+          ...account,
+          enabled: false,
+        })),
+      })
+      expect(await native.chooseAccount(input)).toBeUndefined()
+    } finally {
+      read.mockRestore()
+    }
+    expect(await native.chooseAccount(input)).toBe('main')
+    expect((await native.authorizeAccount(scope, 'main'))?.dispatch).toEqual({
+      kind: 'direct',
+    })
+    expect(await native.chooseAccount(input)).toBeUndefined()
+  })
+  test('dropping an unused choice removes only one matching queued retry', async () => {
+    const fixture = await vault([7, 8, 9])
+    await fixture.runtime.updateRelay({
+      enabled: true,
+      transport: 'http',
+      url: 'https://relay.invalid',
+      fallbackToDirect: true,
+      token: 'synthetic-relay-token',
+    })
+    const native = source(fixture.runtime, fixture.paths)
+    const first = await native.authorizeAccount(scope, 'main')
+    if (!first) throw new Error('Vault authorization refused')
+    const unused = await native.limitFromResponse?.({
+      ...context(first.provenance, 'unused'),
+      dispatch: 'http-relay',
+      status: 401,
+      headers: new Headers(),
+      body: async () => '{}',
+    })
+    const kept = await native.limitFromRelayFailure?.({
+      ...context(first.provenance, 'kept'),
+      dispatch: 'http-relay',
+      status: 502,
+    })
+    for (const limit of [unused, kept]) {
+      if (!limit) throw new Error('Direct fallback was not offered')
+      expect(
+        await native.chooseAccount({
+          ...scope,
+          rerouteFrom: { accountId: 'main', limit },
+        }),
+      ).toBe('main')
+    }
+    const drop = native.dropChoice
+    expect(typeof drop).toBe('function')
+    if (!drop) throw new Error('Missing dropChoice')
+    drop({ ...scope, accountId: 'another-account' })
+    drop({ ...scope, sessionID: 'another-session', accountId: 'main' })
+    drop({ ...scope, modelID: 'another-model', accountId: 'main' })
+    drop({ ...scope, kind: 'compaction', accountId: 'main' })
+    drop({ ...scope, accountId: 'main' })
+    expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
+      accessToken: 'sk-ant-oat01-vault-9',
+      dispatch: { kind: 'direct' },
+    })
+    expect((await native.authorizeAccount(scope, 'main'))?.dispatch?.kind).toBe(
+      'http-relay',
+    )
+    drop({ ...scope, accountId: 'main' })
+  })
+  test('an undefined sticky retry choice leaves the existing session pin unchanged', async () => {
+    const fixture = await local()
+    await fixture.runtime.updateSettings((settings) => {
+      settings.routing = { mode: 'sticky-balanced' }
+    })
+    const native = source(fixture.runtime, fixture.paths)
+    expect(await native.chooseAccount(scope)).toBe('main')
+    await native.drainRoutingPublications()
+    const { routingPath } = await fixture.runtime.read()
+    if (!routingPath) throw new Error('Missing routing path')
+    const before = await readFile(routingPath, 'utf8')
+    expect(
+      await native.chooseAccount({
+        ...scope,
+        previousAccountId: 'main',
+        rerouteFrom: {
+          accountId: 'main',
+          limit: { reason: 'provider-429', status: 429 },
+        },
+      }),
+    ).toBeUndefined()
+    await native.drainRoutingPublications()
+    expect(await readFile(routingPath, 'utf8')).toBe(before)
+  })
   test('vault session affinity is kept in the vault routing file and never in the local one', async () => {
     const fixture = await vault([7, 8], () => identity, {
       mode: 'sticky-balanced',

@@ -284,6 +284,8 @@ export interface NativeAnthropicSource<Q, P> {
   readonly chooseAccount: (
     input: ChooseAccountInput,
   ) => Promise<string | undefined> | string | undefined
+  /** Discards one queued choice that the installer will not authorize. */
+  readonly dropChoice?: (input: AccountRequest) => Promise<void> | void
   /**
    * The credential for one send with the chosen account; `undefined` refuses
    * the request before anything is sent.
@@ -382,7 +384,9 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
 }
 
 export interface NativeAnthropicAdapter<Q, P> {
-  readonly adapter: OpenCode2AuthAdapter<Q, NativeAnthropicAttemptData<P>>
+  readonly adapter: OpenCode2AuthAdapter<Q, NativeAnthropicAttemptData<P>> & {
+    readonly dropChoice: (input: AccountRequest) => Promise<void> | void
+  }
   /**
    * Drops the session's authorized sends that have not been rewritten yet,
    * revokes its choices, authorizations and rewrites still in progress so
@@ -1128,7 +1132,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     })
   }
 
-  const adapter: OpenCode2AuthAdapter<Q, Data> = {
+  const adapter: NativeAnthropicAdapter<Q, P>['adapter'] = {
     providerID: ANTHROPIC_PROVIDER_ID,
     chooseAccount: (input) =>
       tracked(input, async () => {
@@ -1136,6 +1140,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         if (!accountId) throw refuse(input)
         return accountId
       }),
+    dropChoice: (input) => source.dropChoice?.(input),
     accountHeaders,
     rewriteRequest,
     rewriteHandshakeURL() {

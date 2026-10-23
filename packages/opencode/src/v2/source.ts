@@ -263,6 +263,9 @@ export function createNativeAnthropicSource(
 
   const source: NativeSource = {
     async chooseAccount(input: ChooseAccountInput) {
+      // Credential maintenance and quota readings may occur without selecting
+      // an account. Returning undefined must not consume a pending retry,
+      // queue an account choice, or create, move or delete a session pin.
       const active = controller(input)
       options.onOwnedRequest?.()
       let snapshot = await runtime.read()
@@ -324,11 +327,11 @@ export function createNativeAnthropicSource(
       )
         return undefined
       if (retry && input.rerouteFrom) {
-        retries.delete(input.rerouteFrom.limit.reason)
         const account = snapshot.accounts.find(
           (row) => row.id === retry.accountId,
         )
         if (!account || !eligible(account, snapshot, modelID)) return undefined
+        retries.delete(input.rerouteFrom.limit.reason)
         const queueKey = key(input, retry.accountId)
         const queue = choices.get(queueKey) ?? []
         queue.push(retry)
@@ -389,6 +392,8 @@ export function createNativeAnthropicSource(
           storage: snapshot.policyStorage,
           inputBytes: 1,
           preferredAccountId: input.previousAccountId,
+          // A refusal leaves the host in charge; it must not clear its route.
+          preserveOnNoCandidate: true,
         })
         active.signal.throwIfAborted()
         if (selected) return selected.accountId
@@ -435,6 +440,12 @@ export function createNativeAnthropicSource(
           nativeAccountCanServe(account) &&
           account.id !== input.rerouteFrom?.accountId,
       )?.id
+    },
+    dropChoice(input) {
+      const queueKey = key(input, input.accountId)
+      const queue = choices.get(queueKey)
+      queue?.shift()
+      if (queue?.length === 0) choices.delete(queueKey)
     },
     async authorizeAccount(scope, accountId) {
       const active = controller(scope)

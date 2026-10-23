@@ -146,6 +146,7 @@ const CUSTODY_CODES = everyCode<NativeCustodyErrorCode>()([
   'host-slot-login',
   'host-slot-placeholder',
   'placeholder-refresh',
+  'invalid-order',
 ])
 
 const ERROR_FIELD_VALUES = {

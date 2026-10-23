@@ -48,6 +48,7 @@ const codes = new Set([
   'host-slot-login',
   'host-slot-placeholder',
   'placeholder-refresh',
+  'invalid-order',
   'publication-refused',
   'unsafe-runtime',
   'invalid-runtime',

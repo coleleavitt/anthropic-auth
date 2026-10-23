@@ -1030,6 +1030,8 @@ export class StickySessionRouter {
     inputBytes: number
     preferredAccountId?: string
     excludeAccountIds?: ReadonlySet<string>
+    /** Leave the current pin intact when selection cannot offer an account. */
+    preserveOnNoCandidate?: boolean
   }): Promise<StickyRouteResolution | null> {
     if (!input.sessionId) return null
     this.recoverLocalPins()
@@ -1127,7 +1129,7 @@ export class StickySessionRouter {
     const selected =
       preferred ?? this.selectCandidate({ ...input, candidates, state })
     if (!selected) {
-      if (current) {
+      if (current && !input.preserveOnNoCandidate) {
         delete state.assignments[key]
         save('delete')
       }

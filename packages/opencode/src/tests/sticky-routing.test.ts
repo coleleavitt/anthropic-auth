@@ -969,6 +969,52 @@ describe('sticky-balanced session routing', () => {
     expect(resolution).toBeNull()
   })
 
+  for (const preserve of [false, true]) {
+    test(`no-candidate resolution ${preserve ? 'preserves the pin when requested' : 'clears the pin by default'}`, async () => {
+      const path = await statePath()
+      const router = ownRouter({ path, now: () => NOW })
+      const input = {
+        sessionId: 'no-candidate-existing-pin',
+        family: 'general' as const,
+        storage,
+        inputBytes: 1_000,
+      }
+      expect(
+        (
+          await router.resolve({
+            ...input,
+            candidates: [
+              { accountId: 'main', order: 0, quota: { kind: 'unknown' } },
+            ],
+            retainAccountIds: new Set(['main']),
+          })
+        )?.accountId,
+      ).toBe('main')
+      await router.drain()
+      const before = await readFile(path, 'utf8')
+      expect(
+        await router.resolve({
+          ...input,
+          candidates: [
+            candidate({
+              accountId: 'exhausted',
+              order: 0,
+              fiveHour: 0,
+              sevenDay: 0,
+              fable: 0,
+            }),
+          ],
+          retainAccountIds: new Set(['exhausted']),
+          ...(preserve ? { preserveOnNoCandidate: true } : {}),
+        }),
+      ).toBeNull()
+      await router.drain()
+      const after = await readFile(path, 'utf8')
+      if (preserve) expect(after).toBe(before)
+      else expect(JSON.parse(after).assignments).toEqual({})
+    })
+  }
+
   test('router-level pending bytes reset when an unknown quota becomes known', async () => {
     const path = await statePath()
     const router = ownRouter({ path, now: () => NOW })
