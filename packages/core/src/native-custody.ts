@@ -396,9 +396,7 @@ export function createNativeCustody(
       // Local shutdown and adapter validation are not evidence of a vault outage.
       if (error instanceof NativeCustodyError)
         throw new ClaustrumConsumerError(
-          // The constructor stores this validated code unchanged; 0.24.0's
-          // declarations do not yet include the 0.25.0 invalid-order member.
-          error.code as ConstructorParameters<typeof ClaustrumConsumerError>[0],
+          error.code,
           'Native custody operation refused',
         )
       if (classifyVaultFailure(error) === 'unreachable')

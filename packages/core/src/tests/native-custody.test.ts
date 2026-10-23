@@ -44,11 +44,8 @@ type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
 // Compare Core's structural types with common-auth and the published client.
 // Keep these dependencies in tests, outside Core's public type declarations.
 export type ClientParity = Assert<Same<NativeCustodyClient, PublishedClient>>
-// common-auth 0.25.0 adds invalid-order; include it while also checking against
-// the pinned 0.24.0 declarations. Every other error kind must still match.
-type ConsumerFailureKind = ClaustrumConsumerFailureKind | 'invalid-order'
 export type ErrorParity = Assert<
-  Same<NativeCustodyErrorCode, ConsumerFailureKind>
+  Same<NativeCustodyErrorCode, ClaustrumConsumerFailureKind>
 >
 export type InventoryParity = Assert<
   Same<NativeCustodyInventory, VaultInventory>
@@ -662,7 +659,7 @@ const consumerKinds = [
   'host-slot-placeholder',
   'placeholder-refresh',
   'invalid-order',
-] as const satisfies readonly ConsumerFailureKind[]
+] as const satisfies readonly ClaustrumConsumerFailureKind[]
 
 export type ErrorTestCoverage = Assert<
   Same<(typeof consumerKinds)[number], NativeCustodyErrorCode>
@@ -673,7 +670,7 @@ describe('closed redacted error and logger boundary', () => {
     'maps consumer kind %s to its own native code',
     async (kind) => {
       const producer = new ClaustrumConsumerError(
-        kind as ClaustrumConsumerFailureKind,
+        kind,
         `consumer detail ${enrollmentToken} ${bearer}`,
       )
       const f = fixture({
