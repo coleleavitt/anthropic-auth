@@ -570,11 +570,12 @@ export function nativeMigrationAuthorityPhase(
 
 /**
  * Whether a finished legacy import may be replaced by a fresh import of a
- * later OpenCode login. Setups first run on 2.0.2 or earlier, with no login,
- * finished a legacy import of nothing instead of recording empty-init. Such a
- * journal stands in for empty-init only when it is retired with no requested
- * or completed vault switch; callers must still prove the pool holds no account
- * data, so a pool with accounts is never re-imported.
+ * later OpenCode login. A first OpenCode 1 setup with no login finishes a
+ * legacy import of nothing instead of recording empty-init (only OpenCode 2
+ * setup records empty-init). Such a journal stands in for empty-init only when
+ * it is retired with no requested or completed vault switch; callers must still
+ * prove the pool holds no account data, so a pool with accounts is never
+ * re-imported.
  */
 export function nativeJournalMayAdoptLaterHostLogin(
   journal: NativeMigrationJournal | undefined,

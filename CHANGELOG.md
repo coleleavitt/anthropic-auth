@@ -11,7 +11,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ### Setup
 
 - Enrollment status for an old Claustrum vault now directs users to run `ck upgrade` to move to v0.2.0 or newer.
-- Rerunning OpenCode 1 setup now imports an OpenCode Anthropic login added after a first setup that ran on 2.0.2 or earlier and found no accounts, as long as the pool is still empty; before, setup left that login unused. Addresses #335.
+- Rerunning OpenCode 1 setup now imports an OpenCode Anthropic login you added after a first setup that found no accounts, as long as the pool is still empty; before, setup left that login unused until `setup --login`. Addresses #335.
 
 ## 2.2.3
 
