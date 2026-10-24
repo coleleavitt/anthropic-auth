@@ -1234,6 +1234,22 @@ broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
 
 [[control]]
+id = "relay-direct-fallback-sends-once"
+guards = "A direct fallback that fails after it started must not be sent a second time by sendViaRelay's outer catch: its request may already have reached Anthropic."
+file = "packages/core/src/relay.ts"
+old = "    if (directFallbackStarted) {"
+new = "    if (false) { // NON-VACUITY BREAK: resend a failed direct fallback"
+test_file = "packages/core/src/tests/relay-authorization.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/relay-authorization.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a direct fallback after a relay 5xx that fails is not sent again", "a direct fallback after a relay-only 401 that fails is not sent again", "a failed WebSocket relay whose HTTP relay fallback falls back direct and fails is not sent again"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
 id = "quota-call-pause-default-waits"
 guards = "Without an injected pause, QuotaManager waits on a real timer so physical quota GETs start at least one second apart."
 file = "packages/core/src/quota-manager.ts"

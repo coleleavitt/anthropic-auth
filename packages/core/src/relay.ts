@@ -1867,6 +1867,15 @@ export async function sendViaRelay(options: {
     responseMode ??= requestResponseMode(bodyText)
     return responseMode
   }
+  // The direct fallback runs at most once per request. Once it has started,
+  // its request may already have reached Anthropic (a connection can reset
+  // after the body was sent), so its failure goes to the caller instead of
+  // sending the same request again.
+  let directFallbackStarted = false
+  const directFallback = () => {
+    directFallbackStarted = true
+    return fallback()
+  }
   try {
     let result: RelaySendResult
     const sendStart = perfNowMs()
@@ -1902,7 +1911,7 @@ export async function sendViaRelay(options: {
           payload,
           bodyText,
           requestMode,
-          fallback,
+          fallback: directFallback,
           signal: init?.signal,
           authorizeAttempt,
         })
@@ -1913,7 +1922,7 @@ export async function sendViaRelay(options: {
         payload,
         bodyText,
         requestMode,
-        fallback,
+        fallback: directFallback,
         signal: init?.signal,
         authorizeAttempt,
       })
@@ -1983,6 +1992,12 @@ export async function sendViaRelay(options: {
     // The upstream already answered this request; a direct fallback would
     // send it a second time.
     if (error instanceof RelayResponseMetadataError) throw error
+    if (directFallbackStarted) {
+      relayLog(
+        `direct fallback failed session=${shortAffinity(affinity)}; not sending it again code=relay_transport_error`,
+      )
+      throw error
+    }
     if (!config.fallbackToDirect) {
       relayLog(
         `relay failed session=${shortAffinity(affinity)} and fallbackToDirect=false code=relay_transport_error`,

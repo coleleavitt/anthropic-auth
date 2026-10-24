@@ -173,6 +173,108 @@ test('a relay transport 401 without upstream provenance falls back direct withou
   }
 })
 
+// A direct fallback can fail after its request already reached Anthropic,
+// for example when the connection resets after the body was sent. Sending it
+// again would bill the same request twice, so its error goes to the caller.
+for (const [label, status] of [
+  ['a relay 5xx', 503],
+  ['a relay-only 401', 401],
+] as const) {
+  test(`a direct fallback after ${label} that fails is not sent again`, async () => {
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: () => new Response('relay unavailable', { status }),
+    })
+    let direct = 0
+    try {
+      await expect(
+        sendViaRelay({
+          config: config(server.url.href),
+          input: 'https://api.anthropic.com/v1/messages',
+          init: { method: 'POST' },
+          headers: new Headers(),
+          body: body(`failed-fallback-${status}`),
+          affinity: randomUUID(),
+          fallback: async () => {
+            direct++
+            throw new Error('connection reset after the request was sent')
+          },
+          authorizeAttempt: async () => ({
+            headers: new Headers({ authorization: 'Bearer test-access' }),
+          }),
+        }),
+      ).rejects.toThrow('connection reset after the request was sent')
+      expect(direct).toBe(1)
+    } finally {
+      await server.stop(true)
+    }
+  })
+}
+
+test('a failed WebSocket relay whose HTTP relay fallback falls back direct and fails is not sent again', async () => {
+  // Refusing the upgrade fails the WebSocket; the HTTP relay then answers 503.
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch: () => new Response('relay unavailable', { status: 503 }),
+  })
+  let direct = 0
+  try {
+    await expect(
+      sendViaRelay({
+        config: config(server.url.href, 'websocket'),
+        input: 'https://api.anthropic.com/v1/messages',
+        init: { method: 'POST' },
+        headers: new Headers(),
+        body: body('failed-websocket-fallback'),
+        affinity: randomUUID(),
+        fallback: async () => {
+          direct++
+          throw new Error('connection reset after the request was sent')
+        },
+        authorizeAttempt: async () => ({
+          headers: new Headers({ authorization: 'Bearer test-access' }),
+        }),
+      }),
+    ).rejects.toThrow('connection reset after the request was sent')
+    expect(direct).toBe(1)
+  } finally {
+    server.stop(true)
+  }
+})
+
+test('a relay that fails before any direct fallback still falls back direct once', async () => {
+  // A stopped server leaves a port that refuses connections, so the relay
+  // POST itself rejects before the relay could forward anything.
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch: () => new Response('unused'),
+  })
+  const url = server.url.href
+  await server.stop(true)
+  let direct = 0
+  const response = await sendViaRelay({
+    config: config(url),
+    input: 'https://api.anthropic.com/v1/messages',
+    init: { method: 'POST' },
+    headers: new Headers(),
+    body: body('relay-unreachable'),
+    affinity: randomUUID(),
+    fallback: async () => {
+      direct++
+      return new Response('direct-ok', { status: 200 })
+    },
+    authorizeAttempt: async () => ({
+      headers: new Headers({ authorization: 'Bearer test-access' }),
+    }),
+  })
+  expect(response.status).toBe(200)
+  expect(await response.text()).toBe('direct-ok')
+  expect(direct).toBe(1)
+})
+
 test('optimistic WebSocket reconnect uses a fresh receipt without reporting its synthetic 200', async () => {
   const sent: Array<{
     id: string
