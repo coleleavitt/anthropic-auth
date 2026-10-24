@@ -16,6 +16,7 @@ import {
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   type NativeAccountRuntime,
+  type NativeAccountSnapshot,
   type NativeMenuDispatch,
   nativeAccountCanServe,
   resetClaustrumEnrollmentState,
@@ -37,6 +38,29 @@ const record = (value: unknown): Record<string, unknown> =>
     : {}
 
 const POOL_CONNECTION_GUIDANCE = `For first-time model access, connect Anthropic with "${CLAUDE_POOL_LOGIN_METHOD_LABEL}".\nRun: opencode auth login anthropic --method ${CLAUDE_POOL_LOGIN_METHOD_ID}`
+
+/**
+ * The pool login connects OpenCode and stores the pool's main account, and
+ * running it again replaces that main account. So the menu only points users
+ * at it while a local pool has no main account yet. Vault custody signs in
+ * through a different method, so it never gets this guidance.
+ */
+const needsPoolConnection = (snapshot: NativeAccountSnapshot) =>
+  snapshot.mode === 'local' &&
+  !snapshot.accounts.some((account) => account.id === 'main')
+
+const formatAccountStatus = (
+  account: NativeAccountSnapshot['accounts'][number],
+) => {
+  const role = account.id === 'main' ? 'main' : 'fallback'
+  const details = `${account.enabled ? 'enabled' : 'disabled'}, ${account.type}, ${account.source}${account.state ? `, ${formatNativeAccountState(account)}` : ''}`
+  // A label is the user's name for the account, so the route id goes on its
+  // own line. Without a label the role (and a fallback's route id) is the
+  // name, printed once.
+  if (account.label)
+    return `${account.label} [${role}]: ${details}\n  Route: ${account.id}`
+  return `${role === 'main' ? 'Main account' : `Fallback ${account.id}`}: ${details}`
+}
 
 /** Account and setting changes use the same Core runtime as model requests. */
 export function createNativeMenuCapabilities(options: {
@@ -139,9 +163,12 @@ export function createNativeMenuCapabilities(options: {
         options.signal?.throwIfAborted()
         if (closed) return { ok: false, text: 'Sign-in cancelled.' }
         pending.delete(request.sessionId)
+        const stored = 'OAuth account stored in the native account pool.'
         return {
           ok: true,
-          text: `OAuth account stored in the native account pool.\n\n${POOL_CONNECTION_GUIDANCE}\n\nAdding an account here does not change OpenCode's Anthropic connection.`,
+          text: needsPoolConnection(await runtime.read())
+            ? `${stored}\n\n${POOL_CONNECTION_GUIDANCE}\n\nAdding an account here does not change OpenCode's Anthropic connection.`
+            : stored,
         }
       }
       case 'reset-backoff': {
@@ -277,13 +304,9 @@ export function createNativeMenuCapabilities(options: {
       const snapshot = await runtime.read()
       if (command === 'account') {
         const accounts =
-          snapshot.accounts
-            .map(
-              (account) =>
-                `${account.label ?? account.id} [${account.id === 'main' ? 'main' : 'fallback'}]: ${account.enabled ? 'enabled' : 'disabled'}, ${account.type}, ${account.source}${account.state ? `, ${formatNativeAccountState(account)}` : ''}\n  Route: ${account.id}`,
-            )
-            .join('\n') || 'No native Claude accounts.'
-        return snapshot.mode === 'local'
+          snapshot.accounts.map(formatAccountStatus).join('\n') ||
+          'No native Claude accounts.'
+        return needsPoolConnection(snapshot)
           ? `${accounts}\n\n${POOL_CONNECTION_GUIDANCE}\nQuota refresh checks the pool; it does not check OpenCode's Anthropic connection.`
           : accounts
       }

@@ -8,12 +8,35 @@ import { createNativeMenuCapabilities } from '../v2/menu'
 import type { NativeSource } from '../v2/source'
 import { setupAnthropicTui } from '../v2/tui'
 
-test('account status identifies a disabled main account and named fallbacks', async () => {
-  const snapshot: NativeAccountSnapshot = {
-    mode: 'local',
-    settings: {},
-    policyStorage: { version: 1, accounts: [] },
-    accounts: [
+const GUIDANCE_COMMAND =
+  'opencode auth login anthropic --method native-claude-oauth'
+
+const statusFor = async (snapshot: NativeAccountSnapshot) => {
+  const capabilities = createNativeMenuCapabilities({
+    runtime: { read: async () => snapshot } as NativeAccountRuntime,
+    source: {} as NativeSource,
+    start: async () => {},
+  })
+  try {
+    return await capabilities.readStatus('account')
+  } finally {
+    capabilities.close()
+  }
+}
+
+const snapshotWith = (
+  mode: NativeAccountSnapshot['mode'],
+  accounts: NativeAccountSnapshot['accounts'],
+): NativeAccountSnapshot => ({
+  mode,
+  settings: {},
+  policyStorage: { version: 1, accounts: [] },
+  accounts,
+})
+
+test('account status names each account once and prints a route only under a label', async () => {
+  const status = await statusFor(
+    snapshotWith('local', [
       { id: 'main', type: 'oauth', source: 'local', enabled: false },
       {
         id: 'synthetic-fallback',
@@ -22,26 +45,79 @@ test('account status identifies a disabled main account and named fallbacks', as
         source: 'local',
         enabled: true,
       },
-    ],
-  }
-  const capabilities = createNativeMenuCapabilities({
-    runtime: { read: async () => snapshot } as NativeAccountRuntime,
-    source: {} as NativeSource,
-    start: async () => {},
-  })
-  try {
-    const local = await capabilities.readStatus('account')
-    expect(local).toContain('main [main]: disabled, oauth, local')
-    expect(local).toContain('Personal [fallback]: enabled, oauth, local')
-    expect(local).toContain('Route: synthetic-fallback')
-    expect(local).toContain(
-      'opencode auth login anthropic --method native-claude-oauth',
-    )
-    snapshot.mode = 'claustrum'
-    const vault = await capabilities.readStatus('account')
-    expect(vault).not.toContain('native-claude-oauth')
-  } finally {
-    capabilities.close()
+      {
+        id: 'unlabelled-fallback',
+        type: 'oauth',
+        source: 'local',
+        enabled: true,
+      },
+    ]),
+  )
+  expect(status).toBe(
+    [
+      'Main account: disabled, oauth, local',
+      'Personal [fallback]: enabled, oauth, local',
+      '  Route: synthetic-fallback',
+      'Fallback unlabelled-fallback: enabled, oauth, local',
+    ].join('\n'),
+  )
+})
+
+test('a labelled main account prints its label, role and route', async () => {
+  const status = await statusFor(
+    snapshotWith('local', [
+      {
+        id: 'main',
+        label: 'Work',
+        type: 'oauth',
+        source: 'local',
+        enabled: true,
+      },
+    ]),
+  )
+  expect(status).toBe('Work [main]: enabled, oauth, local\n  Route: main')
+})
+
+test('local account status shows the pool connection guidance only without a main account', async () => {
+  const fallback = {
+    id: 'synthetic-fallback',
+    type: 'oauth',
+    source: 'local',
+    enabled: true,
+  } as const
+  const withoutMain = await statusFor(snapshotWith('local', [fallback]))
+  expect(withoutMain).toContain(GUIDANCE_COMMAND)
+  expect(withoutMain).toContain(
+    "Quota refresh checks the pool; it does not check OpenCode's Anthropic connection.",
+  )
+  const empty = await statusFor(snapshotWith('local', []))
+  expect(empty).toContain('No native Claude accounts.')
+  expect(empty).toContain(GUIDANCE_COMMAND)
+  const withMain = await statusFor(
+    snapshotWith('local', [
+      { id: 'main', type: 'oauth', source: 'local', enabled: false },
+      fallback,
+    ]),
+  )
+  expect(withMain).not.toContain(GUIDANCE_COMMAND)
+  expect(withMain).not.toContain('Quota refresh checks the pool')
+})
+
+test('vault account status never shows the pool connection guidance', async () => {
+  const fallback = {
+    id: 'synthetic-fallback',
+    type: 'oauth',
+    source: 'vault',
+    enabled: true,
+  } as const
+  for (const accounts of [
+    [],
+    [fallback],
+    [{ ...fallback, id: 'main' }, fallback],
+  ]) {
+    const status = await statusFor(snapshotWith('claustrum', accounts))
+    expect(status).not.toContain('native-claude-oauth')
+    expect(status).not.toContain('Quota refresh checks the pool')
   }
 })
 
