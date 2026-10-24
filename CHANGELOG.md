@@ -6,6 +6,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - In sticky-balanced mode on OpenCode 1 and Pi, a session now waits on its account when whichever quota window blocks it resets within 15 minutes, including 7-day and model limits, instead of moving and rebuilding its cache. OpenCode 2 does not hold yet.
 
+- Addresses #471 (vault grant principal)
 - OpenCode 2: finishing an OAuth sign-in from `/claude` → Accounts no longer fails with "Action failed"; the Accounts menu explains how to connect OpenCode when no main account exists. Thanks to @colinmollenhour. Addresses #464.
 
 ## 2.2.6

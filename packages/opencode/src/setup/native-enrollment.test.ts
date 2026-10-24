@@ -25,6 +25,110 @@ async function fixture(body: (root: string) => Promise<void>) {
   }
 }
 
+for (const host of ['opencode', 'pi'] as const) {
+  test(`${host} enrollment grants the principal approved under a different name`, async () => {
+    await fixture(async (root) => {
+      const calls: string[][] = []
+      await enrollNativeVaultForHost(host, {
+        env: {},
+        paths: {
+          tokenPath: join(root, 'token.json'),
+          statePath: join(root, 'state.json'),
+        },
+        processFence: async () => {},
+        runner: {
+          run: async (_command, args) => {
+            calls.push(args)
+            return { exitCode: 0, stdout: '', stderr: '' }
+          },
+        },
+        client: {
+          enrollPropose: async () => ({ requestId: 'synthetic-request-id' }),
+          enrollPoll: async () => ({
+            status: 'approved',
+            name: `anthropic-auth-${host}-v2`,
+            token: 'a'.repeat(64),
+            tokenGeneration: 1,
+          }),
+        },
+      })
+      expect(calls).toEqual([
+        [
+          'auth',
+          'grant',
+          '--principal',
+          `enrolled:anthropic-auth-${host}-v2`,
+          '--selector-kind',
+          'category',
+          '--selector',
+          'anthropic-native',
+          '--operation',
+          'read',
+        ],
+      ])
+    })
+  })
+
+  for (const approvedName of [
+    undefined,
+    'bad;synthetic-secret',
+    'has space',
+    'x'.repeat(129),
+    '',
+    42,
+  ]) {
+    test(`${host} grant ${approvedName === undefined ? 'falls back only when no approved name is recorded' : `refuses invalid approved name ${JSON.stringify(approvedName)}`}`, async () => {
+      await fixture(async (root) => {
+        const env = {
+          [`${host.toUpperCase()}_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`]:
+            join(root, 'token.json'),
+        }
+        const paths = getHostClaustrumEnrollmentPaths(host, env)
+        await writeFile(
+          paths.tokenPath,
+          JSON.stringify({ token: 'a'.repeat(64), token_generation: 1 }),
+          { mode: 0o600 },
+        )
+        await writeFile(
+          paths.statePath,
+          JSON.stringify({
+            version: 1,
+            phase: 'approved',
+            proposedName: `anthropic-auth-${host}`,
+            approvedName,
+            tokenGeneration: 1,
+            updatedAt: 1,
+          }),
+          { mode: 0o600 },
+        )
+        const calls: string[][] = []
+        const operation = grantNativeVaultForHost(host, {
+          env,
+          processFence: async () => {},
+          runner: {
+            run: async (_command, args) => {
+              calls.push(args)
+              return { exitCode: 0, stdout: '', stderr: '' }
+            },
+          },
+        })
+        if (approvedName === undefined) {
+          await operation
+          expect(calls).toHaveLength(1)
+          expect(calls[0]?.[3]).toBe(`enrolled:anthropic-auth-${host}`)
+        } else {
+          await expect(operation).rejects.toMatchObject({
+            code: 'permission-refused',
+            message:
+              'Native vault setup: permission-refused. Could not grant this host read access to native Claude accounts. An older ck may refuse a grant that already exists. Update CortexKit tools and run setup again.',
+          })
+          expect(calls).toEqual([])
+        }
+      })
+    })
+  }
+}
+
 for (const [name, exitCode, stdout] of [
   [
     'a fresh grant',
@@ -39,55 +143,61 @@ for (const [name, exitCode, stdout] of [
   ['a real grant failure', 1, 'synthetic-secret-output'],
 ] as const) {
   test(`${name} uses only the grant exit status and never exposes command output`, async () => {
-    const calls: Array<{ command: string; args: string[] }> = []
-    let fences = 0
-    const operation = grantNativeVaultForHost('opencode', {
-      env: {},
-      ckBinary: '/fixture/ck',
-      processFence: async () => {
-        fences++
-      },
-      runner: {
-        run: async (command, args) => {
-          calls.push({ command, args })
-          return {
-            exitCode,
-            stdout,
-            stderr:
-              'error: the running module refused the op: credential already exists; synthetic-secret-stderr',
-          }
+    await fixture(async (root) => {
+      const calls: Array<{ command: string; args: string[] }> = []
+      let fences = 0
+      const operation = grantNativeVaultForHost('opencode', {
+        env: {},
+        paths: {
+          tokenPath: join(root, 'token.json'),
+          statePath: join(root, 'state.json'),
         },
-      },
-    })
-    if (exitCode === 0) await expect(operation).resolves.toBeUndefined()
-    else {
-      await expect(operation).rejects.toMatchObject({
-        code: 'permission-refused',
+        ckBinary: '/fixture/ck',
+        processFence: async () => {
+          fences++
+        },
+        runner: {
+          run: async (command, args) => {
+            calls.push({ command, args })
+            return {
+              exitCode,
+              stdout,
+              stderr:
+                'error: the running module refused the op: credential already exists; synthetic-secret-stderr',
+            }
+          },
+        },
       })
-      await expect(operation).rejects.toThrow(
-        'Update CortexKit tools and run setup again.',
-      )
-      await expect(operation).rejects.not.toThrow('synthetic-secret')
-      await expect(operation).rejects.not.toThrow('credential already exists')
-    }
-    expect(fences).toBe(1)
-    expect(calls).toEqual([
-      {
-        command: '/fixture/ck',
-        args: [
-          'auth',
-          'grant',
-          '--principal',
-          'enrolled:anthropic-auth-opencode',
-          '--selector-kind',
-          'category',
-          '--selector',
-          'anthropic-native',
-          '--operation',
-          'read',
-        ],
-      },
-    ])
+      if (exitCode === 0) await expect(operation).resolves.toBeUndefined()
+      else {
+        await expect(operation).rejects.toMatchObject({
+          code: 'permission-refused',
+        })
+        await expect(operation).rejects.toThrow(
+          'Update CortexKit tools and run setup again.',
+        )
+        await expect(operation).rejects.not.toThrow('synthetic-secret')
+        await expect(operation).rejects.not.toThrow('credential already exists')
+      }
+      expect(fences).toBe(1)
+      expect(calls).toEqual([
+        {
+          command: '/fixture/ck',
+          args: [
+            'auth',
+            'grant',
+            '--principal',
+            'enrolled:anthropic-auth-opencode',
+            '--selector-kind',
+            'category',
+            '--selector',
+            'anthropic-native',
+            '--operation',
+            'read',
+          ],
+        },
+      ])
+    })
   })
 }
 

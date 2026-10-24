@@ -458,7 +458,7 @@ function closedFenceHosts(
  * Display text must be a fixed remedy, the runner's unknown-argument message,
  * an OAuth metadata error matching its own integer HTTP status (100–599),
  * a shared-setup enrollment refusal matching HOST_NOT_ENROLLED_PATTERNS, or
- * a running-host list rebuilt from validated own host names and PIDs.
+ * a running-host list or vault grant remedy rebuilt from validated fields.
  */
 export function knownFailureMessage(error: unknown): string | undefined {
   try {
@@ -472,6 +472,26 @@ export function knownFailureMessage(error: unknown): string | undefined {
     )
       return message
     if (CLOSED_MESSAGES.has(message)) return message
+    if (
+      ownData(error, 'name') === 'NativeVaultActivationError' &&
+      ownData(error, 'code') === 'no-read-grant'
+    ) {
+      const host = ownData(error, 'host')
+      const approvedName = ownData(error, 'approvedName')
+      if (
+        (host === 'opencode' || host === 'pi') &&
+        typeof approvedName === 'string'
+      ) {
+        // The constructor validates the principal before building the command.
+        // Compare the whole remedy so no other error text reaches the terminal.
+        const rebuilt = new NativeVaultActivationError(
+          'no-read-grant',
+          host,
+          approvedName,
+        ).message
+        if (message === rebuilt) return rebuilt
+      }
+    }
     if (message.startsWith('Unknown setup argument: ')) return message
     if (
       ownData(error, 'name') === 'HostNotEnrolledError' &&

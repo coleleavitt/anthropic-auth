@@ -163,6 +163,47 @@ test('a fresh OpenCode install enrolls and discovers vault accounts without crea
   })
 })
 
+for (const host of ['opencode', 'pi'] as const) {
+  test(`${host} activation and the empty-vault remedy use the approved principal`, async () => {
+    const f = await fixture(host)
+    const grants: string[][] = []
+    const run = f.options.runner.run
+    f.options.runner.run = async (command, args, options) => {
+      if (args.includes('grant')) grants.push(args)
+      return run(command, args, options)
+    }
+    f.options.enrollment.client.enrollPoll = async () => ({
+      status: 'approved',
+      name: `anthropic-auth-${host}-v2`,
+      token: 'c'.repeat(64),
+      tokenGeneration: 1,
+    })
+    f.options.discover = async () => ({
+      view: 'synthetic-view',
+      credentials: [],
+      skipped: [],
+      grantReach: { grants: 0, tuples: [] },
+    })
+    await expect(activateNativeVaultForHost(host, f.options)).rejects.toThrow(
+      `Run ck auth grant --principal enrolled:anthropic-auth-${host}-v2 --selector-kind category --selector anthropic-native --operation read, then rerun setup.`,
+    )
+    expect(grants).toEqual([
+      [
+        'auth',
+        'grant',
+        '--principal',
+        `enrolled:anthropic-auth-${host}-v2`,
+        '--selector-kind',
+        'category',
+        '--selector',
+        'anthropic-native',
+        '--operation',
+        'read',
+      ],
+    ])
+  })
+}
+
 test('a retired local pool is activated without rerunning its migration', async () => {
   const f = await fixture('opencode')
   await writeHostAuth(f.paths.hostAuthPath)

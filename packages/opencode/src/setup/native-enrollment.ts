@@ -181,12 +181,19 @@ export async function enrollNativeVaultForHost(
  * the vault's anthropic-native category. Setup runs them, and the empty-vault
  * message shows the same command so the user can run it by hand.
  */
-export function nativeVaultGrantArgs(host: HarnessKind): string[] {
+export function nativeVaultGrantArgs(
+  host: HarnessKind,
+  approvedName?: string,
+): string[] {
+  const name = approvedName ?? NATIVE_VAULT_HOST_NAMES[host]
+  // Match the principal-name rules used by the Accounts enrollment display.
+  if (typeof name !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(name))
+    throw new NativeVaultEnrollmentError('permission-refused')
   return [
     'auth',
     'grant',
     '--principal',
-    `enrolled:${NATIVE_VAULT_HOST_NAMES[host]}`,
+    `enrolled:${name}`,
     '--selector-kind',
     'category',
     '--selector',
@@ -201,18 +208,28 @@ export async function grantNativeVaultForHost(
   host: HarnessKind,
   options: Pick<
     NativeVaultEnrollmentOptions,
-    'env' | 'runner' | 'processFence' | 'ckBinary'
+    'env' | 'runner' | 'processFence' | 'ckBinary' | 'paths'
   >,
-): Promise<void> {
+): Promise<string | undefined> {
   try {
     await options.processFence()
-    const grant = await options.runner.run(
-      options.ckBinary ?? 'ck',
-      nativeVaultGrantArgs(host),
-      { env: options.env },
+    // common-auth's public status API includes the operator's approvedName;
+    // the proposed default can belong to a different installation.
+    const status = await readClaustrumEnrollmentStatus(
+      options.paths ?? getHostClaustrumEnrollmentPaths(host, options.env),
+      NATIVE_VAULT_HOST_NAMES[host],
     )
+    if (status.state === 'blocked')
+      throw new NativeVaultEnrollmentError('permission-refused')
+    const approvedName =
+      status.state === 'approved' ? status.approvedName : undefined
+    const args = nativeVaultGrantArgs(host, approvedName)
+    const grant = await options.runner.run(options.ckBinary ?? 'ck', args, {
+      env: options.env,
+    })
     if (grant.exitCode !== 0)
       throw new NativeVaultEnrollmentError('permission-refused')
+    return approvedName
   } catch {
     throw new NativeVaultEnrollmentError('permission-refused')
   }

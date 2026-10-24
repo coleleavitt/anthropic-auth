@@ -1,6 +1,6 @@
 # Vault custody
 
-Claustrum is a local credential-vault service. Each host explicitly enrolls as `anthropic-auth-opencode` or `anthropic-auth-pi`; its enrollment record, not an account setting, selects vault custody. OpenCode and Pi can be enrolled, disconnected or revoked independently.
+Claustrum is a local credential-vault service. Each host explicitly proposes enrollment as `anthropic-auth-opencode` or `anthropic-auth-pi`; the vault operator can approve a different name. Its enrollment record, not an account setting, selects vault custody. OpenCode and Pi can be enrolled, disconnected or revoked independently.
 
 ## Setup
 
@@ -13,6 +13,14 @@ npx @cortexkit/opencode-anthropic-auth setup --claustrum
 ```
 
 The shared runner owns the per-host enrollment ceremony. Anthropic callbacks then ensure the host-specific grant to read the `anthropic-native` category, discover inventory and require a verified default Claude account. If that default is unverified, sign in through the vault and rerun setup; setup does not import local tokens into the vault.
+
+Setup grants the principal named by the enrollment's `approvedName`, using the proposed default only when no approved name is recorded. If setup reports no read grant, its recovery command names that principal. To grant access by hand, use the approved principal shown in `/claude` → **Accounts**. For example, if the operator approved OpenCode as `anthropic-auth-opencode-v2`, run:
+
+```sh
+ck auth grant --principal enrolled:anthropic-auth-opencode-v2 --selector-kind category --selector anthropic-native --operation read
+```
+
+Do not substitute `anthropic-auth-opencode` or `anthropic-auth-pi` unless that is this installation's approved name (or its default when no approved name was recorded). If a read grant reaches no Claude login, run `ck auth reclassify --from-registry` and check the logins with `ck auth status` before rerunning setup.
 
 If setup fails after enrollment is approved, the host stays connected to the vault. Run setup again to finish connecting. Or, in that host, run `/claude` → **Accounts** → **Disconnect from the vault** to undo it. Local settings do not undo enrollment.
 

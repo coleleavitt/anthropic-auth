@@ -3793,12 +3793,19 @@ const UNREACHED_TEXT =
   "OpenCode's vault read grant reaches no Claude login: no vault login carries the anthropic-native category, which logins saved before vault categories existed lack. Run ck auth reclassify --from-registry, check the logins with ck auth status, then rerun setup."
 const UNVERIFIED_TEXT =
   'The vault has no verified default Claude account. Sign in through the vault and rerun setup.'
-for (const { name, inventory, code, text } of [
+for (const scenario of [
   {
     name: 'no grant at all',
     inventory: { grantReach: { grants: 0, tuples: [] }, credentials: [] },
     code: 'no-read-grant',
     text: NO_GRANT_TEXT,
+  },
+  {
+    name: 'no grant for an enrollment approved under a different name',
+    approvedName: 'anthropic-auth-opencode-v2',
+    inventory: { grantReach: { grants: 0, tuples: [] }, credentials: [] },
+    code: 'no-read-grant',
+    text: 'OpenCode has no read grant in the vault, so setup cannot see any Claude login. Run ck auth grant --principal enrolled:anthropic-auth-opencode-v2 --selector-kind category --selector anthropic-native --operation read, then rerun setup.',
   },
   {
     name: 'a grant that reaches no login',
@@ -3831,6 +3838,7 @@ for (const { name, inventory, code, text } of [
     text: UNVERIFIED_TEXT,
   },
 ]) {
+  const { name, inventory, code, text } = scenario
   lifetimes.test(
     `vault setup with ${name} explains the empty listing with one fixed remedy`,
     async () => {
@@ -3844,6 +3852,18 @@ for (const { name, inventory, code, text } of [
         await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
           ...f.io,
           vaultActivate: async (host, options, preflight) => {
+            if ('approvedName' in scenario) {
+              const { statePath } = getHostClaustrumEnrollmentPaths(host, f.env)
+              const state = JSON.parse(await readFile(statePath, 'utf8'))
+              await writeFile(
+                statePath,
+                JSON.stringify({
+                  ...state,
+                  approvedName: scenario.approvedName,
+                }),
+                { mode: 0o600 },
+              )
+            }
             try {
               return await completeNativeVaultActivation(
                 host,

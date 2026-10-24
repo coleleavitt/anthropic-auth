@@ -46,6 +46,7 @@ const HOST_LABELS = { opencode: 'OpenCode', pi: 'Pi' } as const
 function activationMessage(
   code: HostIndependentActivationCode | HostActivationCode,
   host: HarnessKind,
+  approvedName?: string,
 ): string {
   switch (code) {
     case 'auth-content-refused':
@@ -59,7 +60,7 @@ function activationMessage(
     case 'primary-unverified':
       return 'The vault has no verified default Claude account. Sign in through the vault and rerun setup.'
     case 'no-read-grant':
-      return `${HOST_LABELS[host]} has no read grant in the vault, so setup cannot see any Claude login. Run ${['ck', ...nativeVaultGrantArgs(host)].join(' ')}, then rerun setup.`
+      return `${HOST_LABELS[host]} has no read grant in the vault, so setup cannot see any Claude login. Run ${['ck', ...nativeVaultGrantArgs(host, approvedName)].join(' ')}, then rerun setup.`
     case 'grant-reaches-nothing':
       return `${HOST_LABELS[host]}'s vault read grant reaches no Claude login: no vault login carries the anthropic-native category, which logins saved before vault categories existed lack. Run ck auth reclassify --from-registry, check the logins with ck auth status, then rerun setup.`
   }
@@ -69,14 +70,19 @@ export class NativeVaultActivationError extends Error {
   readonly code: HostIndependentActivationCode | HostActivationCode
 
   constructor(code: HostIndependentActivationCode)
-  constructor(code: HostActivationCode, host: HarnessKind)
+  constructor(
+    code: HostActivationCode,
+    host: HarnessKind,
+    approvedName?: string,
+  )
   constructor(
     code: HostIndependentActivationCode | HostActivationCode,
-    host: HarnessKind = 'opencode',
+    readonly host: HarnessKind = 'opencode',
+    readonly approvedName?: string,
   ) {
-    // Every message is fixed text chosen by code and host; nothing from a
-    // vault reply or a caught error is ever part of it.
-    super(activationMessage(code, host))
+    // The remedy includes only a validated principal name; vault replies and
+    // caught error messages are never displayed as free-form text.
+    super(activationMessage(code, host, approvedName))
     this.name = 'NativeVaultActivationError'
     this.code = code
   }
@@ -237,11 +243,12 @@ export async function completeNativeVaultActivation(
     preflight.fingerprint
   )
     throw new NativeVaultActivationError('host-auth-invalid')
-  await grantNativeVaultForHost(host, {
+  const approvedName = await grantNativeVaultForHost(host, {
     env,
     runner: options.runner,
     processFence,
     ckBinary: options.enrollment?.ckBinary,
+    paths: options.enrollment?.paths,
   })
   const listVault =
     options.discover ??
@@ -282,7 +289,7 @@ export async function completeNativeVaultActivation(
       const code = unservedCode(listed)
       throw code === 'primary-unverified'
         ? new NativeVaultActivationError(code)
-        : new NativeVaultActivationError(code, host)
+        : new NativeVaultActivationError(code, host, approvedName)
     }
     await processFence()
     if (host === 'pi')

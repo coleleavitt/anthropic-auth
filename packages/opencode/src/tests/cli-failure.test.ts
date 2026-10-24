@@ -220,6 +220,45 @@ test('fixed remedies and validated closed codes are admitted word for word', () 
     expect(knownFailureMessage(error)).toBe(error.message)
 })
 
+test('empty-vault remedies admit only a canonical command for a validated approved principal', () => {
+  for (const host of ['opencode', 'pi'] as const) {
+    const error = new NativeVaultActivationError(
+      'no-read-grant',
+      host,
+      `anthropic-auth-${host}-v2`,
+    )
+    expect(knownFailureMessage(error)).toBe(error.message)
+    expect(
+      knownFailureMessage({
+        name: error.name,
+        code: error.code,
+        host,
+        approvedName: error.approvedName,
+        message: error.message,
+      }),
+    ).toBe(error.message)
+    for (const fields of [
+      { approvedName: 'bad;synthetic-secret' },
+      { approvedName: 'x'.repeat(129) },
+      { host: 'unknown' },
+      { code: 'unknown' },
+      { name: 'Error' },
+      { message: `${error.message} synthetic-secret` },
+    ]) {
+      expect(
+        knownFailureMessage({
+          name: error.name,
+          code: error.code,
+          host,
+          approvedName: error.approvedName,
+          message: error.message,
+          ...fields,
+        }),
+      ).toBeUndefined()
+    }
+  }
+})
+
 test('shared setup enrollment refusals are shown word for word and look-alikes are not', () => {
   const refusal = (message: string, name = 'HostNotEnrolledError') =>
     Object.assign(new Error(message), { name })

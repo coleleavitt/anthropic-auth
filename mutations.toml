@@ -8,6 +8,23 @@ prebuild = [
 ]
 
 [[control]]
+id = "oc-native-enrollment-grant-uses-approved-name"
+guards = "A grant must use the enrollment's approved principal, not another installation's default name."
+file = "packages/opencode/src/setup/native-enrollment.ts"
+old = "    const args = nativeVaultGrantArgs(host, approvedName)"
+new = "    const args = nativeVaultGrantArgs(host) // NON-VACUITY BREAK: restore the default enrollment principal."
+test_file = "packages/opencode/src/tests/native-activation.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/native-activation.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["opencode activation and the empty-vault remedy use the approved principal"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+junit_class = "suites"
+
+[[control]]
 id = "local-bookkeeping-never-nests-pool-lock"
 guards = "A held pool writer must not delay independent runtime bookkeeping."
 file = "packages/core/src/native-account-runtime.ts"
