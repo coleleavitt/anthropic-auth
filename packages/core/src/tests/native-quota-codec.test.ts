@@ -10,6 +10,7 @@ import {
 } from '../accounts.ts'
 import {
   fromNativeQuotaMap,
+  type NativeQuotaMap,
   nativeQuotaCodec,
   nativeQuotaModelScope,
   toNativeQuotaMap,
@@ -454,4 +455,103 @@ test('captured Team poll and response headers survive the production provider pa
     },
   ])
   expect(fromNativeQuotaMap(toNativeQuotaMap(headers))).toEqual(headers)
+})
+
+test('a poll merges shared windows by their clocks without resurrecting cleared poll-only fields', () => {
+  const previous: OAuthQuotaSnapshot = {
+    accountIdentity: 'synthetic-account-A',
+    source: 'poll',
+    checkedAt: 3000,
+    five_hour: { usedPercent: 30, remainingPercent: 70, checkedAt: 1000 },
+    seven_day: { usedPercent: 40, remainingPercent: 60, checkedAt: 3000 },
+    scoped: [
+      {
+        id: 'fable',
+        title: 'Fable',
+        modelName: 'Fable',
+        usedPercent: 50,
+        remainingPercent: 50,
+        checkedAt: 3000,
+      },
+    ],
+  }
+  const incoming: OAuthQuotaSnapshot = {
+    accountIdentity: 'synthetic-account-A',
+    source: 'poll',
+    checkedAt: 2000,
+    five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: 2000 },
+    seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt: 2000 },
+    scoped: [
+      {
+        id: 'fable',
+        title: 'Fable',
+        modelName: 'Fable',
+        usedPercent: 15,
+        remainingPercent: 85,
+        checkedAt: 2000,
+      },
+    ],
+    extraUsage: {
+      used: { amountMinor: 192.25, currency: 'USD', exponent: 2 },
+      limit: { amountMinor: 1000, currency: 'USD', exponent: 2 },
+      exhausted: false,
+      utilizationPercent: 19.225,
+    },
+  }
+  for (const [stored, observation] of [
+    [previous, incoming],
+    [incoming, previous],
+  ] as const) {
+    const merged = fromNativeQuotaMap(
+      nativeQuotaCodec.merge(
+        toNativeQuotaMap(stored),
+        toNativeQuotaMap(observation),
+      ),
+    )
+    expect(merged.checkedAt).toBe(3000)
+    expect(merged.source).toBe('poll')
+    expect(merged.five_hour).toEqual(incoming.five_hour)
+    expect(merged.seven_day).toEqual(previous.seven_day)
+    expect(merged.scoped).toEqual(previous.scoped)
+    expect(merged.extraUsage).toBeUndefined()
+  }
+})
+
+test('the native poll clock survives headers without leaking into public snapshots', () => {
+  const poll = { ...full, source: 'poll' as const, checkedAt: 1000 }
+  const initial = nativeQuotaCodec.merge(
+    undefined,
+    toNativeQuotaMap(poll),
+  ) as NativeQuotaMap
+  expect(initial.anthropic.pollCheckedAt).toBe(1000)
+  const headers: OAuthQuotaSnapshot = {
+    source: 'headers',
+    accountIdentity: poll.accountIdentity,
+    checkedAt: 3000,
+    five_hour: { usedPercent: 12, remainingPercent: 88, checkedAt: 3000 },
+  }
+  const merged = nativeQuotaCodec.merge(
+    initial,
+    toNativeQuotaMap(headers),
+  ) as NativeQuotaMap
+  expect(merged.anthropic.pollCheckedAt).toBe(1000)
+  expect(fromNativeQuotaMap(merged)).not.toHaveProperty('pollCheckedAt')
+  expect(nativeQuotaCodec.validate(merged)).toBe(true)
+  const { pollCheckedAt: _clock, ...legacy } = merged.anthropic
+  expect(nativeQuotaCodec.validate({ ...merged, anthropic: legacy })).toBe(true)
+  expect(
+    nativeQuotaCodec.validate({
+      ...merged,
+      anthropic: { ...merged.anthropic, pollCheckedAt: -1 },
+    }),
+  ).toBe(false)
+  expect(
+    nativeQuotaCodec.validate({
+      ...merged,
+      anthropic: { ...merged.anthropic, pollCheckedAt: '1000' },
+    }),
+  ).toBe(false)
+  expect(() =>
+    toNativeQuotaMap({ ...poll, pollCheckedAt: 1000 } as OAuthQuotaSnapshot),
+  ).toThrow()
 })

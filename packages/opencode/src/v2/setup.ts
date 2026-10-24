@@ -294,7 +294,7 @@ export async function setupAnthropicAuth(
     await cacheKeep?.dispose()
     await source.close()
     await runtime.drainQuotaPublications()
-    runtime.close()
+    await runtime.close()
     throw error
   })
   let cleanup: Promise<void> | undefined
@@ -320,7 +320,7 @@ export async function setupAnthropicAuth(
       // write stops waiting for its file lock after a fixed timeout, so this
       // wait is bounded.
       await runtime.drainQuotaPublications()
-      runtime.close()
+      await runtime.close()
     })()
     return cleanup
   }

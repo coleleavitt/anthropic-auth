@@ -67,7 +67,9 @@ export function nativeRuntimeConnectionFile(
 }
 
 /** A release applies to the runtime entry acquired earlier, not to a later entry created with the same key. */
-export class NativeRuntimeRegistry<T extends { close(): void }> {
+export class NativeRuntimeRegistry<
+  T extends { close(): void | Promise<void> },
+> {
   private readonly entries = new Map<string, { runtime: T; users: number }>()
 
   acquire(key: string, create: () => T) {
@@ -79,17 +81,19 @@ export class NativeRuntimeRegistry<T extends { close(): void }> {
     const owned = entry
     owned.users++
     let closed = false
+    let closing: void | Promise<void>
     return {
       use: (): T => {
         if (closed) throw new NativeCustodyError('closed')
         return owned.runtime
       },
       close: () => {
-        if (closed) return
+        if (closed) return closing
         closed = true
         if (--owned.users !== 0) return
         if (this.entries.get(key) === owned) this.entries.delete(key)
-        owned.runtime.close()
+        closing = owned.runtime.close()
+        return closing
       },
     }
   }

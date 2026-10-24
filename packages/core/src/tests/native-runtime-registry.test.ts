@@ -76,3 +76,24 @@ test('runtime registry removes a retired generation before a reentrant acquisiti
   otherLease.close()
   expect(successorCloses).toBe(1)
 })
+
+test('the last runtime lease returns its asynchronous close drain on repeated release', async () => {
+  const registry = new NativeRuntimeRegistry<{ close(): Promise<void> }>()
+  const drain = gate()
+  let closes = 0
+  const create = () => ({
+    close() {
+      closes++
+      return drain.wait
+    },
+  })
+  const first = registry.acquire('same', create)
+  const last = registry.acquire('same', create)
+  expect(first.close()).toBeUndefined()
+  const closing = last.close()
+  expect(closing).toBe(drain.wait)
+  expect(last.close()).toBe(closing)
+  expect(closes).toBe(1)
+  drain.open()
+  await closing
+})

@@ -302,7 +302,7 @@ export interface NativeVaultRuntime {
     receipt: NativeCustodyReceipt,
     delta?: PrimeUsageDelta,
   ): Promise<boolean>
-  close(): void
+  close(): void | Promise<void>
 }
 
 /** Publish the initial roster from validated account inventory. A caller importing captured state must fence that state through assertOwned, which runs again at the roster's actual publication. */
@@ -660,7 +660,7 @@ export function createNativeVaultRuntime(
       )
       if (shutdown.signal.aborted || !allowed.some(Boolean)) return
       const roster = await runtime.refresh(shutdown.signal)
-      if (shutdown.signal.aborted) return
+      if (shutdown.signal.aborted) return store.close()
       // Watch while vault custody is active; a refresh outside it (the host
       // left the vault) returns no roster, and the watch is closed.
       if (roster) openRosterWatch()
@@ -1257,6 +1257,7 @@ export function createNativeVaultRuntime(
       shutdown.abort(new NativeCustodyError('closed'))
       unwatchAuthority()
       closeCustody()
+      return store.close()
     },
   }
   function currentDisplaySubject(receipt: NativeCustodyReceipt) {
@@ -1610,7 +1611,7 @@ export function acquireNativeVaultRuntime(
 /** Each account lease wraps the shared vault runtime and tracks its own subscriptions, so releasing the lease removes those subscriptions. */
 export function leaseNativeVaultRuntime(
   use: () => NativeVaultRuntime,
-  close: () => void,
+  close: () => void | Promise<void>,
 ): NativeVaultRuntime {
   const watches = new Set<NativeVaultWatch>()
   const quotaObservations = use().quotaObservations
@@ -1653,7 +1654,7 @@ export function leaseNativeVaultRuntime(
     close() {
       for (const watch of watches) watch.close()
       watches.clear()
-      close()
+      return close()
     },
   }
 }

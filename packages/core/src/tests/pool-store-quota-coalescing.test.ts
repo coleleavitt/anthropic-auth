@@ -1,7 +1,5 @@
 // Core's rules for local-pool quota readings, checked through Core's own store
-// wiring (`createNativePoolStore`) with common-auth's opt-in quota coalescer
-// switched on. These run only when the installed common-auth has the coalescer
-// (0.26.0 or later); with the published 0.25.0 they skip.
+// wiring (`createNativePoolStore`) with common-auth's opt-in quota coalescer.
 //
 // The shared rules run twice: with `nativeQuotaCodec`, which production uses, and
 // with common-auth's own `quotaCodec` as a control, to tell a failure of the
@@ -28,7 +26,6 @@ import type { NativePoolStorePaths } from '../pool-store.ts'
 import {
   closeStore,
   coalescingOpens,
-  coalescingSupported,
   credential,
   type Facts,
   headerSnapshot,
@@ -40,7 +37,7 @@ import {
   pollSnapshot,
 } from './pool-store-coalescing-fixture.ts'
 
-const coalescing = test.skipIf(!coalescingSupported)
+const coalescing = test
 const roots: string[] = []
 const open: NativeStore[] = []
 const BINDING_CHANGED = /binding changed/
@@ -65,7 +62,7 @@ async function fixture() {
   )
 }
 
-/** A store that writes every reading at once, as Core opens it today. */
+/** An immediate writer used as an independent control. */
 function plain(paths: NativePoolStorePaths, lane: Lane) {
   return openNativeStore({ paths, quota: lane.codec })
 }
@@ -81,8 +78,7 @@ function coalesced(
     { paths, quota: lane.codec, ...options },
     { drainTimeoutMs },
   )
-  // Confirms this store was opened through the wrapper that adds
-  // `coalesceQuota`, so a test cannot pass against the immediate writer.
+  // Confirms Core opted into coalescing rather than opening an immediate writer.
   expect(coalescingOpens()).toBe(before + 1)
   open.push(store)
   return store
@@ -801,6 +797,62 @@ describe('quota coalescing with native codec', () => {
         overlay: { usedPercent: 51, checkedAt: 1_000 },
         disk: { usedPercent: 51, checkedAt: 1_000 },
       })
+    },
+  )
+})
+
+describe('quota coalescing with native codec', () => {
+  coalescing(
+    'a newer complete poll clears stale Fable and extra usage even after later headers',
+    async () => {
+      const paths = await fixture()
+      await seed(paths, nativeLane, [['a', 'acct-a']])
+      const store = coalesced(paths, nativeLane)
+      const olderPoll = pollSnapshot('acct-a', 1000, {
+        five_hour: 70,
+        seven_day: 40,
+        fable: 100,
+      })
+      await store.recordQuota(
+        'a',
+        epoch1('acct-a'),
+        nativeLane.observe(olderPoll),
+      )
+      await store.recordQuota(
+        'a',
+        epoch1('acct-a'),
+        nativeLane.observe({
+          ...headerSnapshot('acct-a', 2000, { five_hour: 10, seven_day: 20 }),
+          source: 'poll',
+        }),
+      )
+      await closeStore(store)
+      expect(await onDisk(paths, nativeLane, 'a')).toEqual({
+        five_hour: { usedPercent: 10, checkedAt: 2000 },
+        seven_day: { usedPercent: 20, checkedAt: 2000 },
+      })
+      const next = coalesced(paths, nativeLane)
+      await next.recordQuota(
+        'a',
+        epoch1('acct-a'),
+        nativeLane.observe(
+          headerSnapshot('acct-a', 3000, { five_hour: 12, seven_day: 21 }),
+        ),
+      )
+      await closeStore(next)
+      const late = coalesced(paths, nativeLane)
+      await late.recordQuota(
+        'a',
+        epoch1('acct-a'),
+        nativeLane.observe({ ...olderPoll, checkedAt: 1500 }),
+      )
+      const expected = {
+        five_hour: { usedPercent: 12, checkedAt: 3000 },
+        seven_day: { usedPercent: 21, checkedAt: 3000 },
+      }
+      expect(await facts(late, nativeLane, 'a')).toEqual(expected)
+      await closeStore(late)
+      expect(await onDisk(paths, nativeLane, 'a')).toEqual(expected)
     },
   )
 })

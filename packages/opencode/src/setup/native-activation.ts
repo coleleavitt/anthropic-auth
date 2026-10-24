@@ -299,7 +299,7 @@ export async function completeNativeVaultActivation(
       }).enterVault()
     return preflight.priorMode === 'claustrum' ? 'already-vault' : 'committed'
   } finally {
-    runtime.close()
+    await runtime.close()
   }
 }
 

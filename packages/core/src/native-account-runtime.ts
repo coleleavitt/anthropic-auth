@@ -13,7 +13,6 @@ import {
   type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
   type PrimeUsageDelta,
-  quotaSnapshotCheckedAt,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
 } from './accounts.ts'
@@ -57,11 +56,7 @@ import {
   nativeLockObserver,
   observeNativeLocks,
 } from './native-lock-observer.ts'
-import {
-  fromNativeQuotaMap,
-  nativeQuotaCodec,
-  toNativeQuotaMap,
-} from './native-quota-codec.ts'
+import { nativeQuotaCodec, toNativeQuotaMap } from './native-quota-codec.ts'
 import {
   type NativeQuotaObservations,
   nativeLocalQuotaLineage,
@@ -88,6 +83,7 @@ import {
   joinNativePoolWrite,
   NativeTransientAccountError,
 } from './native-transient-account.ts'
+import { createNativeUsagePublisher } from './native-usage-publication.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
@@ -347,8 +343,9 @@ export function acquireNativeAccountRuntime(
     fetchProfileForDisplay: (id, transport, signal) =>
       use().fetchProfileForDisplay(id, transport, signal),
     close: () => {
-      vault.close()
+      const closing = vault.close()
       return Promise.all([
+        closing,
         drainQuotaPublications(),
         drainRoutingPublications(),
       ]).then(() => {})
@@ -413,7 +410,7 @@ export function createNativeAccountRuntime(
   })
   const shutdown = new AbortController()
   let closing: Promise<void> | undefined
-  const quotaPublications = acquireNativeLocalPublisher(paths.config)
+  const quotaPublications = createNativeUsagePublisher('quota')
   const metadataPublications = acquireNativeLocalPublisher(paths.runtime)
   const store = createNativePoolStore({
     paths,
@@ -1546,7 +1543,7 @@ export function createNativeAccountRuntime(
     async publishLocal(subject, rawPatch) {
       const captured = captureNativeMetadataPatch(rawPatch)
       const { quota: _quota, ...metadata } = captured
-      // Enqueue before awaiting admission so close cannot miss an accepted write.
+      // Track writes before awaiting admission so close cannot miss an accepted write.
       // Mixed patches share one exact-credential check for both destinations.
       const mixed =
         captured.quota !== undefined && Object.keys(metadata).length > 0
@@ -1560,41 +1557,32 @@ export function createNativeAccountRuntime(
         })())
       const key = JSON.stringify(subject)
       const writes: Promise<boolean>[] = []
-      if (captured.quota)
-        writes.push(
-          quotaPublications.enqueue(
-            mixed ? `${key}:mixed` : key,
-            { quota: captured.quota },
-            async ({ quota }) => {
-              if (mixed && !(await admitted())) return false
-              if (!quota || (await authority()) !== 'local') return false
-              const row = await poolRow(subject.binding.rowId)
-              if (
-                row?.stamp !== 'bound' ||
-                row.credential?.type !== 'oauth' ||
-                !nativeLocalPoolBindingMatches(subject.binding, paths, row) ||
-                quota.accountIdentity !== subject.binding.identity
-              )
-                return false
-              if (
-                quota.source !== 'headers' &&
-                row.quota &&
-                quotaSnapshotCheckedAt(fromNativeQuotaMap(row.quota)) >
-                  quotaSnapshotCheckedAt(quota)
-              )
-                return false
-              await store.recordQuota(
-                subject.binding.rowId,
-                {
-                  credentialEpoch: subject.binding.credentialEpoch,
-                  identity: subject.binding.identity,
-                },
-                toNativeQuotaMap(quota),
-              )
-              return true
+      if (captured.quota) {
+        const quota = captured.quota
+        const write = (async () => {
+          if (mixed && !(await admitted())) return false
+          if ((await authority()) !== 'local') return false
+          const row = await poolRow(subject.binding.rowId)
+          if (
+            row?.stamp !== 'bound' ||
+            row.credential?.type !== 'oauth' ||
+            !nativeLocalPoolBindingMatches(subject.binding, paths, row) ||
+            quota.accountIdentity !== subject.binding.identity
+          )
+            return false
+          await store.recordQuota(
+            subject.binding.rowId,
+            {
+              credentialEpoch: subject.binding.credentialEpoch,
+              identity: subject.binding.identity,
             },
-          ),
-        )
+            toNativeQuotaMap(quota),
+          )
+          return true
+        })()
+        void quotaPublications.observe(write)
+        writes.push(write)
+      }
       if (Object.keys(metadata).length)
         writes.push(
           metadataPublications.enqueue(
@@ -1801,12 +1789,12 @@ export function createNativeAccountRuntime(
       const draining = runtime.drainQuotaPublications()
       // Release this vault lease synchronously, as callers of the shared
       // registry rely on the last close releasing its consumer immediately.
-      vault.close()
-      closing = Promise.all([draining, vaultRouter.drain()])
+      const vaultClosing = vault.close()
+      closing = Promise.all([draining, vaultRouter.drain(), vaultClosing])
+        .finally(() => Promise.all([store.close(), vaultStore.close()]))
         .then(() => {})
         .finally(() => {
           shutdown.abort(new NativeCustodyError('closed'))
-          quotaPublications.release()
           metadataPublications.release()
         })
       return closing

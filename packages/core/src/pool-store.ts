@@ -57,6 +57,7 @@ export function createNativePoolStore(options: NativePoolStoreOptions) {
     statePath: options.paths.state,
     storeLocks: nativePoolStoreLocks(options.paths),
     requireCredentialStamps: true,
+    coalesceQuota: true,
     quota: options.quota,
     now: options.now,
     onStep: options.onStep,

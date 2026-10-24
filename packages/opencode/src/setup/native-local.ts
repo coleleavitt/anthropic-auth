@@ -342,7 +342,7 @@ export async function migrateNativeLocalForHost(
       await processFence()
       await runtime.loginOAuth({ routeId: 'main', replace: true, ...login })
     } finally {
-      runtime.close()
+      await runtime.close()
     }
   }
   if (options.skipMigration) {

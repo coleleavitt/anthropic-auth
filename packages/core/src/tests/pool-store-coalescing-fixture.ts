@@ -1,12 +1,6 @@
 // Shared by the quota-coalescing store tests and their child processes.
-//
-// common-auth 0.26.0 adds an opt-in quota coalescer (`coalesceQuota` on
-// `openPoolStore`). Core's `createNativePoolStore` does not forward that option
-// yet, so this module wraps `openPoolStore` and adds it only for stores opened
-// through `openNativeStore(..., { coalesce })`. Every other option still comes
-// from Core's real wiring: the native store locks, the refusal of credentials the
-// store did not stamp (`requireCredentialStamps`) and the codec the caller passes. With the published 0.25.0 nothing is wrapped and
-// `coalescingSupported` is false, so the tests that need the coalescer skip.
+// Coalesced stores use Core's production opt-in; the wrapper only supplies a
+// drain bound or disables coalescing for independent on-disk control readers.
 import { mock } from 'bun:test'
 import {
   isQuotaMap,
@@ -27,31 +21,14 @@ const real = { ...storeModule }
 let injected: Record<string, unknown> | undefined
 let wrappedOpens = 0
 
-function supportsCoalescing(): boolean {
-  // Opening a store touches no file; only the returned surface is inspected.
-  const probe = real.openPoolStore({
-    provider: 'anthropic',
-    configPath: '/nonexistent/coalescing-probe/config.json',
-    statePath: '/nonexistent/coalescing-probe/state.json',
-    quota: {
-      validate: () => true,
-      merge: (_stored, observation) => observation,
-    },
-  })
-  return typeof (probe as { close?: unknown }).close === 'function'
-}
-
-export const coalescingSupported = supportsCoalescing()
-
-if (coalescingSupported)
-  mock.module('@cortexkit/common-auth/store', () => ({
-    ...real,
-    openPoolStore: (options: storeModule.OpenPoolStoreOptions) => {
-      if (!injected) return real.openPoolStore(options)
-      wrappedOpens++
-      return real.openPoolStore({ ...options, ...injected } as typeof options)
-    },
-  }))
+mock.module('@cortexkit/common-auth/store', () => ({
+  ...real,
+  openPoolStore: (options: storeModule.OpenPoolStoreOptions) => {
+    const configured = { ...options, ...injected }
+    if (configured.coalesceQuota) wrappedOpens++
+    return real.openPoolStore(configured)
+  },
+}))
 
 // Imported after the wrapper is installed so Core binds to it.
 const { createNativePoolStore } = await import('../pool-store.ts')
@@ -73,12 +50,11 @@ export function openNativeStore(
 ): NativeStore {
   injected = coalesce
     ? {
-        coalesceQuota: true,
         ...(coalesce.drainTimeoutMs !== undefined
           ? { quotaDrainTimeoutMs: coalesce.drainTimeoutMs }
           : {}),
       }
-    : undefined
+    : { coalesceQuota: false }
   try {
     return createNativePoolStore(options)
   } finally {
@@ -86,9 +62,9 @@ export function openNativeStore(
   }
 }
 
-/** `close()` is new in 0.26.0; the published 0.25.0 types do not declare it. */
+/** Drain queued quota readings before removing a fixture's files. */
 export function closeStore(store: NativeStore): Promise<void> {
-  return (store as unknown as { close(): Promise<void> }).close()
+  return store.close()
 }
 
 export const FABLE_ID = 'claude-weekly-scoped-fable'

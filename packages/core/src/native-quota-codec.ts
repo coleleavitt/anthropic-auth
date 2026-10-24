@@ -29,6 +29,8 @@ export type NativeQuotaMetadata = Omit<
   'five_hour' | 'seven_day' | 'scoped'
 > & {
   version: 1
+  /** Poll-owned fields can be older than the latest header-owned window. */
+  pollCheckedAt?: number
   remainingPercent: { five_hour?: number; seven_day?: number }
   scoped?: ScopedMetadata[]
 }
@@ -218,9 +220,14 @@ function scopedMetadata(value: unknown): value is ScopedMetadata {
 function nativeMetadata(value: unknown): value is NativeQuotaMetadata {
   return (
     record(value) &&
-    keys(value, ['version', 'remainingPercent'], ['scoped', ...metadataKeys]) &&
+    keys(
+      value,
+      ['version', 'remainingPercent'],
+      ['scoped', 'pollCheckedAt', ...metadataKeys],
+    ) &&
     value.version === 1 &&
     metadataFields(value) &&
+    optional(value, 'pollCheckedAt', time) &&
     record(value.remainingPercent) &&
     keys(value.remainingPercent, [], ['five_hour', 'seven_day']) &&
     Object.values(value.remainingPercent).every(finite) &&
@@ -364,6 +371,7 @@ export function fromNativeQuotaMap(value: unknown): OAuthQuotaSnapshot {
     version: _version,
     remainingPercent,
     scoped,
+    pollCheckedAt: _pollCheckedAt,
     ...metadata
   } = value.anthropic
   const snapshot: OAuthQuotaSnapshot = structuredClone(metadata)
@@ -401,9 +409,39 @@ export function fromNativeQuotaMap(value: unknown): OAuthQuotaSnapshot {
     })
   }
   // This also rejects extension/map disagreement, unowned limits and budgets.
-  if (!equalJson(toNativeQuotaMap(snapshot), value))
+  const { pollCheckedAt: _pollTime, ...canonicalMetadata } = value.anthropic
+  if (
+    !equalJson(toNativeQuotaMap(snapshot), {
+      ...value,
+      anthropic: canonicalMetadata,
+    })
+  )
     throw new NativeQuotaCodecError()
   return snapshot
+}
+
+function pollTime(map: NativeQuotaMap, snapshot: OAuthQuotaSnapshot) {
+  if (map.anthropic.pollCheckedAt !== undefined)
+    return map.anthropic.pollCheckedAt
+  if (snapshot.source === 'poll')
+    return snapshot.checkedAt ?? quotaSnapshotCheckedAt(snapshot)
+  // Older stored maps have no separate poll clock. Preserve their poll-only
+  // data conservatively until a newer poll supplies an authoritative reading.
+  if (snapshot.scoped?.length || snapshot.extraUsage)
+    return Math.max(
+      ...(snapshot.scoped?.map((window) => window.checkedAt) ?? []),
+      snapshot.checkedAt ?? 0,
+    )
+  return undefined
+}
+
+function withPollTime(
+  snapshot: OAuthQuotaSnapshot,
+  checkedAt: number | undefined,
+) {
+  const map = toNativeQuotaMap(snapshot)
+  if (checkedAt !== undefined) map.anthropic.pollCheckedAt = checkedAt
+  return map
 }
 
 export const nativeQuotaCodec: QuotaCodec = {
@@ -417,23 +455,47 @@ export const nativeQuotaCodec: QuotaCodec = {
   },
   merge(stored, observation) {
     const incoming = fromNativeQuotaMap(observation)
-    if (stored === undefined) return toNativeQuotaMap(incoming)
+    const incomingPollTime = pollTime(observation as NativeQuotaMap, incoming)
+    if (stored === undefined) return withPollTime(incoming, incomingPollTime)
     const previous = fromNativeQuotaMap(stored)
+    const previousPollTime = pollTime(stored as NativeQuotaMap, previous)
     if (previous.accountIdentity !== incoming.accountIdentity)
       throw new NativeQuotaCodecError()
     if (incoming.source === 'headers')
-      return toNativeQuotaMap(
+      return withPollTime(
         mergeHeaderQuotaForPersistence(previous, incoming),
+        previousPollTime,
       )
     const previousTime = quotaSnapshotCheckedAt(previous)
     const incomingTime = quotaSnapshotCheckedAt(incoming)
-    return toNativeQuotaMap(
+    const keepPrevious =
       previousTime > incomingTime ||
-        (previousTime === incomingTime &&
-          previous.source === 'poll' &&
-          incoming.source !== 'poll')
-        ? previous
-        : incoming,
+      (previousTime === incomingTime &&
+        previous.source === 'poll' &&
+        incoming.source !== 'poll')
+    const [older, newer] = keepPrevious
+      ? [incoming, previous]
+      : [previous, incoming]
+    // Header freshness must not discard an older poll's fields, but a newer
+    // complete poll can remove scoped limits or extra usage by omitting them.
+    const merged = { ...older, ...newer }
+    for (const key of ['five_hour', 'seven_day'] as const) {
+      const oldWindow = older[key]
+      const newWindow = newer[key]
+      merged[key] =
+        oldWindow && (!newWindow || oldWindow.checkedAt > newWindow.checkedAt)
+          ? oldWindow
+          : newWindow
+    }
+    const useIncomingPoll =
+      incomingPollTime !== undefined &&
+      (previousPollTime === undefined || incomingPollTime >= previousPollTime)
+    const poll = useIncomingPoll ? incoming : previous
+    merged.scoped = poll.scoped
+    merged.extraUsage = poll.extraUsage
+    return withPollTime(
+      merged,
+      useIncomingPoll ? incomingPollTime : previousPollTime,
     )
   },
 }

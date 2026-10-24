@@ -92,6 +92,25 @@ const runtimes = new Map<
   { contextKey: string; storagePath: string; runtime: PiNativeRuntime }
 >()
 const RUNTIME_LIMIT = 16
+const closingRuntimes = new Map<string, Set<Promise<void>>>()
+
+function closeRuntime(entry: {
+  storagePath: string
+  runtime: PiNativeRuntime
+}) {
+  const closing = entry.runtime.close()
+  const pending =
+    closingRuntimes.get(entry.storagePath) ?? new Set<Promise<void>>()
+  closingRuntimes.set(entry.storagePath, pending)
+  pending.add(closing)
+  void closing.then(
+    () => {
+      pending.delete(closing)
+      if (!pending.size) closingRuntimes.delete(entry.storagePath)
+    },
+    () => {},
+  )
+}
 
 function runtimeCacheKey(storagePath: string) {
   const enrollment = getHostClaustrumEnrollmentPaths('pi')
@@ -463,7 +482,8 @@ export function getPiNativeRuntime(
   while (runtimes.size >= RUNTIME_LIMIT) {
     const oldest = runtimes.keys().next().value
     if (oldest === undefined) break
-    void runtimes.get(oldest)?.runtime.close()
+    const evicted = runtimes.get(oldest)
+    if (evicted) closeRuntime(evicted)
     runtimes.delete(oldest)
   }
   runtimes.set(key, { contextKey, storagePath: resolve(storagePath), runtime })
@@ -473,11 +493,14 @@ export function getPiNativeRuntime(
 export function closePiNativeRuntime(
   storagePath = getPiAccountStoragePath(),
 ): Promise<void> {
-  const closing: Promise<void>[] = []
   for (const [key, entry] of runtimes) {
     if (entry.storagePath !== resolve(storagePath)) continue
     runtimes.delete(key)
-    closing.push(entry.runtime.close())
+    closeRuntime(entry)
   }
-  return Promise.all(closing).then(() => {})
+  // Eviction removes cache entries before their quota drain finishes. Shutdown
+  // must also join those closes, not only the runtimes still in the cache.
+  return Promise.all(closingRuntimes.get(resolve(storagePath)) ?? []).then(
+    () => {},
+  )
 }

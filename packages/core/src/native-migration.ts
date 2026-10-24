@@ -865,6 +865,7 @@ export async function runNativeMigration(
 ): Promise<NativeLegacyMigrationJournal> {
   const paths = { ...input.paths }
   const operation = { ...input, paths, env: { ...input.env } }
+  let closePoolStore: (() => Promise<void>) | undefined
   try {
     return await withLock(
       paths.journal,
@@ -916,20 +917,23 @@ export async function runNativeMigration(
           captured.journal?.kind === 'empty-init' || captured.replaces
             ? undefined
             : captured.journal
-        const store = createNativePoolStore({
-          paths,
-          quota: nativeQuotaCodec,
-          onLockStep: hooks.store?.onLockStep,
-          onStep: async (write, info) => {
-            await hooks.store?.onStep?.(write, info)
-            await step(`${write}:store:${info.operation}`)
-            if (write.startsWith('before-')) {
-              await checkLegacy(captured)
-              await operation.processFence()
-              await assertMigration()
-            }
-          },
-        })
+        const openStore = () =>
+          createNativePoolStore({
+            paths,
+            quota: nativeQuotaCodec,
+            onLockStep: hooks.store?.onLockStep,
+            onStep: async (write, info) => {
+              await hooks.store?.onStep?.(write, info)
+              await step(`${write}:store:${info.operation}`)
+              if (write.startsWith('before-')) {
+                await checkLegacy(captured)
+                await operation.processFence()
+                await assertMigration()
+              }
+            },
+          })
+        let store = openStore()
+        closePoolStore = () => store.close()
         const settingsDigest = async () => {
           const settings = await store.readSettings()
           if (settings.status !== 'ready') refuse('settings-changed')
@@ -1121,6 +1125,10 @@ export async function runNativeMigration(
             await assertMigration()
             await step('after:roster')
           }
+          // Migration proofs must describe committed files, not queued quota.
+          // Reopen after draining so a timed-out drain fails the source check.
+          await store.close()
+          store = openStore()
           const rows = await publicRows(store)
           requireNativeMigrationSourceRows(projection, rows)
           const projected = projectNativeMigrationRuntime(
@@ -1449,6 +1457,10 @@ export async function runNativeMigration(
       refuse('migration-busy')
     throw error
   } finally {
-    if (operation.preflight) preflights.delete(operation.preflight)
+    try {
+      await closePoolStore?.()
+    } finally {
+      if (operation.preflight) preflights.delete(operation.preflight)
+    }
   }
 }

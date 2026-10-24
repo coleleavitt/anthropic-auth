@@ -772,6 +772,7 @@ export function createNativePoolStore(options) {
   const store = realStore(options);
   return new Proxy(store, { get(target, key) {
     if (key === 'read') return async () => { reads++; events.push('read'); return target.read(); };
+    if (key === 'close' || key === 'dispose') return target[key].bind(target);
     forbidden++; throw new Error('Only strict read allowed');
   }});
 }

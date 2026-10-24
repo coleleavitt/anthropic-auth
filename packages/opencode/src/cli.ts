@@ -30,7 +30,7 @@ async function withNativeAccounts<T>(
     await runtime.read()
     return await run(runtime)
   } finally {
-    runtime.close()
+    await runtime.close()
   }
 }
 

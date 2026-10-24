@@ -1568,7 +1568,7 @@ const anthropicAuthPlugin = async (
       [...stickySessionRouters.values()].map((router) => router.drain()),
     )
     await nativeAccounts.drainRoutingPublications()
-    nativeAccounts.close()
+    await nativeAccounts.close()
   }
 
   function assertNativeEnvironment() {

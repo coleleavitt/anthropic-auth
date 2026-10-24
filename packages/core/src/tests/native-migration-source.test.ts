@@ -1,5 +1,9 @@
 import { expect, test } from 'bun:test'
-import { projectNativeMigrationSource } from '../native-migration-source.ts'
+import type { PoolRow } from '@cortexkit/common-auth/store'
+import {
+  projectNativeMigrationSource,
+  requireNativeMigrationSourceRows,
+} from '../native-migration-source.ts'
 import { tokenFingerprint } from '../token-fingerprint.ts'
 
 const hostAuth = {
@@ -10,14 +14,18 @@ const hostAuth = {
     expires: 123,
   },
 }
-function source(config: unknown = {}, state: unknown = {}) {
+function source(
+  config: unknown = {},
+  state: unknown = {},
+  auth: unknown = hostAuth,
+) {
   return projectNativeMigrationSource({
     host: 'opencode',
     storageId: 'a'.repeat(64),
     configDigest: null,
     config,
     state,
-    hostAuth,
+    hostAuth: auth,
   })
 }
 
@@ -371,4 +379,67 @@ test('settings and imported errors exclude token fields and free-form upstream m
   expect(JSON.stringify(projected.accounts)).not.toContain(
     'synthetic-secret-in-message',
   )
+})
+
+test('source row comparison ignores the quota poll clock but detects quota changes', () => {
+  const projection = source(
+    { accounts: [fallbackRow] },
+    { accounts: { one: { quota: validQuota } } },
+    {},
+  )
+  const projected = projection.accounts[0]
+  if (!projected?.credential || !projected.quota)
+    throw new Error('expected projected quota row')
+  expect(projected.quota.anthropic).not.toHaveProperty('pollCheckedAt')
+  const actual: PoolRow = {
+    id: projected.id,
+    type: projected.credential.type,
+    enabled: projected.enabled,
+    ...(projected.identity !== undefined
+      ? { identity: projected.identity }
+      : {}),
+    credential: projected.credential,
+    credentialEpoch: 1,
+    hasEntry: true,
+    candidate: true,
+    needsFirstReading: false,
+    stamp: 'bound',
+    quota: {
+      ...projected.quota,
+      anthropic: { ...projected.quota.anthropic, pollCheckedAt: 101 },
+    },
+  }
+  expect(() =>
+    requireNativeMigrationSourceRows(projection, [actual]),
+  ).not.toThrow()
+  const changedQuota = source(
+    { accounts: [fallbackRow] },
+    {
+      accounts: {
+        one: {
+          quota: {
+            ...validQuota,
+            five_hour: {
+              ...validQuota.five_hour,
+              usedPercent: 21,
+              remainingPercent: 79,
+            },
+          },
+        },
+      },
+    },
+    {},
+  ).accounts[0]?.quota
+  if (!changedQuota) throw new Error('expected changed projected quota')
+  expect(() =>
+    requireNativeMigrationSourceRows(projection, [
+      {
+        ...actual,
+        quota: {
+          ...changedQuota,
+          anthropic: { ...changedQuota.anthropic, pollCheckedAt: 101 },
+        },
+      },
+    ]),
+  ).toThrow('cannot be imported')
 })

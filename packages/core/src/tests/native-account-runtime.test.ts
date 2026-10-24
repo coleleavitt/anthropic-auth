@@ -95,7 +95,7 @@ test('local bookkeeping refuses an account replaced immediately before runtime r
   ).toBeFalsy()
 })
 
-test('local quota mailbox merges poll-owned fields and keeps observation order and newest lastUsed', async () => {
+test('local quota coalescer merges poll-owned fields and keeps observation order and newest lastUsed', async () => {
   const f = await fixture()
   const subject = await localSubject(f)
   const poll = {
@@ -137,7 +137,7 @@ test('local quota mailbox merges poll-owned fields and keeps observation order a
     await f.runtime.publishLocal(subject, {
       quota: { ...poll, checkedAt: now + 1 },
     }),
-  ).toBe(false)
+  ).toBe(true)
   expect(
     await f.runtime.publishLocal(subject, {
       quota: {
@@ -182,7 +182,13 @@ test('local quota mailbox merges poll-owned fields and keeps observation order a
         quota: { ...poll, checkedAt: now + 4 },
       }),
     ]),
-  ).toEqual([true, false])
+  ).toEqual([true, true])
+  // Older polls are accepted; the codec keeps newer windows while adding any
+  // poll-only fields instead of refusing the whole reading.
+  expect((await f.runtime.read()).accounts[0]?.quota?.five_hour).toEqual({
+    ...header.five_hour,
+    checkedAt: now + 5,
+  })
   const scoped = poll.scoped.map((window) => ({
     ...window,
     checkedAt: now + 20,
@@ -211,7 +217,7 @@ test('local quota mailbox merges poll-owned fields and keeps observation order a
   })
 })
 
-test('local mailboxes share destinations across runtime handles and acquired close drains both stores', async () => {
+test('local runtime metadata combines across handles and each close drains its pool store', async () => {
   const locks: string[] = []
   const onLockEvent = (event: { type: string; name: string }) => {
     if (event.type === 'acquired') locks.push(event.name)
@@ -237,12 +243,19 @@ test('local mailboxes share destinations across runtime handles and acquired clo
     peer.publishLocal(subject, { quota, lastUsed: now + 1 }),
   ]
   await peer.close()
-  expect((await f.runtime.read()).accounts[0]).toMatchObject({
+  await f.runtime.close()
+  const reader = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    vault: { env: f.env },
+  })
+  deferCleanup(() => reader.close())
+  expect((await reader.read()).accounts[0]).toMatchObject({
     lastUsed: now + 1,
     quota: { five_hour: { remainingPercent: 80 } },
   })
   expect(await Promise.all(writes)).toEqual([true, true])
-  expect(locks.filter((name) => name === 'pool-config')).toHaveLength(1)
+  expect(locks.filter((name) => name === 'pool-config')).toHaveLength(2)
   expect(locks.filter((name) => name === 'native-runtime')).toHaveLength(1)
 })
 

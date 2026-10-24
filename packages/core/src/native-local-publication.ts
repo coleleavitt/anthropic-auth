@@ -1,10 +1,4 @@
-import { quotaSnapshotCheckedAt } from './accounts.ts'
 import type { NativeAccountMetadataPatch } from './native-account-view.ts'
-import {
-  fromNativeQuotaMap,
-  nativeQuotaCodec,
-  toNativeQuotaMap,
-} from './native-quota-codec.ts'
 
 const publishers = new Map<
   string,
@@ -54,22 +48,7 @@ function createPublisher() {
       const queued = pending.get(key)
       if (queued) {
         const previous = queued.patch
-        if (
-          previous.quota &&
-          patch.quota &&
-          patch.quota.source !== 'headers' &&
-          quotaSnapshotCheckedAt(previous.quota) >
-            quotaSnapshotCheckedAt(patch.quota)
-        )
-          return Promise.resolve(false)
         queued.patch = { ...previous, ...patch }
-        if (previous.quota && patch.quota)
-          queued.patch.quota = fromNativeQuotaMap(
-            nativeQuotaCodec.merge(
-              toNativeQuotaMap(previous.quota),
-              toNativeQuotaMap(patch.quota),
-            ),
-          )
         if (previous.lastUsed !== undefined || patch.lastUsed !== undefined)
           queued.patch.lastUsed = Math.max(
             previous.lastUsed ?? 0,
@@ -96,7 +75,8 @@ function createPublisher() {
       const batch = { patch, result: Promise.resolve(false) }
       pending.set(key, batch)
       batch.result = run(async () => {
-        // Let headers and attempt-end timestamps from this turn share a write.
+        // Wait one event-loop turn so runtime metadata updates for the same
+        // account can join the pending write.
         await new Promise<void>((resolve) => setTimeout(resolve, 0))
         pending.delete(key)
         return write(batch.patch)
