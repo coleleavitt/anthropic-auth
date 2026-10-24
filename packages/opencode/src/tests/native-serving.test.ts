@@ -40,6 +40,7 @@ import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $ } from 'bun'
 import {
+  fromNativeQuotaMap,
   nativeQuotaCodec,
   toNativeQuotaMap,
 } from '../../../core/src/native-quota-codec.ts'
@@ -971,6 +972,20 @@ for (const concurrency of [4, 8]) {
     await Promise.all(responses.map((response) => response.text()))
     expect(responses.every((response) => response.status === 200)).toBe(true)
     await plugin.dispose?.()
+    // Read through a fresh store so an in-memory quota reading cannot mask a
+    // write that has not reached disk.
+    const diskStore = createNativePoolStore({
+      paths: fixture.paths,
+      quota: nativeQuotaCodec,
+    })
+    lifetimes.deferCleanup(() => diskStore.close())
+    const disk = await diskStore.read()
+    if (disk.status !== 'ready')
+      throw new Error('Expected a ready pool after disposal')
+    const diskQuota = disk.rows.find(
+      (row) => row.identity === mainIdentity,
+    )?.quota
+    expect(fromNativeQuotaMap(diskQuota).five_hour?.remainingPercent).toBe(75)
     const runtime = createNativeAccountRuntime({
       paths: fixture.paths,
       host: 'opencode',
@@ -1297,6 +1312,9 @@ for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
     })
     await runtime.read()
     await runtime.drainRoutingPublications()
+    // The pool accepts quota before it reaches disk. Finish the seed runtime's
+    // drain before measuring a healthy request in an independent runtime.
+    await runtime.close()
     network.mockImplementation((input, init) => {
       const url = input instanceof Request ? input.url : input.toString()
       if (url.includes('/v1/messages')) probe.dispatch()

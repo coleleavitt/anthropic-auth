@@ -168,6 +168,7 @@ export interface NativeAccountRuntime {
   readonly onLockEvent?: (event: NativeLockEvent) => void
   readonly vault: NativeVaultRuntime
   readonly quotaObservations: NativeQuotaObservations
+  /** Waits for pending quota observations, quota submissions, and runtime metadata writes. An accepted pool quota update may not yet be on disk; close() drains the pool's pending quota writes. */
   drainQuotaPublications(): Promise<void>
   drainRoutingPublications(): Promise<void>
   /** Fresh private relay authorization for transport only; never include it in a status snapshot. */
