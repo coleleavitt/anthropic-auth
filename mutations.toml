@@ -636,6 +636,39 @@ broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
 
 [[control]]
+id = "sticky-quota-seven-day-always-migrate"
+guards = "An exhausted seven-day window with a known reset within fifteen minutes must hold instead of migrating immediately."
+file = "packages/core/src/sticky-routing.ts"
+old = "    const resetAt = window.resetsAt ? Date.parse(window.resetsAt) : NaN"
+new = """    if (reason === 'seven-day') return { action: 'migrate', reason } // NON-VACUITY BREAK: migrate on seven-day exhaustion without checking its reset.
+    const resetAt = window.resetsAt ? Date.parse(window.resetsAt) : NaN"""
+test_file = "packages/core/src/tests/sticky-quota-failure.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/sticky-quota-failure.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["sticky quota hold > seven-day holds within fifteen minutes including the boundary"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "sticky-quota-drop-latest-reset-keep-first"
+guards = "The latest reset among exhausted windows blocking the requested model must determine whether to hold and how long to wait."
+file = "packages/core/src/sticky-routing.ts"
+old = "    if (!blocking || resetAt > blocking.resetAt) blocking = { resetAt, reason }"
+new = "    if (!blocking) blocking = { resetAt, reason } // NON-VACUITY BREAK: keep the first reset instead of the latest."
+test_file = "packages/core/src/tests/sticky-quota-failure.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/sticky-quota-failure.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["sticky quota hold > uses the latest blocking reset for both the hold and its duration"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
 id = "pi-auth-slot-uses-sdk-directory"
 guards = "Offline vault setup protects Pi's actual auth file, not an extension-only directory override."
 file = "packages/opencode/src/setup/paths.ts"
