@@ -29,7 +29,7 @@ Guidance for future audits of intentional tradeoffs in this repository.
 ## Sticky-balanced routing
 
 - **Session affinity intentionally outranks moment-to-moment quota ranking.** Once assigned, a session remains on its OAuth account across transient transport/provider/quota-probe failures and relative quota changes so its large prompt cache is not rewritten on another account.
-- **A confirmed five-hour exhaustion does not migrate when reset is within 15 minutes.** The route returns `Retry-After` and remains assigned; longer 5h exhaustion, 7d/model-scoped exhaustion, killswitch blocks, removed/disabled accounts, and permanent re-login failures may migrate.
+- **OpenCode 1 and Pi hold when all exhausted windows blocking the requested model reset within 15 minutes.** Five-hour, seven-day and the requested model's scoped window are treated alike: every exhausted blocking window must have a known future reset, and the latest reset determines the wait, with deterministic session jitter. Another model's scope does not count. OpenCode 1 returns `Retry-After`; Pi emits an error event. Unknown, invalid or past resets, longer waits, killswitch blocks, removed/disabled accounts, and permanent re-login failures may migrate. OpenCode 2 does not implement the hold yet and can reroute instead.
 - **API-key routes are not candidates for quota-balanced first assignment.** Their existing confirmed-main-exhaustion gate remains authoritative.
 
 ## CI test-count floor gate

@@ -9220,7 +9220,7 @@ const anthropicAuthPlugin = async (
                               error: {
                                 type: 'rate_limit_error',
                                 message:
-                                  'Sticky OAuth account five-hour quota resets shortly; retaining session affinity.',
+                                  'Sticky OAuth account quota resets shortly; retaining session affinity.',
                               },
                             }),
                             {

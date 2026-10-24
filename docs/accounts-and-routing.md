@@ -36,6 +36,8 @@ OAuth login must resolve a verified Claude account UUID. Credentials and refresh
 
 Change mode in `/claude` → **Routing**. **Reset routing session** clears the current session's pin; it does not remove accounts. Pins are quota-aware session-affinity hints, not credentials. Changing the selected model can require a fresh assignment. Model-specific exhaustion can move among OAuth accounts, but paid API-key fallback requires confirmed general OAuth exhaustion, not just an exhausted model-specific limit or a display percentage rounded up to 100%.
 
+In OpenCode 1 and Pi, sticky-balanced waits on the assigned account when all exhausted windows blocking the requested model have known future resets and the latest reset is within 15 minutes. This includes five-hour, seven-day and matching model-scoped limits, but not another model's scope. The wait uses the latest reset plus deterministic session jitter; OpenCode 1 returns `Retry-After` and Pi emits an error event. An unknown, invalid or past reset on any exhausted blocking window, or a latest reset beyond 15 minutes, allows migration. OpenCode 2 does not implement this hold yet and can reroute instead.
+
 ## Quota and limits
 
 Quota shows five-hour, seven-day and model-scoped windows when available. OpenCode's **Refresh quota** action requests fresh readings; Pi shows the summary without a refresh action. Passive response headers and quota API polling have different coverage: headers can update standard windows without supplying model-scoped limits.

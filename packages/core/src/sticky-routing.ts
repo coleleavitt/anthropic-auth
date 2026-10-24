@@ -86,7 +86,10 @@ export type StickyQuotaFailureDecision =
   | { action: 'retain'; reason: 'not-exhausted' | 'unknown' }
   | {
       action: 'hold'
-      reason: 'five-hour-short-reset'
+      reason:
+        | 'five-hour-short-reset'
+        | 'seven-day-short-reset'
+        | 'model-scoped-short-reset'
       retryAfterSeconds: number
     }
   | {
@@ -488,43 +491,38 @@ export function decideStickyQuotaFailure(input: {
   const now = input.now ?? Date.now()
   const quota = knownQuota(input.quota)
   if (!quota) return { action: 'retain', reason: 'unknown' }
-  const scoped = getScopedQuotaWindowForModel(quota, input.modelId)
-  if (
-    scoped &&
-    Number.isFinite(scoped.remainingPercent) &&
-    scoped.remainingPercent <= 0
-  ) {
-    return { action: 'migrate', reason: 'model-scoped' }
-  }
-  const sevenDay = quota.seven_day
-  if (
-    sevenDay &&
-    Number.isFinite(sevenDay.remainingPercent) &&
-    sevenDay.remainingPercent <= 0
-  ) {
-    return { action: 'migrate', reason: 'seven-day' }
-  }
-  const fiveHour = quota.five_hour
-  if (
-    fiveHour &&
-    Number.isFinite(fiveHour.remainingPercent) &&
-    fiveHour.remainingPercent <= 0
-  ) {
-    const resetAt = fiveHour.resetsAt ? Date.parse(fiveHour.resetsAt) : NaN
+  let blocking:
+    | { resetAt: number; reason: 'five-hour' | 'seven-day' | 'model-scoped' }
+    | undefined
+  for (const [reason, window] of [
+    ['model-scoped', getScopedQuotaWindowForModel(quota, input.modelId)],
+    ['seven-day', quota.seven_day],
+    ['five-hour', quota.five_hour],
+  ] as const) {
     if (
-      Number.isFinite(resetAt) &&
-      resetAt > now &&
-      resetAt - now <= STICKY_ROUTING_SHORT_RESET_GRACE_MS
-    ) {
-      return {
-        action: 'hold',
-        reason: 'five-hour-short-reset',
-        retryAfterSeconds: Math.max(1, Math.ceil((resetAt - now) / 1000)),
-      }
-    }
-    return { action: 'migrate', reason: 'five-hour' }
+      !window ||
+      !Number.isFinite(window.remainingPercent) ||
+      window.remainingPercent > 0
+    )
+      continue
+    const resetAt = window.resetsAt ? Date.parse(window.resetsAt) : NaN
+    if (!Number.isFinite(resetAt) || resetAt <= now)
+      return { action: 'migrate', reason }
+    // A request can resume only after every exhausted window blocking its model resets.
+    if (!blocking || resetAt > blocking.resetAt) blocking = { resetAt, reason }
   }
-  return { action: 'retain', reason: 'not-exhausted' }
+  if (!blocking) return { action: 'retain', reason: 'not-exhausted' }
+  if (blocking.resetAt - now <= STICKY_ROUTING_SHORT_RESET_GRACE_MS) {
+    return {
+      action: 'hold',
+      reason: `${blocking.reason}-short-reset`,
+      retryAfterSeconds: Math.max(
+        1,
+        Math.ceil((blocking.resetAt - now) / 1000),
+      ),
+    }
+  }
+  return { action: 'migrate', reason: blocking.reason }
 }
 
 export function getStickyRoutingStatePath(accountStoragePath: string) {
