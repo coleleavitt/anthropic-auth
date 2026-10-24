@@ -37,7 +37,7 @@ Pi setup requires explicit stored-login consent. A missing stash or conflicting 
 
 The `/claude` menu manages the plugin's account pool. Adding an account there and refreshing its quota do not select the plugin as OpenCode's Anthropic connection. A separate built-in OAuth or API-key connection can still be handling model requests, including their retries and final **Session failed** error.
 
-1. Run `opencode auth login anthropic --method native-claude-oauth` and complete the browser sign-in. In the TUI, select **Claude Pro / Max (native account pool)** under Anthropic; use **Add account** if a connection already exists.
+1. In OpenCode, run `/connect`, then choose Anthropic → **Claude Pro / Max (native account pool)** and complete the browser sign-in; from a terminal, run `opencode auth login anthropic --method native-claude-oauth`. If Anthropic is already connected, `/connect` → Anthropic opens its account list: make sure the plugin's connection is the active Anthropic account. Running the pool login again replaces the pool's main account.
 2. Select an `anthropic/` model and send a short message.
 3. Open `/claude` → **Accounts** → **View status** to check the main and fallback accounts. If a request still fails, check quota and the actual provider error. HTTP 429 can also mean a real provider rate limit; reconnecting does not bypass one.
 

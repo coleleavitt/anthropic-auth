@@ -14,15 +14,15 @@ Without `--login`, generation-2-only local setup registers the main OpenCode con
 
 Setup initializes storage; model access requires a separate connection step:
 
-1. Start OpenCode's registered pool login:
+1. Start OpenCode's registered pool login. In OpenCode, run `/connect`, then choose Anthropic → **Claude Pro / Max (native account pool)**. From a terminal, the same login is:
 
    ```sh
    opencode auth login anthropic --method native-claude-oauth
    ```
 
-   In the TUI, choose Anthropic's **Claude Pro / Max (native account pool)** login method. If Anthropic is already connected, use **Add account** to choose this method.
+   If Anthropic is already connected, `/connect` → Anthropic opens its account list. Add the pool login there and make sure the plugin's connection is the active Anthropic account.
 
-2. Complete the browser sign-in and paste the returned code. This saves the account as the pool's main account and creates OpenCode's plugin connection.
+2. Complete the browser sign-in and paste the returned code. This saves the account as the pool's main account and creates OpenCode's plugin connection. Running the pool login again replaces the main account, so add other accounts through `/claude` instead.
 3. Select an `anthropic/` model and send a short message to verify model access.
 4. Add other subscription accounts through `/claude` → **Accounts** → **Start OAuth sign-in**, then **Finish OAuth sign-in**. Use **View status** to see the main account, fallbacks, and enabled/disabled states.
 

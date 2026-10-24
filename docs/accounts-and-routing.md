@@ -26,14 +26,6 @@ Use `/claude` → **Accounts** to start and finish OAuth sign-in, add an API-key
 
 OAuth login must resolve a verified Claude account UUID. Credentials and refresh operations stay in the native runtime; the host's inert marker is never a credential. Re-login an account with a permanent `invalid_grant` failure rather than copying tokens between stores. The plugin never uses a separate OpenCode 1 login's access or refresh tokens.
 
-To inspect OpenCode's account list without opening credential state, run:
-
-```sh
-jq '{mainAccountId, accounts: [.accounts[] | {id, label, type, enabled: (.enabled != false)}]}' ~/.config/opencode/anthropic-auth-pool.json
-```
-
-Use the configured storage directory if you override the default. `mainAccountId` names the stored main row; the menu displays that row as route `main`. An unlabeled or disabled row can still be designated main. Do not delete it from the JSON array or copy tokens between rows: use account management so the account list, credentials, and runtime metadata stay consistent. Keep `anthropic-auth-pool-state.json` private; it contains access and refresh tokens.
-
 ## Routing modes
 
 | Mode | Policy |

@@ -2,6 +2,10 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- OpenCode 2: finishing an OAuth sign-in from `/claude` → Accounts no longer fails with "Action failed"; the Accounts menu explains how to connect OpenCode when no main account exists. Thanks to @colinmollenhour. Addresses #464.
+
 ## 2.2.6
 
 - Local mode no longer drops quota and last-used updates when several Claude requests run at once in one OpenCode process: each save takes only the lock it needs, saves for the same account are combined, and on OpenCode 2 the next request uses the newest quota reading straight away. Addresses #461.
