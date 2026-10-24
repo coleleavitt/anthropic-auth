@@ -2,12 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.2.7
 
-- In sticky-balanced mode on OpenCode 1 and Pi, a session now waits on its account when whichever quota window blocks it resets within 15 minutes, including 7-day and model limits, instead of moving and rebuilding its cache. OpenCode 2 does not hold yet.
-
-- Addresses #471 (vault grant principal)
 - OpenCode 2: finishing an OAuth sign-in from `/claude` → Accounts no longer fails with "Action failed"; the Accounts menu explains how to connect OpenCode when no main account exists. Thanks to @colinmollenhour. Addresses #464.
+- When a relay request fell back to a direct send and that direct send failed after going out, the plugin could send the same request a second time. The direct fallback now runs at most once per request, and its failure goes to OpenCode or Pi, which retry as usual.
+- Vault setup now grants read access to the name the vault approved for this installation, not always the default name, and the printed `ck auth grant` command uses that name too. Addresses #471.
+- In sticky-balanced mode on OpenCode 1 and Pi, a session now waits on its account when whichever quota window blocks it resets within 15 minutes, including 7-day and model limits, instead of moving and rebuilding its cache. OpenCode 2 does not hold yet.
 
 ## 2.2.6
 
