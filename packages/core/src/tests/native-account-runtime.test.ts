@@ -2120,6 +2120,39 @@ test('OAuth login validates fresh identity before replacing the pool credential'
   })
 })
 
+test('OAuth login stores only the token fields under the oauth type', async () => {
+  const f = await fixture()
+  // A token-exchange result has its own `type` and may carry other fields.
+  // Neither may reach the stored credential.
+  const exchanged = {
+    type: 'success',
+    access: 'sk-ant-oat01-exchange-result-access',
+    refresh: 'exchange-result-refresh',
+    expires: now + 18_000_000,
+    extra: 'exchange-result-extra-field',
+  }
+  const account = await f.runtime.loginOAuth({
+    routeId: 'exchange-result-route',
+    label: 'Exchange result',
+    credential: exchanged,
+  })
+  expect(account).toMatchObject({ type: 'oauth', label: 'Exchange result' })
+  const saved = await f.store.read()
+  if (saved.status !== 'ready') throw new Error('Login pool was not readable')
+  const row = saved.rows.find((row) => row.id === account.binding?.rowId)
+  expect(row?.credential).toMatchObject({
+    type: 'oauth',
+    access: 'sk-ant-oat01-exchange-result-access',
+    refresh: 'exchange-result-refresh',
+    expires: now + 18_000_000,
+  })
+  expect(row?.credential).not.toHaveProperty('extra')
+  const files = await Promise.all(
+    [f.paths.config, f.paths.state].map((path) => readFile(path, 'utf8')),
+  )
+  expect(files.join('\n')).not.toContain('exchange-result-extra-field')
+})
+
 async function loginStoredBytes(
   paths: Awaited<ReturnType<typeof fixture>>['paths'],
 ) {

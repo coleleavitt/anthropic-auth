@@ -1296,11 +1296,16 @@ export function createNativeAccountRuntime(
       }
       // Verify the exchanged token before replacing any stored credential.
       // putAccount checks authority and custody again after the lookup awaits.
+      // Copy only the three token fields: callers often hold a token-exchange
+      // result that carries its own `type` (such as 'success') or other
+      // fields, and spreading it would override the 'oauth' type or store
+      // fields the pool does not define.
+      const { access, refresh, expires } = input.credential
       return runtime.putAccount({
         ...input,
         accountIdentity,
         replace: input.replace ?? true,
-        credential: { type: 'oauth', ...input.credential },
+        credential: { type: 'oauth', access, refresh, expires },
       })
     },
     async putAccount(input) {
