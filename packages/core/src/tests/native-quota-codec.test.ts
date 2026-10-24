@@ -555,3 +555,64 @@ test('the native poll clock survives headers without leaking into public snapsho
     toNativeQuotaMap({ ...poll, pollCheckedAt: 1000 } as OAuthQuotaSnapshot),
   ).toThrow()
 })
+
+test('legacy encoding cannot distinguish which empty poll preceded the same header', () => {
+  const emptyPoll = (checkedAt: number) =>
+    toNativeQuotaMap({
+      accountIdentity: 'synthetic-account-A',
+      source: 'poll',
+      checkedAt,
+      five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
+      seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt },
+      scoped: [],
+    })
+  const headers = toNativeQuotaMap({
+    accountIdentity: 'synthetic-account-A',
+    source: 'headers',
+    checkedAt: 2000,
+    five_hour: { usedPercent: 12, remainingPercent: 88, checkedAt: 2000 },
+    seven_day: { usedPercent: 21, remainingPercent: 79, checkedAt: 2000 },
+  })
+  const history = (pollAt: number) =>
+    nativeQuotaCodec.merge(
+      nativeQuotaCodec.merge(undefined, emptyPoll(pollAt)),
+      headers,
+    ) as NativeQuotaMap
+  const first = history(1000)
+  const second = history(1500)
+  const legacy = (map: NativeQuotaMap) => {
+    const { pollCheckedAt: _clock, ...anthropic } = map.anthropic
+    return { ...map, anthropic }
+  }
+  // Headers replace the snapshot and shared-window clocks. An empty poll has
+  // no scoped-window clock, and fieldSources stores labels rather than times.
+  expect(legacy(first)).toEqual(legacy(second))
+  expect(first.anthropic.source).toBe('headers')
+  expect(first.anthropic.checkedAt).toBe(2000)
+  const latePoll = toNativeQuotaMap({
+    accountIdentity: 'synthetic-account-A',
+    source: 'poll',
+    checkedAt: 1200,
+    five_hour: { usedPercent: 30, remainingPercent: 70, checkedAt: 1200 },
+    seven_day: { usedPercent: 40, remainingPercent: 60, checkedAt: 1200 },
+    scoped: [
+      {
+        id: 'fable',
+        title: 'Fable',
+        modelName: 'Fable',
+        checkedAt: 1200,
+        usedPercent: 50,
+        remainingPercent: 50,
+      },
+    ],
+    extraUsage: full.extraUsage,
+  })
+  const afterFirst = fromNativeQuotaMap(nativeQuotaCodec.merge(first, latePoll))
+  const afterSecond = fromNativeQuotaMap(
+    nativeQuotaCodec.merge(second, latePoll),
+  )
+  expect(afterFirst.scoped?.map((window) => window.id)).toEqual(['fable'])
+  expect(afterFirst.extraUsage).toBeDefined()
+  expect(afterSecond.scoped).toEqual([])
+  expect(afterSecond.extraUsage).toBeUndefined()
+})
