@@ -19265,31 +19265,56 @@ describe('auth.loader', () => {
         }),
       )
       const records: LogTestRecord[] = []
+      const affinity = 'quota-relay-direct-fallback'
+      // A marker in this request's body tells its own sends apart from any
+      // other request that reaches the mock. When an earlier test overruns
+      // Bun's timeouts, its body and its teardown keep running into this test:
+      // its own model request can arrive here, and its teardown can re-enable
+      // profile hydration, which sends GET /api/oauth/profile. Counting those
+      // would report a duplicate send that this request never made.
+      const probe = 'relay-direct-fallback-probe'
       let relay503Calls = 0
       let directCalls = 0
       __setLogTestSink((record) => records.push(record))
       globalThis.fetch = mock(
-        withNativeAdmission((input: string | URL | Request) => {
-          const url = extractUrl(input)
-          if (url === 'https://relay.example.test/') {
-            relay503Calls += 1
-            return Promise.resolve(
-              new Response('relay unavailable', { status: 503 }),
-            )
-          }
-          directCalls += 1
-          return Promise.resolve(
-            new Response('direct', { headers: quotaHeaders }),
-          )
-        }),
+        withNativeAdmission(
+          (input: string | URL | Request, init?: RequestInit) => {
+            const url = extractUrl(input)
+            const body = typeof init?.body === 'string' ? init.body : ''
+            if (url === 'https://relay.example.test/') {
+              let relayAffinity: unknown
+              try {
+                relayAffinity = JSON.parse(body).affinity
+              } catch {}
+              if (relayAffinity === affinity) relay503Calls += 1
+              return Promise.resolve(
+                new Response('relay unavailable', { status: 503 }),
+              )
+            }
+            if (
+              url.startsWith(MESSAGES_URL) &&
+              init?.method === 'POST' &&
+              body.includes(probe)
+            ) {
+              directCalls += 1
+              return Promise.resolve(
+                new Response('direct', { headers: quotaHeaders }),
+              )
+            }
+            return Promise.resolve(new Response('unrelated', { status: 404 }))
+          },
+        ),
       ) as unknown as typeof fetch
       const result = await loadFetch()
       setLogLevel('debug')
 
       try {
         const response = await result.fetch(MESSAGES_URL, {
-          ...EMPTY_POST,
-          headers: { 'x-session-affinity': 'quota-relay-direct-fallback' },
+          method: 'POST',
+          body: JSON.stringify({
+            messages: [{ role: 'user', content: probe }],
+          }),
+          headers: { 'x-session-affinity': affinity },
         })
         expect(await response.text()).toBe('direct')
         expect(relay503Calls).toBe(1)
