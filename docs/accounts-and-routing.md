@@ -20,9 +20,19 @@ For empty-init authority, the local routing destination is `OPENCODE_ANTHROPIC_A
 
 ## Adding and managing accounts
 
+For OpenCode 2, [connect the main account through the registered provider login](opencode-2.md#empty-initialization) before adding other accounts. `/claude` → **Accounts** manages the pool; it does not change which Anthropic connection OpenCode uses for model requests. **View status** shows the main account and each fallback's enabled/disabled state.
+
 Use `/claude` → **Accounts** to start and finish OAuth sign-in, add an API-key fallback, enable/disable, reorder, remove or reset backoff. Local changes refuse while enrolled in the vault. The [OpenCode CLI](commands.md#opencode-cli) also offers `login`, `api add` and `list` for OpenCode local custody only.
 
 OAuth login must resolve a verified Claude account UUID. Credentials and refresh operations stay in the native runtime; the host's inert marker is never a credential. Re-login an account with a permanent `invalid_grant` failure rather than copying tokens between stores. The plugin never uses a separate OpenCode 1 login's access or refresh tokens.
+
+To inspect OpenCode's account list without opening credential state, run:
+
+```sh
+jq '{mainAccountId, accounts: [.accounts[] | {id, label, type, enabled: (.enabled != false)}]}' ~/.config/opencode/anthropic-auth-pool.json
+```
+
+Use the configured storage directory if you override the default. `mainAccountId` names the stored main row; the menu displays that row as route `main`. An unlabeled or disabled row can still be designated main. Do not delete it from the JSON array or copy tokens between rows: use account management so the account list, credentials, and runtime metadata stay consistent. Keep `anthropic-auth-pool-state.json` private; it contains access and refresh tokens.
 
 ## Routing modes
 

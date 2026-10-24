@@ -33,6 +33,18 @@ Pi setup requires explicit stored-login consent. A missing stash or conflicting 
 
 ## Requests and diagnostics
 
+### Quota refresh works but Anthropic model requests fail in OpenCode 2
+
+The `/claude` menu manages the plugin's account pool. Adding an account there and refreshing its quota do not select the plugin as OpenCode's Anthropic connection. A separate built-in OAuth or API-key connection can still be handling model requests, including their retries and final **Session failed** error.
+
+1. Run `opencode auth login anthropic --method native-claude-oauth` and complete the browser sign-in. In the TUI, select **Claude Pro / Max (native account pool)** under Anthropic; use **Add account** if a connection already exists.
+2. Select an `anthropic/` model and send a short message.
+3. Open `/claude` → **Accounts** → **View status** to check the main and fallback accounts. If a request still fails, check quota and the actual provider error. HTTP 429 can also mean a real provider rate limit; reconnecting does not bypass one.
+
+For a fresh installation, complete the [main-account connection](opencode-2.md#empty-initialization) before adding fallback accounts.
+
+### Other request failures
+
 Check `/claude` for custody, account, routing and quota status first. Unknown quota, positive remaining-quota floors and model-scoped exhaustion can block an account even when it has a token. Resetting a session pin is not a way to bypass limits.
 
 For transport failures, inspect the [relay log](transports.md#diagnostics-and-dumps); direct fallback is not relay success. OpenCode 2 cannot use WebSocket relay. Enable dumps only for a bounded investigation, and redact prompts, tool content and credentials before sharing them. Silence in debug-only cache records does not prove no traffic. Never investigate by running tests or setup against a live user database or live credentials.

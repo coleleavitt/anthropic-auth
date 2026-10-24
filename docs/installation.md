@@ -31,7 +31,7 @@ A real run checks all selected hosts before the first host writes, including con
 ## After setup
 
 - OpenCode 1: open `/claude`, then **Accounts** to manage the native pool.
-- OpenCode 2: In OpenCode, sign in to Anthropic with "Claude Pro / Max (native account pool)".
+- OpenCode 2: connect your first account with `opencode auth login anthropic --method native-claude-oauth` and complete the browser sign-in. The UI method is **Claude Pro / Max (native account pool)**. This creates the main pool account and connects model requests to the plugin. Only then use `/claude` → **Accounts** for additional accounts; that menu alone does not change OpenCode's Anthropic connection. Follow the [OpenCode 2 setup steps](opencode-2.md#empty-initialization).
 - Pi: use Pi's Anthropic login for local sign-in, or `/claude` → **Accounts** for additional accounts.
 
 For vault custody, use the host's vault option instead. See [OpenCode 2](opencode-2.md#empty-initialization), [local accounts](accounts-and-routing.md#local-storage) and [vault setup](vault.md#setup) before choosing a sign-in method.

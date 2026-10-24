@@ -21,6 +21,10 @@ import {
   resetClaustrumEnrollmentState,
 } from '@cortexkit/anthropic-auth-core'
 import { LANE_START_TEXT } from '../lane-start'
+import {
+  CLAUDE_POOL_LOGIN_METHOD_ID,
+  CLAUDE_POOL_LOGIN_METHOD_LABEL,
+} from './activation'
 import type { NativeMenuCapabilities } from './menu-contract'
 import { buildNativeSidebarState } from './sidebar'
 import type { NativeSource } from './source'
@@ -31,6 +35,8 @@ const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {}
+
+const POOL_CONNECTION_GUIDANCE = `For first-time model access, connect Anthropic with "${CLAUDE_POOL_LOGIN_METHOD_LABEL}".\nRun: opencode auth login anthropic --method ${CLAUDE_POOL_LOGIN_METHOD_ID}`
 
 /** Account and setting changes use the same Core runtime as model requests. */
 export function createNativeMenuCapabilities(options: {
@@ -122,7 +128,11 @@ export function createNativeMenuCapabilities(options: {
           return { ok: false, text: 'OAuth sign-in did not complete.' }
         await runtime.loginOAuth({
           routeId: crypto.randomUUID(),
-          credential: result,
+          credential: {
+            access: result.access,
+            refresh: result.refresh,
+            expires: result.expires,
+          },
           label: request.values.label,
         })
         login.active.signal.throwIfAborted()
@@ -131,7 +141,7 @@ export function createNativeMenuCapabilities(options: {
         pending.delete(request.sessionId)
         return {
           ok: true,
-          text: 'OAuth account stored in the native account pool.',
+          text: `OAuth account stored in the native account pool.\n\n${POOL_CONNECTION_GUIDANCE}\n\nAdding an account here does not change OpenCode's Anthropic connection.`,
         }
       }
       case 'reset-backoff': {
@@ -265,15 +275,18 @@ export function createNativeMenuCapabilities(options: {
     dispatch,
     async readStatus(command) {
       const snapshot = await runtime.read()
-      if (command === 'account')
-        return (
+      if (command === 'account') {
+        const accounts =
           snapshot.accounts
             .map(
               (account) =>
-                `${account.id}${account.label ? ` (${account.label})` : ''}: ${account.type}, ${account.source}, ${account.enabled ? 'enabled' : 'disabled'}${account.state ? `, ${formatNativeAccountState(account)}` : ''}${account.accountIdentity ? `, ${account.accountIdentity}` : ''}`,
+                `${account.label ?? account.id} [${account.id === 'main' ? 'main' : 'fallback'}]: ${account.enabled ? 'enabled' : 'disabled'}, ${account.type}, ${account.source}${account.state ? `, ${formatNativeAccountState(account)}` : ''}\n  Route: ${account.id}`,
             )
             .join('\n') || 'No native Claude accounts.'
-        )
+        return snapshot.mode === 'local'
+          ? `${accounts}\n\n${POOL_CONNECTION_GUIDANCE}\nQuota refresh checks the pool; it does not check OpenCode's Anthropic connection.`
+          : accounts
+      }
       if (command === 'quota')
         return buildClaudeQuotaSummary({
           accounts: snapshot.accounts

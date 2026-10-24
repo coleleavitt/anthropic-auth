@@ -212,15 +212,29 @@ export async function setupAnthropicTui(
             item.actions.map((action) => ({ action, itemId: item.id })),
           ),
         ]
-        const selected = await ctx.ui.dialog.select({
+        const selected = await ctx.ui.dialog.select<
+          (typeof actions)[number] | 'status'
+        >({
           title: section.title,
-          options: actions.map((entry) => ({
-            title: entry.action.label,
-            description: entry.action.description,
-            value: entry,
-          })),
+          options: [
+            ...(section.lines.length
+              ? [{ title: 'View status', value: 'status' as const }]
+              : []),
+            ...actions.map((entry) => ({
+              title: entry.action.label,
+              description: entry.action.description,
+              value: entry,
+            })),
+          ],
         })
         if (!selected) continue
+        if (selected === 'status') {
+          await ctx.ui.dialog.alert({
+            title: `${section.title} status`,
+            message: section.lines.join('\n'),
+          })
+          continue
+        }
         const values = await valuesFor(selected.action)
         if (!values || !active || currentSession() !== sessionId) return
         const confirmed = selected.action.confirm

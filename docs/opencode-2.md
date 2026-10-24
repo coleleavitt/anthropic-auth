@@ -12,11 +12,23 @@ npx @cortexkit/opencode-anthropic-auth setup --yes --opencode=2
 
 Without `--login`, generation-2-only local setup registers the main OpenCode config and initializes an empty native account pool, or reuses matching completed setup. A version-5 `empty-init` journal records that the pool is ready for sign-in. Setup does not read or write OpenCode 1's auth file, install an OpenCode 1 placeholder, create an OpenCode 2 connection, or access an OpenCode database.
 
-Setup prints this instruction once:
+Setup initializes storage; model access requires a separate connection step:
 
-In OpenCode, sign in to Anthropic with "Claude Pro / Max (native account pool)".
+1. Start OpenCode's registered pool login:
 
-After setup, start OpenCode and select **Claude Pro / Max (native account pool)**. The registered login verifies the Claude account identity and commits its credentials to the native pool. Only the fixed, non-secret plugin marker is returned to OpenCode through the host API. The first plugin-served request uses native pool authorization, never an old OpenCode 1 token. An empty pool cannot serve a request.
+   ```sh
+   opencode auth login anthropic --method native-claude-oauth
+   ```
+
+   In the TUI, choose Anthropic's **Claude Pro / Max (native account pool)** login method. If Anthropic is already connected, use **Add account** to choose this method.
+
+2. Complete the browser sign-in and paste the returned code. This saves the account as the pool's main account and creates OpenCode's plugin connection.
+3. Select an `anthropic/` model and send a short message to verify model access.
+4. Add other subscription accounts through `/claude` → **Accounts** → **Start OAuth sign-in**, then **Finish OAuth sign-in**. Use **View status** to see the main account, fallbacks, and enabled/disabled states.
+
+**Do the provider connection before adding fallback accounts.** Signing in through `/claude` only adds an account to the pool. It does not select the plugin's login method or replace an existing OpenCode Anthropic connection. Quota refresh can succeed while model requests still use that separate connection.
+
+The registered provider login verifies the Claude account identity and commits its credentials to the native pool. Only a fixed, non-secret plugin marker is returned to OpenCode through the host API. Requests carrying that marker use the pool; other OpenCode credentials pass through unchanged. Startup never replaces an existing connection automatically. See [connection troubleshooting](troubleshooting.md#quota-refresh-works-but-anthropic-model-requests-fail-in-opencode-2) if model access still fails.
 
 Fresh initialization writes the journal and main config, not the TUI sidebar config or legacy account/state/routing sidecars. A rerun preserves existing pool and journal bytes, including accounts added later. Conflicting files or unfinished migrations refuse instead of being overwritten; see [recovery](releases.md#upgrade-and-recovery).
 

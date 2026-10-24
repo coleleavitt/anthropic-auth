@@ -23,7 +23,13 @@ After setup:
 
 OpenCode 1: open `/claude` → **Accounts** to sign in.
 
-OpenCode 2: In OpenCode, sign in to Anthropic with "Claude Pro / Max (native account pool)".
+OpenCode 2: connect your first account through OpenCode's **Claude Pro / Max (native account pool)** login method:
+
+```sh
+opencode auth login anthropic --method native-claude-oauth
+```
+
+Complete the browser sign-in, then select an `anthropic/` model. After that, use `/claude` → **Accounts** for additional accounts. Signing in through `/claude` alone adds an account to the pool but does **not** connect OpenCode's model requests to it. See the [OpenCode 2 setup steps](docs/opencode-2.md#empty-initialization).
 
 Pi: open `/claude` and use **Start OAuth sign-in**, then **Finish OAuth sign-in**.
 
