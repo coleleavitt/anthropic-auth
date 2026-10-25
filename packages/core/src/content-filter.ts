@@ -294,6 +294,38 @@ export function classify(text: string): ClassificationResult {
   }
 }
 
+let rewriteMatcherCache:
+  | { regex: RegExp; lookup: Map<string, string> }
+  | undefined
+
+/**
+ * Build (once) a single case-insensitive regex matching any REWRITE_RULES key
+ * as a whole token. A boundary is only enforced on sides where the key begins
+ * or ends with an identifier character, so keys with punctuation still work.
+ */
+function getRewriteMatcher(): { regex: RegExp; lookup: Map<string, string> } {
+  if (rewriteMatcherCache) return rewriteMatcherCache
+  const lookup = new Map<string, string>()
+  for (const [k, v] of Object.entries(REWRITE_RULES)) {
+    const key = k.toLowerCase()
+    if (key.length > 0 && !lookup.has(key)) lookup.set(key, v)
+  }
+  const wordChar = /[A-Za-z0-9_]/
+  const alternatives = [...lookup.keys()]
+    .sort((a, b) => b.length - a.length)
+    .map((key) => {
+      const first = key[0]
+      const last = key[key.length - 1]
+      const pre = first && wordChar.test(first) ? '(?<![A-Za-z0-9_])' : ''
+      const post = last && wordChar.test(last) ? '(?![A-Za-z0-9_])' : ''
+      return `${pre}${escapeRegex(key)}${post}`
+    })
+  const regex =
+    alternatives.length > 0 ? new RegExp(alternatives.join('|'), 'gi') : /(?!)/g
+  rewriteMatcherCache = { regex, lookup }
+  return rewriteMatcherCache
+}
+
 /**
  * Rewrite text to neutralize triggers.
  * @param aggressive - If true, strip entire high-risk lines
@@ -362,14 +394,23 @@ export function rewrite(text: string, aggressive = false): RewriteResult {
   }
   rewritten = sanitizedLines.join('\n')
 
-  // Apply rewrite rules (case-insensitive)
-  for (const [old, replacement] of Object.entries(REWRITE_RULES)) {
-    const regex = new RegExp(escapeRegex(old), 'gi')
-    if (regex.test(rewritten)) {
-      rewritten = rewritten.replace(regex, replacement)
-      applied.push([old, replacement])
+  // Apply rewrite rules (case-insensitive, whole-word, single pass).
+  // Previously each rule was a bare substring regex applied sequentially, so
+  // short keys matched inside ordinary words and a replacement could itself be
+  // re-rewritten by a later rule. One combined, longest-first alternation with
+  // identifier-aware boundaries fixes both.
+  const { regex: rewriteRegex, lookup } = getRewriteMatcher()
+  const appliedKeys = new Set<string>()
+  rewritten = rewritten.replace(rewriteRegex, (match) => {
+    const key = match.toLowerCase()
+    const replacement = lookup.get(key)
+    if (replacement === undefined) return match
+    if (!appliedKeys.has(key)) {
+      appliedKeys.add(key)
+      applied.push([key, replacement])
     }
-  }
+    return replacement
+  })
 
   const after = classify(rewritten)
 
@@ -487,6 +528,7 @@ export function filterRequestBody(
     label: string,
     allowStrip: boolean,
     evictable = false,
+    skipScoring = false,
   ): string | undefined => {
     const classification = classify(text)
     summary.blocksScanned++
@@ -504,7 +546,7 @@ export function filterRequestBody(
       const cat = classification.category ?? 'cyber'
       summary.rawTotals[cat] =
         (summary.rawTotals[cat] ?? 0) + EVICT_RESIDUAL_SCORE
-      if (classification.score > summary.maxScoreBefore) {
+      if (!skipScoring && classification.score > summary.maxScoreBefore) {
         summary.maxScoreBefore = classification.score
         summary.maxCategory = classification.category
       }
@@ -526,7 +568,7 @@ export function filterRequestBody(
           (summary.rawTotals[cat] ?? 0) + cappedContribution
       }
     }
-    if (classification.score > summary.maxScoreBefore) {
+    if (!skipScoring && classification.score > summary.maxScoreBefore) {
       summary.maxScoreBefore = classification.score
       summary.maxCategory = classification.category
     }
@@ -567,7 +609,8 @@ export function filterRequestBody(
         )
       }
     }
-    if (scoreAfter > summary.maxScoreAfter) summary.maxScoreAfter = scoreAfter
+    if (!skipScoring && scoreAfter > summary.maxScoreAfter)
+      summary.maxScoreAfter = scoreAfter
     return replacement
   }
   const markRewritten = () => {
@@ -830,7 +873,7 @@ export function filterRequestBody(
     for (let i = 0; i < system.length; i++) {
       const block = system[i]
       if (block?.type === 'text' && typeof block.text === 'string') {
-        const next = filterText(block.text, `system[${i}]`, true)
+        const next = filterText(block.text, `system[${i}]`, true, false, true)
         if (next !== undefined) {
           block.text = next
           markRewritten()
