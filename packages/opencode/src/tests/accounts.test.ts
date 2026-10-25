@@ -1972,7 +1972,7 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
     const manager = new FallbackAccountManager({ fetchImpl: quotaFetch })
     const report = await manager.keepAliveTick()
-    expect(report?.lease).toBe('acquired')
+    expect(report?.lease).toBe('nothing_due')
     expect(report?.refreshed).toEqual([])
     expect(tokenServer.presented).toEqual([])
     expect(quotaFetch).not.toHaveBeenCalled()

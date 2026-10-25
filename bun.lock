@@ -20,9 +20,9 @@
     },
     "packages/core": {
       "name": "@cortexkit/anthropic-auth-core",
-      "version": "999.0.0-dev.20260825",
+      "version": "1.24.1",
       "dependencies": {
-        "@coleleavitt/anthropic-napi": "file:../../../../../RustProjects/active/anthropic/anthropic-napi",
+        "@coleleavitt/anthropic-napi": "https://github.com/coleleavitt/anthropic-rs/releases/download/napi-v0.1.0/coleleavitt-anthropic-napi-0.1.0.tgz",
         "xxhash-wasm": "^1.1.0",
       },
     },
@@ -34,13 +34,13 @@
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-anthropic-auth",
-      "version": "999.0.0-dev.20260825",
+      "version": "1.24.1",
       "bin": {
         "opencode-anthropic-auth": "dist/cli.js",
       },
       "dependencies": {
-        "@coleleavitt/anthropic-napi": "file:../../../../../RustProjects/active/anthropic/anthropic-napi",
-        "@cortexkit/anthropic-auth-core": "999.0.0-dev.20260825",
+        "@coleleavitt/anthropic-napi": "https://github.com/coleleavitt/anthropic-rs/releases/download/napi-v0.1.0/coleleavitt-anthropic-napi-0.1.0.tgz",
+        "@cortexkit/anthropic-auth-core": "1.24.0",
         "@opentui/core": "0.5.6",
         "@opentui/solid": "0.5.6",
         "jsonc-parser": "^3.3.1",
@@ -52,9 +52,9 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-anthropic-auth",
-      "version": "999.0.0-dev.20260825",
+      "version": "1.24.1",
       "dependencies": {
-        "@cortexkit/anthropic-auth-core": "999.0.0-dev.20260825",
+        "@cortexkit/anthropic-auth-core": "1.24.0",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
@@ -205,6 +205,8 @@
     "@cloudflare/workerd-linux-arm64": ["@cloudflare/workerd-linux-arm64@1.20260730.1", "", { "os": "linux", "cpu": "arm64" }, "sha512-YQ+Mi78U3TPdgBPtwq+Sm6rJU+Ihl2y0pjYtuuKkdmUbYzL7oLR6Xqq9wljhasnuCFICssDJaqhMep5WizYoEQ=="],
 
     "@cloudflare/workerd-windows-64": ["@cloudflare/workerd-windows-64@1.20260730.1", "", { "os": "win32", "cpu": "x64" }, "sha512-27fAN+vUECW1oYVc1KOcHYpkL8COM2Uxtxql7TL595kxbjoqS5yckw7NLz7bTf2pALFCZWjqXDjZGJ/xbG4ZKQ=="],
+
+    "@coleleavitt/anthropic-napi": ["@coleleavitt/anthropic-napi@https://github.com/coleleavitt/anthropic-rs/releases/download/napi-v0.1.0/coleleavitt-anthropic-napi-0.1.0.tgz", {}, "sha512-wRED/cD7ehSSaOh0moKBxVoxWAsXYWjKTIF5ddUrCwxcOFGJ174RH/8k1GPz3NYCck6ehczwutyuJ8US7iKRDA=="],
 
     "@cortexkit/anthropic-auth-core": ["@cortexkit/anthropic-auth-core@workspace:packages/core"],
 
@@ -849,10 +851,6 @@
     "@babel/helper-compilation-targets/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
     "@babel/helper-create-class-features-plugin/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
-
-    "@cortexkit/anthropic-auth-core/@coleleavitt/anthropic-napi": ["@coleleavitt/anthropic-napi@file:../../../RustProjects/active/anthropic/anthropic-napi", {}],
-
-    "@cortexkit/opencode-anthropic-auth/@coleleavitt/anthropic-napi": ["@coleleavitt/anthropic-napi@file:../../../RustProjects/active/anthropic/anthropic-napi", {}],
 
     "@google/genai/ws": ["ws@8.20.0", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA=="],
 

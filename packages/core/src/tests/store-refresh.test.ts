@@ -182,7 +182,7 @@ describe('keep-alive replaces background rotation', () => {
       }) as unknown as typeof fetch,
     })
     const report = await manager.keepAliveTick()
-    expect(report?.lease).toBe('acquired')
+    expect(report?.lease).toBe('nothing_due')
     expect(report?.refreshed).toEqual([])
     expect(mock.presented).toEqual([])
     // Quota polling does not wake the idle account either.

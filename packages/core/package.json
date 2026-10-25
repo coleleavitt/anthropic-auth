@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/anthropic-auth-core",
-  "version": "1.24.0",
+  "version": "1.24.1",
   "type": "module",
   "repository": {
     "type": "git",
@@ -28,7 +28,7 @@
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
-    "@coleleavitt/anthropic-napi": "file:../../../../../RustProjects/active/anthropic/anthropic-napi",
+    "@coleleavitt/anthropic-napi": "https://github.com/coleleavitt/anthropic-rs/releases/download/napi-v0.1.0/coleleavitt-anthropic-napi-0.1.0.tgz",
     "xxhash-wasm": "^1.1.0"
   }
 }

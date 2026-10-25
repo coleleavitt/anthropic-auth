@@ -2,11 +2,18 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.24.1
+
+### Patch Changes
+
+- Install the Rust account-store binding (`@coleleavitt/anthropic-napi`) from its GitHub release instead of a local `file:` path, so the packages install on machines other than the build machine. The prebuilt binding covers linux-x64 with glibc 2.39 or newer.
+- Expect the binding's `nothing_due` keep-alive outcome: a pass with no account due no longer takes the store lock.
+
 ## 1.24.0
 
 ### Minor Changes
 
-- Add Claude Opus 5.5 support with cheaper pricing ($4/$20 vs $15/$75), 1M native context, and a `frontier_llm` refusal route to Opus 5.
+- Add Claude Opus 5.5 support with cheaper pricing ($4/$20 per million tokens and $0.20 cache reads, against Opus 5's $5/$25 and $0.50), 1M native context, and a `frontier_llm` refusal route to Opus 5.
 - Add surrogate-guided refusal mitigation: a lightweight logistic model scores request bodies and applies escalating eviction when refusal probability exceeds the threshold.
 - Add session heat tracking with `/claude-split` command for context-aware session management and refusal risk visibility.
 - Add pre-flight content filter with `thought_extraction` and `frontier_llm` classifier categories, whole-word rewrite rules, and system-block score exemption.
