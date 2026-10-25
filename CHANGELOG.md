@@ -2,6 +2,47 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.24.0
+
+### Minor Changes
+
+- Add Claude Opus 5.5 support with cheaper pricing ($4/$20 vs $15/$75), 1M native context, and a `frontier_llm` refusal route to Opus 5.
+- Add surrogate-guided refusal mitigation: a lightweight logistic model scores request bodies and applies escalating eviction when refusal probability exceeds the threshold.
+- Add session heat tracking with `/claude-split` command for context-aware session management and refusal risk visibility.
+- Add pre-flight content filter with `thought_extraction` and `frontier_llm` classifier categories, whole-word rewrite rules, and system-block score exemption.
+- Add low-priority mode (`/claude-low-priority`) that opts into a lower-priority queue when rate-limited, harvesting `slow-*` headers.
+- Add provider block classifier (`classifyProviderBlock`) naming `safety_monitor_blocked`, `policy_blocked`, and `dlp_request_denied` for actionable error messages.
+- Run on OpenCode 2 hosts with the new server architecture.
+
+### Patch Changes
+
+- Build rewrite rules as a single combined regex with identifier-aware word boundaries, preventing substring matches inside words and re-rewriting of replacements.
+- Skip score tracking for system blocks to avoid inflating risk metrics from injected prompts.
+- Fix refresh lock creation when its directory does not yet exist.
+- Share `anthropic-auth.json` sidecar path between OpenCode, Pi, and Prime Agent for unified configuration.
+- Replay thought process signatures only from Anthropic-origin messages to prevent signature injection.
+- Move host refresh tokens into the shared store and fall back past a dead host login.
+- Link the store to Claude Code's login for one-login-per-account semantics.
+- Add remote revoke and Console API-key mint on the Rust binding.
+- Serve the account store, refresh, login, revoke, API keys, identity backfill, and native status from the Rust binding.
+- Require the binding's OAuth test mode for every store handle under test, cutting test runs off from production OAuth endpoints.
+- Run every package test suite in a per-run HOME behind a sandbox guard.
+- Clear all TypeScript errors in core tests and resolve all Biome lint warnings.
+- Fix Pi sub-agent 401 recovery by refreshing the shared account.
+- Save refused request bodies at refusal time in both Pi and OpenCode.
+- Log content-filter outcomes per request with category and score telemetry.
+- Filter `tool_result`, assistant text, and `tool_use` input blocks from prior turns.
+- Seed Pi host auth from the shared store on cold start.
+- Send both server-side-fallback betas (base + category) for safety fallback.
+- Add client-side refusal→fallback routing for Opus 5 / Fable 5 in Pi.
+- Correct Fable/Mythos 5.1 cache-read pricing.
+- Send adaptive thought process (not `budget_tokens`) to adaptive models in Pi.
+- Track live Claude Code version instead of pinning 2.1.233.
+- Follow Anthropic model pagination in catalog fetches.
+- Create log and dump artifacts user-only (0600 permissions).
+- Serialize every refresh-token spender and stop re-presenting dead tokens.
+- Scope account identity by organization, not by email alone.
+
 ## 1.20.0
 
 ### Minor Changes
