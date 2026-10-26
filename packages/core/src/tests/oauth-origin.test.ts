@@ -139,7 +139,7 @@ test('relay upstream check lets the official upstream through to the relay', asy
     hostname: '127.0.0.1',
     port: 0,
     async fetch(request) {
-      relayed.push(await request.json())
+      relayed.push((await request.json()) as { upstream: { url: string } })
       return new Response('relayed')
     },
   })

@@ -1,8 +1,9 @@
 /**
  * Where a Claude OAuth access token may be sent.
  *
- * A Claude sign-in (OAuth) access token is only ever sent to Anthropic's own
- * HTTPS API server. Hosts take the request URL from provider configuration,
+ * A Claude sign-in (OAuth) access token is sent only to Anthropic's own HTTPS
+ * API server, unless a caller explicitly allows one test-only loopback origin
+ * (see `extraOrigin`). Hosts take the request URL from provider configuration,
  * and that configuration can come from a project file in a repository the
  * user opened, so the URL alone is not trusted: every OAuth send checks its
  * final URL here before the token leaves the process. API-key routes are not

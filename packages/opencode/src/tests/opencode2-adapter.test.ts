@@ -2090,7 +2090,8 @@ describe('OpenCode 2 native Anthropic adapter: OAuth destination', () => {
 
   /**
    * Runs one attempt the way the host does and, when the adapter returns a
-   * request, sends it for real. Returns the refusal, or undefined when sent.
+   * request, sends it for real. Returns the started attempt and its failure,
+   * which is undefined when the request was sent.
    */
   async function attempt(host: Host, request: Request) {
     const started = await host.begin(scopeOf())
