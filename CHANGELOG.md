@@ -2,9 +2,9 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.2.8
 
-- OpenCode now sends Claude sign-in (OAuth) requests only to https://api.anthropic.com; a provider baseURL or ANTHROPIC_BASE_URL pointing elsewhere is refused for those accounts and still applies to API keys. Addresses #474.
+- Security: OpenCode 1 and OpenCode 2 now send Claude sign-in (OAuth) requests only to `https://api.anthropic.com`, including the address inside relay requests. A provider `baseURL` (which a project `opencode.json` can set) or `ANTHROPIC_BASE_URL` pointing elsewhere is refused locally for those accounts, before the token is used. API-key routes keep their configured `baseURL` and `ANTHROPIC_BASE_URL`. Pi already worked this way. Addresses #474.
 
 ## 2.2.7
 
