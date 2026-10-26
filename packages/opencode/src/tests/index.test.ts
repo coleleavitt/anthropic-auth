@@ -9,7 +9,13 @@ import {
   spyOn,
 } from 'bun:test'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import {
+  existsSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  watch,
+} from 'node:fs'
 import * as filesystem from 'node:fs/promises'
 import {
   mkdir,
@@ -68,7 +74,10 @@ import {
 import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
 import { withLock } from '@cortexkit/common-auth/fs'
 import * as commonAuthSetup from '@cortexkit/common-auth/setup'
-import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import {
+  fromNativeQuotaMap,
+  nativeQuotaCodec,
+} from '../../../core/src/native-quota-codec.ts'
 import type { NativeRefreshObservation } from '../../../core/src/native-refresh-coordinator.ts'
 import {
   publishNativeLocalRefreshFailure,
@@ -1810,7 +1819,7 @@ async function publishNativeMainQuota(quota: OAuthQuotaSnapshot) {
       throw new Error('Main quota publication refused the current credential')
     return authorization.subject
   } finally {
-    runtime.close()
+    await runtime.close()
   }
 }
 
@@ -2013,6 +2022,53 @@ async function waitForAccountStorage(
   }
   const storage = await readAccountStorage()
   throw new Error(`Account storage did not match: ${JSON.stringify(storage)}`)
+}
+
+/** Wait on pool file changes, not a cache/feed event, when asserting disk quota. */
+async function waitForNativePoolQuota(
+  routeId: string,
+  predicate: (quota: OAuthQuotaSnapshot | undefined) => boolean,
+): Promise<OAuthQuotaSnapshot | undefined> {
+  const pool = migratedPool
+  if (!pool) throw new Error('This test has no migrated pool')
+  const changes = untilStateOrTestEnd()
+  const directories = new Set([
+    dirname(pool.paths.config),
+    dirname(pool.paths.state),
+  ])
+  const watchers: Array<ReturnType<typeof watch>> = []
+  const reader = createNativePoolStore({
+    paths: pool.paths,
+    quota: nativeQuotaCodec,
+  })
+  let quota: OAuthQuotaSnapshot | undefined
+  try {
+    // Keep a live event source while waiting for the store's unref'ed flush timer.
+    for (const directory of directories)
+      watchers.push(watch(directory, changes.notify))
+    while (!changes.ended) {
+      await changes.next()
+      const [loaded, settings] = await Promise.all([
+        reader.read(),
+        reader.readSettings(),
+      ])
+      const id =
+        routeId === 'main' && settings.status === 'ready'
+          ? settings.settings.mainAccountId
+          : routeId
+      const raw =
+        loaded.status === 'ready'
+          ? loaded.rows.find((row) => row.id === id)?.quota
+          : undefined
+      quota = raw === undefined ? undefined : fromNativeQuotaMap(raw)
+      if (predicate(quota)) return quota
+    }
+  } finally {
+    for (const watcher of watchers) watcher.close()
+    changes.close()
+    await reader.close()
+  }
+  throw new Error(`Pool quota did not match: ${JSON.stringify(quota)}`)
 }
 
 async function seedSidebarRouting(
@@ -3128,8 +3184,8 @@ describe('quota header feed integration', () => {
       if (!migratedPool) throw new Error('Missing migrated fixture')
       const entered = bodyLifetime().gate()
       const release = bodyLifetime().gate()
-      // Pause a real pool quota write after credential admission. The header
-      // harvest must reconcile the poll's fields when that write completes.
+      // Pause a real poll flush while a header is accepted. A later harvest
+      // must retain the poll's fields once that flush has reached disk.
       const writer = createNativeAccountRuntime({
         paths: migratedPool.paths,
         host: 'opencode',
@@ -3144,12 +3200,8 @@ describe('quota header feed integration', () => {
           quota: { ...initialPollQuota, scoped, extraUsage },
         })
         bodyLifetime().trackDetached(pollWriter)
-        await Promise.race([
-          entered.wait,
-          pollWriter.then(() => {
-            throw new Error('Poll writer did not reach its pause')
-          }),
-        ])
+        expect(await pollWriter).toBe(true)
+        await entered.wait
       }
       let firstRequest: Promise<Response> | undefined
       const records: LogTestRecord[] = []
@@ -3167,8 +3219,15 @@ describe('quota header feed integration', () => {
           { models: {} },
         )
         setLogLevel('trace')
-        // Response completion also records account use under the pool locks.
-        // Release the poll after header arrival, not after that write.
+        // Release the poll after header receipt. Acceptance need not wait for
+        // either store's queued quota to reach disk.
+        const pollFieldsWritten = waitForNativePoolQuota(
+          'main',
+          (quota) =>
+            Bun.deepEquals(quota?.scoped, scoped) &&
+            Bun.deepEquals(quota?.extraUsage, extraUsage),
+        )
+        bodyLifetime().trackDetached(pollFieldsWritten)
         firstRequest = Promise.resolve(result.fetch(MESSAGES_URL, EMPTY_POST))
         bodyLifetime().trackDetached(firstRequest)
         await entered.wait
@@ -3185,10 +3244,10 @@ describe('quota header feed integration', () => {
             record.channel === 'quota' &&
             record.message === 'response quota awaiting publication' &&
             record.payload?.account === 'main',
-          'header observation awaiting the held poll write',
+          'header receipt while the poll flush is held',
         )
-        expect(cache.getMain(mainAccountId)?.quota.checkedAt).toBe(
-          pollCheckedAt,
+        expect(cache.getMain(mainAccountId)?.quota.bindingWindow).toBe(
+          'claude-weekly-scoped-fable',
         )
         release.open()
         if (!pollWriter)
@@ -3196,14 +3255,17 @@ describe('quota header feed integration', () => {
             'First model request did not start the native poll writer',
           )
         expect(await pollWriter).toBe(true)
+        await pollFieldsWritten
+        await writer.close()
         expect((await readAccountStorage())?.quota?.mainQuota?.scoped).toEqual(
           scoped,
         )
         const firstResponse = await firstRequest
         expect(firstResponse.status).toBe(200)
         await firstResponse.text()
-        await waitForAccountStorage(
-          (loaded) => loaded?.quota?.mainQuota?.checkedAt === clock,
+        await waitForNativePoolQuota(
+          'main',
+          (quota) => quota?.checkedAt === clock,
         )
         expect((await readAccountStorage())?.quota?.mainQuota?.scoped).toEqual(
           scoped,
@@ -3242,7 +3304,7 @@ describe('quota header feed integration', () => {
       } finally {
         release.open()
         await Promise.allSettled([pollWriter, firstRequest])
-        writer.close()
+        await writer.close()
         __setLogTestSink(null)
         setLogLevel('info')
       }
@@ -3533,7 +3595,7 @@ describe('quota header feed integration', () => {
           }),
         ).toBe(true)
       } finally {
-        replacementRuntime.close()
+        await replacementRuntime.close()
       }
       const replacedAccount = (await readAccountStorage())?.accounts.find(
         (account) => account.id === 'fallback-1',
@@ -4816,7 +4878,12 @@ describe('quota header feed integration', () => {
         plugin.__quotaManager.getMain(uuidB)?.quota.five_hour?.usedPercent,
       ).toBe(60)
       expect(
-        (await readAccountStorage())?.quota?.mainQuota?.accountIdentity,
+        (
+          await waitForNativePoolQuota(
+            'main',
+            (quota) => quota?.accountIdentity === uuidB,
+          )
+        )?.accountIdentity,
       ).toBe(uuidB)
       expect(
         (await readAccountStorage())?.quota?.mainQuota?.five_hour?.usedPercent,
@@ -20181,6 +20248,11 @@ describe('auth.loader', () => {
         await result.fetch(MESSAGES_URL, EMPTY_POST)
         await published.wait
         const state = await getSidebarState(sidebarPath)
+        await waitForNativePoolQuota(
+          'main',
+          (quota) =>
+            quota?.source === 'headers' && quota.five_hour?.usedPercent === 78,
+        )
         const storage = await readAccountStorage()
 
         expect(state.main.quota?.five_hour?.usedPercent).toBe(78)

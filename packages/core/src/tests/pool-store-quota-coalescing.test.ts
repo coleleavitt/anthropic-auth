@@ -35,13 +35,16 @@ import {
   openNativeStore,
   pollSnapshot,
 } from './pool-store-coalescing-fixture.ts'
+import { holdPoolStoreLocks } from './pool-store-lock-fixture.ts'
 
 const coalescing = test
 const roots: string[] = []
 const open: NativeStore[] = []
+const holderCleanup: Array<() => void | Promise<void>> = []
 const BINDING_CHANGED = /binding changed/
 
 afterEach(async () => {
+  await Promise.allSettled(holderCleanup.splice(0).map((cleanup) => cleanup()))
   // A failed test can leave a coalescing store with queued readings and a
   // retry timer; stop it before its directory goes away.
   await Promise.allSettled(open.splice(0).map((store) => closeStore(store)))
@@ -481,13 +484,12 @@ for (const lane of lanes) {
       async () => {
         const paths = await fixture()
         await seed(paths, lane, [['a', 'acct-a']])
-        const holder = lockHolder(paths, lane)
-        const adding = holder.store.add({
-          id: 'z',
-          identity: 'acct-z',
-          credential: credential('z'),
+        // A separate process renews the normal store leases while native codec
+        // validation occupies this process; no unrelated row lease can expire.
+        const holder = holdPoolStoreLocks(paths, {
+          deferCleanup: (cleanup) => holderCleanup.push(cleanup),
         })
-        await holder.holding
+        await holder.ready
         let contended!: () => void
         const flushing = new Promise<void>((resolve) => {
           contended = resolve
@@ -579,8 +581,7 @@ for (const lane of lanes) {
               ? pending.rows.find((row) => row.id === 'a')?.quota
               : undefined
           expect(isQuotaMap(quota) ? quota.limits.length : undefined).toBe(128)
-          holder.release()
-          await adding
+          await holder.release()
           await publishing
           expect(accepted).toBe(200)
           await closeStore(store)
@@ -605,8 +606,7 @@ for (const lane of lanes) {
           ).toEqual(expected.sort(byLabel))
         } finally {
           timer.mockRestore()
-          holder.release()
-          await adding
+          await holder.release()
           await publishing
         }
       },

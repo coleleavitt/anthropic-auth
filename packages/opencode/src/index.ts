@@ -2590,9 +2590,8 @@ const anthropicAuthPlugin = async (
       logger.warn('quota', 'Quota publication discarded')
       return null
     }
-    // The pool merges quota under its locks. A poll can finish while this
-    // publication waits, so read the committed result instead of replaying
-    // the pre-write merge into cache and dropping that poll's fields.
+    // Read the store's merged accepted view, including its queued quota, rather
+    // than replaying the pre-submission copy and losing fields already visible.
     const currentSnapshot = await nativeAccounts.read()
     const current = currentSnapshot.accounts.find(
       (candidate) => candidate.id === served.accountId,
@@ -2847,9 +2846,9 @@ const anthropicAuthPlugin = async (
               mainQuotaIdentity?.generation
           )
             return
-          // Publication checks the credential that supplied these headers before
-          // any cache or display can use them. A rejected old response must never
-          // become a transient quota reading for replacement credentials.
+          // Store acceptance fences the row, credential epoch and identity:
+          // only accepted readings reach cache, sidebar or feed. Acceptance
+          // need not mean the shared pool write has reached disk yet.
           const entry = persistedEntry
           if (
             observation &&

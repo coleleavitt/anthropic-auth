@@ -224,7 +224,7 @@ export async function saveNativePiFixture(
       if (account.enabled === false) await runtime.setEnabled(account.id, false)
     }
   } finally {
-    runtime.close()
+    await runtime.close()
   }
 }
 

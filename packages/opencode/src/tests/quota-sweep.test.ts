@@ -495,23 +495,30 @@ async function startBody(options: BodyOptions) {
     startupSweep,
     backgroundSweep,
     async seedQuota(quota: Core.OAuthQuotaSnapshot) {
-      const admitted = await observer.authorizeLocal(FALLBACK_ID)
-      if (admitted.status !== 'usable')
-        throw new Error(
-          `Fixture credential was not admitted: ${admitted.status}`,
-        )
-      const saved = await observer.publishLocal(admitted.subject, {
-        quota: { ...quota, accountIdentity: FALLBACK_UUID },
-      })
-      if (!saved) throw new Error('Fixture quota publication was refused')
-      await observer.updateSettings((settings) => ({
-        ...settings,
-        quota: {
-          enabled: true,
-          minimumRemaining: { five_hour: 5, seven_day: 10 },
-          failClosedOnUnknownQuota: false,
-        },
-      }))
+      // The plugin owns another store. Close this fixture writer so its
+      // accepted quota is on disk before that independent reader runs.
+      const seed = factory({ paths: fixture.paths, host: 'opencode' })
+      try {
+        const admitted = await seed.authorizeLocal(FALLBACK_ID)
+        if (admitted.status !== 'usable')
+          throw new Error(
+            `Fixture credential was not admitted: ${admitted.status}`,
+          )
+        const saved = await seed.publishLocal(admitted.subject, {
+          quota: { ...quota, accountIdentity: FALLBACK_UUID },
+        })
+        if (!saved) throw new Error('Fixture quota publication was refused')
+        await seed.updateSettings((settings) => ({
+          ...settings,
+          quota: {
+            enabled: true,
+            minimumRemaining: { five_hour: 5, seven_day: 10 },
+            failClosedOnUnknownQuota: false,
+          },
+        }))
+      } finally {
+        await seed.close()
+      }
     },
     /** Resolves when the given fallback usage GET reaches the transport. */
     fallbackUsageArrived: (index: number) => arrivalFor(index).promise,
