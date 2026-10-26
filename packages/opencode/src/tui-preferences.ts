@@ -1,4 +1,4 @@
-import { readFileSync, watch } from 'node:fs'
+import { readFileSync, statSync, watch } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -274,6 +274,20 @@ export function queueTuiPreferenceUpdate(
 const WATCH_DEBOUNCE_MS = 150
 const WATCH_POLL_MS = 100
 
+// Identity of the preferences file's current version: its modification time,
+// size and inode. A replacement via rename (how editors and our own writes
+// save it) always changes the inode, so one `stat` per poll is enough to know
+// that nothing was rewritten. The nanosecond timestamps, rather than Date's
+// millisecond rounding, keep two saves within one millisecond distinguishable.
+function statSignature(file: string): string | null {
+  try {
+    const info = statSync(file, { bigint: true })
+    return `${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
+  } catch {
+    return null
+  }
+}
+
 // Watches the directory rather than the file: editors and our own atomic
 // writes replace the file via rename, which kills file-level watchers.
 //
@@ -308,11 +322,23 @@ export function watchTuiPreferences(
     // Missing/unreadable files can still be created later and detected by the
     // directory watcher or polling fallback.
   }
+  // The stat of the file that `lastSeen` was read from. A file whose mtime,
+  // size and inode all match it cannot have changed, so a poll skips the read.
+  let lastStat = statSignature(file)
   let disposed = false
 
-  const checkForChange = async () => {
+  const checkForChange = async (readAnyway = false) => {
+    const current = await statSignature(file)
+    // An absent file cannot have new content; re-reading it would only fail.
+    if (current === null) return
+    const unchanged = current === lastStat && lastSeen !== null
+    // The watcher path always reads, even when the stat looks familiar, so a
+    // hand edit inside one timestamp tick is still noticed there. Only the
+    // poll relies on the stat to skip a read.
+    if (unchanged && !readAnyway) return
     const text = await readFile(file, 'utf8').catch(() => null)
     if (disposed || text === null) return
+    lastStat = current
     if (text === lastSeen) return
     lastSeen = text
     onChange()
@@ -322,7 +348,7 @@ export function watchTuiPreferences(
     if (timer) nativeClearTimeout(timer)
     timer = nativeSetTimeout(() => {
       timer = null
-      void checkForChange()
+      void checkForChange(true)
     }, WATCH_DEBOUNCE_MS)
   }
 
@@ -351,6 +377,9 @@ export function watchTuiPreferences(
   // repeated close/recreate cycles, so polling must be independent of watcher
   // construction. Recursive unreferenced timers avoid fs.watchFile's lingering
   // handles while the host's normal event loop keeps active watchers polling.
+  // A poll only reads the file when its stat changed; one controller per
+  // terminal polled at 10 Hz, so an unconditional read ran ten times a second
+  // per terminal.
   let pollTimer: ReturnType<typeof nativeSetTimeout> | null = null
   let pollInFlight = false
   const schedulePoll = () => {

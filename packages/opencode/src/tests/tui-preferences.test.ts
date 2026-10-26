@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { writeFileSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { renameSync, utimesSync, writeFileSync } from 'node:fs'
+import * as fsPromises from 'node:fs/promises'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -481,6 +482,89 @@ describe('watchTuiPreferences', () => {
       await writeFile(file, '{}', 'utf8')
       await sleep(400)
       expect(fired).toBe(0)
+    } finally {
+      dispose()
+    }
+  })
+
+  // The poll exists as a fallback for events Bun's watcher misses. It runs ten
+  // times a second, and one TUI has one watcher, so a read per tick was a read
+  // per TUI per 100 ms.
+  test('reads an unchanged file once over a second of polling', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const dispose = watchTuiPreferences(
+      () => {
+        fired += 1
+      },
+      // Swallow every directory event, so only polling can observe the file.
+      { watchDirectory: (() => ({ close() {} })) as never },
+    )
+    try {
+      await sleep(300)
+      const reads = spyOn(fsPromises, 'readFile')
+      try {
+        await sleep(1_000)
+        expect(reads.mock.calls.length).toBe(0)
+      } finally {
+        reads.mockRestore()
+      }
+      expect(fired).toBe(0)
+    } finally {
+      dispose()
+    }
+  })
+
+  test('polling picks up a real change, including one of the same size', async () => {
+    await writeFile(file, '{"anthropic-auth":{"pollMs":1500}}', 'utf8')
+    let fired = 0
+    let latest = ''
+    // The watcher records what it saw, so the test can prove the new content
+    // reached a reader rather than only that a callback ran.
+    const readFileOnChange = async () => {
+      fired += 1
+      latest = await readFile(file, 'utf8')
+    }
+    const dispose = watchTuiPreferences(readFileOnChange, {
+      watchDirectory: (() => ({ close() {} })) as never,
+    })
+    try {
+      await sleep(300)
+      await writeFile(file, '{"anthropic-auth":{"pollMs":2500}}', 'utf8')
+      await sleep(400)
+      expect(fired).toBe(1)
+      expect(latest).toContain('2500')
+      // An identical rewrite changes the file but not its content.
+      await writeFile(file, '{"anthropic-auth":{"pollMs":2500}}', 'utf8')
+      await sleep(400)
+      expect(fired).toBe(1)
+    } finally {
+      dispose()
+    }
+  })
+
+  test('polling sees a replacement that keeps its modification time', async () => {
+    await writeFile(file, '{}', 'utf8')
+    let fired = 0
+    const dispose = watchTuiPreferences(
+      () => {
+        fired += 1
+      },
+      { watchDirectory: (() => ({ close() {} })) as never },
+    )
+    try {
+      await sleep(300)
+      // Atomic saves replace the file instead of writing it, and a restore can
+      // even put the old timestamp back. The replaced inode is what counts.
+      // The replacement is named like our own atomic-write temp file, so the
+      // directory watcher cannot tell it is a sibling and filter it out the
+      // way it does for other sibling files.
+      const replaced = join(dir, 'tui-preferences.jsonc.replaced.tmp')
+      writeFileSync(replaced, '{"other-plugin":{}}', 'utf8')
+      utimesSync(replaced, new Date(1_000_000), new Date(1_000_000))
+      renameSync(replaced, file)
+      await sleep(400)
+      expect(fired).toBe(1)
     } finally {
       dispose()
     }

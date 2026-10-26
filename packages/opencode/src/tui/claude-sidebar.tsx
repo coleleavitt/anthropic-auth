@@ -601,6 +601,12 @@ export interface SidebarController {
   toggleCollapsed: () => void
   /** Stops the preference watcher; OpenCode 1 keeps it for the process. */
   dispose: () => void
+  /**
+   * However many refreshes in a row have failed, a retry never waits longer
+   * than this. Every attempt costs the server a full runtime read, so a
+   * failing sidebar must not keep trying at the poll rate forever.
+   */
+  retryMaxMs: number
 }
 
 // The TUI may unmount and remount sidebar_content when the user switches
@@ -658,7 +664,7 @@ export function createSidebarController(
     }
   }
 
-  return { prefs, collapsed, toggleCollapsed, dispose }
+  return { prefs, collapsed, toggleCollapsed, dispose, retryMaxMs: 30_000 }
 }
 
 /** The sidebar panel for one session; the host owns polling and the theme. */
@@ -1070,18 +1076,46 @@ export type ReadSidebarState = (
   signal: AbortSignal,
 ) => Promise<SidebarState>
 
-function HostSidebar(props: {
-  host: ClaudeSidebarHost
+/** What the sidebar reads and draws with, independent of the host chrome. */
+interface HostSidebarPropsState {
   read: ReadSidebarState
   controller: SidebarController
   sessionId: string
-}) {
+}
+
+interface HostSidebarProps extends HostSidebarPropsState {
+  host: ClaudeSidebarHost
+}
+
+/**
+ * Delay before the next refresh after `failures` failed reads in a row, each
+ * one longer than the last until the controller's limit. A successful read
+ * resets the count, so a healthy server is polled at the configured rate. A
+ * failed read still costs the server a full runtime read, so retrying at the
+ * poll rate keeps that cost alive for as long as the failure lasts.
+ */
+export function sidebarRetryDelay(
+  pollMs: number,
+  failures: number,
+  retryMaxMs: number,
+): number {
+  if (failures <= 0) return pollMs
+  return Math.min(pollMs * 2 ** failures, retryMaxMs)
+}
+
+// Runs the sidebar's state: one read on mount, then a timer that backs off
+// after failures and resets after a success. Separate from the component so
+// the refresh schedule can be tested without a host renderer.
+export function useHostSidebarState(
+  props: HostSidebarPropsState,
+): () => SidebarState {
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
   const abort = new AbortController()
   let inFlight = false
   let shown = ''
+  let failures = 0
   const refresh = async () => {
-    if (inFlight || abort.signal.aborted) return
+    if (inFlight || abort.signal.aborted) return false
     inFlight = true
     try {
       const next = await props.read(props.sessionId, abort.signal)
@@ -1092,18 +1126,45 @@ function HostSidebar(props: {
         shown = content
         setState(next)
       }
+      return true
     } catch {
       // Keep the last state; an older server without `sidebar` keeps waiting.
+      return false
     } finally {
       inFlight = false
     }
   }
   createEffect(() => {
-    const timer = setInterval(refresh, props.controller.prefs().pollMs)
-    onCleanup(() => clearInterval(timer))
+    // Reading the prefs here re-runs this effect when they change.
+    const pollMs = props.controller.prefs().pollMs
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const schedule = () => {
+      if (abort.signal.aborted) return
+      const wait = sidebarRetryDelay(
+        pollMs,
+        failures,
+        props.controller.retryMaxMs,
+      )
+      timer = setTimeout(async () => {
+        if (await refresh()) failures = 0
+        else failures += 1
+        schedule()
+      }, wait)
+    }
+    void refresh().then((ok) => {
+      if (!ok) failures += 1
+    })
+    schedule()
+    onCleanup(() => {
+      clearTimeout(timer)
+      abort.abort()
+    })
   })
-  void refresh()
-  onCleanup(() => abort.abort())
+  return state
+}
+
+function HostSidebar(props: HostSidebarProps) {
+  const state = useHostSidebarState(props)
   return (
     <ClaudeSidebar
       state={state}

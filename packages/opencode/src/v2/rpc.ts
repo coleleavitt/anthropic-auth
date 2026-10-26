@@ -8,7 +8,11 @@ import type {
 import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
-import { normalizeSidebarState, type SidebarState } from '../sidebar-state'
+import {
+  DEFAULT_SIDEBAR_STATE,
+  normalizeSidebarState,
+  type SidebarState,
+} from '../sidebar-state'
 import type { NativeMenuCapabilities } from './menu-contract'
 
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -82,13 +86,32 @@ const result = (value: unknown): value is NativeCommandApplyResult =>
   record(value.menu) &&
   Array.isArray(value.menu.sections)
 
+// Anything that is not a JSON value cannot cross the RPC boundary: the host
+// encodes every method output with its JSON codec, which refuses `undefined`
+// and non-finite numbers anywhere in the value. `normalizeSidebarState` drops
+// those on its own; checking the result afterwards is the backstop that turns
+// any later field into a dropped value instead of a failed call.
+const isJsonValue = (value: unknown): boolean => {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean')
+    return true
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (Array.isArray(value)) return value.every(isJsonValue)
+  if (record(value)) return Object.values(value).every(isJsonValue)
+  return false
+}
+
 // Sidebar state is display data: anything that does not parse becomes the
 // empty state, the same fail-closed rule the OpenCode 1 sidebar file uses.
 const sidebarState: StandardSchemaV1<unknown, SidebarState> = {
   '~standard': {
     version: 1 as const,
     vendor: 'cortexkit-native',
-    validate: (value: unknown) => ({ value: normalizeSidebarState(value) }),
+    validate: (value: unknown) => {
+      const state = normalizeSidebarState(value)
+      return {
+        value: isJsonValue(state) ? state : { ...DEFAULT_SIDEBAR_STATE },
+      }
+    },
   },
 }
 

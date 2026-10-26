@@ -414,9 +414,7 @@ function hasEnabledOAuthAccount(
   )
 }
 
-function deriveSidebarRouting(
-  storage: AccountStorage | null,
-): Pick<SidebarState, 'activeId' | 'route'> {
+function deriveSidebarRouting(storage: AccountStorage | null): SidebarRouting {
   const firstFallback = (storage?.accounts ?? []).find(
     (account): account is OAuthAccount =>
       nativeAccountCanServe(account) && isOAuthAccount(account),
@@ -427,15 +425,19 @@ function deriveSidebarRouting(
   return { activeId: 'main', route: 'main' }
 }
 
+// `activeId` is optional on the state so a state without an active account
+// carries no key at all; callers here always get one back.
+type SidebarRouting = { activeId: string | undefined; route: string }
+
 function validateSidebarRouting(
-  routing: Pick<SidebarState, 'activeId' | 'route'> | undefined,
+  routing: SidebarRouting | undefined,
   storage: AccountStorage | null,
-): Pick<SidebarState, 'activeId' | 'route'> {
+): SidebarRouting {
   if (
     routing?.activeId === 'main' ||
     (routing?.activeId && hasEnabledOAuthAccount(storage, routing.activeId))
   ) {
-    return routing
+    return { activeId: routing.activeId, route: routing.route }
   }
   return deriveSidebarRouting(storage)
 }
@@ -443,8 +445,8 @@ function validateSidebarRouting(
 function resolveLoadedSidebarRouting(
   existing: SidebarState,
   freshStorage: AccountStorage | null,
-  fallbackRouting?: Pick<SidebarState, 'activeId' | 'route'>,
-): Pick<SidebarState, 'activeId' | 'route'> {
+  fallbackRouting?: SidebarRouting,
+): SidebarRouting {
   const existingAge = Date.now() - existing.lastUpdated
   if (
     !existing.activeId ||
@@ -454,13 +456,16 @@ function resolveLoadedSidebarRouting(
     return validateSidebarRouting(fallbackRouting, freshStorage)
   }
 
-  return validateSidebarRouting(existing, freshStorage)
+  return validateSidebarRouting(
+    { activeId: existing.activeId, route: existing.route },
+    freshStorage,
+  )
 }
 
 async function resolveFreshSidebarRouting(
   existing: SidebarState,
   loadFreshStorage: () => Promise<AccountStorage | null>,
-  fallbackRouting?: Pick<SidebarState, 'activeId' | 'route'>,
+  fallbackRouting?: SidebarRouting,
 ): Promise<{
   activeId: string | undefined
   route: string

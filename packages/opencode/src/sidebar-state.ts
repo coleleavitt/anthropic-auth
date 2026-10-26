@@ -30,7 +30,9 @@ export interface AccountQuota {
 
 export interface SidebarAccountState {
   id: string
-  label: string | undefined
+  // Absent, rather than present and `undefined`, when the account has no
+  // label: the OpenCode 2 RPC boundary refuses a value carrying `undefined`.
+  label?: string
   quota: AccountQuota | null
   enabled: boolean
   stateLine?: string
@@ -91,7 +93,9 @@ export interface SidebarState {
     refreshBackoffUntil?: number
   }
   fallbacks: SidebarAccountState[]
-  activeId: string | undefined
+  // Absent rather than `undefined`: `normalizeSidebarState` never writes the
+  // key, and the OpenCode 2 RPC boundary refuses a value carrying `undefined`.
+  activeId?: string
   route: string
   relay: { enabled: boolean; transport: string } | null
   fastMode: boolean
@@ -146,7 +150,6 @@ export function getSidebarStateFile(): string {
 export const DEFAULT_SIDEBAR_STATE: SidebarState = {
   main: { quota: null },
   fallbacks: [],
-  activeId: undefined,
   route: 'main',
   relay: null,
   fastMode: false,
@@ -350,40 +353,46 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     }
     if (typeof m.quotaBackedOff === 'boolean')
       main.quotaBackedOff = m.quotaBackedOff
-    if (typeof m.quotaBackoffUntil === 'number')
+    // Only finite numbers are display data: the OpenCode 2 RPC boundary
+    // refuses NaN and Infinity, so they are dropped like any wrong type.
+    if (isFiniteNumber(m.quotaBackoffUntil)) {
       main.quotaBackoffUntil = m.quotaBackoffUntil
+    }
     if (typeof m.refreshBackedOff === 'boolean')
       main.refreshBackedOff = m.refreshBackedOff
-    if (typeof m.refreshBackoffUntil === 'number')
+    if (isFiniteNumber(m.refreshBackoffUntil)) {
       main.refreshBackoffUntil = m.refreshBackoffUntil
+    }
   }
 
   const fallbacks: SidebarAccountState[] = Array.isArray(raw.fallbacks)
     ? raw.fallbacks
         .filter(isRecord)
         .filter((entry) => typeof entry.id === 'string')
-        .map((entry) => ({
-          id: entry.id as string,
-          label: typeof entry.label === 'string' ? entry.label : undefined,
-          quota: normalizeAccountQuota(entry.quota),
-          enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
-          ...(typeof entry.stateLine === 'string' && {
-            stateLine: entry.stateLine,
+        .map(
+          (entry): SidebarAccountState => ({
+            id: entry.id as string,
+            ...(typeof entry.label === 'string' && { label: entry.label }),
+            quota: normalizeAccountQuota(entry.quota),
+            enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
+            ...(typeof entry.stateLine === 'string' && {
+              stateLine: entry.stateLine,
+            }),
+            ...(entry.quotaDated === true && { quotaDated: true }),
+            needsReauth:
+              typeof entry.needsReauth === 'boolean'
+                ? entry.needsReauth
+                : false,
+            ...(entry.vaultReauth === true && { vaultReauth: true }),
+            ...(entry.vaultServed === true && { vaultServed: true }),
+            ...(typeof entry.custodyState === 'string' && {
+              custodyState:
+                entry.custodyState as SidebarAccountState['custodyState'],
+            }),
+            ...(typeof entry.tierLabel === 'string' &&
+              entry.tierLabel.trim() && { tierLabel: entry.tierLabel.trim() }),
           }),
-          ...(entry.quotaDated === true && { quotaDated: true }),
-          needsReauth:
-            typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
-          ...(entry.vaultReauth === true && { vaultReauth: true }),
-          ...(entry.vaultServed === true && { vaultServed: true }),
-          ...(typeof entry.custodyState === 'string' && {
-            custodyState:
-              entry.custodyState as SidebarAccountState['custodyState'],
-          }),
-          tierLabel:
-            typeof entry.tierLabel === 'string' && entry.tierLabel.trim()
-              ? entry.tierLabel.trim()
-              : undefined,
-        }))
+        )
     : []
 
   let relay: SidebarState['relay'] = null
@@ -400,11 +409,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     if (typeof ck.enabled === 'boolean') {
       cacheKeep = {
         enabled: ck.enabled,
-        window: typeof ck.window === 'string' ? ck.window : undefined,
-        trackedSessions:
-          typeof ck.trackedSessions === 'number'
-            ? ck.trackedSessions
-            : undefined,
+        ...(typeof ck.window === 'string' && { window: ck.window }),
+        ...(isFiniteNumber(ck.trackedSessions) && {
+          trackedSessions: ck.trackedSessions,
+        }),
       }
     }
   }
@@ -432,23 +440,23 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
               mode: recovery.mode,
               remaining: Math.max(0, Math.floor(recovery.remaining)),
               changedAt: recovery.changedAt,
-              requestedModelId:
-                typeof recovery.requestedModelId === 'string'
-                  ? recovery.requestedModelId
-                  : undefined,
-              targetModelId:
-                typeof recovery.targetModelId === 'string'
-                  ? recovery.targetModelId
-                  : undefined,
+              ...(typeof recovery.requestedModelId === 'string' && {
+                requestedModelId: recovery.requestedModelId,
+              }),
+              ...(typeof recovery.targetModelId === 'string' && {
+                targetModelId: recovery.targetModelId,
+              }),
             },
           ]
         })
     : []
 
+  const prime = normalizePrimeSection(raw.prime)
+
   return {
     main,
     fallbacks,
-    activeId: typeof raw.activeId === 'string' ? raw.activeId : undefined,
+    ...(typeof raw.activeId === 'string' && { activeId: raw.activeId }),
     route:
       typeof raw.route === 'string' ? raw.route : DEFAULT_SIDEBAR_STATE.route,
     relay,
@@ -457,9 +465,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         ? raw.fastMode
         : DEFAULT_SIDEBAR_STATE.fastMode,
     cacheKeep,
-    prime: normalizePrimeSection(raw.prime),
-    fableRecoveries: fableRecoveries.length > 0 ? fableRecoveries : undefined,
-    lastUpdated: typeof raw.lastUpdated === 'number' ? raw.lastUpdated : 0,
+    ...(prime && { prime }),
+    ...(fableRecoveries.length > 0 && { fableRecoveries }),
+    lastUpdated: isFiniteNumber(raw.lastUpdated) ? raw.lastUpdated : 0,
   }
 }
 
@@ -692,9 +700,10 @@ export interface SidebarStateWriteOptions {
           })
         | undefined
       >
-  onRoutingResolved?: (
-    routing: Pick<SidebarState, 'activeId' | 'route'>,
-  ) => void
+  onRoutingResolved?: (routing: {
+    activeId: string | undefined
+    route: string
+  }) => void
 }
 
 export async function setSidebarState(

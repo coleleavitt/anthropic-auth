@@ -22,6 +22,7 @@ import {
   resetClaustrumEnrollmentState,
 } from '@cortexkit/anthropic-auth-core'
 import { LANE_START_TEXT } from '../lane-start'
+import { normalizeSidebarState } from '../sidebar-state'
 import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
   CLAUDE_POOL_LOGIN_METHOD_LABEL,
@@ -366,11 +367,13 @@ export function createNativeMenuCapabilities(options: {
         runtime.read(),
         options.cacheKeepRegistry?.list() ?? [],
       ])
-      return buildNativeSidebarState(snapshot, {
-        activeId: source.servedAccount(sessionID),
-        trackedSessions: sessions.length,
-        now: Date.now(),
-      })
+      return normalizeSidebarState(
+        buildNativeSidebarState(snapshot, {
+          activeId: source.servedAccount(sessionID),
+          trackedSessions: sessions.length,
+          now: Date.now(),
+        }),
+      )
     },
     forgetSession(sessionID) {
       pending.get(sessionID)?.active.abort()

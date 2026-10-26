@@ -3,6 +3,8 @@ import type {
   NativeAccountSnapshot,
   NativeAccountView,
 } from '@cortexkit/anthropic-auth-core'
+import type { StandardSchemaV1 } from '@standard-schema/spec'
+import { Schema } from 'effect'
 import { normalizeSidebarState } from '../sidebar-state'
 import type { NativeMenuCapabilities } from '../v2/menu-contract'
 import { NATIVE_MENU_RPC, registerNativeMenu } from '../v2/rpc'
@@ -47,6 +49,38 @@ function snapshot(
 }
 
 const extras = { activeId: undefined, trackedSessions: 0, now }
+
+// The host encodes every RPC method output with a JSON codec, built from the
+// plain `Json` schema: no `undefined` and no NaN or Infinity anywhere in the
+// value. This is that codec. (The protocol package's own `Rpc.Output` is the
+// same `Json` schema, but its codec also rejects every complete value unless
+// the outer `output` key is the encoded option form, so it cannot be used
+// here.)
+const toWire = Schema.encodeSync(Schema.toCodecJson(Schema.Unknown)) as (
+  value: unknown,
+) => unknown
+const sidebarOutput = NATIVE_MENU_RPC.methods.sidebar
+  .output as StandardSchemaV1<unknown, unknown>
+async function encodeSidebar(answer: unknown): Promise<unknown> {
+  const checked = await sidebarOutput['~standard'].validate(answer)
+  if (!('value' in checked))
+    throw new Error('sidebar output failed to validate')
+  return toWire(checked.value)
+}
+
+// Every path whose value is `undefined` or a non-finite number. The JSON
+// codec refuses such a value, and the walk names the offending path instead
+// of leaving the reviewer with a schema error.
+function nonJsonPaths(value: unknown, path = '$'): string[] {
+  if (typeof value === 'undefined') return [path]
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? [] : [`${path} (${String(value)})`]
+  }
+  if (value === null || typeof value !== 'object') return []
+  return Object.entries(value).flatMap(([key, entry]) =>
+    nonJsonPaths(entry, `${path}.${key}`),
+  )
+}
 
 describe('OpenCode 2 sidebar state', () => {
   test('lists main and enabled OAuth fallbacks with their quota, never API keys', () => {
@@ -271,12 +305,63 @@ describe('OpenCode 2 sidebar state', () => {
 })
 
 describe('OpenCode 2 sidebar RPC', () => {
-  test('the output schema fails closed to the empty state', async () => {
+  test('the sidebar answer is a JSON value the host codec accepts', async () => {
+    const state = buildNativeSidebarState(
+      snapshot([
+        // No label and no tier on this account, so both fallbacks are absent.
+        account({ id: 'work' }),
+        // A reading the quota parser cannot use must not become NaN.
+        account({
+          id: 'odd',
+          quota: {
+            checkedAt: now,
+            five_hour: {
+              usedPercent: Number.POSITIVE_INFINITY,
+              remainingPercent: Number.NaN,
+              checkedAt: now,
+              resetsAt: new Date(now + 3_600_000).toISOString(),
+            },
+            extraUsage: {
+              used: { amountMinor: 1, currency: 'USD', exponent: 2 },
+              limit: { amountMinor: Number.NaN, currency: 'USD', exponent: 2 },
+              exhausted: false,
+              utilizationPercent: Number.NEGATIVE_INFINITY,
+            },
+          },
+        }),
+      ]),
+      { ...extras, activeId: undefined },
+    )
+    // The value the server sends, exactly as the projection built it.
+    expect(Object.keys(state)).not.toContain('activeId')
+    expect(state.cacheKeep).not.toHaveProperty('window')
+    const wire = await encodeSidebar(state)
+    expect(nonJsonPaths(wire)).toEqual([])
+  })
+
+  test('the output schema turns non-JSON values into the empty state', async () => {
     const validate =
       NATIVE_MENU_RPC.methods.sidebar.output['~standard'].validate
     const result = await validate('not a state')
     expect('value' in result && result.value.fallbacks).toEqual([])
     expect('value' in result && result.value.main.quota).toBeNull()
+  })
+
+  test('the output schema drops non-JSON values instead of failing the call', async () => {
+    const state = buildNativeSidebarState(snapshot([account({})]), extras)
+    const written = {
+      ...state,
+      main: { ...state.main, quotaBackoffUntil: Number.NaN },
+    }
+    const wire = await encodeSidebar(written)
+    expect(nonJsonPaths(wire)).toEqual([])
+    // Nothing else changed on the way: the answer is the same state minus
+    // the NaN, not the empty fallback.
+    expect('main' in (wire as object)).toBe(true)
+    expect((wire as { route: string }).route).toBe(state.route)
+    expect((wire as { lastUpdated: number }).lastUpdated).toBe(
+      state.lastUpdated,
+    )
   })
 
   test('registers a sidebar handler that reads the requested session', async () => {

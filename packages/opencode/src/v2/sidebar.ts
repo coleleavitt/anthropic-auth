@@ -108,17 +108,15 @@ export function buildNativeSidebarState(
           quotaDated: Boolean(stateLine),
         }
       }),
-    activeId: extras.activeId,
+    ...(extras.activeId !== undefined && { activeId: extras.activeId }),
     route: getRoutingMode(storage),
     relay: effectiveRelayStatus(storage.relay),
     fastMode: storage.claudeFast?.enabled === true,
     cacheKeep: {
       enabled: isCacheKeepHybridActive(storage),
-      window: isCacheKeepAlways(storage)
-        ? 'always'
-        : window
-          ? `${window.startHour}-${window.endHour}`
-          : undefined,
+      ...(isCacheKeepAlways(storage)
+        ? { window: 'always' }
+        : window && { window: `${window.startHour}-${window.endHour}` }),
       trackedSessions: extras.trackedSessions,
     },
     prime: isPrimePersistentlyEnabled(storage)
