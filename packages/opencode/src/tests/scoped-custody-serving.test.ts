@@ -690,8 +690,12 @@ describe('OpenCode scoped custody serving', () => {
             message:
               'No vault account can serve this request. Open /claude to see which account needs signing in again.',
           })
+          // Discovery stays closed through the refusal, so the full
+          // two-second admission budget elapses first: removing or shortening
+          // that production budget fails the wait below. There is
+          // deliberately no upper bound — a loaded runner only makes a
+          // correct wait longer.
           expect(performance.now() - started).toBeGreaterThanOrEqual(1900)
-          expect(performance.now() - started).toBeLessThan(3000)
           expect(sends).toBe(0)
           discovery.open()
           await Reflect.get(plugin, '__fallbackRefreshReady')

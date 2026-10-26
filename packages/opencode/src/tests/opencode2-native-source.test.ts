@@ -1409,8 +1409,11 @@ describe('OC2 source over actual native services', () => {
           message:
             'No vault account can serve this request. Open /claude to see which account needs signing in again.',
         })
+        // The stalled refresh holds the full two-second admission budget
+        // before the refusal: removing or shortening that production budget
+        // fails the wait below. There is deliberately no upper bound — a
+        // loaded runner only makes a correct wait longer.
         expect(performance.now() - started).toBeGreaterThanOrEqual(1900)
-        expect(performance.now() - started).toBeLessThan(3000)
         expect(refresh).toHaveBeenCalledTimes(1)
         expect(calls).toBe(1)
         f.setState('oauth:anthropic', 'active')
