@@ -17,6 +17,7 @@ import {
 import type {
   AccountHeadersResult,
   Attempt,
+  ChooseAccountResult,
   HeaderEdits,
   LimitSignal,
   OpenCode2AuthAdapter,
@@ -225,12 +226,15 @@ class Host {
   readonly sent: Request[] = []
   private seq = 0
 
-  constructor(readonly adapter: OpenCode2AuthAdapter<Quota, Data>) {}
+  constructor(
+    readonly adapter: OpenCode2AuthAdapter<Quota, Data, ChooseAccountResult>,
+  ) {}
 
   async begin(scope: RequestScope) {
     const input = { ...scope, phase: 'request' as const }
     const accountId = await this.adapter.chooseAccount(input)
-    if (accountId === undefined) throw new Error('installer: no-account')
+    // A hold is honoured only by the retry hook; a request needs an account.
+    if (typeof accountId !== 'string') throw new Error('installer: no-account')
     const result = (await this.adapter.accountHeaders({
       ...scope,
       accountId,
@@ -1866,9 +1870,8 @@ function contractChecks(_scope: RequestScope, limit: LimitSignal) {
     requestOptions: () => ({ cache1hEnabled: true }),
     limitFromStreamError: () => limit,
   }
-  const typed: OpenCode2AuthAdapter<Quota, Data> = createNativeAnthropicAdapter(
-    { source: healthy },
-  ).adapter
+  const typed: OpenCode2AuthAdapter<Quota, Data, ChooseAccountResult> =
+    createNativeAnthropicAdapter({ source: healthy }).adapter
   type Source = NativeAnthropicSource<Quota, Provenance>
   const rejected: {
     narrowChoose: ContractAccepts<

@@ -34,6 +34,7 @@ import type {
   Attempt,
   AttemptOutcome,
   ChooseAccountInput,
+  ChooseAccountResult,
   EventVerdict,
   HeaderEdits,
   HostError,
@@ -282,10 +283,14 @@ export interface NativeAnthropicAttemptOutcome extends AttemptOutcome {
  * the adapter passes it is rejected at compile time.
  */
 export interface NativeAnthropicSource<Q, P> {
-  /** Picks the account for one request; `undefined` refuses it. */
+  /**
+   * Picks the account for one request; `undefined` refuses it. In phase
+   * `retry` it may instead return a hold, which keeps the refused account and
+   * waits the given delay before the host retries.
+   */
   readonly chooseAccount: (
     input: ChooseAccountInput,
-  ) => Promise<string | undefined> | string | undefined
+  ) => Promise<ChooseAccountResult> | ChooseAccountResult
   /** Discards one queued choice that the installer will not authorize. */
   readonly dropChoice?: (input: AccountRequest) => Promise<void> | void
   /**
@@ -386,7 +391,11 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
 }
 
 export interface NativeAnthropicAdapter<Q, P> {
-  readonly adapter: OpenCode2AuthAdapter<Q, NativeAnthropicAttemptData<P>> & {
+  readonly adapter: OpenCode2AuthAdapter<
+    Q,
+    NativeAnthropicAttemptData<P>,
+    ChooseAccountResult
+  > & {
     readonly dropChoice: (input: AccountRequest) => Promise<void> | void
   }
   /**
@@ -1148,9 +1157,11 @@ export function createNativeAnthropicAdapter<Q, P>(
     providerID: ANTHROPIC_PROVIDER_ID,
     chooseAccount: (input) =>
       tracked(input, async () => {
-        const accountId = await source.chooseAccount(input)
-        if (!accountId) throw refuse(input)
-        return accountId
+        const choice = await source.chooseAccount(input)
+        // The installer honours a hold only while judging a retry.
+        if (typeof choice === 'object' && input.phase === 'retry') return choice
+        if (typeof choice !== 'string' || !choice) throw refuse(input)
+        return choice
       }),
     dropChoice: (input) => source.dropChoice?.(input),
     accountHeaders,

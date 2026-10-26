@@ -1,4 +1,11 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import {
+  afterEach,
+  describe,
+  expect,
+  setSystemTime,
+  spyOn,
+  test,
+} from 'bun:test'
 import { createHash } from 'node:crypto'
 import {
   access,
@@ -26,6 +33,7 @@ import {
   resolveNativePoolPaths,
   runNativeMigration,
   setLogLevel,
+  stickyRetryAfterWithJitter,
 } from '@cortexkit/anthropic-auth-core'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
@@ -1040,6 +1048,19 @@ async function retryHost(native: ReturnType<typeof source>) {
       await run('http.response', draft)
       await draft.response.text()
     },
+    /** Answers with a 200 event stream whose events the host reads to the end. */
+    async streamed(request: Request, events: string, input = scope) {
+      const draft = {
+        ...hostScope(input),
+        request,
+        response: new Response(events, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+      }
+      await run('http.response', draft)
+      await draft.response.text()
+    },
     async retry(retry = true, input = scope) {
       const draft: SessionHooks['retry'] = {
         ...hostScope(input),
@@ -1251,6 +1272,225 @@ describe('OC2 installed retry contract (requires common-auth 0.25.0)', () => {
   }
 })
 
+/**
+ * Publishes a fresh reading for the vault default account whose five-hour
+ * window is exhausted and resets at `resetAt`.
+ */
+async function exhaustDefault(
+  fixture: Awaited<ReturnType<typeof vaultWithFallback>>,
+  resetAt: number,
+  checkedAt = Date.now(),
+) {
+  const receipt = await fixture.runtime.authorizeVault('main')
+  await fixture.runtime.vault.publish(receipt, {
+    quota: {
+      accountIdentity: identity,
+      checkedAt,
+      five_hour: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        checkedAt,
+        resetsAt: new Date(resetAt).toISOString(),
+      },
+      seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt },
+    },
+  })
+}
+
+/** Runs `work` with the clock stopped at `now`, so reset arithmetic is exact. */
+async function atTime<T>(now: number, work: () => Promise<T>) {
+  setSystemTime(new Date(now))
+  try {
+    return await work()
+  } finally {
+    setSystemTime()
+  }
+}
+
+describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => {
+  const mainBearer = 'Bearer sk-ant-oat01-oauth:anthropic'
+  const fallbackBearer = 'Bearer sk-ant-oat01-oauth:anthropic:work'
+
+  async function heldSession(sessionID = scope.sessionID) {
+    const fixture = await vaultWithFallback()
+    const native = source(fixture.runtime, fixture.paths)
+    const choose = spyOn(native, 'chooseAccount')
+    const drop = spyOn(native, 'dropChoice')
+    const host = await retryHost(native)
+    const session = { ...scope, sessionID }
+    const first = await host.send(session)
+    const accountFor = () =>
+      host.installation.installation.accountFor(sessionID, 'primary')
+    expect(accountFor()).toBe('main')
+    expect(first.headers.get('authorization')).toBe(mainBearer)
+    await native.drainRoutingPublications()
+    const { routingPath } = await fixture.runtime.read()
+    if (!routingPath) throw new Error('Missing routing path')
+    const pin = await readFile(routingPath, 'utf8')
+    return {
+      fixture,
+      native,
+      choose,
+      drop,
+      host,
+      session,
+      first,
+      accountFor,
+      routingPath,
+      pin,
+    }
+  }
+
+  test('a 429 with a short reset holds the session on its account for the jittered reset, keeping its pin', async () => {
+    const f = await heldSession()
+    const now = Date.now()
+    await exhaustDefault(f.fixture, now + 120_000, now)
+    await f.host.response(f.first, 429, f.session)
+    // The host would not retry this error; the hold retries it after our wait.
+    expect(await atTime(now, () => f.host.retry(false, f.session))).toEqual({
+      retry: true,
+      delay: stickyRetryAfterWithJitter(f.session.sessionID, 120) * 1000,
+    })
+    expect(f.choose.mock.calls[1]?.[0]).toMatchObject({
+      phase: 'retry',
+      rerouteFrom: { accountId: 'main', limit: { status: 429 } },
+    })
+    await f.native.drainRoutingPublications()
+    expect(await readFile(f.routingPath, 'utf8')).toBe(f.pin)
+    const next = await f.host.send(f.session)
+    expect(next.headers.get('authorization')).toBe(mainBearer)
+    expect(f.accountFor()).toBe('main')
+    // The held retry is served by the queued choice, not a new selection.
+    expect(f.choose).toHaveBeenCalledTimes(2)
+    expect(f.drop).toHaveBeenCalledTimes(0)
+    await f.native.drainRoutingPublications()
+    expect(
+      JSON.parse(
+        rawPin(await readFile(f.routingPath, 'utf8'), f.session.sessionID),
+      ),
+    ).toMatchObject({ accountId: 'main' })
+  })
+
+  test('a 429 whose reset is beyond fifteen minutes moves the session to another account', async () => {
+    const f = await heldSession()
+    const now = Date.now()
+    await exhaustDefault(f.fixture, now + 60 * 60_000, now)
+    await f.host.response(f.first, 429, f.session)
+    expect(await atTime(now, () => f.host.retry(true, f.session))).toEqual({
+      retry: true,
+      delay: 0,
+    })
+    const next = await f.host.send(f.session)
+    expect(next.headers.get('authorization')).toBe(fallbackBearer)
+    expect(f.accountFor()).not.toBe('main')
+  })
+
+  test('a reset exactly fifteen minutes away holds for 920 seconds with the largest jitter, below the installer cap', async () => {
+    let sessionID = ''
+    for (let index = 0; !sessionID; index++) {
+      const candidate = `ses_hold_boundary_${index}`
+      if (stickyRetryAfterWithJitter(candidate, 900) === 920)
+        sessionID = candidate
+    }
+    const f = await heldSession(sessionID)
+    const now = Date.now()
+    await exhaustDefault(f.fixture, now + 15 * 60_000, now)
+    await f.host.response(f.first, 429, f.session)
+    expect(await atTime(now, () => f.host.retry(true, f.session))).toEqual({
+      retry: true,
+      delay: 920_000,
+    })
+    expect((await f.host.send(f.session)).headers.get('authorization')).toBe(
+      mainBearer,
+    )
+  })
+
+  test('a rate limit after output has started never holds or retries', async () => {
+    const f = await heldSession()
+    const now = Date.now()
+    await exhaustDefault(f.fixture, now + 120_000, now)
+    await f.host.streamed(
+      f.first,
+      [
+        'event: content_block_start',
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        '',
+        'event: content_block_delta',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+        '',
+        'event: error',
+        'data: {"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}',
+        '',
+        '',
+      ].join('\n'),
+      f.session,
+    )
+    expect(await atTime(now, () => f.host.retry(true, f.session))).toEqual({
+      retry: false,
+    })
+    expect(f.choose).toHaveBeenCalledTimes(1)
+    await f.native.drainRoutingPublications()
+    expect(await readFile(f.routingPath, 'utf8')).toBe(f.pin)
+  })
+
+  for (const change of ['model', 'agent'] as const) {
+    test(`a held retry whose ${change} changed releases the held choice and selects again`, async () => {
+      const f = await heldSession()
+      const now = Date.now()
+      await exhaustDefault(f.fixture, now + 120_000, now)
+      // A changed model places the session again; that needs a reading for
+      // the other account too, or the incomplete pool refuses placement.
+      const fallback = (await f.fixture.runtime.read()).accounts.find(
+        (account) => account.id !== 'main',
+      )
+      if (!fallback) throw new Error('Missing fallback account')
+      await f.fixture.runtime.vault.publish(
+        await f.fixture.runtime.authorizeVault(fallback.id),
+        {
+          quota: {
+            accountIdentity: fallbackIdentity,
+            checkedAt: now,
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: now,
+            },
+            seven_day: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: now,
+            },
+          },
+        },
+      )
+      await f.host.response(f.first, 429, f.session)
+      expect(
+        (await atTime(now, () => f.host.retry(true, f.session))).retry,
+      ).toBe(true)
+      const changed =
+        change === 'model'
+          ? { ...f.session, modelID: 'claude-haiku-4-5' }
+          : { ...f.session, agent: 'plan' }
+      await f.host.send(changed)
+      expect(f.drop).toHaveBeenCalledTimes(1)
+      expect(f.drop.mock.calls[0]?.[0]).toMatchObject({
+        accountId: 'main',
+        modelID: f.session.modelID,
+        agent: f.session.agent,
+      })
+      expect(f.choose).toHaveBeenCalledTimes(3)
+      const reselect = f.choose.mock.calls[2]?.[0]
+      expect(reselect).toMatchObject({
+        phase: 'request',
+        modelID: changed.modelID,
+        agent: changed.agent,
+        previousAccountId: 'main',
+      })
+      expect(reselect).not.toHaveProperty('rerouteFrom')
+    })
+  }
+})
+
 describe('OC2 source over actual native services', () => {
   usageTests.test(
     'OC2 quota preflight skips an enabled vault account needing sign-in',
@@ -1303,8 +1543,8 @@ describe('OC2 source over actual native services', () => {
           ...scope,
           sessionID: `healthy-${request}`,
         })
-        expect(chosen).toBeDefined()
-        expect((await native.authorizeAccount(scope, chosen!))?.route).toBe(
+        if (typeof chosen !== 'string') throw new Error('No account chosen')
+        expect((await native.authorizeAccount(scope, chosen))?.route).toBe(
           'oauth',
         )
       }
@@ -1446,9 +1686,9 @@ describe('OC2 source over actual native services', () => {
         await f.runtime.vault.refresh()
         const native = source(f.runtime, f.paths)
         const chosen = await native.chooseAccount(scope)
-        expect(chosen).toBeDefined()
+        if (typeof chosen !== 'string') throw new Error('No account chosen')
         expect(chosen).not.toBe('main')
-        const first = await native.authorizeAccount(scope, chosen!)
+        const first = await native.authorizeAccount(scope, chosen)
         expect(first?.route).toBe('oauth')
         expect(first?.provenance.kind).toBe('vault')
         f.setState('oauth:anthropic', 'active')

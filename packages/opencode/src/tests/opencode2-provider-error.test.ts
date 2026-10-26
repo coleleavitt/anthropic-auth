@@ -1,6 +1,7 @@
 import { expect } from 'bun:test'
 import type {
   Attempt,
+  ChooseAccountResult,
   HostError,
   OpenCode2AuthAdapter,
   RequestScope,
@@ -29,7 +30,7 @@ const test = lifetimes.test
 type Provenance = { readonly receipt: string }
 type Quota = { readonly reading: string }
 type Data = NativeAnthropicAttemptData<Provenance>
-type Adapter = OpenCode2AuthAdapter<Quota, Data>
+type Adapter = OpenCode2AuthAdapter<Quota, Data, ChooseAccountResult>
 
 const UPSTREAM = 'https://api.anthropic.com/v1/messages'
 const RELAY = 'https://synthetic-relay.invalid/relay'
@@ -199,7 +200,7 @@ let attemptSeq = 0
 async function send(adapter: Adapter, sessionID: string, stream = true) {
   const scope = scopeOf(sessionID)
   const accountId = await adapter.chooseAccount(scope)
-  if (accountId === undefined) throw new Error('no account')
+  if (typeof accountId !== 'string') throw new Error('no account')
   const result = await adapter.accountHeaders({ ...scope, accountId })
   const data = 'attempt' in result ? result.attempt : undefined
   if (!isAttemptData(data)) throw new Error('adapter returned no attempt data')

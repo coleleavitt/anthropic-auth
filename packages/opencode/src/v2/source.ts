@@ -1,5 +1,6 @@
 import {
   createNativeUsagePublisher,
+  decideStickyQuotaFailure,
   effectiveRelayTransport,
   getClaudeCodeIdentityForVerifiedAccount,
   getQuotaCheckIntervalMs,
@@ -30,12 +31,15 @@ import {
   StickySessionRouter,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
+  stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   ChooseAccountInput,
+  ChooseAccountResult,
   HeaderEdits,
   RequestScope,
+  RetryHold,
 } from '@cortexkit/common-auth/opencode2'
 import { extractAnthropicRequestId } from '../billing-lineage'
 import {
@@ -87,6 +91,59 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
   (['five_hour', 'seven_day'] as const).some(
     (window) => (quota?.[window]?.remainingPercent ?? 1) <= 0,
   )
+
+/**
+ * Sticky-balanced sessions wait on their own account, as OpenCode 1 and Pi
+ * do, when a 429 refused it and every exhausted quota window blocking the
+ * model has a known reset within 15 minutes. The wait is that reset plus the
+ * session's deterministic jitter. The installer then keeps the refused account
+ * and its routing pin and replaces the host's retry wait with this delay.
+ *
+ * `servable` holds the accounts that can serve this model right now. A
+ * refused account outside it would be refused again by `authorizeAccount`
+ * when the held retry runs, so it moves instead of waiting. That covers a
+ * model-scoped window at zero and a configured quota floor or killswitch.
+ */
+function stickyHold(
+  input: ChooseAccountInput,
+  snapshot: NativeAccountSnapshot,
+  servable: readonly NativeAccountView[],
+  modelID: string,
+): RetryHold | undefined {
+  const refused = input.rerouteFrom
+  if (
+    input.phase !== 'retry' ||
+    refused?.limit.status !== 429 ||
+    getRoutingMode(snapshot.policyStorage) !== 'sticky-balanced'
+  )
+    return undefined
+  const account = servable.find((row) => row.id === refused.accountId)
+  // Only a current reading can show when the blocking windows reset.
+  if (
+    !account ||
+    !stickyQuotaSnapshotIsFresh(
+      account.quota,
+      snapshot.policyStorage,
+      Date.now(),
+      modelID,
+    )
+  )
+    return undefined
+  const decision = decideStickyQuotaFailure({
+    quota: account.quota,
+    modelId: modelID,
+  })
+  if (decision.action !== 'hold') return undefined
+  return {
+    hold: {
+      delayMs:
+        stickyRetryAfterWithJitter(
+          input.sessionID,
+          decision.retryAfterSeconds,
+        ) * 1000,
+    },
+  }
+}
 
 export interface NativeSourceOptions {
   readonly runtime: NativeAccountRuntime
@@ -298,7 +355,9 @@ export function createNativeAnthropicSource(
   }
 
   const source: NativeSource = {
-    async chooseAccount(input: ChooseAccountInput) {
+    async chooseAccount(
+      input: ChooseAccountInput,
+    ): Promise<ChooseAccountResult> {
       // Credential maintenance and quota readings may occur without selecting
       // an account. Returning undefined must not consume a pending retry,
       // queue an account choice, or create, move or delete a session pin.
@@ -391,6 +450,8 @@ export function createNativeAnthropicSource(
         }
         oauth.push(account)
       }
+      const hold = stickyHold(input, snapshot, oauth, modelID)
+      if (hold) return hold
       const withoutRejected = oauth.filter(
         (account) => account.id !== input.rerouteFrom?.accountId,
       )

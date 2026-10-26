@@ -1668,7 +1668,7 @@ async function sendSetupOc2(
   try {
     const input = { ...setupScope, phase: 'request' as const }
     const accountId = await adapter.adapter.chooseAccount(input)
-    if (!accountId) throw new Error('fixture: no account')
+    if (typeof accountId !== 'string') throw new Error('fixture: no account')
     const headers = await adapter.adapter.accountHeaders({
       ...setupScope,
       accountId,
