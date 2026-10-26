@@ -38,7 +38,7 @@ bun run --cwd packages/opencode smoke:tui
 
 `check:claustrum-golden` compares pinned custody-marker fixtures with the authoritative Claustrum credential-vault repository over HTTPS. The lock check verifies manifests against `bun.lock`; it does not install dependencies. Packed TUI smoke checks both standalone CLI startup and host renderer resolution. Keep package builds sequential when tests share rebuilt Core dist.
 
-Tests must use disposable home/config/data/state directories, fixture tokens and stubbed upstreams, not a live host, vault or database. Retain the first failure and original deadlines; do not retry an unchanged failure until it disappears. [Mutation proofs](testing/mutations.md#setup-authority-and-local-login-omission-controls) record which assertions fail when authority, import and admission safeguards are deliberately removed, and what those focused runs do not prove.
+Tests must use disposable home/config/data/state directories, fixture tokens and stubbed upstreams, not a live host, vault or database. Retain the first failure and original deadlines; do not retry an unchanged failure until it disappears.
 
 ## Local OpenCode workflow
 

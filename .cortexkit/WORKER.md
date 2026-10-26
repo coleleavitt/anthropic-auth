@@ -17,6 +17,7 @@
 
 ## Which checks to run
 
-- Run the tests that own your change, plus typecheck and lint, on the remote runner. Use `bun test <files>` in the package, after building Core in the same job.
-- Don't run the full Core, OpenCode and Pi suites unless the brief asks for them. GitHub CI runs every suite in parallel jobs in about four minutes on each PR, and its result decides the merge. On the shared runner a full OpenCode run takes several minutes and usually hits unrelated load timeouts.
+- Run the filtered tests for the code you touched, plus typecheck and lint, on the remote runner. Use `bun test <files>` in the package, after building Core in the same job.
+- For a bug fix, show once that the new test fails without the fix.
+- Don't write mutation proofs or lists of deliberate code breaks, don't run the full suites, and don't repeat a run. GitHub CI runs the full Core, OpenCode and Pi suites on every PR, and its result decides the merge.
 - In your report, list what you ran and what you left to CI.
