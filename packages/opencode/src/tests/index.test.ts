@@ -7190,6 +7190,68 @@ describe('auth.loader', () => {
     }
   })
 
+  test('a foreign ANTHROPIC_BASE_URL is refused for OAuth and honoured for an API key', async () => {
+    const previousBase = process.env.ANTHROPIC_BASE_URL
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic'
+    let auth: {
+      type: string
+      access?: string
+      refresh?: string
+      expires?: number
+    } = {
+      type: 'oauth',
+      access: 'sk-ant-oat01-base-url-oauth',
+      refresh: 'base-url-refresh',
+      expires: Date.now() + 100_000,
+    }
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }), {
+      access: 'sk-ant-oat01-base-url-oauth',
+      refresh: 'base-url-refresh',
+      expires: auth.expires as number,
+    })
+    const proxied: string[] = []
+    globalThis.fetch = mock(
+      withNativeAdmission(async (input: unknown) => {
+        const url =
+          input instanceof Request ? input.url : String(input as string | URL)
+        if (url.startsWith('https://proxy.example.test')) proxied.push(url)
+        return new Response('{}', { status: 200 })
+      }),
+    ) as unknown as typeof fetch
+    const request = () => ({
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    try {
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(auth as never),
+        { models: {} },
+      )
+      const refused = await result.fetch(MESSAGES_URL, request())
+      expect(refused.status).toBe(400)
+      expect(((await refused.json()) as any).error.message).toBe(
+        Core.ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
+      )
+      expect(proxied).toEqual([])
+
+      auth = { type: 'api' }
+      const passed = await result.fetch(MESSAGES_URL, request())
+      expect(passed.status).toBe(200)
+      expect(proxied).toEqual([
+        'https://proxy.example.test/anthropic/v1/messages?beta=true',
+      ])
+    } finally {
+      if (previousBase === undefined) delete process.env.ANTHROPIC_BASE_URL
+      else process.env.ANTHROPIC_BASE_URL = previousBase
+    }
+  })
+
   test('returns fetch wrapper for oauth auth', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }), {
       access: 'sk-ant-oat01-token',

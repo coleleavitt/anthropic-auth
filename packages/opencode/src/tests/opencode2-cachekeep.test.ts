@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   CACHE_KEEP_PREWARM_LEAD_MS,
   CACHE_KEEP_TTL_MS,
   CacheKeepSessionRegistry,
@@ -152,13 +153,13 @@ async function fixture(child = false, brokenRegistry = false) {
     },
   })
   cleanups.push(dispose)
-  const live = async () => {
+  const live = async (url = 'https://api.anthropic.com/v1/messages') => {
     const draft = {
       sessionID: 'ses_oc2_keep' as SessionHooks['http.request']['sessionID'],
       agent: 'build',
       model: { providerID: 'anthropic', id: 'claude-sonnet-4-6' },
       kind: 'primary',
-      request: new Request('https://api.anthropic.com/v1/messages', {
+      request: new Request(url, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -342,3 +343,45 @@ test('OpenCode 2 dispose aborts and joins an in-flight prewarm', async () => {
   await tick
   expect(f.timers.callbacks.size).toBe(0)
 })
+
+/** Sets the test-only loopback OAuth origin until the test's cleanup. */
+function admitLoopbackOrigin(origin: string) {
+  const saved = process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN
+  process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = origin
+  cleanups.push(() => {
+    if (saved === undefined)
+      delete process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN
+    else process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = saved
+  })
+}
+
+const LOOPBACK = 'http://127.0.0.1:9'
+
+test('an OpenCode 2 request to a provider baseURL elsewhere is refused and never kept warm', async () => {
+  const f = await fixture()
+  await expect(f.live(`${LOOPBACK}/v1/messages`)).rejects.toThrow(
+    ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
+  )
+  expect(await f.registry.list()).toEqual([])
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+})
+
+for (const stillAdmitted of [true, false]) {
+  test(`an OpenCode 2 prewarm to a remembered loopback URL ${stillAdmitted ? 'is sent while the test origin admits it' : 'is refused once the origin is no longer allowed'}`, async () => {
+    const f = await fixture()
+    admitLoopbackOrigin(LOOPBACK)
+    await (await f.live(`${LOOPBACK}/v1/messages`)).text()
+    expect((await f.registry.list()).map((session) => session.id)).toEqual([
+      'ses_oc2_keep',
+    ])
+    if (!stillAdmitted)
+      delete process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN
+    f.due()
+    await f.timers.fire()
+    expect(f.sent.map((request) => new URL(request.url).origin)).toEqual(
+      stillAdmitted ? [LOOPBACK] : [],
+    )
+  })
+}

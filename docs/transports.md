@@ -45,7 +45,7 @@ Relays always send the uncompressed body to Anthropic in this release: the relay
 
 ## Proxy routes
 
-API-key routes can use a custom base URL and auth-header selection. The CLI's API-route inputs are listed in [commands](commands.md#opencode-cli). `ANTHROPIC_BASE_URL` can override the request endpoint. Pi additionally supports `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL` and `ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU,FABLE}_MODEL` on API-key proxy routes; those custom-header/model overrides do not alter OAuth requests. Protected authentication and protocol headers cannot be replaced by custom headers.
+API-key routes can use a custom base URL and auth-header selection. The CLI's API-route inputs are listed in [commands](commands.md#opencode-cli). `ANTHROPIC_BASE_URL` can override the endpoint of API-key routes. On OpenCode 1 and OpenCode 2, Claude sign-in (OAuth) requests go only to `https://api.anthropic.com`: a provider `baseURL` or `ANTHROPIC_BASE_URL` pointing elsewhere is refused for them with a local 400, and nothing is sent. Pi already sends native OAuth only to that origin. Pi additionally supports `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL` and `ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU,FABLE}_MODEL` on API-key proxy routes; those custom-header/model overrides do not alter OAuth requests. Protected authentication and protocol headers cannot be replaced by custom headers.
 
 Only use endpoints you trust: the route receives the request content and its configured authorization. Do not use insecure transport settings as a remedy for a credential or custody error.
 

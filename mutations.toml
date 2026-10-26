@@ -1712,3 +1712,56 @@ broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/open
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
 junit_class = "suites"
+
+[[control]]
+id = "oc1-oauth-destination-check"
+guards = "OpenCode 1 must refuse a Claude OAuth request whose final URL is not https://api.anthropic.com with a local 400, before any token is sent to a provider baseURL from project configuration."
+file = "packages/opencode/src/index.ts"
+old = "              !isAllowedOAuthDestination("
+new = """              false && // NON-VACUITY BREAK: skip the OC1 OAuth destination check.
+              !isAllowedOAuthDestination("""
+test_file = "packages/opencode/src/tests/native-serving.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/native-serving.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["OC1 claustrum OAuth: a provider baseURL on a loopback server receives no direct request"]
+expect_message = "AnthropicOAuthOriginError: Claude OAuth requests can only go to https://api.anthropic.com."
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+junit_class = "suites"
+
+[[control]]
+id = "oc2-oauth-destination-check"
+guards = "OpenCode 2 must refuse a Claude OAuth request, direct or HTTP relay, whose final URL is not https://api.anthropic.com before it returns a request for the host to send."
+file = "packages/opencode/src/v2/adapter.ts"
+old = """        requireOAuthDestination(url)
+"""
+new = """        // NON-VACUITY BREAK: skip the OC2 OAuth destination check.
+"""
+test_file = "packages/opencode/src/tests/opencode2-adapter.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/opencode2-adapter.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["OpenCode 2 native Anthropic adapter: OAuth destination > a provider baseURL on a loopback server receives no direct OAuth request, including the host retry"]
+expect_message = "error: expect(received).toBeInstanceOf(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+junit_class = "suites"
+
+[[control]]
+id = "relay-oauth-upstream-url-check"
+guards = "The relay must refuse an OAuth envelope whose upstream.url is not Anthropic before anything reaches the relay endpoint, and must not fall back to a direct send."
+file = "packages/core/src/relay.ts"
+old = "  requireUpstreamUrl?.(input instanceof Request ? input.url : input.toString())"
+new = "  // NON-VACUITY BREAK: skip the relay upstream.url check."
+test_file = "packages/core/src/tests/oauth-origin.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/oauth-origin.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["relay upstream check refuses a foreign upstream.url before the relay receives anything"]
+expect_message = "error: expect(received).toBeInstanceOf(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

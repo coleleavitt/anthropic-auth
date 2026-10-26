@@ -75,6 +75,12 @@ function originOptions(): AnthropicOAuthOriginOptions {
  * Throws AnthropicOAuthOriginError unless an OAuth token may be sent to
  * `url`. Call it with the final URL, after rewriteUrl has applied any
  * ANTHROPIC_BASE_URL or provider baseURL, so neither can redirect a token.
+ *
+ * ANTHROPIC_BASE_URL is not trusted either. OpenCode's release binaries are
+ * built with Bun's `.env` autoloading turned off, but OpenCode started with
+ * `bun run` (from source) loads a `.env` file from the working directory, so
+ * an opened repository could set the variable. An OAuth token therefore goes
+ * only to api.anthropic.com whatever the variable says.
  */
 export function requireOAuthDestination(url: string): URL {
   return requireAnthropicOAuthOrigin(url, originOptions())

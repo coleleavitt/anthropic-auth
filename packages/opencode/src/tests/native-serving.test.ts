@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   __setLogTestSink,
+  ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   type authorize,
   CacheKeepManager,
   createNativeAccountRuntime,
@@ -81,6 +82,8 @@ const envKeys = [
   'OPENCODE_AUTH_CONTENT',
   'CLAUDE_CONFIG_DIR',
   'XDG_DATA_HOME',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN',
 ] as const
 const originalFetch = globalThis.fetch
 const provider: Provider = {
@@ -3277,4 +3280,263 @@ test('OpenCode 1 serves through a vault outage without local token rescue', asyn
     false,
   )
   expect(f.scopedReports).toHaveLength(0)
+})
+
+/**
+ * A server standing in for the host a repository's provider baseURL (or an
+ * ANTHROPIC_BASE_URL) points at. It records every request that reaches it;
+ * `onRequest` can answer one instead of the default 200.
+ */
+function destinationServer(
+  onRequest?: (count: number) => Response | undefined,
+) {
+  const received: Array<{ url: string; authorization: string | null }> = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      received.push({
+        url: request.url,
+        authorization: request.headers.get('authorization'),
+      })
+      return (
+        onRequest?.(received.length) ??
+        Response.json({
+          id: 'synthetic-destination-message',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'destination-reached' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        })
+      )
+    },
+  })
+  lifetimes.deferCleanup(() => server.stop(true))
+  return { origin: server.url.origin, received }
+}
+
+/** Sends the native probe to `url` instead of the official Messages URL. */
+async function sendNativeTo(plugin: PluginHooks, url: string) {
+  const options = await load(plugin, async () =>
+    custodyTombstoneOAuth('anthropic'),
+  )
+  return requestFetch(options)(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-session-affinity': `synthetic-destination-${directory}`,
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'Synthetic destination probe' }],
+    }),
+  })
+}
+
+/** Loopback test servers get real network; everything else is the fixture. */
+function routeLoopback(fixture: ServingFixture, origins: string[]) {
+  network.mockImplementation(async (input, init) => {
+    const url = input instanceof Request ? input.url : input.toString()
+    return origins.some((origin) => url.startsWith(origin))
+      ? originalFetch(input, init)
+      : fixture.fetchProvider(input, init)
+  })
+}
+
+async function expectDestinationRefusal(response: Response, origin: string) {
+  expect(response.status).toBe(400)
+  const text = await response.text()
+  expect(JSON.parse(text)).toEqual({
+    type: 'error',
+    error: {
+      type: 'invalid_request_error',
+      message: ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
+    },
+  })
+  expect(text).not.toContain(new URL(origin).host)
+  expect(text).not.toContain('sk-ant-oat01')
+}
+
+for (const mode of ['local', 'claustrum'] as const) {
+  test(`OC1 ${mode} OAuth: a provider baseURL on a loopback server receives no direct request`, async () => {
+    const fixture = await migrateServingFixture(mode)
+    const upstream = destinationServer()
+    routeLoopback(fixture, [upstream.origin])
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    await expectDestinationRefusal(
+      await sendNativeTo(plugin, `${upstream.origin}/v1/messages`),
+      upstream.origin,
+    )
+    expect(upstream.received).toEqual([])
+    expect(
+      fixture.records.filter((record) => record.url.includes('/v1/messages')),
+    ).toEqual([])
+    // A refused destination is a request error, not a credential failure.
+    expect(fixture.scopedReports).toEqual([])
+  })
+}
+
+test('OC1 vault OAuth: the official origin still serves the request', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  const response = await sendNative(plugin)
+  expect(response.status).toBe(200)
+  expect(await response.text()).toContain('native-serving-ok')
+})
+
+test('OC1 vault OAuth: a provider baseURL is refused before the HTTP relay envelope is sent', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const upstream = destinationServer()
+  const relay = new MockRelayServer()
+  relays.add(relay)
+  const address = await relay.start({ token: 'synthetic-native-relay-token' })
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  try {
+    await runtime.updateRelay({
+      enabled: true,
+      url: address.url,
+      token: 'synthetic-native-relay-token',
+      transport: 'http',
+      fallbackToDirect: true,
+    })
+  } finally {
+    runtime.close()
+  }
+  routeLoopback(fixture, [upstream.origin, address.url])
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  await expectDestinationRefusal(
+    await sendNativeTo(plugin, `${upstream.origin}/v1/messages`),
+    upstream.origin,
+  )
+  expect(relay.acceptedRequests()).toBe(0)
+  expect(upstream.received).toEqual([])
+})
+
+test('OC1 vault OAuth: a 401 retry to a destination that is no longer allowed is refused', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  // The first send is admitted by the test-only loopback origin. Its 401
+  // withdraws that permission and rotates the vault record, so the retry with
+  // the newer credential must be refused instead of sent.
+  const upstream = destinationServer((count) => {
+    if (count !== 1) return undefined
+    delete process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN
+    fixture.rotateVault()
+    return Response.json(
+      {
+        type: 'error',
+        error: { type: 'authentication_error', message: 'Synthetic 401' },
+      },
+      { status: 401 },
+    )
+  })
+  process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.origin
+  routeLoopback(fixture, [upstream.origin])
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  await expect(
+    sendNativeTo(plugin, `${upstream.origin}/v1/messages`),
+  ).rejects.toThrow(ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+  expect(upstream.received.map((record) => record.authorization)).toEqual([
+    'Bearer sk-ant-oat01-vault-main-v1',
+  ])
+})
+
+for (const admitted of [false, true]) {
+  test(`OC1 vault CacheKeep prewarm to a remembered loopback URL ${admitted ? 'is sent when the test origin admits it' : 'is refused without authorizing a credential'}`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    const upstream = destinationServer()
+    if (admitted)
+      process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.origin
+    routeLoopback(fixture, [upstream.origin])
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
+    const cacheKeep: unknown = Reflect.get(plugin, '__cacheKeepManager')
+    if (!(cacheKeep instanceof CacheKeepManager))
+      throw new Error('Native host CacheKeep manager is unavailable')
+    const gets = fixture.authorizedGets.length
+    await cacheKeep.prewarmNow({
+      sessionId: 'synthetic-destination-session',
+      url: `${upstream.origin}/v1/messages`,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      bodyText: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'Synthetic warm',
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          },
+        ],
+      }),
+      oauthAccountId: 'main',
+      isSubagent: false,
+    })
+    if (admitted) {
+      expect(upstream.received).toHaveLength(1)
+      expect(upstream.received[0]?.authorization).toBe(
+        'Bearer sk-ant-oat01-vault-main-v1',
+      )
+    } else {
+      expect(upstream.received).toEqual([])
+      expect(fixture.authorizedGets).toHaveLength(gets)
+    }
+  })
+}
+
+for (const admitted of [false, true]) {
+  test(`OC1 vault Prime under a loopback ANTHROPIC_BASE_URL ${admitted ? 'is sent when the test origin admits it' : 'is refused'}`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    await enablePrime(fixture)
+    const upstream = destinationServer()
+    process.env.ANTHROPIC_BASE_URL = upstream.origin
+    if (admitted)
+      process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.origin
+    network.mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (url.includes('/api/oauth/usage')) return primeWindows()
+      return url.startsWith(upstream.origin)
+        ? originalFetch(input, init)
+        : fixture.fetchProvider(input, init)
+    })
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    await tickPrime(plugin)
+    expect(upstream.received).toHaveLength(admitted ? 1 : 0)
+    expect(
+      fixture.records.filter((record) => record.url.includes('/v1/messages')),
+    ).toEqual([])
+  })
+}
+
+test('OC1 OAuth: ANTHROPIC_BASE_URL on a foreign origin is refused', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const upstream = destinationServer()
+  process.env.ANTHROPIC_BASE_URL = upstream.origin
+  routeLoopback(fixture, [upstream.origin])
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  await expectDestinationRefusal(await sendNative(plugin), upstream.origin)
+  expect(upstream.received).toEqual([])
 })

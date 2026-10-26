@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { gunzipSync } from 'node:zlib'
 import {
+  ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
@@ -65,6 +66,7 @@ type Quota = { readonly unified: string | null; readonly scoped: string | null }
 type Data = NativeAnthropicAttemptData<Provenance>
 
 const ENV_KEYS = [
+  'ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_CUSTOM_HEADERS',
   'ANTHROPIC_MODEL',
@@ -350,9 +352,13 @@ const opus55Payload = () => ({
 
 function hostRequest(
   payload: unknown,
-  init: { headers?: Record<string, string>; signal?: AbortSignal } = {},
+  init: {
+    headers?: Record<string, string>
+    signal?: AbortSignal
+    url?: string
+  } = {},
 ) {
-  return new Request(UPSTREAM, {
+  return new Request(init.url ?? UPSTREAM, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -2049,5 +2055,249 @@ describe('OpenCode 2 native Anthropic adapter: request-body gzip', () => {
     )
     expect(await signRequestBody(envelope.body)).toBe(envelope.body)
     expect(extractBillingHeaderCCH(envelope.body)).not.toBe('00000')
+  })
+})
+
+/**
+ * A stand-in for a host chosen by a repository's provider baseURL. Every
+ * request that reaches it is recorded with its credential headers.
+ */
+function loopbackServer() {
+  const received: Array<{
+    url: string
+    authorization: string | null
+    apiKey: string | null
+  }> = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      received.push({
+        url: request.url,
+        authorization: request.headers.get('authorization'),
+        apiKey: request.headers.get('x-api-key'),
+      })
+      return new Response('{}', {
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+  return { origin: server.url.origin, received, stop: () => server.stop(true) }
+}
+
+describe('OpenCode 2 native Anthropic adapter: OAuth destination', () => {
+  const OAUTH_TOKEN = 'sk-ant-oat01-destination-canary'
+
+  /**
+   * Runs one attempt the way the host does and, when the adapter returns a
+   * request, sends it for real. Returns the refusal, or undefined when sent.
+   */
+  async function attempt(host: Host, request: Request) {
+    const started = await host.begin(scopeOf())
+    try {
+      const final = await host.send(started, request)
+      await (await fetch(final)).text()
+      return { started, failure: undefined }
+    } catch (failure) {
+      return { started, failure }
+    }
+  }
+
+  function expectDestinationRefusal(failure: unknown, origin: string) {
+    expect(failure).toBeInstanceOf(NativeAnthropicLocalRefusal)
+    const refusal = failure as NativeAnthropicLocalRefusal
+    expect(refusal.check).toBe('oauth_destination')
+    expect(refusal.message).toBe(ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+    expect(refusal.message).not.toContain(new URL(origin).host)
+    expect(refusal.message).not.toContain(OAUTH_TOKEN)
+  }
+
+  for (const dispatch of ['direct', 'http-relay'] as const) {
+    test(`a provider baseURL on a loopback server receives no ${dispatch} OAuth request, including the host retry`, async () => {
+      const upstream = loopbackServer()
+      const relay = loopbackServer()
+      try {
+        const { source, seen } = makeSource({
+          authorize: () =>
+            oauth(
+              OAUTH_TOKEN,
+              { custody: 'vault', receipt: 'vault:1', version: 1 },
+              dispatch === 'http-relay'
+                ? {
+                    dispatch: {
+                      kind: 'http-relay',
+                      url: `${relay.origin}/send`,
+                      token: 'relay-secret',
+                    },
+                  }
+                : {},
+            ),
+        })
+        const native = createNativeAnthropicAdapter({ source })
+        const host = new Host(native.adapter)
+        // The first attempt and the host's retry of it both go through the
+        // adapter again; neither may reach the configured server.
+        for (const _ of [1, 2]) {
+          const { started, failure } = await attempt(
+            host,
+            hostRequest(sonnetPayload(), {
+              url: `${upstream.origin}/v1/messages`,
+            }),
+          )
+          expectDestinationRefusal(failure, upstream.origin)
+          // A refused destination is not an account limit: nothing reroutes.
+          expect(
+            native.adapter.limitFromError?.(
+              { type: 'api', message: 'refused', status: 401 },
+              started.attempt,
+            ),
+          ).toBeUndefined()
+          await native.adapter.onAttemptEnd?.(started.attempt, {
+            outputStarted: false,
+            error: {
+              reason: 'failed',
+              message: ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
+            },
+          })
+        }
+        expect(host.sent).toHaveLength(0)
+        expect(upstream.received).toEqual([])
+        expect(relay.received).toEqual([])
+        expect(seen.hostErrors).toHaveLength(0)
+        expect(seen.ends.map((end) => end.outcome.localRefusal)).toEqual([
+          { check: 'oauth_destination' },
+          { check: 'oauth_destination' },
+        ])
+        expect(seen.ends.map((end) => end.outcome.status)).toEqual([
+          undefined,
+          undefined,
+        ])
+      } finally {
+        upstream.stop()
+        relay.stop()
+      }
+    })
+  }
+
+  test('the official origin still sends OAuth, and refuses redirects', async () => {
+    const { source } = makeSource({
+      authorize: () =>
+        oauth(OAUTH_TOKEN, { custody: 'local', receipt: 'local:1' }),
+    })
+    const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
+    const { final } = await host.run(scopeOf(), hostRequest(sonnetPayload()))
+    expect(new URL(final.url).origin).toBe('https://api.anthropic.com')
+    expect(final.headers.get('authorization')).toBe(`Bearer ${OAUTH_TOKEN}`)
+    expect(final.redirect).toBe('error')
+  })
+
+  test('ANTHROPIC_BASE_URL on a foreign origin is refused for OAuth and honoured for API keys', async () => {
+    const upstream = loopbackServer()
+    try {
+      process.env.ANTHROPIC_BASE_URL = upstream.origin
+      const oauthHost = new Host(
+        createNativeAnthropicAdapter({
+          source: makeSource({
+            authorize: () =>
+              oauth(OAUTH_TOKEN, { custody: 'local', receipt: 'local:1' }),
+          }).source,
+        }).adapter,
+      )
+      const refused = await attempt(oauthHost, hostRequest(sonnetPayload()))
+      expectDestinationRefusal(refused.failure, upstream.origin)
+      expect(upstream.received).toEqual([])
+
+      const apiHost = new Host(
+        createNativeAnthropicAdapter({
+          source: makeSource({
+            authorize: () =>
+              apiKey('sk-ant-api03-env-key', {
+                custody: 'api',
+                receipt: 'api:1',
+              }),
+          }).source,
+        }).adapter,
+      )
+      const sent = await attempt(apiHost, hostRequest(sonnetPayload()))
+      expect(sent.failure).toBeUndefined()
+      expect(upstream.received).toHaveLength(1)
+      expect(upstream.received[0]?.apiKey).toBe('sk-ant-api03-env-key')
+      expect(upstream.received[0]?.authorization).toBeNull()
+    } finally {
+      upstream.stop()
+    }
+  })
+
+  test('API-key routes still reach their configured baseURL', async () => {
+    const proxy = loopbackServer()
+    try {
+      const { source } = makeSource({
+        authorize: () =>
+          apiKey(
+            'sk-ant-api03-proxy-key',
+            { custody: 'api', receipt: 'api:1' },
+            `${proxy.origin}/anthropic`,
+          ),
+      })
+      const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
+      const { failure } = await attempt(host, hostRequest(sonnetPayload()))
+      expect(failure).toBeUndefined()
+      expect(proxy.received).toHaveLength(1)
+      expect(new URL(proxy.received[0]!.url).pathname).toBe(
+        '/anthropic/v1/messages',
+      )
+      expect(proxy.received[0]?.apiKey).toBe('sk-ant-api03-proxy-key')
+    } finally {
+      proxy.stop()
+    }
+  })
+
+  test('the test-only loopback origin admits exactly that server and leaves API routes alone', async () => {
+    const upstream = loopbackServer()
+    const other = loopbackServer()
+    try {
+      process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.origin
+      const oauthHost = new Host(
+        createNativeAnthropicAdapter({
+          source: makeSource({
+            authorize: () =>
+              oauth(OAUTH_TOKEN, { custody: 'local', receipt: 'local:1' }),
+          }).source,
+        }).adapter,
+      )
+      const allowed = await attempt(
+        oauthHost,
+        hostRequest(sonnetPayload(), { url: `${upstream.origin}/v1/messages` }),
+      )
+      expect(allowed.failure).toBeUndefined()
+      expect(upstream.received).toHaveLength(1)
+      const refused = await attempt(
+        oauthHost,
+        hostRequest(sonnetPayload(), { url: `${other.origin}/v1/messages` }),
+      )
+      expectDestinationRefusal(refused.failure, other.origin)
+      expect(other.received).toEqual([])
+
+      // The variable never narrows or redirects an API route.
+      const apiHost = new Host(
+        createNativeAnthropicAdapter({
+          source: makeSource({
+            authorize: () =>
+              apiKey(
+                'sk-ant-api03-other-key',
+                { custody: 'api', receipt: 'api:1' },
+                other.origin,
+              ),
+          }).source,
+        }).adapter,
+      )
+      expect(
+        (await attempt(apiHost, hostRequest(sonnetPayload()))).failure,
+      ).toBeUndefined()
+      expect(other.received).toHaveLength(1)
+    } finally {
+      upstream.stop()
+      other.stop()
+    }
   })
 })

@@ -13,7 +13,7 @@ The plugin uses the same folder layout on every OS. In these docs:
 
 | Variable | Effect |
 | --- | --- |
-| `ANTHROPIC_BASE_URL` | Override the Anthropic endpoint with an HTTP(S) URL |
+| `ANTHROPIC_BASE_URL` | Override the Anthropic endpoint with an HTTP(S) URL on API-key routes. Claude sign-in (OAuth) requests go only to `https://api.anthropic.com`, so OpenCode refuses them while this points elsewhere |
 | `ANTHROPIC_INSECURE` | OpenCode 1 TLS opt-out: `1` or `true`, effective only with `ANTHROPIC_BASE_URL`; avoid outside controlled diagnostics |
 | `ANTHROPIC_CUSTOM_HEADERS` | Add proxy metadata on API-key routes; ignored for OAuth |
 | `ANTHROPIC_MODEL` | Default proxy alias for any `claude-*` model |
