@@ -517,7 +517,9 @@ test('Prime caught exceptions log fixed stages with the account label only', asy
   const payloads = (message: string) =>
     logs.find('prime', message).map((r) => r.payload)
   expect(payloads('refresh failed')).toEqual([{ account: 'main' }])
-  expect(payloads('account evaluation failed')).toEqual([{ account: 'main' }])
+  expect(payloads('account evaluation failed')).toEqual([
+    { account: 'main', stage: 'fingerprint' },
+  ])
   expect(payloads('prime fire threw')).toEqual([{ account: 'main' }])
   expect(payloads('recordSuccess failed')).toEqual([{ account: 'main' }])
   expect(payloads('post-fire refresh failed')).toEqual([{ account: 'main' }])

@@ -697,6 +697,10 @@ export class PrimeManager {
     storage: AccountStorage,
     now: number,
   ): Promise<void> {
+    // The step the current attempt reached. The catch below logs only this
+    // fixed label, so provider text and other error details never reach the log.
+    let stage: 'fingerprint' | 'marker' | 'claim' | 'refresh' | 'fire' =
+      'fingerprint'
     try {
       if (this.stopped) return
 
@@ -744,6 +748,9 @@ export class PrimeManager {
       const claimIdentity = `${evaluation.id}:${accountFingerprint
         .toLowerCase()
         .slice(0, 12)}`
+      // Resolving the marker folder rejects a non-hex fingerprint before any
+      // quota or send work runs.
+      stage = 'marker'
       const markerDir = this.markerDir(accountFingerprint)
       const bootstrapMarkerPath = primeBootstrapMarkerPath(
         markerDir,
@@ -772,6 +779,9 @@ export class PrimeManager {
       }
       if (this.stopped) return
 
+      // The quota fresh-check gates the claim; its own failure already logs
+      // separately and skips this tick without consuming a claim.
+      stage = 'refresh'
       // Binding the throttle to the observed epoch preserves the immediate
       // check when a newly passed reset replaces the previous window.
       const lastForcedCheck = this.lastForcedCheck.get(claimIdentity)
@@ -846,6 +856,9 @@ export class PrimeManager {
       this.windowActive.delete(evaluation.id)
 
       const markerEpoch = freshResetEpoch ?? storedResetEpoch
+      // Claiming the marker is the cross-process exactly-once gate; only one
+      // process per reset epoch reaches the send.
+      stage = 'claim'
       const markerPath =
         markerEpoch === undefined
           ? await this.tryClaimBootstrap(evaluation.id, accountFingerprint)
@@ -874,10 +887,14 @@ export class PrimeManager {
         }
       }
 
+      // The send and its counter update run only after this process owns the
+      // marker; unexpected failures there are reported with the fire stage.
+      stage = 'fire'
       await this.fire(evaluation, now, postClaimStorage)
     } catch {
       logger.warn('prime', 'account evaluation failed', {
         account: evaluation.label,
+        stage,
       })
     }
   }

@@ -55,6 +55,65 @@ const privateFilesUnavailableReasons = new Set([
   'native-addon-unavailable',
 ])
 
+// Enrollment mode INFO records already emitted this process. The key covers
+// the host, the resolved token file and the resolved mode, so a repeat read
+// stays silent and a mode change logs again without tracking anything else.
+const loggedEnrollmentModes = new Set<string>()
+
+/** Test-only reset for the once-per-process enrollment mode log. */
+export function __resetEnrollmentModeLogForTests(): void {
+  loggedEnrollmentModes.clear()
+}
+
+function resolveEnrollmentSource(
+  host: 'opencode' | 'pi',
+  env: NodeJS.ProcessEnv,
+): 'env' | 'default' {
+  const configured =
+    env[
+      `${host.toUpperCase()}_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`
+    ]?.trim()
+  return configured ? 'env' : 'default'
+}
+
+async function maybeLogEnrollmentMode(
+  host: 'opencode' | 'pi',
+  paths: ReturnType<typeof getHostClaustrumEnrollmentPaths>,
+  mode: 'local' | 'claustrum',
+  env: NodeJS.ProcessEnv,
+  readStatus: typeof readClaustrumEnrollmentStatus,
+): Promise<void> {
+  const key = `${host}${'\0'}${paths.tokenPath}${'\0'}${mode}`
+  if (loggedEnrollmentModes.has(key)) return
+  // Names come from the enrollment status file, never from token bytes. A
+  // status read failure still logs the mode without names rather than
+  // changing the mode decision.
+  let proposedName: string | undefined
+  let approvedName: string | undefined
+  try {
+    const status = await readStatus(paths, `anthropic-auth-${host}`)
+    if (status && typeof status === 'object' && 'proposedName' in status) {
+      const name = (status as { proposedName?: unknown }).proposedName
+      if (typeof name === 'string' && name.length > 0) proposedName = name
+    }
+    if (status && typeof status === 'object' && 'approvedName' in status) {
+      const name = (status as { approvedName?: unknown }).approvedName
+      if (typeof name === 'string' && name.length > 0) approvedName = name
+    }
+  } catch {
+    // Leave the names undefined and log the mode below.
+  }
+  loggedEnrollmentModes.add(key)
+  logger.info('enrollment', 'Native enrollment mode', {
+    host,
+    tokenPath: paths.tokenPath,
+    source: resolveEnrollmentSource(host, env),
+    ...(proposedName !== undefined ? { proposedName } : {}),
+    ...(approvedName !== undefined ? { approvedName } : {}),
+    mode,
+  })
+}
+
 async function logRefusal(
   host: 'opencode' | 'pi',
   paths: ReturnType<typeof getHostClaustrumEnrollmentPaths>,
@@ -149,5 +208,13 @@ export async function readNativeEnrollmentMode(
       throw new NativePrivateFilesUnavailableError()
     throw new NativeCustodyError('invalid-token')
   }
-  return authority === 'vault' ? 'claustrum' : 'local'
+  const mode = authority === 'vault' ? 'claustrum' : 'local'
+  await maybeLogEnrollmentMode(
+    host,
+    paths,
+    mode,
+    env,
+    dependencies.readClaustrumEnrollmentStatus,
+  )
+  return mode
 }

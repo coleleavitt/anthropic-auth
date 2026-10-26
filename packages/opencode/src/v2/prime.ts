@@ -6,6 +6,7 @@ import {
   nativeAccountCanServe,
   PrimeManager,
   type PrimeSendResult,
+  tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
 import {
@@ -231,14 +232,18 @@ export function createNativePrime(options: {
         return undefined
       if (account.source === 'vault') {
         const receipt = await runtime.authorizeVault(accountId, abort.signal)
-        return runtime.getOrCreateAuthLineage(accountId, receipt)
+        const lineage = await runtime.getOrCreateAuthLineage(accountId, receipt)
+        return lineage ? tokenFingerprint(lineage) : undefined
       }
       const credential = await runtime.authorizeLocal(accountId, {
         signal: abort.signal,
       })
-      return credential.status === 'usable'
-        ? runtime.getOrCreateAuthLineage(accountId, credential.subject)
-        : undefined
+      if (credential.status !== 'usable') return undefined
+      const lineage = await runtime.getOrCreateAuthLineage(
+        accountId,
+        credential.subject,
+      )
+      return lineage ? tokenFingerprint(lineage) : undefined
     },
     async refreshQuota(accountId) {
       const snapshot = await runtime.read()
