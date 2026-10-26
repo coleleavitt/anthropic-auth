@@ -59,6 +59,7 @@ const alerts = [];
 const toasts = [];
 const sizes = [];
 let shown = 0;
+let active;
 let selects = 0;
 let dialog;
 let opened;
@@ -92,11 +93,12 @@ const cleanup = await setup({
     toast: { show(options) { toasts.push(options); } },
     dialog: {
       // Section, then action; the third pick (after the sign-in dialog
-      // closes) is a dismissal that ends the menu.
-      async select(options) { selects++; return selects <= 2 ? options.options[0].value : undefined; },
-      async alert(options) { alerts.push(options); },
-      show(renderDialog, onClose) { shown++; dialog = { renderDialog, onClose }; opened(); },
-      set(options) { sizes.push(options); },
+      // closes) is a dismissal that ends the menu. Each size set is recorded
+      // with the dialog that was active then.
+      async select(options) { active = 'select'; selects++; return selects <= 2 ? options.options[0].value : undefined; },
+      async alert(options) { active = 'alert'; alerts.push(options); },
+      show(renderDialog, onClose) { active = 'show'; shown++; dialog = { renderDialog, onClose }; opened(); },
+      set(options) { sizes.push({ dialog: active, ...options }); },
       clear() {},
     },
   },
@@ -163,7 +165,14 @@ test(
     // The link opened the sign-in dialog, not the result alert.
     expect(run.shown).toBe(1)
     expect(run.alerts).toEqual([])
-    expect(run.sizes).toEqual([{ size: 'xlarge' }])
+    // The sign-in dialog is the widest size, as are the menu's selects
+    // before and after it.
+    expect(run.sizes).toEqual(
+      ['select', 'select', 'show', 'select'].map((dialog) => ({
+        dialog,
+        size: 'xlarge',
+      })),
+    )
     expect(run.frame).toContain('Claude sign-in')
     expect(run.frame).toContain('Press Esc to close.')
     // 44 columns cannot fit the link on one row; it must still read whole.

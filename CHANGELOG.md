@@ -8,6 +8,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode now sends Claude sign-in (OAuth) requests only to https://api.anthropic.com; a provider baseURL or ANTHROPIC_BASE_URL pointing elsewhere is refused for those accounts and still applies to API keys. Addresses #474.
 - OpenCode 2: Prime now fires; it failed on every check because of an account-fingerprint format mismatch, and its failure log now says which step failed. Addresses #480.
 - The plugin logs which vault enrollment file, names and mode it uses, once per process. Addresses #476.
+- OpenCode 2: `/claude` opens with section names only and shows status in a wide view instead of raw Markdown. Addresses #478.
 
 ## 2.2.7
 

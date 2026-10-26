@@ -3,6 +3,7 @@ import type {
   CommandDialogPayload,
   KnobValues,
   MenuAction,
+  MenuSection,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin as Tui } from '@opencode/plugin/tui'
 import type { KeyEvent, PasteEvent } from '@opentui/core'
@@ -29,6 +30,22 @@ export type ShowSignInLink = (
   signal: AbortSignal,
 ) => Promise<void>
 
+/**
+ * Shows one menu section's status in a wide dialog that stays open until the
+ * person closes it, and settles then or when `signal` aborts. `readQuota` is
+ * given for the Quota section, whose view draws the sidebar's account blocks.
+ * `entry.mjs` passes the precompiled renderer, as it does for the sidebar.
+ */
+export type ShowMenuStatus = (
+  ctx: Tui.Context,
+  view: {
+    readonly title: string
+    readonly lines: readonly string[]
+    readonly readQuota?: (signal: AbortSignal) => Promise<SidebarState>
+  },
+  signal: AbortSignal,
+) => Promise<void>
+
 const SIGN_IN_FALLBACK_INSTRUCTIONS =
   'Open this link in your browser and sign in. Then choose Finish OAuth sign-in in the Accounts menu and paste the code Claude shows you.'
 
@@ -43,6 +60,7 @@ export async function setupAnthropicTui(
   options: {
     readonly mountSidebar?: MountSidebar
     readonly showSignInLink?: ShowSignInLink
+    readonly showStatus?: ShowMenuStatus
   } = {},
 ) {
   const rpc = ctx.client.rpc(NATIVE_MENU_RPC)
@@ -191,17 +209,56 @@ export async function setupAnthropicTui(
       message: `${SIGN_IN_FALLBACK_INSTRUCTIONS}\n\n${url}\n`,
     })
   }
+  async function showStatus(sessionId: string, section: MenuSection) {
+    const title = `${section.title} status`
+    if (options.showStatus) {
+      try {
+        await options.showStatus(
+          ctx,
+          {
+            title,
+            lines: section.lines,
+            ...(section.slot === 'quota' && {
+              readQuota: (signal: AbortSignal) =>
+                rpc.sidebar({ sessionId }, { signal, location: ctx.location }),
+            }),
+          },
+          abort.signal,
+        )
+        return
+      } catch {
+        // The status view could not be shown (its renderer did not load, or
+        // it failed); the alert below still shows the status, as plain text.
+      }
+    }
+    await ctx.ui.dialog.alert({ title, message: section.lines.join('\n') })
+  }
+  /**
+   * A menu select in the widest dialog, as OpenCode 1 opens its menu.
+   * `DialogSelectOptions` has no size; `dialog.set` sets the active dialog's
+   * size, and `select` opens its dialog before returning, so the set right
+   * after it applies to the select. Set before it, the host's own reset of a
+   * new dialog to medium would undo it.
+   */
+  function wideSelect<Value>(
+    request: Parameters<typeof ctx.ui.dialog.select<Value>>[0],
+  ): Promise<Value | undefined> {
+    const picked = ctx.ui.dialog.select(request)
+    ctx.ui.dialog.set({ size: 'xlarge' })
+    return picked
+  }
   async function render(sessionId: string, initial: CommandDialogPayload) {
     if (!active || rendering || currentSession() !== sessionId) return
     rendering = true
     let payload = initial
     try {
       while (active && currentSession() === sessionId) {
-        const section = await ctx.ui.dialog.select({
+        // Section names only, as on OpenCode 1: a section's status can run
+        // to many lines, which "View status" shows in a wide dialog.
+        const section = await wideSelect({
           title: payload.menu.title,
           options: payload.menu.sections.map((entry) => ({
             title: entry.title,
-            description: entry.lines.join('\n'),
             value: entry,
           })),
         })
@@ -212,9 +269,7 @@ export async function setupAnthropicTui(
             item.actions.map((action) => ({ action, itemId: item.id })),
           ),
         ]
-        const selected = await ctx.ui.dialog.select<
-          (typeof actions)[number] | 'status'
-        >({
+        const selected = await wideSelect<(typeof actions)[number] | 'status'>({
           title: section.title,
           options: [
             ...(section.lines.length
@@ -229,10 +284,7 @@ export async function setupAnthropicTui(
         })
         if (!selected) continue
         if (selected === 'status') {
-          await ctx.ui.dialog.alert({
-            title: `${section.title} status`,
-            message: section.lines.join('\n'),
-          })
+          await showStatus(sessionId, section)
           continue
         }
         const values = await valuesFor(selected.action)

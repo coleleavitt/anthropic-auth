@@ -181,6 +181,8 @@ test('View status opens all section lines without dispatching an account action'
         async alert(options: { title: string; message: string }) {
           alerts.push(options)
         },
+        // The menu sizes each select it opens.
+        set() {},
       },
     },
   } as unknown as Plugin.Context)

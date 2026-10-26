@@ -59,6 +59,17 @@ async function loadSignInLink() {
   return import('../tui-compiled/tui/sign-in-link.tsx')
 }
 
+// The /claude menu's status view, loaded the same way as the sidebar.
+async function loadMenuStatus() {
+  try {
+    await import(runtimeProbe)
+  } catch (error) {
+    if (!isMissingRuntimeRegistry(error)) throw error
+    return import('./menu-status.tsx')
+  }
+  return import('../tui-compiled/tui/menu-status.tsx')
+}
+
 let legacyModule
 
 // OpenCode 1 reads id and tui from the default definition; OpenCode 2 reads
@@ -84,6 +95,8 @@ export const setup = async (context) => {
       (await loadSidebar()).mountClaudeSidebar(ctx, read),
     showSignInLink: async (ctx, url, signal) =>
       (await loadSignInLink()).showSignInLinkDialog(ctx, url, signal),
+    showStatus: async (ctx, view, signal) =>
+      (await loadMenuStatus()).showMenuStatusDialog(ctx, view, signal),
   })
 }
 
