@@ -278,6 +278,7 @@ export {
   publishNativeVaultRosterSeed,
   publishNativeVaultRuntimeSeed,
 } from './native-vault-runtime.ts'
+export * from './oauth-origin.ts'
 export * from './oauth-profile.ts'
 export {
   createWindowsOwnerOnly,

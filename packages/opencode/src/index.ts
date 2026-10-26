@@ -6,6 +6,7 @@ import type { NativeRefreshFailure } from '@cortexkit/anthropic-auth-core'
 import {
   type AccountCommandStatusProjection,
   type AccountStorage,
+  ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   type ApiKeyAccount,
   acquireNativeAccountRuntime,
   applyCustomHeaders,
@@ -249,6 +250,11 @@ import {
   LaneStartTracker,
 } from './lane-start.ts'
 import { createNativeCommand } from './native-command.js'
+import {
+  fetchOAuth,
+  isAllowedOAuthDestination,
+  requireOAuthDestination,
+} from './oauth-destination.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import { logFallbackQuotaPreflightWarning } from './quota-preflight.ts'
@@ -3491,6 +3497,8 @@ const anthropicAuthPlugin = async (
   const cacheKeepScopedAttempts = new Map<number, NativeOAuthAuthorization>()
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    // Prewarms carry an OAuth bearer: recheck the destination, no redirects.
+    fetchImpl: fetchOAuth,
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
     onTrackedSessionsChanged: async (sessions) => {
@@ -3632,6 +3640,9 @@ const anthropicAuthPlugin = async (
       return rotatedHeaders
     },
     prepareHeaders: async (headers, target, attempt) => {
+      // A remembered URL gets the same destination rule as a live request;
+      // refuse it before any credential is authorized for the prewarm.
+      if (!isAllowedOAuthDestination(target.url)) return undefined
       const accountId = target.oauthAccountId ?? 'main'
       let modelId: string | undefined
       try {
@@ -3785,6 +3796,16 @@ const anthropicAuthPlugin = async (
         (!latestGetActivation || !(await latestGetActivation()).active)
       )
         throw new Error('Native main OAuth activation is not available')
+      // Route through rewriteUrl so the request inherits the canonical
+      // ?beta=true query param like every other direct Anthropic call in
+      // this codebase. The URL is rendered back to a string here because the
+      // surrounding fetch wrapper and test mocks expect a string input.
+      // ANTHROPIC_BASE_URL can still move it, so check the destination before
+      // any token is authorized for it.
+      const primeRequest = rewriteUrl(PRIME_MESSAGES_URL, { baseURL: '' })
+      const primeUrl =
+        primeRequest.url?.toString() ?? primeRequest.input.toString()
+      requireOAuthDestination(primeUrl)
       const initialAuthorization = await authorizeOAuth(
         accountId,
         undefined,
@@ -3815,14 +3836,6 @@ const anthropicAuthPlugin = async (
       })
       headers.delete('content-length')
       headers.delete('transfer-encoding')
-      // Route through rewriteUrl so the request inherits the canonical
-      // ?beta=true query param and ANTHROPIC_BASE_URL overrides like every
-      // other direct Anthropic call in this codebase. The URL is rendered
-      // back to a string here because the surrounding fetch wrapper and
-      // test mocks expect a string input.
-      const primeRequest = rewriteUrl(PRIME_MESSAGES_URL, { baseURL: '' })
-      const primeUrl =
-        primeRequest.url?.toString() ?? primeRequest.input.toString()
       const signal = AbortSignal.timeout(30_000)
       const primeInit = { method: 'POST', headers, body, signal }
       let physicalAuthorization = await authorizeOAuth(
@@ -3848,7 +3861,7 @@ const anthropicAuthPlugin = async (
       const sendPhysical = async () => {
         const scope = createProviderErrorResponseScope([primeSecret], 'http')
         physicalScope = scope
-        return scope.redactResponse(await fetch(primeUrl, primeInit))
+        return scope.redactResponse(await fetchOAuth(primeUrl, primeInit))
       }
       let response = await sendPhysical()
       if (response.status === 401 && scopedAttempt && !signal.aborted) {
@@ -7092,6 +7105,23 @@ const anthropicAuthPlugin = async (
             scopedAttempt?: NativeCustodyReceipt,
           ) {
             assertNotCustodyTombstone(accessToken, 'anthropic')
+            // The URL comes from the host's provider configuration, which a
+            // project file in an opened repository can set. Refuse any
+            // destination other than Anthropic before authorizing a token,
+            // with a local 400 that no fallback account or retry repeats.
+            const rewritten = rewriteUrl(input)
+            if (
+              !isAllowedOAuthDestination(
+                rewritten.url?.toString() ?? fetchInputUrl(rewritten.input),
+              )
+            ) {
+              logger.warn(
+                'oauth-destination',
+                'refused a Claude OAuth request to a non-Anthropic origin; nothing was sent',
+                { route },
+              )
+              return localInvalidRequestResponse(ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+            }
             // A request admitted with the placeholder cannot switch to a
             // separate login while native authorization or refresh is waiting.
             const separateLocalLogin = isRealHostLogin(await hostGetAuth())
@@ -7338,7 +7368,6 @@ const anthropicAuthPlugin = async (
 
             const cacheDiagnosticsBetas =
               await getCacheDiagnosticsBetas(requestHeaders)
-            const rewritten = rewriteUrl(input)
             if (fableRequest) fableRequest.oauthAccountId = oauthAccountId
             if (
               typeof body === 'string' &&
@@ -7443,7 +7472,8 @@ const anthropicAuthPlugin = async (
                   wireBody: RequestInit['body'],
                   wireHeaders: Headers,
                 ) =>
-                  fetch(rewritten.input, {
+                  // fetchOAuth rechecks the destination and refuses redirects.
+                  fetchOAuth(rewritten.input, {
                     ...init,
                     body: wireBody,
                     headers: wireHeaders,
@@ -7557,6 +7587,8 @@ const anthropicAuthPlugin = async (
               sendViaRelay({
                 config: relayConfig,
                 input: rewritten.input,
+                // The envelope's upstream.url carries the bearer to that URL.
+                requireUpstreamUrl: requireOAuthDestination,
                 init,
                 headers: requestHeaders,
                 body,
@@ -10173,7 +10205,7 @@ const anthropicAuthPlugin = async (
                     result.state,
                   )
                   if (credentials.type === 'failed') return credentials
-                  const apiKey = await fetch(
+                  const apiKey = await fetchOAuth(
                     `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
                     {
                       method: 'POST',

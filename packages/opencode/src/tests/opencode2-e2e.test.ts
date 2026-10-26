@@ -753,6 +753,10 @@ async function scenario(
       throw new Error('Synthetic transport cleanup failed (details redacted)')
     }
   })
+  // The provider baseURL below points OAuth requests at the synthetic
+  // upstream. The plugin refuses any OAuth destination but api.anthropic.com
+  // unless this test-only variable names the exact loopback origin.
+  env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.url.origin
   const paths = await seed(
     env,
     transport === 'direct' ? undefined : { url: relay.url.href, transport },

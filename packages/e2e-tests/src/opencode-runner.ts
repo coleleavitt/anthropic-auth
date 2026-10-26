@@ -1051,6 +1051,13 @@ export async function spawnOpencode(
       // would trigger a different credential-source refusal first.
       delete childEnv.OPENCODE_AUTH_CONTENT
     childEnv.ANTHROPIC_BASE_URL = options.anthropicBaseURL
+    // The plugin sends Claude OAuth requests only to api.anthropic.com and
+    // refuses them when ANTHROPIC_BASE_URL points elsewhere. This test-only
+    // variable lets them reach the local mock server too; it accepts only a
+    // loopback origin.
+    childEnv.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = new URL(
+      options.anthropicBaseURL,
+    ).origin
     childEnv.ANTHROPIC_API_KEY = 'test-key-not-real'
     for (const [key, value] of Object.entries(options.childEnv ?? {})) {
       if (value === undefined) delete childEnv[key]

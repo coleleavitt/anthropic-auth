@@ -6,6 +6,7 @@
 
 import { createHash } from 'node:crypto'
 import {
+  AnthropicOAuthOriginError,
   applyCustomHeaders,
   assertNotCustodyTombstone,
   type ClaudeCodeIdentity,
@@ -47,6 +48,7 @@ import {
   EffortMarkerCorrelationError,
 } from '../effort-history'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
+import { requireOAuthDestination } from '../oauth-destination'
 import { isAuxiliaryAgent } from '../request-class'
 import {
   applyServerSideFallbackToBody,
@@ -459,8 +461,9 @@ export class NativeAnthropicTransportRefusal extends Error {
 
 /**
  * The request was refused with a local 400 because it can never succeed as
- * written: its history ends on a meaningful assistant turn, or an effort
- * marker in it cannot be matched to the session's effort plan. Nothing was
+ * written: its history ends on a meaningful assistant turn, an effort marker
+ * in it cannot be matched to the session's effort plan, or it is an OAuth
+ * request whose URL is not Anthropic's API server. Nothing was
  * sent, and another account cannot help, so the adapter never reports it as
  * an account limit. The message and `check` describe only the shape of the
  * problem, never conversation content.
@@ -471,7 +474,10 @@ export class NativeAnthropicLocalRefusal extends Error {
   readonly check: string
 
   constructor(
-    cause: TrailingAssistantHistoryError | EffortMarkerCorrelationError,
+    cause:
+      | TrailingAssistantHistoryError
+      | EffortMarkerCorrelationError
+      | AnthropicOAuthOriginError,
   ) {
     super(cause.message, { cause })
     this.name = 'NativeAnthropicLocalRefusal'
@@ -536,7 +542,8 @@ function isMessagesUrl(url: string) {
 
 function localRefusalFrom(error: unknown) {
   return error instanceof TrailingAssistantHistoryError ||
-    error instanceof EffortMarkerCorrelationError
+    error instanceof EffortMarkerCorrelationError ||
+    error instanceof AnthropicOAuthOriginError
     ? new NativeAnthropicLocalRefusal(error)
     : undefined
 }
@@ -965,9 +972,18 @@ export function createNativeAnthropicAdapter<Q, P>(
     // options or the body rewrite.
     ensureLive()
     const messages = body !== undefined && isMessagesUrl(request.url)
+    const url =
+      rewriteUrl(
+        request.url,
+        send.baseURL !== undefined ? { baseURL: send.baseURL } : {},
+      ).url?.toString() ?? request.url
 
     try {
       if (data.route === 'oauth' && send.oauth) {
+        // The request URL comes from provider configuration, which a project
+        // file in an opened repository can set. An OAuth token goes only to
+        // Anthropic: refuse anything else before the request is built.
+        requireOAuthDestination(url)
         const { accessToken, identity } = send.oauth
         for (const [name, value] of Object.entries(
           lowerCaseEdits(send.oauthHeaders),
@@ -1063,11 +1079,6 @@ export function createNativeAnthropicAdapter<Q, P>(
         : 'http',
       headers,
     )
-    const url =
-      rewriteUrl(
-        request.url,
-        send.baseURL !== undefined ? { baseURL: send.baseURL } : {},
-      ).url?.toString() ?? request.url
     if (data.route === 'oauth' && messages && body !== undefined) {
       await source.onRequestPrepared?.({
         ...contextOf(attempt, data),
@@ -1126,7 +1137,8 @@ export function createNativeAnthropicAdapter<Q, P>(
     return new Request(url, {
       method: request.method,
       headers,
-      redirect: request.redirect,
+      // An OAuth bearer must not follow a redirect to another host.
+      redirect: data.route === 'oauth' ? 'error' : request.redirect,
       signal: request.signal,
       ...(wireBody !== undefined ? { body: wireBody } : {}),
     })

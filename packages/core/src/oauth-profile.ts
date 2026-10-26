@@ -17,6 +17,8 @@ export async function fetchOAuthAccountProfile(input: {
   assertNotCustodyTombstone(input.accessToken, 'anthropic')
   const response = await (input.fetchImpl ?? fetch)(PROFILE_URL, {
     method: 'GET',
+    // The bearer is an OAuth token; never let a redirect carry it elsewhere.
+    redirect: 'error',
     signal: input.signal,
     headers: {
       Authorization: `Bearer ${input.accessToken}`,

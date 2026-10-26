@@ -1670,6 +1670,8 @@ export async function fetchOAuthQuotaSnapshot(input: {
   const fetchImpl = input.fetchImpl ?? fetch
   const response = await fetchImpl(QUOTA_URL, {
     method: 'GET',
+    // The bearer is an OAuth token; never let a redirect carry it elsewhere.
+    redirect: 'error',
     headers: {
       Authorization: `Bearer ${input.accessToken}`,
       Accept: 'application/json',

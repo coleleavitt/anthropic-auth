@@ -1806,6 +1806,12 @@ export async function sendViaRelay(options: {
   onDumpCreated?: (handle: import('./dump.ts').DumpHandle) => void
   setTimeoutImpl?: typeof globalThis.setTimeout
   clearTimeoutImpl?: typeof globalThis.clearTimeout
+  /**
+   * Checks the URL the relay will forward to (the envelope's upstream.url)
+   * and throws to refuse it. Runs before anything is sent, relay or direct;
+   * its error reaches the caller unchanged and never triggers a fallback.
+   */
+  requireUpstreamUrl?: (url: string) => unknown
 }): Promise<Response> {
   const {
     config,
@@ -1822,7 +1828,9 @@ export async function sendViaRelay(options: {
     onDumpCreated,
     setTimeoutImpl = globalThis.setTimeout,
     clearTimeoutImpl = globalThis.clearTimeout,
+    requireUpstreamUrl,
   } = options
+  requireUpstreamUrl?.(input instanceof Request ? input.url : input.toString())
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
 
   const affinity =
