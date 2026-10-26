@@ -457,106 +457,7 @@ test('captured Team poll and response headers survive the production provider pa
   expect(fromNativeQuotaMap(toNativeQuotaMap(headers))).toEqual(headers)
 })
 
-test('a poll merges shared windows by their clocks without resurrecting cleared poll-only fields', () => {
-  const previous: OAuthQuotaSnapshot = {
-    accountIdentity: 'synthetic-account-A',
-    source: 'poll',
-    checkedAt: 3000,
-    five_hour: { usedPercent: 30, remainingPercent: 70, checkedAt: 1000 },
-    seven_day: { usedPercent: 40, remainingPercent: 60, checkedAt: 3000 },
-    scoped: [
-      {
-        id: 'fable',
-        title: 'Fable',
-        modelName: 'Fable',
-        usedPercent: 50,
-        remainingPercent: 50,
-        checkedAt: 3000,
-      },
-    ],
-  }
-  const incoming: OAuthQuotaSnapshot = {
-    accountIdentity: 'synthetic-account-A',
-    source: 'poll',
-    checkedAt: 2000,
-    five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: 2000 },
-    seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt: 2000 },
-    scoped: [
-      {
-        id: 'fable',
-        title: 'Fable',
-        modelName: 'Fable',
-        usedPercent: 15,
-        remainingPercent: 85,
-        checkedAt: 2000,
-      },
-    ],
-    extraUsage: {
-      used: { amountMinor: 192.25, currency: 'USD', exponent: 2 },
-      limit: { amountMinor: 1000, currency: 'USD', exponent: 2 },
-      exhausted: false,
-      utilizationPercent: 19.225,
-    },
-  }
-  for (const [stored, observation] of [
-    [previous, incoming],
-    [incoming, previous],
-  ] as const) {
-    const merged = fromNativeQuotaMap(
-      nativeQuotaCodec.merge(
-        toNativeQuotaMap(stored),
-        toNativeQuotaMap(observation),
-      ),
-    )
-    expect(merged.checkedAt).toBe(3000)
-    expect(merged.source).toBe('poll')
-    expect(merged.five_hour).toEqual(incoming.five_hour)
-    expect(merged.seven_day).toEqual(previous.seven_day)
-    expect(merged.scoped).toEqual(previous.scoped)
-    expect(merged.extraUsage).toBeUndefined()
-  }
-})
-
-test('the native poll clock survives headers without leaking into public snapshots', () => {
-  const poll = { ...full, source: 'poll' as const, checkedAt: 1000 }
-  const initial = nativeQuotaCodec.merge(
-    undefined,
-    toNativeQuotaMap(poll),
-  ) as NativeQuotaMap
-  expect(initial.anthropic.pollCheckedAt).toBe(1000)
-  const headers: OAuthQuotaSnapshot = {
-    source: 'headers',
-    accountIdentity: poll.accountIdentity,
-    checkedAt: 3000,
-    five_hour: { usedPercent: 12, remainingPercent: 88, checkedAt: 3000 },
-  }
-  const merged = nativeQuotaCodec.merge(
-    initial,
-    toNativeQuotaMap(headers),
-  ) as NativeQuotaMap
-  expect(merged.anthropic.pollCheckedAt).toBe(1000)
-  expect(fromNativeQuotaMap(merged)).not.toHaveProperty('pollCheckedAt')
-  expect(nativeQuotaCodec.validate(merged)).toBe(true)
-  const { pollCheckedAt: _clock, ...legacy } = merged.anthropic
-  expect(nativeQuotaCodec.validate({ ...merged, anthropic: legacy })).toBe(true)
-  expect(
-    nativeQuotaCodec.validate({
-      ...merged,
-      anthropic: { ...merged.anthropic, pollCheckedAt: -1 },
-    }),
-  ).toBe(false)
-  expect(
-    nativeQuotaCodec.validate({
-      ...merged,
-      anthropic: { ...merged.anthropic, pollCheckedAt: '1000' },
-    }),
-  ).toBe(false)
-  expect(() =>
-    toNativeQuotaMap({ ...poll, pollCheckedAt: 1000 } as OAuthQuotaSnapshot),
-  ).toThrow()
-})
-
-test('legacy encoding cannot distinguish which empty poll preceded the same header', () => {
+test('the older-poll gap cannot be closed without a storage-format change because legacy data loses the poll clock', () => {
   const emptyPoll = (checkedAt: number) =>
     toNativeQuotaMap({
       accountIdentity: 'synthetic-account-A',
@@ -578,29 +479,28 @@ test('legacy encoding cannot distinguish which empty poll preceded the same head
       nativeQuotaCodec.merge(undefined, emptyPoll(pollAt)),
       headers,
     ) as NativeQuotaMap
-  const first = history(1000)
-  const second = history(1500)
-  const legacy = (map: NativeQuotaMap) => {
-    const { pollCheckedAt: _clock, ...anthropic } = map.anthropic
-    return { ...map, anthropic }
-  }
+  const earlierPollAt = 1000
+  const laterPollAt = 1500
+  const latePollAt = 1200
+  const first = history(earlierPollAt)
+  const second = history(laterPollAt)
   // Headers replace the snapshot and shared-window clocks. An empty poll has
   // no scoped-window clock, and fieldSources stores labels rather than times.
-  expect(legacy(first)).toEqual(legacy(second))
+  expect(first).toEqual(second)
   expect(first.anthropic.source).toBe('headers')
   expect(first.anthropic.checkedAt).toBe(2000)
   const latePoll = toNativeQuotaMap({
     accountIdentity: 'synthetic-account-A',
     source: 'poll',
-    checkedAt: 1200,
-    five_hour: { usedPercent: 30, remainingPercent: 70, checkedAt: 1200 },
-    seven_day: { usedPercent: 40, remainingPercent: 60, checkedAt: 1200 },
+    checkedAt: latePollAt,
+    five_hour: { usedPercent: 30, remainingPercent: 70, checkedAt: latePollAt },
+    seven_day: { usedPercent: 40, remainingPercent: 60, checkedAt: latePollAt },
     scoped: [
       {
         id: 'fable',
         title: 'Fable',
         modelName: 'Fable',
-        checkedAt: 1200,
+        checkedAt: latePollAt,
         usedPercent: 50,
         remainingPercent: 50,
       },
@@ -611,8 +511,30 @@ test('legacy encoding cannot distinguish which empty poll preceded the same head
   const afterSecond = fromNativeQuotaMap(
     nativeQuotaCodec.merge(second, latePoll),
   )
-  expect(afterFirst.scoped?.map((window) => window.id)).toEqual(['fable'])
-  expect(afterFirst.extraUsage).toBeDefined()
-  expect(afterSecond.scoped).toEqual([])
-  expect(afterSecond.extraUsage).toBeUndefined()
+  // The newest-poll rule would accept the late poll only after the earlier
+  // history, but identical legacy inputs cannot distinguish those outcomes.
+  expect(latePollAt > earlierPollAt).toBe(true)
+  expect(latePollAt > laterPollAt).toBe(false)
+  expect(afterFirst).toEqual(afterSecond)
+  expect(afterFirst.scoped).toEqual([])
+  expect(afterFirst.extraUsage).toBeUndefined()
+})
+
+test('a newer complete poll replaces the whole snapshot and clears older scoped limits and extra usage', () => {
+  const stored = toNativeQuotaMap({ ...full, source: 'poll' })
+  for (const scoped of [undefined, []] as const) {
+    const incoming: OAuthQuotaSnapshot = {
+      accountIdentity: full.accountIdentity,
+      source: 'poll',
+      checkedAt: 2000,
+      five_hour: { usedPercent: 12, remainingPercent: 88, checkedAt: 2000 },
+      ...(scoped !== undefined ? { scoped: [...scoped] } : {}),
+    }
+    const merged = fromNativeQuotaMap(
+      nativeQuotaCodec.merge(stored, toNativeQuotaMap(incoming)),
+    )
+    expect(merged).toEqual(incoming)
+    expect(merged.scoped ?? []).toEqual([])
+    expect(merged.extraUsage).toBeUndefined()
+  }
 })

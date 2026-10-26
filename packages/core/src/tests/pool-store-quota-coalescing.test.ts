@@ -4,8 +4,8 @@
 // The shared rules run twice: with `nativeQuotaCodec`, which production uses, and
 // with common-auth's own `quotaCodec` as a control, to tell a failure of the
 // coalescer apart from a mismatch between the coalescer and Core's codec.
-// Native-only regressions check that an older poll cannot replace newer base
-// windows and that its Fable scoped window remains available.
+// Native snapshots keep legacy whole-snapshot precedence. A late older poll
+// may therefore lose poll-only fields; the library codec is a per-field control.
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   mkdir,
@@ -32,7 +32,6 @@ import {
   type Lane,
   lanes,
   type NativeStore,
-  nativeLane,
   openNativeStore,
   pollSnapshot,
 } from './pool-store-coalescing-fixture.ts'
@@ -167,7 +166,7 @@ for (const lane of lanes) {
       'newer header, then older poll',
     ] as const) {
       coalescing(
-        `a header reading merges into a poll reading instead of replacing it (${order})`,
+        `quota observations preserve newer windows using each codec's precedence (${order})`,
         async () => {
           const paths = await fixture()
           await seed(paths, lane, [['a', 'acct-a']])
@@ -186,18 +185,21 @@ for (const lane of lanes) {
             ? [poll, header]
             : [header, poll])
             await store.recordQuota('a', epoch1('acct-a'), reading)
+          const keepsPollFields =
+            lane.name === 'library' || order === 'poll, then newer header'
           const expected: Facts = {
             five_hour: { usedPercent: 12, checkedAt: 2_000 },
             seven_day: { usedPercent: 41, checkedAt: 2_000 },
-            fable: { usedPercent: 51, checkedAt: 1_000 },
-            extraUsagePercent: 19.225,
+            ...(keepsPollFields
+              ? {
+                  fable: { usedPercent: 51, checkedAt: 1_000 },
+                  extraUsagePercent: 19.225,
+                }
+              : {}),
           }
           expect(await facts(store, lane, 'a')).toEqual(expected)
-          const written = await eventually(
-            () => onDisk(paths, lane, 'a'),
-            (value) => Bun.deepEquals(value, expected),
-          )
-          expect(written).toEqual(expected)
+          await closeStore(store)
+          expect(await onDisk(paths, lane, 'a')).toEqual(expected)
         },
       )
     }
@@ -234,16 +236,18 @@ for (const lane of lanes) {
         const expected: Facts = {
           five_hour: { usedPercent: 12, checkedAt: 2_000 },
           seven_day: { usedPercent: 41, checkedAt: 2_000 },
-          fable: { usedPercent: 51, checkedAt: 1_000 },
-          extraUsagePercent: 19.225,
+          ...(lane.name === 'library'
+            ? {
+                fable: { usedPercent: 51, checkedAt: 1_000 },
+                extraUsagePercent: 19.225,
+              }
+            : {}),
         }
         expect(await facts(store, lane, 'a')).toEqual(expected)
-        // The poll's Fable window shows that its flush has landed.
-        const written = await eventually(
-          () => onDisk(paths, lane, 'a'),
-          (value) => value.fable !== undefined,
-        )
-        expect(written).toEqual(expected)
+        // Native snapshots can stay unchanged, so join the drain rather than
+        // waiting for a poll-only field that the legacy merge does not retain.
+        await closeStore(store)
+        expect(await onDisk(paths, lane, 'a')).toEqual(expected)
       },
     )
 
@@ -732,127 +736,3 @@ for (const lane of lanes) {
     )
   })
 }
-
-describe('quota coalescing with native codec', () => {
-  coalescing('an older poll cannot replace newer base windows', async () => {
-    const paths = await fixture()
-    await seed(paths, nativeLane, [['a', 'acct-a']])
-    const store = coalesced(paths, nativeLane)
-    await store.recordQuota(
-      'a',
-      epoch1('acct-a'),
-      nativeLane.observe(
-        headerSnapshot('acct-a', 2_000, { five_hour: 12, seven_day: 41 }),
-      ),
-    )
-    await closeStore(store)
-    const next = coalesced(paths, nativeLane)
-    await next.recordQuota(
-      'a',
-      epoch1('acct-a'),
-      nativeLane.observe({
-        ...headerSnapshot('acct-a', 1_000, { five_hour: 70, seven_day: 40 }),
-        source: 'poll',
-      }),
-    )
-    await closeStore(next)
-    expect(await onDisk(paths, nativeLane, 'a')).toEqual({
-      five_hour: { usedPercent: 12, checkedAt: 2_000 },
-      seven_day: { usedPercent: 41, checkedAt: 2_000 },
-    })
-  })
-
-  coalescing(
-    'an older poll keeps its Fable scoped window after a newer header flushes',
-    async () => {
-      const paths = await fixture()
-      await seed(paths, nativeLane, [['a', 'acct-a']])
-      const store = coalesced(paths, nativeLane)
-      await store.recordQuota(
-        'a',
-        epoch1('acct-a'),
-        nativeLane.observe(
-          headerSnapshot('acct-a', 2_000, { five_hour: 12, seven_day: 41 }),
-        ),
-      )
-      await closeStore(store)
-      const next = coalesced(paths, nativeLane)
-      await next.recordQuota(
-        'a',
-        epoch1('acct-a'),
-        nativeLane.observe(
-          pollSnapshot('acct-a', 1_000, {
-            five_hour: 70,
-            seven_day: 40,
-            fable: 51,
-          }),
-        ),
-      )
-      const overlay = await facts(next, nativeLane, 'a')
-      await closeStore(next)
-      const disk = await onDisk(paths, nativeLane, 'a')
-      // Check both surfaces after draining, so a missing overlay cannot conceal
-      // whether the accepted poll's scoped window was also lost on disk.
-      expect({ overlay: overlay.fable, disk: disk.fable }).toEqual({
-        overlay: { usedPercent: 51, checkedAt: 1_000 },
-        disk: { usedPercent: 51, checkedAt: 1_000 },
-      })
-    },
-  )
-})
-
-describe('quota coalescing with native codec', () => {
-  coalescing(
-    'a newer complete poll clears stale Fable and extra usage even after later headers',
-    async () => {
-      const paths = await fixture()
-      await seed(paths, nativeLane, [['a', 'acct-a']])
-      const store = coalesced(paths, nativeLane)
-      const olderPoll = pollSnapshot('acct-a', 1000, {
-        five_hour: 70,
-        seven_day: 40,
-        fable: 100,
-      })
-      await store.recordQuota(
-        'a',
-        epoch1('acct-a'),
-        nativeLane.observe(olderPoll),
-      )
-      await store.recordQuota(
-        'a',
-        epoch1('acct-a'),
-        nativeLane.observe({
-          ...headerSnapshot('acct-a', 2000, { five_hour: 10, seven_day: 20 }),
-          source: 'poll',
-        }),
-      )
-      await closeStore(store)
-      expect(await onDisk(paths, nativeLane, 'a')).toEqual({
-        five_hour: { usedPercent: 10, checkedAt: 2000 },
-        seven_day: { usedPercent: 20, checkedAt: 2000 },
-      })
-      const next = coalesced(paths, nativeLane)
-      await next.recordQuota(
-        'a',
-        epoch1('acct-a'),
-        nativeLane.observe(
-          headerSnapshot('acct-a', 3000, { five_hour: 12, seven_day: 21 }),
-        ),
-      )
-      await closeStore(next)
-      const late = coalesced(paths, nativeLane)
-      await late.recordQuota(
-        'a',
-        epoch1('acct-a'),
-        nativeLane.observe({ ...olderPoll, checkedAt: 1500 }),
-      )
-      const expected = {
-        five_hour: { usedPercent: 12, checkedAt: 3000 },
-        seven_day: { usedPercent: 21, checkedAt: 3000 },
-      }
-      expect(await facts(late, nativeLane, 'a')).toEqual(expected)
-      await closeStore(late)
-      expect(await onDisk(paths, nativeLane, 'a')).toEqual(expected)
-    },
-  )
-})

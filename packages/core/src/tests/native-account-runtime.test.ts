@@ -127,12 +127,14 @@ test('local quota coalescer merges poll-owned fields and keeps observation order
     checkedAt: now + 2,
     five_hour: { usedPercent: 90, remainingPercent: 10, checkedAt: now + 2 },
   }
+  // Establish the poll before headers; a late older poll deliberately retains
+  // the legacy whole-snapshot precedence instead of adding poll-only fields.
   expect(
-    await Promise.all([
-      f.runtime.publishLocal(subject, { quota: poll, lastUsed: now + 2 }),
-      f.runtime.publishLocal(subject, { quota: header, lastUsed: now + 1 }),
-    ]),
-  ).toEqual([true, true])
+    await f.runtime.publishLocal(subject, { quota: poll, lastUsed: now + 2 }),
+  ).toBe(true)
+  expect(
+    await f.runtime.publishLocal(subject, { quota: header, lastUsed: now + 1 }),
+  ).toBe(true)
   expect(
     await f.runtime.publishLocal(subject, {
       quota: { ...poll, checkedAt: now + 1 },
@@ -183,8 +185,8 @@ test('local quota coalescer merges poll-owned fields and keeps observation order
       }),
     ]),
   ).toEqual([true, true])
-  // Older polls are accepted; the codec keeps newer windows while adding any
-  // poll-only fields instead of refusing the whole reading.
+  // Store acceptance does not override the codec: the newer stored snapshot
+  // wins as a whole when the accepted poll is older.
   expect((await f.runtime.read()).accounts[0]?.quota?.five_hour).toEqual({
     ...header.five_hour,
     checkedAt: now + 5,

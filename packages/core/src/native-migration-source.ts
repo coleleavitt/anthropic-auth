@@ -14,7 +14,6 @@ import {
   requireNativeMigrationDataObject,
 } from './native-migration-proof.ts'
 import {
-  fromNativeQuotaMap,
   isNativeOAuthQuotaSnapshot,
   type NativeQuotaMap,
   toNativeQuotaMap,
@@ -683,19 +682,12 @@ export function requireNativeMigrationSourceRows(
       nativeMigrationCanonicalJson(expected.credential)
     )
       refuse()
-    if (checkQuota) {
-      // The native map also stores a poll clock used only for later merges.
-      // Source equality covers the public reading, not that bookkeeping.
-      const actualQuota =
-        actual.quota === undefined ? null : fromNativeQuotaMap(actual.quota)
-      const expectedQuota =
-        expected.quota === undefined ? null : fromNativeQuotaMap(expected.quota)
-      if (
-        nativeMigrationCanonicalJson(actualQuota) !==
-        nativeMigrationCanonicalJson(expectedQuota)
-      )
-        refuse()
-    }
+    if (
+      checkQuota &&
+      nativeMigrationCanonicalJson(actual.quota ?? null) !==
+        nativeMigrationCanonicalJson(expected.quota ?? null)
+    )
+      refuse()
   }
 }
 
