@@ -7,6 +7,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 2: Prime now fires; it failed on every check because of an account-fingerprint format mismatch, and its failure log now says which step failed. Addresses #480.
 - The plugin logs which vault enrollment file, names and mode it uses, once per process. Addresses #476.
 - OpenCode 2: `/claude` opens with section names only and shows status in a wide view instead of raw Markdown. Addresses #478.
+- `@cortexkit/common-auth` moves to 0.26.0; local-mode quota saves use its shared write combining.
 
 ## 2.2.8
 
