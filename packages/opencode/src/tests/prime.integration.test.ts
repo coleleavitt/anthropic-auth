@@ -1,7 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock } from 'bun:test'
-import { rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { afterEach, describe, expect, mock } from 'bun:test'
 import type { PrimeManager } from '@cortexkit/anthropic-auth-core'
 import * as Core from '@cortexkit/anthropic-auth-core'
 import {
@@ -15,13 +12,10 @@ import {
   getClaudeCodeIdentityForVerifiedAccount,
   hashRefreshToken,
   type LogTestRecord,
-  type NativeCustodyClient,
-  type OAuthQuotaSnapshot,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import type { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
-import { type getSidebarState, getSidebarStateFile } from '../sidebar-state'
 import { rewriteRequestBody } from '../transform.ts'
 import { getPluginTestHandles } from './plugin-test-handles'
 import {
@@ -29,77 +23,33 @@ import {
   type createMockClient,
 } from './support/opencode1-client.ts'
 import {
-  addPoolOAuthAccount as addPoolOAuthAccountWithCtx,
   bindMainAccount,
   bindMainQuotaToAccount,
   bindPoolAccounts,
   createFallbackStorage,
   expectHostActivationNonSecret as expectHostActivationNonSecretWithCtx,
-  expectNoCredentialFragment as expectNoCredentialFragmentWithCtx,
   getPlugin as getPluginWithCtx,
   loginIssues as loginIssuesWithCtx,
   mainAccountIssues as mainAccountIssuesWithCtx,
-  migratedHostAuth as migratedHostAuthWithCtx,
-  nativeAdmissionAnswer as nativeAdmissionAnswerWithCtx,
-  nativeBootstrapAnswer as nativeBootstrapAnswerWithCtx,
-  nativeTokenAnswer as nativeTokenAnswerWithCtx,
+  ownPrimeMarkerNamespace,
   poolMainAccess as poolMainAccessWithCtx,
-  poolMainIdentity as poolMainIdentityWithCtx,
-  publishNativeMainQuota as publishNativeMainQuotaWithCtx,
-  publishPoolMetadata as publishPoolMetadataWithCtx,
-  publishPoolQuota as publishPoolQuotaWithCtx,
   readNativeRuntimeState as readNativeRuntimeStateWithCtx,
-  readNativeSettings as readNativeSettingsWithCtx,
   refreshPoolLoginElsewhere as refreshPoolLoginElsewhereWithCtx,
   refreshPoolMainElsewhere as refreshPoolMainElsewhereWithCtx,
-  registerPoolLogins as registerPoolLoginsWithCtx,
-  replacePoolMainLogin as replacePoolMainLoginWithCtx,
-  setupExpiredTokenLoader as setupExpiredTokenLoaderWithCtx,
   syntheticMainAccountUuid,
   syntheticMainHostAuth,
-  updatePoolRelay as updatePoolRelayWithCtx,
-  updatePoolSettings as updatePoolSettingsWithCtx,
   useTempAccountFile as useTempAccountFileWithCtx,
-  useUnmigratedAccountFile as useUnmigratedAccountFileWithCtx,
-  useVaultAccountFile as useVaultAccountFileWithCtx,
-  waitForPoolCredential as waitForPoolCredentialWithCtx,
-  withMainAdmission as withMainAdmissionWithCtx,
   withNativeAdmission as withNativeAdmissionWithCtx,
   withNativeBootstrap as withNativeBootstrapWithCtx,
-  withNativeTokenExchange as withNativeTokenExchangeWithCtx,
 } from './support/opencode1-pool-fixture.ts'
+import { readAccountStorage as readAccountStorageWithCtx } from './support/opencode1-state-observers.ts'
+import type { PluginRuntimeOverrides } from './support/opencode1-test-context.ts'
 import {
-  expectNonOatMainRefused as expectNonOatMainRefusedWithCtx,
-  expectUnknownQuotaAdmissionBlocked as expectUnknownQuotaAdmissionBlockedWithCtx,
-  loadMainAndFetch as loadMainAndFetchWithCtx,
-  type readFeedEntries,
-  waitForFeedEntries as waitForFeedEntriesWithCtx,
-  waitForLogRecord as waitForLogRecordWithCtx,
-} from './support/opencode1-quota-feed.ts'
-import {
-  readAccountStorage as readAccountStorageWithCtx,
-  waitForAccountStorage as waitForAccountStorageWithCtx,
-  waitForNativePoolQuota as waitForNativePoolQuotaWithCtx,
-  waitForSidebarState as waitForSidebarStateWithCtx,
-} from './support/opencode1-state-observers.ts'
-import type {
-  MigratedPool,
-  PluginRuntimeOverrides,
-  PoolLogin,
-} from './support/opencode1-test-context.ts'
-import {
-  cleanupTempConfigDirs as cleanupTempConfigDirsWithCtx,
   createOpencode1Test,
   createOpencode1TestContext,
   EMPTY_POST,
   getBodyLifetime,
-  heldResponse as heldResponseWithCtx,
   installOpencode1TestHooks,
-  lifetimeSignal as lifetimeSignalWithCtx,
-  onSidebarWrite as onSidebarWriteWithCtx,
-  recordedCondition as recordedConditionWithCtx,
-  setSidebarWriteTestHooks as setSidebarWriteTestHooksWithCtx,
-  untilStateOrTestEnd as untilStateOrTestEndWithCtx,
 } from './support/opencode1-test-context.ts'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
 
@@ -110,31 +60,10 @@ const test = createOpencode1Test(testContext)
 function bodyLifetime(): TestLifetime {
   return getBodyLifetime(testContext)
 }
-function _lifetimeSignal() {
-  return lifetimeSignalWithCtx(testContext)
-}
-function _recordedCondition() {
-  return recordedConditionWithCtx(testContext)
-}
-function _untilStateOrTestEnd(pauseMs?: number) {
-  return untilStateOrTestEndWithCtx(testContext, pauseMs)
-}
-function _heldResponse() {
-  return heldResponseWithCtx(testContext)
-}
-function _cleanupTempConfigDirs(drainTimeoutMs = 4_000) {
-  return cleanupTempConfigDirsWithCtx(testContext, drainTimeoutMs)
-}
-function __setSidebarStateWriteTestHooks(
-  hooks: Parameters<typeof setSidebarWriteTestHooksWithCtx>[1],
-  stateFile: string = getSidebarStateFile(),
-) {
-  return setSidebarWriteTestHooksWithCtx(testContext, hooks, stateFile)
-}
-function _onSidebarWrite(stateFile: string, listener: () => void) {
-  return onSidebarWriteWithCtx(testContext, stateFile, listener)
-}
-function useTempAccountFile(
+// Every Prime case clears its own marker namespace here, after the account
+// file exists and before any plugin starts, instead of sweeping the shared
+// marker root that other test files' plugins may also be using.
+async function useTempAccountFile(
   storage: AccountStorage,
   mainHostAuth: {
     access: string
@@ -142,37 +71,8 @@ function useTempAccountFile(
     expires: number
   } = syntheticMainHostAuth(),
 ) {
-  return useTempAccountFileWithCtx(testContext, storage, mainHostAuth)
-}
-function _useVaultAccountFile(
-  storage: AccountStorage,
-  client: NativeCustodyClient,
-) {
-  return useVaultAccountFileWithCtx(testContext, storage, client)
-}
-function _useUnmigratedAccountFile(storage: AccountStorage) {
-  return useUnmigratedAccountFileWithCtx(testContext, storage)
-}
-function _registerPoolLogins(
-  storage: AccountStorage,
-  main: { access: string; refresh: string },
-) {
-  return registerPoolLoginsWithCtx(testContext, storage, main)
-}
-function _nativeTokenAnswer(
-  input: Parameters<typeof fetch>[0],
-  init?: RequestInit,
-  logins?: readonly PoolLogin[],
-) {
-  return nativeTokenAnswerWithCtx(testContext, input, init, logins)
-}
-function _withNativeTokenExchange<Input, Init>(
-  handler: (input: Input, init: Init) => Response | Promise<Response>,
-) {
-  return withNativeTokenExchangeWithCtx(testContext, handler)
-}
-function _poolMainIdentity(): string {
-  return poolMainIdentityWithCtx(testContext)
+  await useTempAccountFileWithCtx(testContext, storage, mainHostAuth)
+  await ownPrimeMarkerNamespace(testContext)
 }
 function mainAccountIssues(...accesses: string[]) {
   return mainAccountIssuesWithCtx(testContext, ...accesses)
@@ -180,43 +80,15 @@ function mainAccountIssues(...accesses: string[]) {
 function loginIssues(current: string, ...accesses: string[]) {
   return loginIssuesWithCtx(testContext, current, ...accesses)
 }
-function _nativeAdmissionAnswer(
-  input: Parameters<typeof fetch>[0],
-  init?: RequestInit,
-) {
-  return nativeAdmissionAnswerWithCtx(testContext, input, init)
-}
-function _nativeBootstrapAnswer(
-  input: Parameters<typeof fetch>[0],
-  init?: RequestInit,
-  logins?: readonly PoolLogin[],
-) {
-  return nativeBootstrapAnswerWithCtx(testContext, input, init, logins)
-}
 function withNativeAdmission<Input, Init>(
   handler: (input: Input, init: Init) => unknown,
 ) {
   return withNativeAdmissionWithCtx(testContext, handler)
 }
-function _withMainAdmission<Input, Init>(
-  handler: (input: Input, init: Init) => Response | Promise<Response>,
-) {
-  return withMainAdmissionWithCtx(testContext, handler)
-}
 function withNativeBootstrap<Input, Init>(
   handler: (input: Input, init: Init) => unknown,
 ) {
   return withNativeBootstrapWithCtx(testContext, handler)
-}
-function _replacePoolMainLogin(
-  credential: { access: string; refresh: string; expires: number },
-  options?: { sameAccount: boolean; accountIdentity?: string },
-) {
-  return replacePoolMainLoginWithCtx(
-    testContext,
-    credential,
-    options as { sameAccount: boolean; accountIdentity?: string },
-  )
 }
 function refreshPoolMainElsewhere(successor: {
   access: string
@@ -225,78 +97,17 @@ function refreshPoolMainElsewhere(successor: {
 }) {
   return refreshPoolMainElsewhereWithCtx(testContext, successor)
 }
-function _waitForPoolCredential(routeId: string, access: string) {
-  return waitForPoolCredentialWithCtx(testContext, routeId, access)
-}
 function refreshPoolLoginElsewhere(
   routeId: string,
   successor: { access: string; refresh: string; expires: number },
 ) {
   return refreshPoolLoginElsewhereWithCtx(testContext, routeId, successor)
 }
-function _updatePoolSettings(
-  mutator: (settings: Record<string, unknown>) => Record<string, unknown>,
-) {
-  return updatePoolSettingsWithCtx(testContext, mutator)
-}
-function _addPoolOAuthAccount(
-  routeId: string,
-  credential: { access: string; refresh: string; expires: number },
-  accountIdentity?: string,
-) {
-  return accountIdentity === undefined
-    ? addPoolOAuthAccountWithCtx(testContext, routeId, credential)
-    : addPoolOAuthAccountWithCtx(
-        testContext,
-        routeId,
-        credential,
-        accountIdentity,
-      )
-}
-function _updatePoolRelay(
-  patch: Parameters<
-    ReturnType<
-      typeof import('@cortexkit/anthropic-auth-core').createNativeAccountRuntime
-    >['updateRelay']
-  >[0],
-) {
-  return updatePoolRelayWithCtx(testContext, patch)
-}
-function _publishPoolQuota(routeId: string, quota: OAuthQuotaSnapshot) {
-  return publishPoolQuotaWithCtx(testContext, routeId, quota)
-}
-function _publishPoolMetadata(
-  routeId: string,
-  patch: (
-    identity: string,
-  ) => Parameters<
-    ReturnType<
-      typeof import('@cortexkit/anthropic-auth-core').createNativeAccountRuntime
-    >['publishLocal']
-  >[1],
-) {
-  return publishPoolMetadataWithCtx(testContext, routeId, patch)
-}
 function expectHostActivationNonSecret(...tokens: string[]) {
   return expectHostActivationNonSecretWithCtx(testContext, ...tokens)
 }
 function poolMainAccess(): Promise<string> {
   return poolMainAccessWithCtx(testContext)
-}
-function _migratedHostAuth(
-  pool: MigratedPool,
-  testAuth: () => Promise<Record<string, unknown>>,
-) {
-  return migratedHostAuthWithCtx(testContext, pool, testAuth)
-}
-function _expectNoCredentialFragment(value: unknown) {
-  return expectNoCredentialFragmentWithCtx(testContext, value)
-}
-function _readNativeSettings(): Promise<Record<string, unknown>> {
-  return readNativeSettingsWithCtx(testContext)
-}
-function _publishNativeMainQuota(quota: OAuthQuotaSnapshot) {
-  return publishNativeMainQuotaWithCtx(testContext, quota)
 }
 function readNativeRuntimeState() {
   return readNativeRuntimeStateWithCtx(testContext)
@@ -308,28 +119,8 @@ function getPlugin(
 ): any {
   return getPluginWithCtx(testContext, client, directory, runtimeOverrides)
 }
-function _setupExpiredTokenLoader(...issuedAccess: string[]) {
-  return setupExpiredTokenLoaderWithCtx(testContext, ...issuedAccess)
-}
-function _waitForSidebarState(
-  predicate: (state: Awaited<ReturnType<typeof getSidebarState>>) => boolean,
-) {
-  return waitForSidebarStateWithCtx(testContext, predicate)
-}
 function readAccountStorage(): Promise<AccountStorage | null> {
   return readAccountStorageWithCtx(testContext)
-}
-function _waitForAccountStorage(
-  predicate: (storage: AccountStorage | null) => boolean,
-) {
-  return waitForAccountStorageWithCtx(testContext, predicate)
-}
-function _waitForNativePoolQuota(
-  routeId: string,
-  predicate: (quota: OAuthQuotaSnapshot | undefined) => boolean,
-  options?: { keepAliveUntil?: Promise<unknown> },
-) {
-  return waitForNativePoolQuotaWithCtx(testContext, routeId, predicate, options)
 }
 function applyMenuAction(
   plugin: any,
@@ -337,32 +128,6 @@ function applyMenuAction(
   request: Omit<CommandApplyRequest, 'command' | 'sessionId'>,
 ): Promise<CommandApplyResult> {
   return applyMenuActionWithCtx(testContext, plugin, sessionId, request)
-}
-function _waitForFeedEntries(
-  predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
-  description: string,
-) {
-  return waitForFeedEntriesWithCtx(testContext, predicate, description)
-}
-function _waitForLogRecord(
-  records: LogTestRecord[],
-  predicate: (record: LogTestRecord) => boolean,
-  description: string,
-) {
-  return waitForLogRecordWithCtx(testContext, records, predicate, description)
-}
-function _loadMainAndFetch(
-  storage: AccountStorage,
-  response: Response | (() => Response),
-  requestHeaders?: Record<string, string>,
-) {
-  return loadMainAndFetchWithCtx(testContext, storage, response, requestHeaders)
-}
-function _expectNonOatMainRefused(access: string) {
-  return expectNonOatMainRefusedWithCtx(testContext, access)
-}
-function _expectUnknownQuotaAdmissionBlocked(storage: AccountStorage) {
-  return expectUnknownQuotaAdmissionBlockedWithCtx(testContext, storage)
 }
 async function assertPrimeWithPublicDiagnostics(
   manager: PrimeManager,
@@ -386,7 +151,6 @@ async function assertPrimeWithPublicDiagnostics(
     throw error
   }
 }
-
 async function freshPrimeQuotaResponse(
   body: unknown,
   init: ResponseInit = { status: 200 },
@@ -399,15 +163,6 @@ async function freshPrimeQuotaResponse(
 
 describe('claude-prime direct request', () => {
   const originalFetch = globalThis.fetch
-
-  beforeEach(async () => {
-    // Marker dir is shared across processes; sweep leftovers so a prior
-    // suite's fire doesn't suppress the next suite's claim.
-    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
-      recursive: true,
-      force: true,
-    }).catch(() => {})
-  })
 
   afterEach(() => {
     globalThis.fetch = originalFetch
@@ -977,13 +732,6 @@ describe('claude-prime direct request', () => {
   test('fallback prime uses fallback OAuth token', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
-    // Marker dir is shared across tests; sweep any leftover marker for
-    // this reset epoch so a prior suite's fire doesn't suppress the
-    // claim and the fresh-check is forced through.
-    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
-      recursive: true,
-      force: true,
-    }).catch(() => {})
     await useTempAccountFile(
       bindPoolAccounts(
         createFallbackStorage({
@@ -1459,12 +1207,6 @@ describe('claude-prime direct request', () => {
 describe('claude-prime sidebar on toggle', () => {
   let sidebarStateFile: string | undefined
 
-  beforeEach(async () => {
-    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
-      recursive: true,
-      force: true,
-    }).catch(() => {})
-  })
   async function readSidebar(): Promise<{
     prime?: { enabled?: boolean; accounts?: unknown }
   }> {
@@ -1571,15 +1313,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
   // that request, and the fallback quota check must not poll twice.
 
   const originalFetch = globalThis.fetch
-
-  beforeEach(async () => {
-    // Marker dir is shared across processes; sweep leftovers so a prior
-    // suite's fire doesn't suppress the next suite's claim.
-    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
-      recursive: true,
-      force: true,
-    }).catch(() => {})
-  })
 
   afterEach(() => {
     globalThis.fetch = originalFetch
@@ -1742,13 +1475,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
   test('R2: refreshPrimeFallbackQuota makes exactly one usage-API call per tick', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
-    // A marker records that an account's five-hour window was already started.
-    // Remove markers from this sandbox so a previous run cannot suppress
-    // this test's request or make it check a different reset window.
-    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
-      recursive: true,
-      force: true,
-    }).catch(() => {})
     await useTempAccountFile(
       bindPoolAccounts(
         createFallbackStorage({
@@ -2102,15 +1828,6 @@ describe('claude-prime — warn dedup (R3)', () => {
   // so one failed request produces one warning rather than duplicate alerts.
 
   const originalFetch = globalThis.fetch
-
-  beforeEach(async () => {
-    // Marker dir is shared across processes; sweep leftovers so a prior
-    // suite's fire doesn't suppress the next suite's claim.
-    await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
-      recursive: true,
-      force: true,
-    }).catch(() => {})
-  })
 
   afterEach(() => {
     globalThis.fetch = originalFetch

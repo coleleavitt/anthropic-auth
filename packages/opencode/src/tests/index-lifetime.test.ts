@@ -9,7 +9,13 @@ import {
 
 const suite = createTestLifetimeSuite()
 
-/** Capture the owning suite's cleanup hook without importing its tests or plugins. */
+/**
+ * Capture the shared OpenCode 1 fixture's outer cleanup hook without importing
+ * any test file or plugin. The hook lives in support/opencode1-test-context.ts
+ * and every test file split out of the former index.test.ts (the
+ * *.integration.test.ts files and plugin-harness.test.ts) installs it through
+ * installOpencode1TestHooks.
+ */
 async function outerCleanupHook(): Promise<
   (cleanup: () => Promise<void>, lifetime: TestLifetime) => Promise<unknown>
 > {
