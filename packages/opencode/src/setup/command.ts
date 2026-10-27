@@ -10,6 +10,7 @@ import {
   type SetupCallbackContext,
   type SetupIO,
   type SetupPlugin,
+  setupUsage,
 } from '@cortexkit/anthropic-auth-core'
 import { confirm } from '@cortexkit/common-auth/auth-menu'
 import {
@@ -64,6 +65,48 @@ export interface SetupCommandOptions extends SetupIO {
 const OPENCODE_VAULT_LOGIN_WARNING =
   'Warning: OpenCode holds a separate Anthropic OAuth login. Remove the separate OpenCode Anthropic login, then choose "Claude via credential vault". Setup has left that login unchanged.'
 
+/** How users run setup; the help's usage line shows it. */
+const SETUP_COMMAND = 'npx @cortexkit/opencode-anthropic-auth setup'
+
+const REMOVE_PI_AUTH = '--remove-pi-auth'
+const YES_ALIAS = '-y'
+const HELP_FLAGS = ['--help', '-h']
+
+/**
+ * The flags this command handles itself before handing the remaining
+ * arguments to the shared setup parser. The argument handling in
+ * `runSetupCommand` and the help text both read these names, so the help
+ * cannot drift from what the command accepts.
+ */
+const COMMAND_FLAGS: ReadonlyArray<{ label: string; description: string }> = [
+  {
+    label: REMOVE_PI_AUTH,
+    description:
+      'Agree in advance to move a stored Pi Anthropic login out of the way: into the local account pool, or aside privately for vault use (restored on disconnect).',
+  },
+  { label: YES_ALIAS, description: 'Same as --yes.' },
+  { label: HELP_FLAGS.join(', '), description: 'Show this help.' },
+]
+
+/**
+ * The text `setup --help` prints: the shared parser's own flag list (which
+ * comes from the same copy of common-auth that parses the arguments), then the
+ * flags and limits this command adds.
+ */
+function setupHelpText(): string {
+  const width = Math.max(...COMMAND_FLAGS.map((flag) => flag.label.length))
+  return [
+    setupUsage({ command: SETUP_COMMAND }),
+    '',
+    'Also accepted by this command:',
+    ...COMMAND_FLAGS.map(
+      (flag) => `  ${flag.label.padEnd(width)}  ${flag.description}`,
+    ),
+    '',
+    '--login cannot be combined with --claustrum, or with --opencode=2: for OpenCode 2, sign in from OpenCode itself.',
+  ].join('\n')
+}
+
 function hostPlan<Value>(
   plans: ReadonlyMap<HarnessKind, Value>,
   host: HarnessKind,
@@ -84,9 +127,15 @@ export async function runSetupCommand(
     signals: process,
   }
   const print = (text: string) => terminal.output.write(`${text}\n`)
+  // The shared parser has no help flag of its own, so help is answered here,
+  // before any argument check or host inspection.
+  if (argv.some((arg) => HELP_FLAGS.includes(arg))) {
+    print(setupHelpText())
+    return 0
+  }
   const args = argv
-    .filter((arg) => arg !== '--remove-pi-auth')
-    .map((arg) => (arg === '-y' ? '--yes' : arg))
+    .filter((arg) => arg !== REMOVE_PI_AUTH)
+    .map((arg) => (arg === YES_ALIAS ? '--yes' : arg))
   const login = args.includes('--login')
   if (login && args.includes('--claustrum')) {
     print(
@@ -138,7 +187,7 @@ export async function runSetupCommand(
         if (slot.slot === 'placeholder') return
       }
     }
-    if (argv.includes('--remove-pi-auth')) {
+    if (argv.includes(REMOVE_PI_AUTH)) {
       consent.set('pi', true)
       return
     }

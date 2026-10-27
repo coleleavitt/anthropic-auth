@@ -330,7 +330,8 @@ test('shared runner plain errors retain their exact display messages', async () 
   const cases = [
     {
       argv: ['--unknown-fixture'],
-      message: 'Unknown setup argument: --unknown-fixture',
+      message:
+        "Unknown setup argument: --unknown-fixture. Run the plugin's own setup --help to list the flags setup accepts.",
     },
     {
       argv: ['--claustrum', '--no-claustrum'],

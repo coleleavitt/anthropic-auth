@@ -119,6 +119,28 @@ function observeSetupArguments() {
   return calls
 }
 
+/** Record the host and the selected hosts each of our setup callbacks receives. */
+function observeSetupCallbackHosts() {
+  const original = core.runSetup
+  const seen: Array<{ callback: string; host: string; hosts: string[] }> = []
+  const spy = spyOn(core, 'runSetup').mockImplementation((plugin, argv, io) => {
+    const { beforeSignIn, migrate } = plugin
+    if (beforeSignIn)
+      plugin.beforeSignIn = async (host, context) => {
+        seen.push({ callback: 'beforeSignIn', host, hosts: [...context.hosts] })
+        return beforeSignIn(host, context)
+      }
+    if (migrate)
+      plugin.migrate = async (host, context) => {
+        seen.push({ callback: 'migrate', host, hosts: [...context.hosts] })
+        return migrate(host, context)
+      }
+    return original(plugin, argv, io)
+  })
+  lifetimes.deferCleanup(() => spy.mockRestore())
+  return seen
+}
+
 function ambiguousSetupIO(io: SetupIO): SetupIO {
   const fs = io.fs!
   const second = join(io.env!.HOME!, 'fixture-bin', 'opencode2')
@@ -4233,10 +4255,78 @@ describe('setup CLI boundary', () => {
           '--unknown=kept',
         ],
       ])
-      expect(f.screen()).toBe('Unknown setup argument: --unknown=kept\n')
+      expect(f.screen()).toBe(
+        "Unknown setup argument: --unknown=kept. Run the plugin's own setup --help to list the flags setup accepts.\n",
+      )
       await expectNoDiagnostics(f)
     },
   )
+
+  for (const flag of ['--help', '-h']) {
+    lifetimes.test(
+      `setup ${flag} prints the shared flag list and this command's own flags, then exits 0`,
+      async () => {
+        const f = await callbackFixture()
+        const calls = observeSetupArguments()
+        const before = await setupBytes(f.plan)
+        expect(await runSetupCommand([flag], f.io)).toBe(0)
+        expect(calls).toEqual([])
+        const screen = f.screen()
+        // The shared parser's own help text comes first, verbatim.
+        expect(
+          screen.startsWith(
+            `${commonAuthSetup.setupUsage({ command: 'npx @cortexkit/opencode-anthropic-auth setup' })}\n`,
+          ),
+        ).toBe(true)
+        // Every flag the shared parser accepts, named independently of its
+        // help text so a help that dropped one would fail here.
+        for (const shared of [
+          /^ {2}--yes {2,}\S/m,
+          /^ {2}--dry-run {2,}\S/m,
+          /^ {2}--host opencode\|pi {2,}\S/m,
+          /^ {2}--opencode=1\|2\|both {2,}\S/m,
+          /^ {2}--claustrum {2,}\S/m,
+          /^ {2}--no-claustrum {2,}\S/m,
+          /^ {2}--login {2,}\S/m,
+          /^ {2}--enroll-only {2,}\S/m,
+        ])
+          expect(screen).toMatch(shared)
+        // Then the flags only this command handles.
+        expect(screen).toMatch(/^ {2}--remove-pi-auth {2,}\S/m)
+        expect(screen).toMatch(/^ {2}-y {2,}Same as --yes\.$/m)
+        expect(screen).toMatch(/^ {2}--help, -h {2,}Show this help\.$/m)
+        expect(await setupBytes(f.plan)).toEqual(before)
+        await expectNoDiagnostics(f)
+      },
+    )
+  }
+
+  for (const argv of [
+    ['--yes', '--host', 'pi'],
+    ['--yes', '--host=pi'],
+  ]) {
+    lifetimes.test(
+      `${argv.slice(1).join(' ')} selects only Pi in every setup callback`,
+      async () => {
+        const f = await callbackFixture({
+          opencode: true,
+          pi: true,
+          claustrum: false,
+        })
+        const seen = observeSetupCallbackHosts()
+        expect(await runSetupCommand(argv, f.io)).toBe(0)
+        expect(seen.map(({ callback }) => callback)).toContain('beforeSignIn')
+        expect(seen.map(({ callback }) => callback)).toContain('migrate')
+        for (const call of seen)
+          expect(call).toEqual({
+            callback: call.callback,
+            host: 'pi',
+            hosts: ['pi'],
+          })
+        await expectNoDiagnostics(f)
+      },
+    )
+  }
 
   for (const dry of [false, true]) {
     for (const choice of ['--claustrum', '--opencode=2']) {
@@ -4311,7 +4401,7 @@ describe('setup CLI boundary', () => {
     [
       'unknown argument',
       ['--yes', '--unknown'],
-      'Unknown setup argument: --unknown',
+      "Unknown setup argument: --unknown. Run the plugin's own setup --help to list the flags setup accepts.",
     ],
     [
       'conflicting vault flags',
