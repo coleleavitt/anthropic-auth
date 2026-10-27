@@ -80,8 +80,12 @@ interface SharedCacheKeep {
   /** Live leases by generation, in the order they were taken. */
   readonly leases: Map<number, CacheKeepLease>
   nextGeneration: number
-  /** Set once the last lease is released; the entry is then never reused. */
-  released: boolean
+  /** The scheduler pass in progress, so the last release can wait for it. */
+  ticking?: Promise<void>
+  /** Called after the last lease is released. */
+  readonly retain: () => void
+  /** Called when a lease is taken; resumes warming any retained sessions. */
+  readonly adopt: () => void
 }
 
 // Kept on globalThis rather than in a module variable, so a plugin reload that
@@ -100,6 +104,7 @@ function sharedCacheKeeps(): Map<string, SharedCacheKeep> {
 }
 
 function createSharedCacheKeep(
+  storageId: string,
   options: NativeCacheKeepOptions,
 ): SharedCacheKeep {
   const prepared: SharedCacheKeep['prepared'] = new Map()
@@ -123,19 +128,21 @@ function createSharedCacheKeep(
       return lease ? lease.loadStorage() : null
     },
     now: options.now,
-    // Return the scheduler pass to timer drivers, so they can join the same
-    // work as disposal rather than observe a detached callback.
+    // Return the tick's promise from the timer callback, so an injected timer
+    // can await the scheduled pass; the last release also waits for it.
     setIntervalImpl: ((_callback: unknown, ms: number | undefined) =>
-      schedule(
-        () =>
-          manager.tick().catch(() => {
-            logger.warn('cachekeep', 'tick failed')
-          }),
-        ms,
-      )) as typeof globalThis.setInterval,
+      schedule(() => {
+        const pass = manager.tick()
+        shared.ticking = pass.catch(() => {
+          logger.warn('cachekeep', 'tick failed')
+        })
+        return shared.ticking
+      }, ms)) as typeof globalThis.setInterval,
     clearIntervalImpl: options.clearIntervalImpl,
+    // While no instance is live the sessions are only retained, not warmed,
+    // so the shared session list for the status menu shows none of them.
     onTrackedSessionsChanged: (sessions) =>
-      registry.publish(shared.released ? [] : sessions),
+      registry.publish(leases.size === 0 ? [] : sessions),
     prepareHeaders(_headers, target, attempt) {
       // Bind each prewarm to the newest live instance when it is prepared, so
       // it never authorizes through an instance OpenCode already disposed.
@@ -168,13 +175,51 @@ function createSharedCacheKeep(
       prepared.delete(attempt.id)
     },
   })
+  // OpenCode 2 disposes an evicted directory's instance before anything boots
+  // that directory again, so the last release must not drop the sessions: a
+  // new instance for this storage may adopt them while their cache is alive.
+  // Only the request bodies stay, in memory; there is no timer sending
+  // prewarms, no runtime and no credential until an instance adopts them.
+  // A single timer deletes each body when its cache expires.
+  let expiry: ReturnType<typeof setTimeout> | undefined
+  const stopExpiry = () => {
+    if (expiry !== undefined) clearTimeout(expiry)
+    expiry = undefined
+  }
+  const dropExpired = () => {
+    stopExpiry()
+    if (leases.size > 0) return
+    const earliest = manager.dropExpiredTargets()
+    if (earliest === undefined) {
+      const shareds = sharedCacheKeeps()
+      if (shareds.get(storageId) === shared) shareds.delete(storageId)
+      return
+    }
+    const now = options.now?.() ?? Date.now()
+    expiry = setTimeout(dropExpired, Math.max(0, earliest - now))
+    if (typeof expiry === 'object' && 'unref' in expiry) expiry.unref()
+  }
   const shared: SharedCacheKeep = {
     manager,
     registry,
     prepared,
     leases,
     nextGeneration: 0,
-    released: false,
+    retain() {
+      manager.stop()
+      prepared.clear()
+      dropExpired()
+    },
+    adopt() {
+      stopExpiry()
+      // A session whose cache expired while no instance was live has nothing
+      // left to keep warm; drop it rather than prewarm it.
+      if (manager.dropExpiredTargets() === undefined) return
+      manager.start()
+      registry.publish(manager.trackedSessions()).catch(() => {
+        logger.warn('cachekeep', 'failed to publish tracked sessions')
+      })
+    },
   }
   return shared
 }
@@ -183,7 +228,9 @@ function createSharedCacheKeep(
  * Keep admitted hybrid-cache prefixes warm using fresh native authorization for
  * each send. Instances for the same account storage share one set of tracked
  * sessions: a later instance takes over sending for sessions an earlier one
- * tracked, and the timer stops only when the last instance is disposed.
+ * tracked, and the timer stops only when the last instance is disposed. The
+ * sessions themselves outlive the last instance until their cache expires, so
+ * an instance that boots for the same storage in that time adopts them.
  */
 export function createNativeCacheKeep(
   options: NativeCacheKeepOptions & {
@@ -198,7 +245,9 @@ export function createNativeCacheKeep(
   const { runtime, source } = options
   const abort = new AbortController()
   const shareds = sharedCacheKeeps()
-  const owner = shareds.get(options.storageId) ?? createSharedCacheKeep(options)
+  const owner =
+    shareds.get(options.storageId) ??
+    createSharedCacheKeep(options.storageId, options)
   shareds.set(options.storageId, owner)
   const { manager, registry } = owner
   const send = async (
@@ -385,7 +434,9 @@ export function createNativeCacheKeep(
     send,
     inflight: new Set(),
   }
+  const adopting = owner.leases.size === 0
   owner.leases.set(lease.generation, lease)
+  if (adopting) owner.adopt()
   let cleanup: Promise<void> | undefined
   return {
     async track(
@@ -451,28 +502,22 @@ export function createNativeCacheKeep(
         if (entry.lease === lease) owner.prepared.delete(id)
       // Only this instance's own lease is released. A predecessor disposed
       // after its successor started leaves the successor's sessions and timer
-      // alone; the shared entry ends only when no instance holds a lease.
+      // alone; the timer stops only when no instance holds a lease.
       const last =
         owner.leases.delete(lease.generation) && owner.leases.size === 0
-      if (last) {
-        owner.released = true
-        manager.stop()
-        if (shareds.get(options.storageId) === owner)
-          shareds.delete(options.storageId)
-      }
+      if (last) owner.retain()
       cleanup = (async () => {
         try {
-          // tick() joins an active scheduler pass; with no lease left, the
-          // manager reads no storage and cannot start another send.
-          if (last) await manager.tick()
+          // Join a scheduler pass already in progress. With no lease left it
+          // cannot authorize or send anything more.
+          if (last) await owner.ticking
           // Sends this instance started use its runtime, which the caller
           // closes after disposal; wait for them to observe the abort.
           await Promise.all(lease.inflight)
         } finally {
-          if (last) {
-            owner.prepared.clear()
-            await registry.dispose()
-          }
+          // Retained sessions are not being warmed, so withdraw them from the
+          // shared session list unless another instance adopted them already.
+          if (last && owner.leases.size === 0) await registry.dispose()
         }
       })()
       return cleanup

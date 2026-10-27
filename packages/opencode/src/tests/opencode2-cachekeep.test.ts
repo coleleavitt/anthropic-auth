@@ -215,6 +215,9 @@ async function fixture(child = false, brokenRegistry = false) {
     due: () => {
       now += CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS
     },
+    advance: (ms: number) => {
+      now += ms
+    },
   }
 }
 test('OpenCode 2 hybrid requests publish a CacheKeep lease and dispose removes its timer', async () => {
@@ -441,31 +444,77 @@ test('an OpenCode 2 prewarm never goes through a disposed instance, even the new
   )
 })
 
-test('OpenCode 2 instances for different account storage never share tracked sessions', async () => {
+test('an OpenCode 2 instance for different account storage adopts nothing a disposed instance retained', async () => {
   const f = await fixture()
-  const other = await fixture()
   await f.live()
-  expect(other.timers.callbacks.size).toBe(0)
-  // The other storage's live instance must not keep these sessions alive.
   await f.dispose()
+  const other = await fixture()
+  // Adoption would restart the retained sessions' timer, which runs on the
+  // first fixture's timers, and list them in the first fixture's registry.
   expect(f.timers.callbacks.size).toBe(0)
+  expect(other.timers.callbacks.size).toBe(0)
+  f.due()
   other.due()
+  await f.timers.fire()
   await other.timers.fire()
   expect(other.sent).toHaveLength(0)
+  expect(await f.registry.list()).toEqual([])
   expect(await other.registry.list()).toEqual([])
 })
 
-test('releasing the last OpenCode 2 instance for a storage stops the timer and drops its sessions', async () => {
+test('an OpenCode 2 instance that boots after the last one was disposed keeps warming its sessions', async () => {
+  const f = await fixture()
+  await f.live()
+  await f.dispose()
+  expect(f.timers.callbacks.size).toBe(0)
+  const next = await f.start()
+  expect(f.timers.callbacks.size).toBe(1)
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  expect(next.sent).toHaveLength(1)
+  expect(next.sent[0]!.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-first',
+  )
+})
+
+test('nothing is sent while no OpenCode 2 instance exists, and the next one sends with the current token', async () => {
   const f = await fixture()
   await f.live()
   const next = await f.start()
   await next.dispose()
-  expect(f.timers.callbacks.size).toBe(1)
   await f.dispose()
   expect(f.timers.callbacks.size).toBe(0)
   expect(await f.registry.list()).toEqual([])
-  const later = await f.start()
   f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  expect(next.sent).toHaveLength(0)
+  // The prewarm must read the token current when it is sent, never one held
+  // from an instance that has gone.
+  await f.store.rotate('first', {
+    type: 'oauth',
+    access: 'sk-ant-oat01-rebooted-first',
+    refresh: 'refresh-first',
+    expires: Date.now() + 12 * 3600_000,
+  })
+  const later = await f.start()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  expect(next.sent).toHaveLength(0)
+  expect(later.sent).toHaveLength(1)
+  expect(later.sent[0]!.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-rebooted-first',
+  )
+})
+
+test('an OpenCode 2 instance that boots after the cache expired adopts nothing', async () => {
+  const f = await fixture()
+  await f.live()
+  await f.dispose()
+  f.advance(CACHE_KEEP_TTL_MS)
+  const later = await f.start()
+  expect(f.timers.callbacks.size).toBe(0)
   await f.timers.fire()
   expect(later.sent).toHaveLength(0)
   expect(await f.registry.list()).toEqual([])

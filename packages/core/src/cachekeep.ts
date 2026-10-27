@@ -512,6 +512,24 @@ export class CacheKeepManager {
     return this.targets.size
   }
 
+  /**
+   * Drop targets whose cache has already expired, without sending or
+   * publishing anything. Returns the earliest expiry among the targets that
+   * remain, or undefined when none remain.
+   */
+  dropExpiredTargets(
+    now = this.options.now?.() ?? Date.now(),
+  ): number | undefined {
+    this.pruneTargets(now)
+    let earliest: number | undefined
+    for (const target of this.targets.values())
+      earliest = Math.min(
+        earliest ?? target.cacheExpiresAt,
+        target.cacheExpiresAt,
+      )
+    return earliest
+  }
+
   private publishTrackedSessions() {
     const callback = this.options.onTrackedSessionsChanged
     if (!callback) return
