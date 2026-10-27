@@ -103,6 +103,36 @@ export interface RelocationDataset {
   readonly storageIds: { readonly local: string; readonly vault: string }
 }
 
+/** The legacy-layout files of OpenCode's default dataset of one config folder. */
+export interface LegacyDatasetFiles {
+  /** The canonical config folder holding the legacy files. */
+  readonly oldDir: string
+  readonly oldPaths: NativePoolPaths
+  readonly oldVault: NativeVaultPaths
+}
+
+/**
+ * Resolve only the config folder's side of the dataset. Nothing under the
+ * state folder is resolved or read, so a start that stays legacy does not
+ * depend on the state folder being readable.
+ */
+export async function resolveLegacyDatasetFiles(
+  configDir: string,
+): Promise<LegacyDatasetFiles> {
+  const oldPaths = await resolveNativePoolPaths(
+    join(configDir, ACCOUNT_FILE),
+    join(configDir, ACCOUNT_STATE_FILE),
+    { kind: 'legacy' },
+  )
+  return {
+    // The folder itself, not the folder of a resolved file: a file that is a
+    // link elsewhere must not move the folder the move works in.
+    oldDir: await canonicalPath(configDir),
+    oldPaths,
+    oldVault: nativeVaultPaths(oldPaths, { kind: 'legacy' }),
+  }
+}
+
 export async function resolveRelocationDataset(input: {
   configDir: string
   identity: string
@@ -112,16 +142,15 @@ export async function resolveRelocationDataset(input: {
 }): Promise<RelocationDataset> {
   const legacyConfig = join(input.configDir, ACCOUNT_FILE)
   const legacyState = join(input.configDir, ACCOUNT_STATE_FILE)
-  const oldPaths = await resolveNativePoolPaths(legacyConfig, legacyState, {
-    kind: 'legacy',
-  })
+  const { oldDir, oldPaths, oldVault } = await resolveLegacyDatasetFiles(
+    input.configDir,
+  )
   const stateHome = { kind: 'state-home', dir: input.sub } as const
   const newPaths = await resolveNativePoolPaths(
     legacyConfig,
     legacyState,
     stateHome,
   )
-  const oldVault = nativeVaultPaths(oldPaths, { kind: 'legacy' })
   const newVault = nativeVaultPaths(newPaths, stateHome)
   const pairs: Record<RelocationRole, [string, string]> = {
     localPoolState: [oldPaths.state, newPaths.state],
@@ -138,9 +167,7 @@ export async function resolveRelocationDataset(input: {
     identity: input.identity,
     stateRoot: input.stateRoot,
     sub: input.sub,
-    // The folder itself, not the folder of a resolved file: a file that is a
-    // link elsewhere must not move the folder the move works in.
-    oldDir: await canonicalPath(input.configDir),
+    oldDir,
     oldPaths,
     oldVault,
     newPaths,

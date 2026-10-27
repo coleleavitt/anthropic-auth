@@ -406,13 +406,13 @@ test('a crash at every restore step recovers to exactly one usable copy', async 
       })
     } else {
       // `restored` with its copies still to remove: the old folder is
-      // complete and an ordinary start finishes the removal.
+      // complete, and a start with moving off serves it without looking at
+      // the state folder, so the removal waits for the command's rerun.
       expect(phase).toBe('restored')
       expect(await usableCopies(m)).toEqual(['legacy'])
+      const record = await readStateLayoutRecord(m.sub)
       expect((await decide(m, { moveEnabled: false })).kind).toBe('legacy')
-      expect((await readStateLayoutRecord(m.sub))?.restore?.cleanup).toBe(
-        'done',
-      )
+      expect(await readStateLayoutRecord(m.sub)).toEqual(record)
     }
     // A rerun of the command (needed only before `restored`) ends restored.
     expect((await restore(m)).status).toMatch(/^(restored|not-moved)$/)

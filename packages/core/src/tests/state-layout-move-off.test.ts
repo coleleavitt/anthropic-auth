@@ -4,6 +4,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
   rm,
   writeFile,
@@ -17,6 +18,7 @@ import {
   HolderRegistrationError,
   type NativeHolderRegistration,
   resetNativeHolderRegistryForTests,
+  stateRefusalPublicMessage,
 } from '../holder-registry.ts'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import type { NativeLockEvent } from '../native-lock-observer.ts'
@@ -27,7 +29,11 @@ import {
   decideOpenCodeStateLayout,
   decidePiStateLayout,
 } from '../state-layout-decision.ts'
-import { StateLayoutRefusalError } from '../state-layout-errors.ts'
+import {
+  StateLayoutRefusalError,
+  stateLayoutRefusalPublicMessage,
+} from '../state-layout-errors.ts'
+import { relocationTombstone } from '../state-layout-move.ts'
 import {
   LEGACY_STATE_LAYOUT,
   resetProcessStateLayoutsForTests,
@@ -254,3 +260,102 @@ for (const kind of ['legacy', 'explicit', 'pi'] as const)
       })
     })
   }
+
+/** The state-home folder of the machine's config folder. */
+function stateSub(m: Machine) {
+  return join(m.stateRoot, 'cortexkit', 'anthropic-auth', 'opencode')
+}
+
+/** A relocation tombstone over the legacy local runtime, as a move leaves it. */
+async function tombstone(m: Machine) {
+  await writeFile(
+    m.legacy.runtime,
+    relocationTombstone({
+      sub: stateSub(m),
+      stateRoot: join(m.stateRoot, 'cortexkit', 'anthropic-auth'),
+      identity: m.configDir,
+      attempt: '00000000-0000-4000-8000-000000000000',
+      by: 'test',
+    }),
+  )
+}
+
+/** What a start shows a person for a refusal: the fixed text, naming no file. */
+function expectFixedRefusal(error: unknown, m: Machine) {
+  expect(error).toBeInstanceOf(StateLayoutRefusalError)
+  expect(error).toMatchObject({ code: 'marker-unreadable' })
+  const shown = stateRefusalPublicMessage(error)
+  expect(shown).toBe(stateLayoutRefusalPublicMessage('marker-unreadable'))
+  expect(shown).not.toContain(m.root)
+}
+
+test('moving off: a state root that is not a folder, or that the process may not read, does not stop a legacy start', async () => {
+  for (const kind of ['not-a-folder', 'unreadable'] as const) {
+    const m = await machine()
+    if (kind === 'not-a-folder') {
+      await writeFile(m.stateRoot, 'a file where the state root would be')
+    } else {
+      await mkdir(stateSub(m), { recursive: true })
+      await chmod(m.stateRoot, 0o000)
+    }
+    try {
+      const decision = await decide(m, { moveEnabled: false })
+      expect(decision.kind).toBe('legacy')
+      expect(decision.layout).toEqual(LEGACY_STATE_LAYOUT)
+    } finally {
+      if (kind === 'unreadable') await chmod(m.stateRoot, 0o700)
+    }
+  }
+})
+
+test('moving off: a corrupt layout.json in the state folder with no tombstone in the config folder does not stop a legacy start', async () => {
+  const m = await machine()
+  await mkdir(stateSub(m), { recursive: true })
+  await writeFile(join(stateSub(m), 'layout.json'), '{ not json')
+  await writeFile(join(stateSub(m), 'config-dir.json'), '{ not json either')
+  const decision = await decide(m, { moveEnabled: false })
+  expect(decision.kind).toBe('legacy')
+  // Nothing in the state folder was read or changed.
+  expect(await readFile(join(stateSub(m), 'layout.json'), 'utf8')).toBe(
+    '{ not json',
+  )
+})
+
+test('a tombstone in the config folder keeps the strict checks: an unreadable state folder or record refuses with the fixed text', async () => {
+  for (const moveEnabled of [false, true])
+    for (const kind of [
+      'state-root-not-a-folder',
+      'config-dir-marker-unreadable',
+      'layout-corrupt',
+    ] as const) {
+      const m = await machine()
+      await tombstone(m)
+      if (kind === 'state-root-not-a-folder')
+        await writeFile(m.stateRoot, 'a file where the state root would be')
+      else await mkdir(stateSub(m), { recursive: true })
+      if (kind === 'config-dir-marker-unreadable')
+        await mkdir(join(stateSub(m), 'config-dir.json'))
+      if (kind === 'layout-corrupt')
+        await writeFile(join(stateSub(m), 'layout.json'), '{ not json')
+      const error = await decide(m, { moveEnabled }).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      )
+      expectFixedRefusal(error, m)
+    }
+})
+
+test('moving off: a journal a move set aside keeps the strict checks', async () => {
+  const m = await machine()
+  await writeFile(
+    `${m.legacy.journal}.moving-00000000-0000-4000-8000-000000000000`,
+    '{}\n',
+  )
+  await mkdir(stateSub(m), { recursive: true })
+  await writeFile(join(stateSub(m), 'layout.json'), '{ not json')
+  const error = await decide(m, { moveEnabled: false }).then(
+    () => undefined,
+    (caught: unknown) => caught,
+  )
+  expectFixedRefusal(error, m)
+})

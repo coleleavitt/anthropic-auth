@@ -190,10 +190,23 @@ for (const moveEnabled of [false, true]) {
 
 test('OpenCode 2 refuses at setup with the fixed text of a layout refusal, naming no folder', async () => {
   const m = await machine(false)
-  // A record of the move that can't be read: no copy may be served.
+  // The config folder's runtime file is a tombstone pointing at the state
+  // folder, and the record of the move there can't be read: no copy may be
+  // served.
   const target = resolveStateHomeTarget()
   if (!target) throw new Error('the config folder has no identity')
   await mkdir(target.dir, { recursive: true })
+  await Bun.write(
+    join(m.configDir, 'anthropic-auth-native-state.json'),
+    JSON.stringify({
+      version: 0,
+      relocatedTo: target.dir,
+      stateRoot: target.stateRoot,
+      identity: target.identity,
+      attempt: '00000000-0000-4000-8000-000000000000',
+      by: 'test',
+    }),
+  )
   await Bun.write(join(target.dir, 'layout.json'), '{ not json')
   const failure = await setupAnthropicAuth(openCode2Context(), {
     vault: { env: { ...process.env } },
@@ -202,6 +215,25 @@ test('OpenCode 2 refuses at setup with the fixed text of a layout refusal, namin
   const message = (failure as Error).message
   expect(message).toBe(stateLayoutRefusalPublicMessage('marker-unreadable'))
   expect(message).not.toContain(m.root)
+})
+
+test('OpenCode 2 with moving off serves its config folder when the state folder holds a corrupt record but the config folder shows no move', async () => {
+  const m = await machine(false)
+  const target = resolveStateHomeTarget()
+  if (!target) throw new Error('the config folder has no identity')
+  await mkdir(target.dir, { recursive: true })
+  await Bun.write(join(target.dir, 'layout.json'), '{ not json')
+  const dispose = await setupAnthropicAuth(openCode2Context(), {
+    vault: { env: { ...process.env } },
+  })
+  cleanups.push(() => dispose())
+  expect(await holderEntries(m.configDir)).toContainEqual(
+    expect.objectContaining({
+      pid: process.pid,
+      role: 'opencode2',
+      kind: 'legacy',
+    }),
+  )
 })
 
 test('setup --restore-legacy refuses while a host runs, and otherwise restores', async () => {

@@ -1,6 +1,6 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { LockContentionError } from '@cortexkit/common-auth/fs'
 
 import { getOpenCodeConfigDir } from './accounts.ts'
@@ -55,12 +55,15 @@ import {
   acquireHolderLocks,
   cleanupOldCopies,
   drainCoalescedWrites,
+  exists,
   LAYOUT_LOCK_NAME,
   LAYOUT_LOCK_TIMEOUT_MS,
+  type LegacyDatasetFiles,
   moveDataset,
   movePreconditionFailure,
   type RelocationDataset,
   recordFilesProblem,
+  resolveLegacyDatasetFiles,
   resolveRelocationDataset,
   rollbackPreparing,
   StateLayoutCrash,
@@ -442,6 +445,24 @@ async function admitFast(
 }
 
 /**
+ * Read the relocation tombstone over `runtime`, if any. A file that can't be
+ * read at all refuses with a fixed public message instead of escaping as a
+ * raw error that names the file.
+ */
+async function readPointer(runtime: string) {
+  try {
+    return await readRelocationPointer(runtime)
+  } catch (error) {
+    refuse(
+      'marker-unreadable',
+      `anthropic-auth can't read ${runtime}, which may record that its state was moved, so it won't use either copy.`,
+      [runtime],
+      error,
+    )
+  }
+}
+
+/**
  * Read both relocation tombstones in the old folder. Refuses when one belongs
  * to another config folder or names another state root; true when one
  * points at this dataset's state-home folder.
@@ -449,7 +470,7 @@ async function admitFast(
 async function readPointers(dataset: RelocationDataset): Promise<boolean> {
   let pointed = false
   for (const runtime of [dataset.oldPaths.runtime, dataset.oldVault.runtime]) {
-    const pointer = await readRelocationPointer(runtime)
+    const pointer = await readPointer(runtime)
     if (!pointer) continue
     if (pointer.identity !== dataset.identity)
       refuse(
@@ -495,6 +516,104 @@ async function legacyHeld(
     ctx,
   )
   return chooseLegacy(dataset.oldPaths, reasons, log, registration)
+}
+
+/**
+ * Whether the config folder shows a move or restore of its dataset: a
+ * relocation tombstone over either runtime file, or the journal set aside by
+ * a move that stopped before its tombstones. A move installs both
+ * tombstones before it commits, and a restore removes them only once the
+ * legacy files are back, so without either the config folder's copy is the
+ * only one any process may serve, whatever the state folder holds.
+ */
+async function oldFolderTransition(old: LegacyDatasetFiles): Promise<boolean> {
+  for (const runtime of [old.oldPaths.runtime, old.oldVault.runtime])
+    if (await readPointer(runtime)) return true
+  // Only a journal that is absent can have been set aside.
+  const journal = old.oldPaths.journal
+  let names: string[]
+  try {
+    if (await exists(journal)) return false
+    names = await readdir(dirname(journal))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false
+    // What the folder holds is unknown: let the full decision look.
+    return true
+  }
+  const prefix = `${basename(journal)}.moving-`
+  return names.some((name) => name.startsWith(prefix))
+}
+
+/**
+ * While moving is off: stay legacy, as 2.4.x does, without resolving or
+ * reading anything in the state folder, so an unreadable state root or stray
+ * files there never stop a healthy legacy install. Undefined when the config
+ * folder shows a move or restore (`oldFolderTransition`); the full decision
+ * then runs, with its strict checks of the state folder.
+ *
+ * The tombstones are read again under the config folder's holder lock: a
+ * mover under any `XDG_STATE_HOME` holds that lock from its fence to its
+ * end, so a move that committed while this start waited is seen. When the
+ * lock can't be taken the start still serves, as 2.4.x does, with its
+ * registration retried in the background; a move that commits later is
+ * stopped by the tombstones it installs, which the relocation guards check.
+ */
+async function legacyWhileMoveOff(
+  configDir: string,
+  identity: string,
+  options: DecideStateLayoutOptions,
+  ctx: StateLayoutTransitionContext,
+  stayReasons: string[],
+): Promise<StateLayoutDecision | undefined> {
+  const old = await resolveLegacyDatasetFiles(configDir)
+  if (await oldFolderTransition(old)) return undefined
+  try {
+    await stateLayoutStep(ctx, 'old-holders-locking')
+    let lockFailure: { error: unknown } | undefined
+    try {
+      await ctx.stack.acquire({
+        name: 'holders',
+        path: join(old.oldDir, HOLDER_FILE_NAME),
+        timeoutMs: ctx.holderLockTimeoutMs,
+      })
+    } catch (error) {
+      lockFailure = { error }
+    }
+    if (await oldFolderTransition(old)) return undefined
+    const registration = lockFailure
+      ? deferLegacyRegistration(
+          old.oldPaths,
+          old.oldDir,
+          options,
+          lockFailure.error,
+        )
+      : await registerLegacyHeld(
+          old.oldDir,
+          old.oldPaths,
+          identity,
+          options,
+          ctx,
+        )
+    // Moving being off is not worth a log line; the other reasons are.
+    return chooseLegacy(
+      old.oldPaths,
+      stayReasons.length ? stayReasons : [RELOCATION_MOVE_DISABLED_REASON],
+      stayReasons.length > 0,
+      registration,
+    )
+  } finally {
+    await ctx.stack.releaseAll().catch(() => {})
+  }
+}
+
+/** The state folder can't be resolved; refuse with a fixed public message. */
+function stateFolderUnreadable(dir: string, cause: unknown): never {
+  refuse(
+    'marker-unreadable',
+    `anthropic-auth can't read ${dir}, the state folder that may hold its state, so it won't use either copy.`,
+    [dir],
+    cause,
+  )
 }
 
 /**
@@ -586,17 +705,43 @@ export async function decideOpenCodeStateLayout(
     if (!target) throw new HolderRegistrationError('unavailable', configDir)
     neverMove.push(reason)
   }
-
-  const sub = await canonicalPath(target.dir)
-  const dataset = await resolveRelocationDataset({
-    configDir,
-    identity: target.identity,
-    stateRoot: target.stateRoot,
-    sub,
-  })
   const overrides = statePathOverrides(env)
+  const stayReasons = [
+    ...overrides.map((variable) => `${variable} is set`),
+    ...neverMove,
+  ]
 
-  // 3. The subfolder must belong to this config folder.
+  // 3. While moving is off, a config folder with no sign of a move stays
+  // legacy without looking at the state folder.
+  const moveEnabled = relocationMoveEnabled(options)
+  if (!moveEnabled) {
+    const legacy = await legacyWhileMoveOff(
+      configDir,
+      target.identity,
+      options,
+      newContext(),
+      stayReasons,
+    )
+    if (legacy) return legacy
+  }
+
+  // From here the state folder may hold the dataset, so a failure to read it
+  // refuses, with a fixed message.
+  let sub: string
+  let dataset: RelocationDataset
+  try {
+    sub = await canonicalPath(target.dir)
+    dataset = await resolveRelocationDataset({
+      configDir,
+      identity: target.identity,
+      stateRoot: target.stateRoot,
+      sub,
+    })
+  } catch (error) {
+    stateFolderUnreadable(target.dir, error)
+  }
+
+  // 4. The subfolder must belong to this config folder.
   let marker: Awaited<ReturnType<typeof readConfigDirMarker>>
   try {
     marker = await readConfigDirMarker(sub)
@@ -617,11 +762,10 @@ export async function decideOpenCodeStateLayout(
       [sub, marker.identity, target.identity],
     )
 
-  // 4. The pointer left in the old folder by a move.
+  // 5. The pointer left in the old folder by a move.
   const pointed = await readPointers(dataset)
 
-  // 5. The marker, read without a lock.
-  const moveEnabled = relocationMoveEnabled(options)
+  // 6. The marker, read without a lock.
   for (let round = 0; round < 3; round++) {
     const record = await readRecord(sub)
     if (record) requireRecordMatches(record, dataset)
@@ -649,10 +793,6 @@ export async function decideOpenCodeStateLayout(
       // holds it from before its fence read to its end, and the checks under
       // it see a move that committed.
       const ctx = newContext()
-      const stayReasons = [
-        ...overrides.map((variable) => `${variable} is set`),
-        ...neverMove,
-      ]
       // Moving being off is not worth a log line; the other reasons are.
       const reasons = stayReasons.length
         ? stayReasons
@@ -710,7 +850,7 @@ export async function decideOpenCodeStateLayout(
     break
   }
 
-  // 6. Under the layout lock.
+  // 7. Under the layout lock.
   await ensureSubfolder(sub, fs)
   for (let round = 0; round < 4; round++) {
     const ctx = newContext()
