@@ -70,6 +70,7 @@ import {
   resolveNativePoolPaths,
 } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
+import { processStateLayout } from './state-layout-paths.ts'
 import { migrateStickyRoutingState } from './sticky-routing.ts'
 
 export class NativeMigrationError extends Error {
@@ -302,9 +303,12 @@ export async function publishNativeEmptyInit(
           !(await absent(routingDestinationPath))
         )
           refuse()
+        // Re-resolve in this process's layout: paths resolved in another
+        // layout differ in at least one key and are refused below.
         const resolved = await resolveNativePoolPaths(
           paths.legacyConfig,
           paths.legacyState,
+          processStateLayout(),
         )
         for (const key of Object.keys(resolved) as Array<keyof NativePoolPaths>)
           if (paths[key] !== resolved[key]) refuse()
@@ -366,9 +370,12 @@ async function capture(
 ): Promise<Captured> {
   requireNoSupervisedAuthContentSnapshot(input.env)
   await input.processFence()
+  // Re-resolve in this process's layout: paths resolved in another layout
+  // differ in at least one key and are refused below.
   const resolved = await resolveNativePoolPaths(
     input.paths.legacyConfig,
     input.paths.legacyState,
+    processStateLayout(),
   )
   for (const key of Object.keys(resolved) as Array<keyof NativePoolPaths>)
     if (input.paths[key] !== resolved[key]) refuse()

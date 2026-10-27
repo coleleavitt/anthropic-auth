@@ -3,6 +3,11 @@ import { realpath } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 
 import { getAccountStatePath, getAccountStoragePath } from './accounts.ts'
+import {
+  processStateLayout,
+  type StateLayout,
+  stateHomeDatasetFiles,
+} from './state-layout-paths.ts'
 import { getStickyRoutingStatePath } from './sticky-routing.ts'
 
 export interface NativePoolPaths {
@@ -67,10 +72,17 @@ function sibling(
 /**
  * Separate runtime authority from import inputs so a stale legacy writer cannot
  * rewrite a stamped credential. Both independently configured paths matter.
+ *
+ * `layout` places the pool state, runtime, journal and custody roster; the pool
+ * config stays beside the account file in every layout. It defaults to this
+ * process's layout decision, so a re-resolution matches the first resolution.
+ * The storage id is always computed from the pool state's legacy-layout path,
+ * so moving files between layouts never changes it.
  */
 export async function resolveNativePoolPaths(
   legacyConfig = getAccountStoragePath(),
   legacyState = getAccountStatePath(legacyConfig),
+  layout: StateLayout = processStateLayout(),
 ): Promise<NativePoolPaths> {
   const [sourceConfig, sourceState] = await Promise.all([
     canonicalPath(legacyConfig),
@@ -84,7 +96,7 @@ export async function resolveNativePoolPaths(
       'pool',
     ),
   )
-  const state = await canonicalPath(
+  const legacyLayoutState = await canonicalPath(
     sibling(
       sourceState,
       'anthropic-auth-state.json',
@@ -92,7 +104,8 @@ export async function resolveNativePoolPaths(
       'pool',
     ),
   )
-  const runtime = await canonicalPath(
+  let state = legacyLayoutState
+  let runtime = await canonicalPath(
     sibling(
       sourceState,
       'anthropic-auth-state.json',
@@ -100,7 +113,7 @@ export async function resolveNativePoolPaths(
       'native',
     ),
   )
-  const journal = await canonicalPath(
+  let journal = await canonicalPath(
     sibling(
       sourceState,
       'anthropic-auth-state.json',
@@ -108,7 +121,7 @@ export async function resolveNativePoolPaths(
       'migration',
     ),
   )
-  const roster = await canonicalPath(
+  let roster = await canonicalPath(
     sibling(
       sourceState,
       'anthropic-auth-state.json',
@@ -116,6 +129,15 @@ export async function resolveNativePoolPaths(
       'roster',
     ),
   )
+  if (layout.kind === 'state-home') {
+    const moved = stateHomeDatasetFiles(layout, sourceConfig, sourceState)
+    ;[state, runtime, journal, roster] = await Promise.all([
+      canonicalPath(moved.localPoolState),
+      canonicalPath(moved.localRuntime),
+      canonicalPath(moved.journal),
+      canonicalPath(moved.localRoster),
+    ])
+  }
   const paths = [
     sourceConfig,
     sourceState,
@@ -131,7 +153,7 @@ export async function resolveNativePoolPaths(
     )
   }
   const storageId = createHash('sha256')
-    .update(JSON.stringify(['anthropic', config, state]))
+    .update(JSON.stringify(['anthropic', config, legacyLayoutState]))
     .digest('hex')
   return {
     legacyConfig: sourceConfig,

@@ -20,6 +20,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { types as utilTypes } from 'node:util'
 import {
+  anthropicAuthStateRoot,
   createProviderErrorRedactor,
   createWindowsOwnerOnly,
   ensureWindowsOwnerOnlyDirectory,
@@ -781,13 +782,12 @@ function envText(env: object, key: string): string | undefined {
  */
 export function cliDiagnosticsDirectory(env: unknown): string | undefined {
   if (!isInspectable(env)) return undefined
-  const configured = envText(env, 'XDG_STATE_HOME')
   const home = envText(env, 'HOME')
-  const stateHome =
-    configured && isAbsolute(configured)
-      ? configured
-      : join(home && isAbsolute(home) ? home : homedir(), '.local', 'state')
-  return join(stateHome, 'cortexkit', 'anthropic-auth', 'diagnostics')
+  const root = anthropicAuthStateRoot({
+    xdgStateHome: envText(env, 'XDG_STATE_HOME'),
+    home: home && isAbsolute(home) ? home : homedir(),
+  })
+  return join(root, 'diagnostics')
 }
 
 /**

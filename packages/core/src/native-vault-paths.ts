@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto'
 import { basename, dirname, join } from 'node:path'
 
 import type { NativePoolPaths } from './pool-paths.ts'
+import {
+  processStateLayout,
+  type StateLayout,
+  stateHomeDatasetFiles,
+} from './state-layout-paths.ts'
 
 /** Vault files have no migration journal: enrollment alone authorizes their use. */
 export interface NativeVaultPaths {
@@ -20,38 +25,61 @@ function sibling(path: string, expected: string, name: string, suffix: string) {
     : path.replace(/(?:\.json)?$/, `.${suffix}.json`)
 }
 
-/** Keep vault settings, metadata and affinity outside every local recovery file. */
-export function nativeVaultPaths(local: NativePoolPaths): NativeVaultPaths {
+/**
+ * Keep vault settings, metadata and affinity outside every local recovery file.
+ *
+ * `layout` must be the one `local` was resolved in: the local paths don't say
+ * where the vault's state files are. It defaults to this process's layout
+ * decision. Vault settings stay beside the account file in every layout, and
+ * the storage id is always computed from the vault store state's
+ * legacy-layout path.
+ */
+export function nativeVaultPaths(
+  local: NativePoolPaths,
+  layout: StateLayout = processStateLayout(),
+): NativeVaultPaths {
   const config = sibling(
     local.legacyConfig,
     'anthropic-auth.json',
     'anthropic-auth-vault-settings.json',
     'vault-settings',
   )
-  const state = sibling(
+  const legacyLayoutState = sibling(
     local.legacyState,
     'anthropic-auth-state.json',
     'anthropic-auth-vault-store-state.json',
     'vault-store',
   )
-  const runtime = sibling(
+  let state = legacyLayoutState
+  let runtime = sibling(
     local.legacyState,
     'anthropic-auth-state.json',
     'anthropic-auth-vault-state.json',
     'vault-native',
   )
-  const roster = sibling(
+  let roster = sibling(
     local.legacyState,
     'anthropic-auth-state.json',
     'anthropic-auth-vault-roster.json',
     'vault-roster',
   )
-  const routing = sibling(
+  let routing = sibling(
     local.legacyState,
     'anthropic-auth-state.json',
     'anthropic-auth-vault-routing-state.json',
     'vault-routing',
   )
+  if (layout.kind === 'state-home') {
+    const moved = stateHomeDatasetFiles(
+      layout,
+      local.legacyConfig,
+      local.legacyState,
+    )
+    state = moved.vaultStoreState
+    runtime = moved.vaultRuntime
+    roster = moved.vaultRoster
+    routing = moved.vaultRouting
+  }
   const destinations = [config, state, runtime, roster, routing]
   const localFiles = [
     local.legacyConfig,
@@ -75,7 +103,7 @@ export function nativeVaultPaths(local: NativePoolPaths): NativeVaultPaths {
     roster,
     routing,
     storageId: createHash('sha256')
-      .update(JSON.stringify(['anthropic-vault', config, state]))
+      .update(JSON.stringify(['anthropic-vault', config, legacyLayoutState]))
       .digest('hex'),
   }
 }

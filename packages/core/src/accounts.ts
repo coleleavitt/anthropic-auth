@@ -490,20 +490,21 @@ const DEFAULT_MINIMUM_REMAINING: Record<QuotaWindowName, number> = {
 const DEFAULT_FAIL_CLOSED_ON_UNKNOWN_QUOTA = true
 export const FALLBACK_BACKGROUND_TICK_MS = 60_000
 
-function getConfigDir() {
-  if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
-    return process.env.OPENCODE_CONFIG_DIR.trim()
+/** OpenCode's config folder, as OpenCode itself resolves it. */
+export function getOpenCodeConfigDir(
+  env: NodeJS.ProcessEnv = process.env,
+  home = homedir(),
+) {
+  if (env.OPENCODE_CONFIG_DIR?.trim()) {
+    return env.OPENCODE_CONFIG_DIR.trim()
   }
-  return join(
-    process.env.XDG_CONFIG_HOME || join(homedir(), '.config'),
-    'opencode',
-  )
+  return join(env.XDG_CONFIG_HOME || join(home, '.config'), 'opencode')
 }
 
 export function getAccountStoragePath() {
   return (
     process.env.OPENCODE_ANTHROPIC_AUTH_FILE?.trim() ||
-    join(getConfigDir(), ACCOUNT_FILE_NAME)
+    join(getOpenCodeConfigDir(), ACCOUNT_FILE_NAME)
   )
 }
 

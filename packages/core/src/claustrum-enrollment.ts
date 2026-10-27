@@ -34,6 +34,7 @@ import {
   type OwnerOnlyOptions,
   readWindowsOwnerOnly,
 } from './owner-only.ts'
+import { anthropicAuthStateRoot } from './state-layout-paths.ts'
 
 export const CLAUSTRUM_OPENCODE_ENROLLMENT_NAME = 'anthropic-auth-opencode'
 export const CLAUSTRUM_PI_ENROLLMENT_NAME = 'anthropic-auth-pi'
@@ -158,9 +159,11 @@ export function getHostClaustrumEnrollmentPaths(
       ? configured
       : resolve(cwd, configured)
     : join(
-        env.XDG_STATE_HOME || join(homedir(), '.local', 'state'),
-        'cortexkit',
-        'anthropic-auth',
+        anthropicAuthStateRoot({
+          xdgStateHome: env.XDG_STATE_HOME,
+          home: homedir(),
+          acceptRelative: true,
+        }),
         `${host}-enrollment.json`,
       )
   return getClaustrumEnrollmentPaths(tokenPath)
