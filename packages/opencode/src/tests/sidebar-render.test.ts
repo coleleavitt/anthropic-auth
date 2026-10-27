@@ -547,6 +547,51 @@ test('a 30-column sidebar drops resets that do not fit instead of wrapping rows 
   expect(stdout).toMatch(/reserve \d+% · lasts to re…/)
 })
 
+test('a 36-column sidebar keeps an exhausted window used-up line on one row', async () => {
+  const now = Date.now()
+  const minute = 60_000
+  const state = {
+    main: {
+      quota: {
+        // Elapsed 2h50m of 5h with nothing left: deficit pacing whose runout
+        // is now, resetting in 2h10m.
+        five_hour: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: now,
+          resetsAt: new Date(now + 130 * minute).toISOString(),
+        },
+        seven_day: {
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: now,
+          resetsAt: new Date(now + 5 * 24 * 60 * minute).toISOString(),
+        },
+      },
+    },
+    fallbacks: [],
+    activeId: 'main',
+    route: 'main',
+    lastUpdated: now,
+  }
+  const stdout = await renderSidebar(
+    state,
+    ['used up · resets in', 'Routing'],
+    false,
+    { width: 36, height: 30 },
+  )
+  expect(stdout).toMatch(/used up · resets in \d+h\d+m/)
+  expect(stdout).not.toContain('out in now')
+  expect(stdout).not.toContain('out in 0m')
+  const rows = expectOneLineQuotaRows(stdout, ['main'])
+  expect(rows).toHaveLength(2)
+  const pace = stdout
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .find((line) => /used up · resets in \d+h\d+m$/.test(line.trim()))
+  expect(pace).toBeDefined()
+})
+
 test('scoped rows whose models share a short name extend it as the collapsed line does', async () => {
   const now = Date.now()
   const window = (used: number) => ({

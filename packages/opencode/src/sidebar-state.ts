@@ -1053,19 +1053,41 @@ export function fitQuotaRow(input: {
 /**
  * The pacing subline for a window that is off pace: `deficit 12% · out in
  * 1d23h` for a deficit that runs out before the reset, otherwise the delta
- * and `lasts to reset` (`reserve 4% · lasts to reset`). When it is wider than
- * `width` cells it is cut to fit and ends in `…` rather than wrapping. Null
- * when there is no pacing or the window is on pace.
+ * and `lasts to reset` (`reserve 4% · lasts to reset`). A window already at
+ * 0% left is used up until its reset (`used up · resets in 2h10m`, with no
+ * deficit percentage and no `out in` clause). A runout under a minute away
+ * reads `out in <1m`, never `out in now`. When the line is wider than `width`
+ * cells it is cut to fit and ends in `…` rather than wrapping. Null when
+ * there is no pacing or the window is on pace.
  */
 export function fitPaceLine(
   pacing: QuotaPacing | null,
   width: number | undefined,
   runsOutIn: string | undefined,
+  resetIn?: string | undefined,
+  remainingPercent?: number | undefined,
 ): string | null {
   if (!pacing || pacing.state === 'on-pace') return null
+  // An exhausted window reports its deficit as a large percentage with a
+  // runout of `now`, which reads as broken wording. The percentage no longer
+  // means anything once nothing is left, so the line names the state instead.
+  if (remainingPercent !== undefined && remainingPercent <= 0) {
+    const line = resetIn ? `used up \u00b7 resets in ${resetIn}` : 'used up'
+    if (width === undefined || Bun.stringWidth(line) <= width) return line
+    if (width <= 0) return ''
+    let cut = ''
+    for (const character of line) {
+      if (Bun.stringWidth(cut + character) > width - 1) break
+      cut += character
+    }
+    return `${cut.trimEnd()}\u2026`
+  }
+  // A projected runout under a minute away is not `now` while quota remains.
+  const normalizedRunsOutIn =
+    runsOutIn === 'now' || runsOutIn === '0m' ? '<1m' : runsOutIn
   const head = `${pacing.state} ${Math.round(Math.abs(pacing.deltaPercent))}%`
-  const line = runsOutIn
-    ? `${head} \u00b7 out in ${runsOutIn}`
+  const line = normalizedRunsOutIn
+    ? `${head} \u00b7 out in ${normalizedRunsOutIn}`
     : `${head} \u00b7 lasts to reset`
   if (width === undefined || Bun.stringWidth(line) <= width) return line
   if (width <= 0) return ''

@@ -544,6 +544,30 @@ describe('fitPaceLine', () => {
       null,
     )
   })
+
+  test('an exhausted window says it is used up until its reset', () => {
+    expect(fitPaceLine(deficit, 30, 'now', '2h10m', 0)).toBe(
+      'used up \u00b7 resets in 2h10m',
+    )
+    expect(fitPaceLine(deficit, 30, '2h10m', '2h10m', 0)).toBe(
+      'used up \u00b7 resets in 2h10m',
+    )
+    expect(fitPaceLine(deficit, 30, 'now', '2h10m', 0)).not.toContain('out in')
+    expect(fitPaceLine(deficit, 30, 'now', '2h10m', 0)).not.toContain('43%')
+    expect(
+      Bun.stringWidth(fitPaceLine(deficit, 30, 'now', '2h10m', 0) ?? ''),
+    ).toBe(Bun.stringWidth('used up \u00b7 resets in 2h10m'))
+  })
+
+  test('a runout under a minute away reads out in <1m, never out in now', () => {
+    expect(fitPaceLine(deficit, 30, 'now')).toBe(
+      'deficit 12% \u00b7 out in <1m',
+    )
+    expect(fitPaceLine(deficit, 30, '0m')).toBe('deficit 12% \u00b7 out in <1m')
+    expect(fitPaceLine(deficit, 30, '<1m')).toBe(
+      'deficit 12% \u00b7 out in <1m',
+    )
+  })
 })
 
 describe('getCollapsedQuotaSummary', () => {

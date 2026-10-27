@@ -79,9 +79,11 @@ const QUOTA_ROW = new RegExp(
   `^(\\S+) +(${BAR}+ )?\\d+% left( •)?( +\\d+[a-z]+(\\d+[a-z]+)?)?$`,
 )
 // A whole pacing subline, or one cut to fit that ends in `…`. A wrapped
-// subline leaves a piece without either ending.
+// subline leaves a piece without either ending. An exhausted window names
+// itself used up until its reset instead of reporting a deficit runout, and
+// a runout under a minute away reads `<1m`, never `now` or `0m`.
 const PACE_LINE =
-  /^ +(reserve|deficit) \d+%( · (lasts to reset|out in \d+[a-z]+(\d+[a-z]+)?)| ·[^…]*…)?$/
+  /^ +((reserve|deficit) \d+%( · (lasts to reset|out in (<1m|\d+[a-z]+(\d+[a-z]+)?))| ·[^…]*…)?|used up( · resets in \S+| ·[^…]*…)?)$/
 
 /**
  * Checks every line of the expanded sidebar's Quota section: each one is a

@@ -172,7 +172,9 @@ function quotaBarSegments(
 function formatResetIn(resetsAt: string | undefined, now: number): string {
   if (!resetsAt) return ''
   const ms = new Date(resetsAt).getTime() - now
-  if (ms <= 0) return 'now'
+  // A pacing runout under a minute away is not `now` while quota remains;
+  // the exhausted window never reaches this formatter with an `out in` line.
+  if (ms < 60_000) return '<1m'
   const mins = Math.floor(ms / 60_000)
   if (mins < 60) return `${mins}m`
   const hrs = Math.floor(mins / 60)
@@ -318,7 +320,8 @@ function Cell(props: { fg: SidebarColor; text: string }) {
 // instead of letting it wrap. When pacing data is present, the bar gains a
 // pace segment and an off-pace window adds a one-line subline under the bar
 // with the reserve/deficit delta and either the projected runout or
-// `lasts to reset`.
+// `lasts to reset`; a window already at 0% left names itself used up until
+// its reset instead.
 function QuotaRow(props: {
   theme: SidebarTheme
   appearance: AppearancePrefs
@@ -354,6 +357,8 @@ function QuotaRow(props: {
       props.pacing?.runsOutAt
         ? formatResetIn(props.pacing.runsOutAt, props.now)
         : undefined,
+      props.part?.resetIn,
+      props.part?.remainingPercent,
     )
   return (
     <Show
