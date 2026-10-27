@@ -13,6 +13,10 @@ import {
   withNativeLock,
 } from './native-lock-observer.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
+import {
+  ensureWindowsOwnerOnlyDirectory,
+  type OwnerOnlyOptions,
+} from './owner-only.ts'
 import { type NativePoolPaths, stateLayoutOfPaths } from './pool-paths.ts'
 import {
   findRelocationTombstone,
@@ -431,6 +435,8 @@ export interface RegisterNativePoolHolderOptions {
   retryIntervalMs?: number
   liveness?: HolderLiveness
   now?: () => number
+  /** How a missing folder is made owner-only; tests simulate Windows here. */
+  ownerOnly?: OwnerOnlyOptions
   /**
    * `mandatory`: the entry is published in every holder file before the
    * process serves, even before any dataset file exists there, and any
@@ -483,6 +489,31 @@ async function assertNoTombstone(paths: NativePoolPaths) {
   }
 }
 
+/**
+ * Create `dir` for a holder file when it is missing, readable by its owner
+ * only: `0700` on POSIX, and on Windows a protected owner-only DACL set by
+ * the native helper as the folder is created, along with any missing parent.
+ * An existing folder is left exactly as it is: it may be the user's own
+ * config folder, shared on purpose. On Windows a folder that another process
+ * created first is adopted only if it is owner-only; otherwise this throws.
+ */
+export async function ensureHolderDirectory(
+  dir: string,
+  ownerOnly: OwnerOnlyOptions = {},
+): Promise<void> {
+  if ((ownerOnly.platform ?? process.platform) !== 'win32') {
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    return
+  }
+  try {
+    await lstat(dir)
+    return
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  await ensureWindowsOwnerOnlyDirectory(dir, ownerOnly)
+}
+
 async function publishEntry(
   holderFile: string,
   entry: HolderEntry,
@@ -490,7 +521,7 @@ async function publishEntry(
   mandatory: boolean,
 ) {
   const dir = dirname(holderFile)
-  if (mandatory) await mkdir(dir, { recursive: true, mode: 0o700 })
+  if (mandatory) await ensureHolderDirectory(dir, options.ownerOnly)
   await withNativeLock(
     holderFile,
     {

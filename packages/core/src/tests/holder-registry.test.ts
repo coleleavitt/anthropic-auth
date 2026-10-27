@@ -28,6 +28,7 @@ import {
 } from '../holder-registry.ts'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import type { NativeLockEvent } from '../native-lock-observer.ts'
+import type { OwnerOnlyOptions } from '../owner-only.ts'
 import { type NativePoolPaths, resolveNativePoolPaths } from '../pool-paths.ts'
 import { RelocatedError } from '../relocation-guard.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
@@ -520,4 +521,75 @@ test('OpenCode datasets named by a path override register as explicit', () => {
       OPENCODE_ANTHROPIC_AUTH_STATE_FILE: '/x/state.json',
     }),
   ).toBe('explicit')
+})
+
+/**
+ * Windows' private-files helper, simulated: each folder it creates gets an
+ * owner-only ACL; a folder created any other way has none recorded, which
+ * the owner-only check refuses.
+ */
+function windowsFolders() {
+  const acl = new Map<string, 'owner-only' | 'permissive'>()
+  const created: string[] = []
+  const privateFiles = {
+    verifyOwnerOnly: async (path: string) =>
+      acl.get(path) === 'owner-only'
+        ? { ok: true as const }
+        : { ok: false as const, refusal: { reason: 'extra-ace' } },
+    readPrivateFile: async () => Buffer.alloc(0),
+    verifySafeParent: async () => ({ ok: true as const }),
+    createPrivateDirectory: async (path: string) => {
+      await mkdir(path, { mode: 0o700 })
+      acl.set(path, 'owner-only')
+      created.push(path)
+    },
+  }
+  return {
+    acl,
+    created,
+    privateFiles,
+    ownerOnly: {
+      platform: 'win32' as const,
+      privateFiles: privateFiles as unknown as OwnerOnlyOptions['privateFiles'],
+    },
+  }
+}
+
+test('Windows: a mandatory registration creates a missing folder, and any missing parent, owner-only', async () => {
+  const parent = await folder('shared')
+  const dir = join(parent, 'missing', 'opencode')
+  const paths = await dataset(dir, true)
+  const win = windowsFolders()
+  await register(paths, { policy: 'mandatory', ownerOnly: win.ownerOnly })
+  expect(win.created).toEqual([join(parent, 'missing'), dir])
+  expect(win.acl.get(dir)).toBe('owner-only')
+  expect((await holders(dir)).entries).toHaveLength(1)
+})
+
+test('Windows: a mandatory registration leaves an existing folder as it is', async () => {
+  const dir = await folder('config', 'opencode')
+  const paths = await dataset(dir, true)
+  const win = windowsFolders()
+  await register(paths, { policy: 'mandatory', ownerOnly: win.ownerOnly })
+  expect(win.created).toEqual([])
+  // Not tightened, and not refused for being shared.
+  expect(win.acl.get(dir)).toBeUndefined()
+  expect((await holders(dir)).entries).toHaveLength(1)
+})
+
+test('Windows: a folder another process created first with a shared ACL is refused, and nothing is written in it', async () => {
+  const parent = await folder('shared')
+  const dir = join(parent, 'opencode')
+  const paths = await dataset(dir, true)
+  const win = windowsFolders()
+  // The other process wins the creation race.
+  win.privateFiles.createPrivateDirectory = async (path: string) => {
+    await mkdir(path)
+    win.acl.set(path, 'permissive')
+    throw Object.assign(new Error('exists'), { code: 'EEXIST' })
+  }
+  await expect(
+    register(paths, { policy: 'mandatory', ownerOnly: win.ownerOnly }),
+  ).rejects.toBeInstanceOf(HolderRegistrationError)
+  expect(await readdir(dir)).toEqual([])
 })
