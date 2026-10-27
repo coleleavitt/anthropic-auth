@@ -428,6 +428,29 @@ async function isManagedDirectory(dir: string): Promise<boolean> {
   )
 }
 
+/**
+ * Refuse dataset paths a caller chose itself, rather than the layout
+ * decision, when they reach into the state folder: paths resolved in the
+ * state-home layout, or with any dataset file in a folder anthropic-auth
+ * manages (holding `config-dir.json` or `layout.json`) or in a
+ * destination-shaped folder. Serving such files needs the decision's
+ * admission under the holder lock, which checks the move record; registering
+ * them as an ordinary `legacy` dataset would skip it. Throws
+ * `HolderRegistrationError('managed-folder')`, whose message is fixed.
+ */
+export async function assertUnmanagedInjectedPaths(
+  paths: NativePoolPaths,
+): Promise<void> {
+  if (stateLayoutOfPaths(paths).kind === 'state-home')
+    throw new HolderRegistrationError('managed-folder', dirname(paths.runtime))
+  const dirs = [
+    ...new Set(nativeHolderDatasetFiles(paths).map((file) => dirname(file))),
+  ].sort()
+  for (const dir of dirs)
+    if (isDestinationShapedDirectory(dir) || (await isManagedDirectory(dir)))
+      throw new HolderRegistrationError('managed-folder', dir)
+}
+
 const instance = randomUUID()
 let ownIncarnation: Promise<string | null> | undefined
 /**

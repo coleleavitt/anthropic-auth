@@ -12,9 +12,12 @@ import { join } from 'node:path'
 import { Writable } from 'node:stream'
 import {
   HOLDER_FILE_NAME,
+  HOLDER_REGISTRATION_ERROR_MESSAGES,
+  LEGACY_STATE_LAYOUT,
   resetNativeHolderRegistryForTests,
   resetProcessStateLayoutsForTests,
   resetStateLayoutDecisionsForTests,
+  resolveNativePoolPaths,
   resolveStateHomeTarget,
   setRelocationMoveEnabledForTests,
   stateLayoutRefusalPublicMessage,
@@ -287,3 +290,46 @@ test('setup --restore-legacy refuses while a host runs, and otherwise restores',
   expect(calls).toHaveLength(1)
   expect(stopped.chunks.join('')).toContain(m.configDir)
 })
+
+for (const variant of ['state-home layout', 'managed folder'] as const)
+  test(`OpenCode 2 refuses injected paths that reach into the state folder (${variant}), with the fixed text and no registration there`, async () => {
+    const m = await machine(false)
+    const sub = join(
+      m.stateRoot,
+      'cortexkit',
+      'anthropic-auth',
+      'opencode-0123456789abcdef',
+    )
+    // A folder holding the marker of a moved dataset.
+    const managed = join(m.root, 'managed')
+    await mkdir(managed)
+    await Bun.write(join(managed, 'config-dir.json'), '{}\n')
+    const paths =
+      variant === 'state-home layout'
+        ? await resolveNativePoolPaths(
+            join(m.configDir, 'anthropic-auth.json'),
+            join(m.configDir, 'anthropic-auth-state.json'),
+            { kind: 'state-home', dir: sub },
+          )
+        : await resolveNativePoolPaths(
+            join(managed, 'anthropic-auth.json'),
+            join(managed, 'anthropic-auth-state.json'),
+            LEGACY_STATE_LAYOUT,
+          )
+    const failure = await setupAnthropicAuth(openCode2Context(), {
+      paths,
+      vault: { env: { ...process.env } },
+    }).then(
+      (dispose) => {
+        cleanups.push(() => dispose())
+        return undefined
+      },
+      (error: unknown) => error,
+    )
+    expect(failure).toBeInstanceOf(Error)
+    const message = (failure as Error).message
+    expect(HOLDER_REGISTRATION_ERROR_MESSAGES).toContain(message)
+    expect(message).not.toContain(m.root)
+    for (const dir of [sub, managed])
+      expect(await Bun.file(join(dir, HOLDER_FILE_NAME)).exists()).toBe(false)
+  })

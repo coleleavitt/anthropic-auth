@@ -1,5 +1,6 @@
 import {
   acquireNativeAccountRuntime,
+  assertUnmanagedInjectedPaths,
   authorize,
   createNativeUi,
   decideOpenCodeStateLayoutOnce,
@@ -17,6 +18,7 @@ import {
   registerNativePoolHolder,
   resolveNativePoolPaths,
   setDumpEnabled,
+  unmovedRegistrationPolicy,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type PoolLoginMethod,
@@ -52,6 +54,11 @@ export const ANTHROPIC_AUTH_PLUGIN_ID = 'cortexkit-anthropic-auth'
 export type NativeEnrollmentMode = 'local' | 'claustrum'
 
 export interface AnthropicAuthV2Options {
+  /**
+   * Pool files to serve instead of the ones the layout decision picks; a
+   * seam for tests. They must lie outside the state folder (see
+   * `decideNativePaths`).
+   */
   readonly paths?: NativePoolPaths
   readonly local?: NativeAccountRuntimeOptions['local']
   readonly vault?: NativeAccountRuntimeOptions['vault']
@@ -216,23 +223,37 @@ export function createAnthropicAuthPlugin(
  * process before any is resolved: the config folder, or the state folder once
  * the state has moved there; the decision also registers this process. A
  * refusal is reported with its fixed text, which names no folder; the log
- * names them. Injected paths were chosen by the caller and are only
- * registered.
+ * names them.
+ *
+ * `options.paths` is a seam for tests: OpenCode loads the plugin through
+ * `server.ts`, which passes no options. Injected paths skip the decision, and
+ * with it the holder-locked admission that checks the state folder's move
+ * record, so they may name only files outside the state folder: paths in
+ * the state-home layout, or in a folder anthropic-auth manages or a
+ * destination-shaped one, refuse. Other injected paths are only registered.
  */
 async function decideNativePaths(options: AnthropicAuthV2Options): Promise<{
   paths: NativePoolPaths
   holderRegistration: NativeHolderRegistration | undefined
 }> {
-  if (options.paths)
-    return {
-      paths: options.paths,
-      holderRegistration: await registerNativePoolHolder({
-        paths: options.paths,
-        role: 'opencode2',
-        kind: openCodeHolderKind(),
-        onLockEvent: options.local?.onLockEvent,
-      }),
+  if (options.paths) {
+    const paths = options.paths
+    try {
+      await assertUnmanagedInjectedPaths(paths)
+      return {
+        paths,
+        holderRegistration: await registerNativePoolHolder({
+          paths,
+          role: 'opencode2',
+          kind: openCodeHolderKind(),
+          policy: unmovedRegistrationPolicy(),
+          onLockEvent: options.local?.onLockEvent,
+        }),
+      }
+    } catch (error) {
+      throw stateRefusalFrom(error) ?? error
     }
+  }
   let decision: Awaited<ReturnType<typeof decideOpenCodeStateLayoutOnce>>
   try {
     decision = await decideOpenCodeStateLayoutOnce({
