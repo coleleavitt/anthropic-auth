@@ -1071,24 +1071,18 @@ export function fitPaceLine(
   // An exhausted window reports its deficit as a large percentage with a
   // runout of `now`, which reads as broken wording. The percentage no longer
   // means anything once nothing is left, so the line names the state instead.
-  if (remainingPercent !== undefined && remainingPercent <= 0) {
-    const line = resetIn ? `used up \u00b7 resets in ${resetIn}` : 'used up'
-    if (width === undefined || Bun.stringWidth(line) <= width) return line
-    if (width <= 0) return ''
-    let cut = ''
-    for (const character of line) {
-      if (Bun.stringWidth(cut + character) > width - 1) break
-      cut += character
-    }
-    return `${cut.trimEnd()}\u2026`
-  }
+  const exhausted = remainingPercent !== undefined && remainingPercent <= 0
   // A projected runout under a minute away is not `now` while quota remains.
   const normalizedRunsOutIn =
     runsOutIn === 'now' || runsOutIn === '0m' ? '<1m' : runsOutIn
   const head = `${pacing.state} ${Math.round(Math.abs(pacing.deltaPercent))}%`
-  const line = normalizedRunsOutIn
-    ? `${head} \u00b7 out in ${normalizedRunsOutIn}`
-    : `${head} \u00b7 lasts to reset`
+  const line = exhausted
+    ? resetIn
+      ? `used up \u00b7 resets in ${resetIn}`
+      : 'used up'
+    : normalizedRunsOutIn
+      ? `${head} \u00b7 out in ${normalizedRunsOutIn}`
+      : `${head} \u00b7 lasts to reset`
   if (width === undefined || Bun.stringWidth(line) <= width) return line
   if (width <= 0) return ''
   let cut = ''
