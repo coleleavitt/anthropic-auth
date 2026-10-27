@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import {
+  type FileHandle,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   realpath,
@@ -38,12 +40,7 @@ import {
   type StateLayoutFs,
   syncFile,
 } from '../state-layout-io.ts'
-import {
-  resolveRelocationDataset,
-  StateLayoutCrash,
-  type StateLayoutStep,
-  stateLayoutDataLockOrder,
-} from '../state-layout-move.ts'
+import { StateLayoutCrash, type StateLayoutStep } from '../state-layout-move.ts'
 import {
   LEGACY_STATE_LAYOUT,
   readRelocationPointer,
@@ -108,11 +105,12 @@ interface Machine {
 
 /**
  * A home folder whose default OpenCode config folder holds a migrated local
- * pool with one row, both runtimes, a custody roster and the vault files,
- * minus any role in `absent`. `fresh` leaves the folder empty.
+ * pool with one row (with `identity` when given), both runtimes, a custody
+ * roster and the vault files, minus any role in `absent`. `fresh` leaves the
+ * folder empty.
  */
 async function machine(
-  options: { absent?: Role[]; fresh?: boolean } = {},
+  options: { absent?: Role[]; fresh?: boolean; identity?: string } = {},
 ): Promise<Machine> {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'state-restore-')))
   roots.push(root)
@@ -134,6 +132,7 @@ async function machine(
     await store.initialize()
     await store.add({
       id: 'a',
+      ...(options.identity ? { identity: options.identity } : {}),
       credential: {
         type: 'oauth',
         access: 'access-a',
@@ -254,24 +253,43 @@ async function configTree(m: Machine) {
 }
 
 /**
- * Which copies a process could serve now: the legacy copy (no barrier is up
- * and the journal, or a vault runtime, authorizes it) and the state-home copy
- * (a committed record). At most one may ever be usable.
+ * Which copies a process could serve now, for each account mode. Local mode
+ * serves the legacy copy while the local runtime is not a tombstone and the
+ * journal authorizes the local pool; vault mode serves it while the vault
+ * runtime is not a tombstone and a vault file is there. So the local copy
+ * can be back while the vault runtime is still a tombstone, and a vault-only
+ * dataset serves with no journal at all. Either mode serves the state-home
+ * copy once the record is committed. At most one copy per mode may ever be
+ * usable.
  */
 async function usableCopies(m: Machine) {
   const files = oldFiles(m.oldPaths)
-  const copies: string[] = []
-  const tombstoned =
-    (await readRelocationPointer(files.localRuntime)) !== undefined ||
-    (await readRelocationPointer(files.vaultRuntime)) !== undefined
-  const journal = await readNativeMigrationJournal(m.oldPaths).catch(
-    () => undefined,
+  const notTombstone = async (path: string) =>
+    (await readRelocationPointer(path).catch(() => undefined)) === undefined
+  const local: string[] = []
+  const vault: string[] = []
+  if (
+    (await notTombstone(files.localRuntime)) &&
+    (await readNativeMigrationJournal(m.oldPaths).catch(() => undefined)) !==
+      undefined
   )
-  if (!tombstoned && journal !== undefined) copies.push('legacy')
+    local.push('legacy')
+  if (
+    (await notTombstone(files.vaultRuntime)) &&
+    ((await exists(files.vaultRuntime)) ||
+      (await exists(files.vaultStoreState)))
+  )
+    vault.push('legacy')
   const record = await readStateLayoutRecord(m.sub).catch(() => undefined)
-  if (record?.phase === 'committed') copies.push('state-home')
-  return copies
+  if (record?.phase === 'committed') {
+    local.push('state-home')
+    vault.push('state-home')
+  }
+  return { local, vault }
 }
+
+const SERVED_LEGACY = { local: ['legacy'], vault: ['legacy'] }
+const SERVED_STATE_HOME = { local: ['state-home'], vault: ['state-home'] }
 
 /** Data files of the closed list, and restore staging files, in `<sub>` and the config folder. */
 async function strayFiles(m: Machine) {
@@ -299,13 +317,39 @@ async function moved(options: Parameters<typeof machine>[0] = {}) {
 }
 
 for (const variant of [
-  { name: 'a full dataset', options: {} },
-  { name: 'no local runtime', options: { absent: ['localRuntime'] as Role[] } },
-  { name: 'no vault runtime', options: { absent: ['vaultRuntime'] as Role[] } },
-  { name: 'a fresh install', options: { fresh: true } },
+  { name: 'a full dataset', options: {}, served: SERVED_LEGACY },
+  {
+    name: 'no local runtime',
+    options: { absent: ['localRuntime'] as Role[] },
+    served: SERVED_LEGACY,
+  },
+  {
+    name: 'no vault runtime',
+    options: { absent: ['vaultRuntime'] as Role[] },
+    served: SERVED_LEGACY,
+  },
+  {
+    // Vault accounts only: no local pool, journal, local runtime or roster.
+    name: 'a vault-only dataset',
+    options: {
+      absent: [
+        'localPoolState',
+        'journal',
+        'localRuntime',
+        'localRoster',
+      ] as Role[],
+    },
+    served: { local: [], vault: ['legacy'] },
+  },
+  {
+    name: 'a fresh install',
+    options: { fresh: true },
+    served: { local: [], vault: [] },
+  },
 ]) {
   test(`a move followed by a restore leaves the config folder byte for byte as before the move: ${variant.name}`, async () => {
     const { m, before } = await moved(variant.options)
+    expect(await usableCopies(m)).toEqual(SERVED_STATE_HOME)
     const outcome = await restore(m)
     expect(outcome).toMatchObject({
       status: 'restored',
@@ -322,50 +366,63 @@ for (const variant of [
     // With moving off, the next start serves the old folder again.
     const decision = await decide(m, { moveEnabled: false })
     expect(decision.kind).toBe('legacy')
-    if (!variant.options.fresh)
-      expect(await usableCopies(m)).toEqual(['legacy'])
+    expect(await usableCopies(m)).toEqual(variant.served)
     // Running the command again has nothing to do.
     expect((await restore(m)).status).toBe('not-moved')
   })
 }
 
 test('restore takes the layout and holder locks, then the move’s data locks without its row and provider locks, each once and in the move’s order', async () => {
-  const { m } = await moved()
+  // A row with an identity, so the move also takes a per-account provider
+  // lock and the order comparison covers one.
+  const m = await machine({ identity: 'account-a' })
+  const forwardEvents: NativeLockEvent[] = []
+  expect(
+    (await decide(m, { onLockEvent: (event) => forwardEvents.push(event) }))
+      .kind,
+  ).toBe('state-home')
   const events: NativeLockEvent[] = []
   await restore(m, { onLockEvent: (event) => events.push(event) })
-  const acquired = events
-    .filter((event) => event.type === 'acquired')
-    .map((event) => `${event.name}@${event.path}`)
-  const dataset = await resolveRelocationDataset({
-    configDir: m.configDir,
-    identity: m.configDir,
-    stateRoot: join(m.root, 'state', 'cortexkit', 'anthropic-auth'),
-    sub: m.sub,
-  })
-  const data = stateLayoutDataLockOrder(dataset).map(
-    (spec) => `${spec.name}@${spec.path}`,
-  )
-  expect(acquired).toEqual([
+  const acquired = (list: NativeLockEvent[]) =>
+    list
+      .filter((event) => event.type === 'acquired')
+      .map((event) => `${event.name}@${event.path}`)
+  const old = (name: string) => join(m.configDir, name)
+  // Written out by hand: the old files' locks in the one order every layout
+  // transition takes them, with no row or provider lock.
+  const data = [
+    `native-migration@${old('anthropic-auth-migration.json')}`,
+    `pool-config@${old('anthropic-auth-pool.json')}`,
+    `pool-state@${old('anthropic-auth-pool-state.json')}`,
+    `claustrum-roster-write@${old('anthropic-auth-custody-roster.json')}`,
+    `native-runtime@${old('anthropic-auth-native-state.json')}`,
+    `pool-config@${old('anthropic-auth-vault-settings.json')}`,
+    `pool-state@${old('anthropic-auth-vault-store-state.json')}`,
+    `claustrum-roster@${old('anthropic-auth-vault-roster.json')}`,
+    `claustrum-roster-write@${old('anthropic-auth-vault-roster.json')}`,
+    `native-runtime@${old('anthropic-auth-vault-state.json')}`,
+    `write@${old('anthropic-auth-vault-routing-state.json')}`,
+  ]
+  expect(acquired(events)).toEqual([
     `runtime-layout@${join(m.sub, 'layout.json')}`,
-    ...[join(m.configDir, HOLDER_FILE_NAME), join(m.sub, HOLDER_FILE_NAME)]
-      .sort()
-      .map((path) => `holders@${path}`),
+    // The config folder sorts before the state folder in this machine.
+    `holders@${join(m.configDir, HOLDER_FILE_NAME)}`,
+    `holders@${join(m.sub, HOLDER_FILE_NAME)}`,
     ...data,
   ])
-  expect(new Set(acquired).size).toBe(acquired.length)
   // No row or provider lock, on either side.
   expect(
-    acquired.filter(
-      (name) => name.startsWith('row-') || name.startsWith('provider-'),
+    acquired(events).filter((lock) =>
+      /^(row-|provider-|native-account-provider-)/.test(lock),
     ),
   ).toEqual([])
-  // The restore order is a subsequence of the move's.
-  const forward = stateLayoutDataLockOrder(dataset, {
-    refresh: {
-      local: { rows: ['row-a'], providers: [], identities: [] },
-      vault: { rows: [], providers: [], identities: [] },
-    },
-  }).map((spec) => `${spec.name}@${spec.path}`)
+  // The restore order is a subsequence of the order the move really took,
+  // which includes the row, provider and per-account provider locks.
+  const forward = acquired(forwardEvents)
+  expect(forward).toContain(`row-a@${old('anthropic-auth-pool-state.json')}`)
+  expect(
+    forward.some((lock) => lock.startsWith('native-account-provider-')),
+  ).toBe(true)
   let at = 0
   for (const lock of data) {
     at = forward.indexOf(lock, at)
@@ -373,27 +430,90 @@ test('restore takes the layout and holder locks, then the move’s data locks wi
   }
 })
 
-/** The steps a complete restore of `m`'s dataset passes, in order. */
-async function restoreSteps() {
-  const { m } = await moved()
-  const steps: StateLayoutStep[] = []
-  await restore(m, { onStep: (step) => void steps.push(step) })
-  return steps.filter((step) => step.startsWith('restore:'))
-}
+/**
+ * Every step and every folder flush of a complete restore of a full dataset,
+ * in order, written out by hand. Each role's file is staged and retired in
+ * the closed list's order; data files are put back before the journal and
+ * runtime barriers.
+ */
+const ROLES_IN_ORDER = [
+  'localPoolState',
+  'journal',
+  'localRoster',
+  'vaultStoreState',
+  'vaultRoster',
+  'vaultRouting',
+  'localRuntime',
+  'vaultRuntime',
+] as const
+const FULL_RESTORE = [
+  'old-holders-locking',
+  'restore:locks-held',
+  'flush:state',
+  'restore:restoring-written',
+  ...ROLES_IN_ORDER.map((role) => `restore:staged:${role}`),
+  'flush:config',
+  'restore:staging-flushed',
+  'flush:state',
+  'restore:staged-written',
+  'restore:placed:localPoolState',
+  'restore:placed:localRoster',
+  'restore:placed:vaultStoreState',
+  'restore:placed:vaultRoster',
+  'restore:placed:vaultRouting',
+  'flush:config',
+  'restore:data-flushed',
+  'restore:placed:journal',
+  'restore:placed:localRuntime',
+  'restore:placed:vaultRuntime',
+  'flush:config',
+  'restore:barriers-flushed',
+  'flush:state',
+  'restore:restored-written',
+  ...ROLES_IN_ORDER.map((role) => `restore:retired:${role}`),
+  'flush:state',
+  'restore:sub-flushed',
+  'flush:state',
+  'restore:done',
+]
+const FULL_RESTORE_STEPS = FULL_RESTORE.filter((event) =>
+  event.startsWith('restore:'),
+) as StateLayoutStep[]
 
-test('a crash at every restore step recovers to exactly one usable copy', async () => {
-  const steps = await restoreSteps()
-  expect(steps[0]).toBe('restore:locks-held')
-  expect(steps).toContain('restore:staged-written')
-  expect(steps.at(-1)).toBe('restore:done')
-  const boundary = steps.indexOf('restore:staged-written')
-  for (const [index, step] of steps.entries()) {
+test('a complete restore passes exactly the written-out steps and folder flushes, in order', async () => {
+  const { m } = await moved()
+  const events: string[] = []
+  const base = defaultStateLayoutFs()
+  await restore(m, {
+    onStep: (step) => void events.push(step),
+    fs: {
+      ...base,
+      syncDirectory: async (dir) => {
+        await base.syncDirectory(dir)
+        events.push(
+          dir === m.configDir
+            ? 'flush:config'
+            : dir === m.sub
+              ? 'flush:state'
+              : `flush:${dir}`,
+        )
+      },
+    },
+  })
+  expect(events).toEqual(FULL_RESTORE)
+})
+
+test('a crash at every restore step recovers to at most one usable copy per mode, and the rerun to the legacy copy', async () => {
+  const boundary = FULL_RESTORE_STEPS.indexOf('restore:staged-written')
+  for (const [index, step] of FULL_RESTORE_STEPS.entries()) {
     const { m, before } = await moved()
     await expect(restore(m, { onStep: crashAt(step) })).rejects.toBeInstanceOf(
       StateLayoutCrash,
     )
-    // Never two usable copies, at any crash point.
-    expect((await usableCopies(m)).length).toBeLessThanOrEqual(1)
+    // Never two usable copies for one mode, at any crash point.
+    const usable = await usableCopies(m)
+    expect(usable.local.length).toBeLessThanOrEqual(1)
+    expect(usable.vault.length).toBeLessThanOrEqual(1)
     const phase = (await readStateLayoutRecord(m.sub))?.phase
     if (index < boundary) {
       // Before the boundary nothing at a legacy name changed: an ordinary
@@ -401,7 +521,7 @@ test('a crash at every restore step recovers to exactly one usable copy', async 
       expect(phase === 'committed' || phase === 'restoring').toBe(true)
       const decision = await decide(m)
       expect(decision.kind).toBe('state-home')
-      expect(await usableCopies(m)).toEqual(['state-home'])
+      expect(await usableCopies(m)).toEqual(SERVED_STATE_HOME)
       expect((await strayFiles(m)).staging).toEqual([])
     } else if (phase === 'restore-staged') {
       // Past the boundary only the command may finish; a start refuses.
@@ -413,14 +533,14 @@ test('a crash at every restore step recovers to exactly one usable copy', async 
       // complete, and a start with moving off serves it without looking at
       // the state folder, so the removal waits for the command's rerun.
       expect(phase).toBe('restored')
-      expect(await usableCopies(m)).toEqual(['legacy'])
+      expect(await usableCopies(m)).toEqual(SERVED_LEGACY)
       const record = await readStateLayoutRecord(m.sub)
       expect((await decide(m, { moveEnabled: false })).kind).toBe('legacy')
       expect(await readStateLayoutRecord(m.sub)).toEqual(record)
     }
     // A rerun of the command (needed only before `restored`) ends restored.
     expect((await restore(m)).status).toMatch(/^(restored|not-moved)$/)
-    expect(await usableCopies(m)).toEqual(['legacy'])
+    expect(await usableCopies(m)).toEqual(SERVED_LEGACY)
     expect(await configTree(m)).toEqual(before)
     expect(await strayFiles(m)).toEqual({ sub: [], staging: [] })
   }
@@ -651,10 +771,10 @@ test('the move gate: off keeps a movable dataset in place with no state folder; 
       expect(await configTree(m)).toEqual(before)
       // Nothing is created in the state folder, not even the subfolder.
       expect(await exists(m.sub)).toBe(false)
-      expect(await usableCopies(m)).toEqual(['legacy'])
+      expect(await usableCopies(m)).toEqual(SERVED_LEGACY)
     } else {
       expect(decision.kind).toBe('state-home')
-      expect(await usableCopies(m)).toEqual(['state-home'])
+      expect(await usableCopies(m)).toEqual(SERVED_STATE_HOME)
     }
   }
 })
@@ -666,10 +786,45 @@ test('with the move gate off, a dataset already moved is still served from the s
   expect(decision.layout).toEqual({ kind: 'state-home', dir: m.sub })
 })
 
+/**
+ * Run `work` while counting every flush of an open directory, at the file
+ * handle every flush goes through (`FileHandle.prototype.sync`), so a
+ * directory flush counts however the code under test reaches it.
+ */
+async function countDirectoryFlushes<T>(
+  probe: string,
+  work: () => Promise<T>,
+): Promise<{ result: T; directories: number }> {
+  const handle = await open(probe, 'r')
+  const prototype = Object.getPrototypeOf(handle) as {
+    sync: (this: FileHandle) => Promise<void>
+  }
+  await handle.close()
+  const sync = prototype.sync
+  let directories = 0
+  prototype.sync = async function (this: FileHandle) {
+    if ((await this.stat()).isDirectory()) directories++
+    return sync.call(this)
+  }
+  try {
+    return { result: await work(), directories }
+  } finally {
+    prototype.sync = sync
+  }
+}
+
 test('Windows: no directory flush, and a sharing violation on a restore rename is retried until it succeeds', async () => {
+  // The spy sees a real directory flush: a POSIX restore makes some.
+  const posix = await moved()
+  const control = await countDirectoryFlushes(posix.m.configDir, () =>
+    restore(posix.m),
+  )
+  expect(control.result.status).toBe('restored')
+  expect(control.directories).toBeGreaterThan(0)
+
   const { m, before } = await moved()
   let clock = 0
-  let flushes = 0
+  let flushRequests = 0
   let refusals = 0
   const base = defaultStateLayoutFs('win32')
   const fs: StateLayoutFs = {
@@ -679,7 +834,7 @@ test('Windows: no directory flush, and a sharing violation on a restore rename i
       await writeFile(path, bytes, { flag: 'wx', mode: 0o600 })
     },
     syncDirectory: async (dir) => {
-      flushes++
+      flushRequests++
       await base.syncDirectory(dir)
     },
     rename: async (from, to) => {
@@ -693,8 +848,13 @@ test('Windows: no directory flush, and a sharing violation on a restore rename i
       clock += ms
     },
   }
-  expect((await restore(m, { fs })).status).toBe('restored')
-  expect(flushes).toBeGreaterThan(0)
+  const windows = await countDirectoryFlushes(m.configDir, () =>
+    restore(m, { fs }),
+  )
+  expect(windows.result.status).toBe('restored')
+  // The restore asks for its flushes, and none reaches a directory.
+  expect(flushRequests).toBeGreaterThan(0)
+  expect(windows.directories).toBe(0)
   expect(refusals).toBe(3)
   expect(await configTree(m)).toEqual(before)
 })

@@ -6,11 +6,13 @@ import {
   readFile,
   realpath,
   rm,
+  writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Writable } from 'node:stream'
 import {
+  decideOpenCodeStateLayout,
   HOLDER_FILE_NAME,
   HOLDER_REGISTRATION_ERROR_MESSAGES,
   LEGACY_STATE_LAYOUT,
@@ -239,20 +241,22 @@ test('OpenCode 2 with moving off serves its config folder when the state folder 
   )
 })
 
-test('setup --restore-legacy refuses while a host runs, and otherwise restores', async () => {
-  const m = await machine(true)
-  const output = () => {
-    const chunks: string[] = []
-    return {
-      chunks,
-      stream: new Writable({
-        write(chunk, _encoding, done) {
-          chunks.push(String(chunk))
-          done()
-        },
-      }),
-    }
+/** A writable stream that keeps what is written to it. */
+function captured() {
+  const chunks: string[] = []
+  return {
+    chunks,
+    stream: new Writable({
+      write(chunk, _encoding, done) {
+        chunks.push(String(chunk))
+        done()
+      },
+    }),
   }
+}
+
+test('setup --restore-legacy refuses while a host runs, and otherwise dispatches to the restore and prints where the state went', async () => {
+  const m = await machine(true)
   // Move the empty dataset first, as a start with moving on does.
   await relaySetup({
     prompt: async () => {
@@ -261,7 +265,7 @@ test('setup --restore-legacy refuses while a host runs, and otherwise restores',
   }).catch(() => {})
   const sub = await subfolder(m)
   if (!sub) throw new Error('the dataset was not moved')
-  const running = output()
+  const running = captured()
   expect(
     await runSetupCommand(['--restore-legacy'], {
       env: { ...process.env },
@@ -274,7 +278,7 @@ test('setup --restore-legacy refuses while a host runs, and otherwise restores',
   expect(
     JSON.parse(await readFile(join(sub, 'layout.json'), 'utf8')).phase,
   ).toBe('committed')
-  const stopped = output()
+  const stopped = captured()
   const calls: unknown[] = []
   expect(
     await runSetupCommand(['--restore-legacy'], {
@@ -289,6 +293,52 @@ test('setup --restore-legacy refuses while a host runs, and otherwise restores',
   ).toBe(0)
   expect(calls).toHaveLength(1)
   expect(stopped.chunks.join('')).toContain(m.configDir)
+})
+
+test('setup --restore-legacy puts a moved fixture tree back in the config folder, byte for byte', async () => {
+  const m = await machine(true)
+  // A dataset of the closed list: both runtimes and the vault files.
+  const fixture: Record<string, string> = {
+    'anthropic-auth-native-state.json': '{"version":1,"note":"local"}\n',
+    'anthropic-auth-vault-state.json': '{"version":1,"note":"vault"}\n',
+    'anthropic-auth-vault-store-state.json': '{"accounts":{},"version":1}\n',
+    'anthropic-auth-vault-roster.json': '{"roster":"vault"}\n',
+    'anthropic-auth-vault-routing-state.json': '{"routing":"vault"}\n',
+  }
+  for (const [name, text] of Object.entries(fixture))
+    await writeFile(join(m.configDir, name), text, { mode: 0o600 })
+  const decision = await decideOpenCodeStateLayout({ role: 'cli' })
+  expect(decision.kind).toBe('state-home')
+  const sub = await subfolder(m)
+  if (!sub) throw new Error('the dataset was not moved')
+  expect(
+    await readFile(join(m.configDir, 'anthropic-auth-vault-roster.json'), {
+      encoding: 'utf8',
+    }).catch(() => undefined),
+  ).toBeUndefined()
+  // The host that moved it has exited: no process is registered.
+  for (const dir of [m.configDir, sub])
+    await writeFile(
+      join(dir, HOLDER_FILE_NAME),
+      JSON.stringify({ version: 1, entries: [] }),
+    ).catch(() => {})
+  const out = captured()
+  expect(
+    await runSetupCommand(['--restore-legacy'], {
+      env: { ...process.env },
+      fence: { listRunningHosts: async () => [] },
+      terminal: { input: process.stdin, output: out.stream },
+    }),
+  ).toBe(0)
+  expect(out.chunks.join('')).toContain(m.configDir)
+  for (const [name, text] of Object.entries(fixture))
+    expect(await readFile(join(m.configDir, name), 'utf8')).toBe(text)
+  expect(
+    JSON.parse(await readFile(join(sub, 'layout.json'), 'utf8')),
+  ).toMatchObject({ phase: 'restored', restore: { cleanup: 'done' } })
+  // The state folder keeps no data file of the closed list.
+  const left = await readdir(sub)
+  for (const name of Object.keys(fixture)) expect(left).not.toContain(name)
 })
 
 for (const variant of ['state-home layout', 'managed folder'] as const)
