@@ -178,10 +178,11 @@ export type StateHomeFilePaths = {
 }
 
 /**
- * Every file of a state-home subfolder. The settings files
- * (`anthropic-auth.json`, `anthropic-auth-state.json`, `-pool.json`,
- * `-vault-settings.json`), the local routing file and the TUI preferences stay
- * in the config folder in both layouts and are not listed.
+ * Every file of a state-home subfolder. The account files
+ * (`anthropic-auth.json`, `anthropic-auth-state.json`), the pool settings
+ * (`anthropic-auth-pool.json`), the vault settings
+ * (`anthropic-auth-vault-settings.json`), the local routing file and the TUI
+ * preferences stay in the config folder in both layouts and are not listed.
  */
 export function stateHomeFilePaths(
   dir: string,
