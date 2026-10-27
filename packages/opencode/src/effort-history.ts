@@ -805,8 +805,9 @@ function equivalentRecordedPlan(input: {
 }
 
 /**
- * Consume request-correlated markers and insert Anthropic effort system
- * messages. `recordedVersions` lists every plan still recorded for the
+ * Consume request-correlated markers and, when enabled for a model that
+ * supports per-message effort, insert Anthropic effort system messages.
+ * `recordedVersions` lists every plan still recorded for the
  * resolved plan's user message; it is consulted only when the body's anchor
  * differs from the header plan's.
  */

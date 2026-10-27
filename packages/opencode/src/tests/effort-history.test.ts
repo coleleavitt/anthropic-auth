@@ -1662,7 +1662,8 @@ describe('OpenCode effort anchor restored from an earlier plan version', () => {
 
   test('refuses an earlier anchor on a different boundary', () => {
     // The plan for the T2 turn, whose anchor names T2 instead of the current
-    // boundary. Offer it as a version anyway so only the boundary differs.
+    // boundary. Offer it as a version anyway to check that an anchor naming a
+    // different boundary is refused.
     const otherBoundary = oldWindow().slice(0, 7)
     const otherPlan = plan(otherBoundary)
     expect(otherPlan.messageId).toBe(ids.t2)
