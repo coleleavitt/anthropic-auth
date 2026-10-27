@@ -7,6 +7,7 @@ import { getOpenCodeConfigDir } from './accounts.ts'
 import {
   anthropicAuthRelease,
   buildHolderEntry,
+  deferNativePoolHolderRegistration,
   ensureHolderDirectory,
   HOLDER_FILE_NAME,
   type HolderLiveness,
@@ -94,10 +95,12 @@ const ACCOUNT_STATE_FILE = 'anthropic-auth-state.json'
 /**
  * Whether a start may move OpenCode's dataset out of its config folder into
  * the state folder. While it is false, a start the fence would let move keeps
- * the legacy layout instead; everything else the decision does still runs:
- * serving a dataset already moved, recovering an unfinished move or restore,
- * the conflict and refusal checks, and the mandatory registration. The
- * release that ships the move turns it on.
+ * the legacy layout instead, and registration of a dataset that has not
+ * moved is best-effort, as in 2.4.x (see `unmovedRegistrationPolicy`).
+ * Everything else the decision does still runs: serving a dataset already
+ * moved, recovering an unfinished move or restore, the conflict and refusal
+ * checks, and the mandatory state-home registration. The release that ships
+ * the move turns it on.
  */
 export const RELOCATION_MOVE_ENABLED = false
 
@@ -110,8 +113,27 @@ export function setRelocationMoveEnabledForTests(
   moveEnabledOverride = enabled
 }
 
-function relocationMoveEnabled(options: DecideStateLayoutOptions): boolean {
+function relocationMoveEnabled(options: { moveEnabled?: boolean }): boolean {
   return options.moveEnabled ?? moveEnabledOverride ?? RELOCATION_MOVE_ENABLED
+}
+
+/**
+ * How a dataset that has not moved (OpenCode's legacy or explicit dataset,
+ * or Pi's) is registered, from the same switch as the move itself.
+ *
+ * While moving is off this code ships in ordinary releases before the move
+ * release, and must serve every install that 2.4.x serves. So, as in 2.4.x,
+ * a failed registration is logged once at WARN and retried in the
+ * background (`undefined`, the ordinary policy of `registerNativePoolHolder`).
+ * Once moving is on, an unregistered process could have its files moved from
+ * under it, so registration is `mandatory`. Either way a state-home
+ * admission must register, and a relocation tombstone or an override into a
+ * managed folder refuses.
+ */
+export function unmovedRegistrationPolicy(
+  options: { moveEnabled?: boolean } = {},
+): 'mandatory' | undefined {
+  return relocationMoveEnabled(options) ? 'mandatory' : undefined
 }
 
 /** Why a start the fence would let move stays legacy while moving is off. */
@@ -268,11 +290,87 @@ async function registerHeld(
       assertOwned: () => ctx.stack.assertAll(),
     })
   } catch (error) {
-    // Registration is mandatory from this release on: without the entry a
-    // later move or restore can't see this process, so it must not serve.
+    // Without the entry a later move or restore can't see this process. A
+    // state-home admission therefore refuses; a legacy one decides by
+    // `unmovedRegistrationPolicy` (see `registerLegacyHeld`).
     throw error instanceof HolderRegistrationError
       ? error
       : new HolderRegistrationError('unavailable', dirname(holderFile), error)
+  }
+}
+
+/**
+ * The ordinary registration of a legacy dataset, handed to the background
+ * retry after `error`: logged once at WARN and retried until it succeeds.
+ */
+function deferLegacyRegistration(
+  paths: NativePoolPaths,
+  dir: string,
+  options: DecideStateLayoutOptions,
+  error: unknown,
+): NativeHolderRegistration {
+  return deferNativePoolHolderRegistration(
+    {
+      paths,
+      role: options.role,
+      kind: 'legacy',
+      onLockEvent: options.onLockEvent,
+      liveness: options.liveness,
+      lockTimeoutMs: options.timeouts?.holderMs,
+      now: options.now,
+    },
+    { directory: dir, error },
+  )
+}
+
+/**
+ * Register a legacy start while `ctx` holds the config folder's holder lock.
+ * Resolves undefined once registered. When `unmovedRegistrationPolicy` is
+ * mandatory a failure refuses; otherwise it is handed to the background
+ * retry and the pending registration is returned, and the start serves.
+ */
+async function registerLegacyHeld(
+  oldDir: string,
+  paths: NativePoolPaths,
+  identity: string,
+  options: DecideStateLayoutOptions,
+  ctx: StateLayoutTransitionContext,
+): Promise<NativeHolderRegistration | undefined> {
+  try {
+    await registerHeld(
+      join(oldDir, HOLDER_FILE_NAME),
+      paths,
+      'legacy',
+      identity,
+      options,
+      ctx,
+    )
+    return undefined
+  } catch (error) {
+    if (unmovedRegistrationPolicy(options) === 'mandatory') throw error
+    return deferLegacyRegistration(paths, oldDir, options, error)
+  }
+}
+
+/** Record and return the legacy layout for `paths`. */
+function chooseLegacy(
+  paths: NativePoolPaths,
+  reasons: string[],
+  log: boolean,
+  registration: NativeHolderRegistration | undefined,
+): StateLayoutDecision {
+  recordProcessStateLayout(paths.legacyConfig, LEGACY_STATE_LAYOUT)
+  if (reasons.length && log)
+    logger.info(
+      'state-layout',
+      'anthropic-auth keeps its runtime files in OpenCode’s config folder until every running OpenCode or Pi using them has restarted on this version',
+      { reasons },
+    )
+  return {
+    kind: 'legacy',
+    layout: LEGACY_STATE_LAYOUT,
+    reasons,
+    ...(registration ? { registration } : {}),
   }
 }
 
@@ -389,22 +487,14 @@ async function legacyHeld(
   if (record) requireRecordMatches(record, dataset)
   if (pointed && noMoveRecord(record)) markerUnreadable(dataset.sub)
   if (pointed || !noMoveRecord(record)) return 'changed'
-  await registerHeld(
-    join(dataset.oldDir, HOLDER_FILE_NAME),
+  const registration = await registerLegacyHeld(
+    dataset.oldDir,
     dataset.oldPaths,
-    'legacy',
     dataset.identity,
     options,
     ctx,
   )
-  recordProcessStateLayout(dataset.oldPaths.legacyConfig, LEGACY_STATE_LAYOUT)
-  if (reasons.length && log)
-    logger.info(
-      'state-layout',
-      'anthropic-auth keeps its runtime files in OpenCode’s config folder until every running OpenCode or Pi using them has restarted on this version',
-      { reasons },
-    )
-  return { kind: 'legacy', layout: LEGACY_STATE_LAYOUT, reasons }
+  return chooseLegacy(dataset.oldPaths, reasons, log, registration)
 }
 
 /**
@@ -454,9 +544,7 @@ export async function decideOpenCodeStateLayout(
       paths,
       role: options.role,
       kind: 'explicit',
-      // Every registration this release makes must succeed, whatever the
-      // folder looks like.
-      policy: 'mandatory',
+      policy: unmovedRegistrationPolicy(options),
       onLockEvent: options.onLockEvent,
       liveness: options.liveness,
       lockTimeoutMs: options.timeouts?.holderMs,
@@ -473,14 +561,30 @@ export async function decideOpenCodeStateLayout(
   let target = resolveStateHomeTarget({ env, home })
   const neverMove: string[] = []
   if (!target) {
+    const reason = 'the config folder did not exist when this process started'
     try {
       await ensureHolderDirectory(configDir)
     } catch (error) {
-      throw new HolderRegistrationError('unavailable', configDir, error)
+      if (unmovedRegistrationPolicy(options) === 'mandatory')
+        throw new HolderRegistrationError('unavailable', configDir, error)
+      // While registration is best-effort the folder is only a place for
+      // the holder file, and 2.4.x serves without it: stay legacy and let
+      // the background retry register once the folder and a file exist.
+      const paths = await resolveNativePoolPaths(
+        join(configDir, ACCOUNT_FILE),
+        join(configDir, ACCOUNT_STATE_FILE),
+        LEGACY_STATE_LAYOUT,
+      )
+      return chooseLegacy(
+        paths,
+        [reason],
+        true,
+        deferLegacyRegistration(paths, configDir, options, error),
+      )
     }
     target = resolveStateHomeTarget({ env, home })
     if (!target) throw new HolderRegistrationError('unavailable', configDir)
-    neverMove.push('the config folder did not exist when this process started')
+    neverMove.push(reason)
   }
 
   const sub = await canonicalPath(target.dir)
@@ -545,23 +649,53 @@ export async function decideOpenCodeStateLayout(
       // holds it from before its fence read to its end, and the checks under
       // it see a move that committed.
       const ctx = newContext()
+      const stayReasons = [
+        ...overrides.map((variable) => `${variable} is set`),
+        ...neverMove,
+      ]
+      // Moving being off is not worth a log line; the other reasons are.
+      const reasons = stayReasons.length
+        ? stayReasons
+        : [RELOCATION_MOVE_DISABLED_REASON]
       try {
         await stateLayoutStep(ctx, 'old-holders-locking')
-        await ctx.stack.acquire({
-          name: 'holders',
-          path: join(dataset.oldDir, HOLDER_FILE_NAME),
-          timeoutMs: ctx.holderLockTimeoutMs,
-        })
-        const stayReasons = [
-          ...overrides.map((variable) => `${variable} is set`),
-          ...neverMove,
-        ]
-        // Moving being off is not worth a log line; the other reasons are.
+        try {
+          await ctx.stack.acquire({
+            name: 'holders',
+            path: join(dataset.oldDir, HOLDER_FILE_NAME),
+            timeoutMs: ctx.holderLockTimeoutMs,
+          })
+        } catch (error) {
+          if (
+            !(error instanceof LockContentionError) ||
+            unmovedRegistrationPolicy(options) === 'mandatory'
+          )
+            throw error
+          // While registration is best-effort a start serves, as 2.4.x
+          // does, when the holder lock stays taken, provided the files read
+          // again still show no move; the background retry registers it.
+          if (
+            (await readPointers(dataset)) ||
+            !noMoveRecord(await readRecord(sub))
+          )
+            busy(dataset.configDir, error)
+          return chooseLegacy(
+            dataset.oldPaths,
+            reasons,
+            stayReasons.length > 0,
+            deferLegacyRegistration(
+              dataset.oldPaths,
+              dataset.oldDir,
+              options,
+              error,
+            ),
+          )
+        }
         const decided = await legacyHeld(
           dataset,
           options,
           ctx,
-          stayReasons.length ? stayReasons : [RELOCATION_MOVE_DISABLED_REASON],
+          reasons,
           stayReasons.length > 0,
         )
         if (decided !== 'changed') return decided
@@ -878,9 +1012,9 @@ export function resetStateLayoutDecisionsForTests(): void {
 /**
  * Pi's part of the decision. Pi never moves: OpenCode doesn't watch its
  * folder, so its dataset stays in the legacy layout. It still registers
- * beside its files before any pool I/O, as every process of this release
- * must, so a move of a dataset it aliases waits for it and an alias into a
- * moved or managed folder refuses.
+ * beside its files before any pool I/O, by `unmovedRegistrationPolicy`, so a
+ * move of a dataset it aliases waits for it and an alias into a moved or
+ * managed folder refuses.
  */
 export async function decidePiStateLayout(options: {
   paths: NativePoolPaths
@@ -888,6 +1022,8 @@ export async function decidePiStateLayout(options: {
   onLockEvent?: (event: NativeLockEvent) => void
   liveness?: HolderLiveness
   lockTimeoutMs?: number
+  /** Overrides `RELOCATION_MOVE_ENABLED`; tests only. */
+  moveEnabled?: boolean
 }): Promise<{
   readonly kind: 'pi'
   readonly layout: StateLayout
@@ -897,7 +1033,7 @@ export async function decidePiStateLayout(options: {
     paths: options.paths,
     role: options.role,
     kind: 'pi',
-    policy: 'mandatory',
+    policy: unmovedRegistrationPolicy(options),
     onLockEvent: options.onLockEvent,
     liveness: options.liveness,
     lockTimeoutMs: options.lockTimeoutMs,

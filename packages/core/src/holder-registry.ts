@@ -457,11 +457,11 @@ export interface RegisterNativePoolHolderOptions {
   /**
    * `mandatory`: the entry is published in every holder file before the
    * process serves, even before any dataset file exists there, and any
-   * failure to publish refuses with `HolderRegistrationError`. A release that
-   * decides the state layout at start passes it on every path. Without it,
-   * a failed write refuses only for an `explicit` or `pi` dataset with a file
-   * in a destination-shaped folder; every other failure is retried in the
-   * background.
+   * failure to publish refuses with `HolderRegistrationError`. The layout
+   * decision passes it once moving is enabled (`unmovedRegistrationPolicy`).
+   * Without it, a failed write refuses only for an `explicit` or `pi`
+   * dataset with a file in a destination-shaped folder; every other failure
+   * is retried in the background.
    */
   policy?: 'mandatory'
 }
@@ -691,9 +691,63 @@ export async function registerNativePoolHolder(
   const mandatory =
     options.policy === 'mandatory' ||
     (entry.kind !== 'legacy' && dirs.some(isDestinationShapedDirectory))
+  const attempt = registrationAttempt(options, entry, mandatory)
+  if (await attempt()) return done
+  return retryInBackground(attempt, options)
+}
 
-  /** Publish in every holder file not yet published; true when all are. */
-  const attempt = async (): Promise<boolean> => {
+/**
+ * Hand a registration that already failed once to the ordinary policy's
+ * background retry, for a caller that tried to publish `options`'s entry
+ * itself and may serve without it: log the failure at WARN (once per folder
+ * and process) and retry at most once a minute until it succeeds or `close()`
+ * is called. A retry that finds a relocation tombstone or a managed folder
+ * stops retrying; the relocation guards then refuse every later write.
+ */
+export function deferNativePoolHolderRegistration(
+  options: RegisterNativePoolHolderOptions,
+  failure: { readonly directory: string; readonly error: unknown },
+): NativeHolderRegistration {
+  warnRegistrationFailure(failure.directory, failure.error)
+  let attempt: (() => Promise<boolean>) | undefined
+  return retryInBackground(async () => {
+    attempt ??= registrationAttempt(options, await buildEntry(options), false)
+    return attempt()
+  }, options)
+}
+
+function warnRegistrationFailure(dir: string, error: unknown): void {
+  if (warned.has(dir)) return
+  warned.add(dir)
+  logger.warn(
+    'state-layout',
+    `anthropic-auth could not record that it is using ${dir}; if a newer version moves these files while this process runs, this process will stop and ask for a restart`,
+    {
+      code:
+        error instanceof HolderRegistrationError
+          ? error.code
+          : error instanceof LockContentionError
+            ? 'lock-timeout'
+            : ((error as NodeJS.ErrnoException)?.code ?? 'unknown'),
+    },
+  )
+}
+
+/**
+ * One attempt to publish `entry` in every holder file of its dataset not yet
+ * published; resolves true when all are. Without `mandatory`, a failure is
+ * logged once and leaves the attempt incomplete; with it, the failure throws
+ * `HolderRegistrationError`. A relocation tombstone or a managed folder
+ * always throws.
+ */
+function registrationAttempt(
+  options: RegisterNativePoolHolderOptions,
+  entry: HolderEntry,
+  mandatory: boolean,
+): () => Promise<boolean> {
+  const dirs = [...new Set(entry.files.map((file) => dirname(file)))].sort()
+  const holderFiles = dirs.map((dir) => join(dir, HOLDER_FILE_NAME))
+  return async (): Promise<boolean> => {
     let complete = true
     for (const holderFile of holderFiles) {
       if (published.has(registrationKey(holderFile, entry))) continue
@@ -732,28 +786,18 @@ export async function registerNativePoolHolder(
                 error,
               )
         complete = false
-        if (!warned.has(dir)) {
-          warned.add(dir)
-          logger.warn(
-            'state-layout',
-            `anthropic-auth could not record that it is using ${dir}; if a newer version moves these files while this process runs, this process will stop and ask for a restart`,
-            {
-              code:
-                error instanceof HolderRegistrationError
-                  ? error.code
-                  : error instanceof LockContentionError
-                    ? 'lock-timeout'
-                    : ((error as NodeJS.ErrnoException)?.code ?? 'unknown'),
-            },
-          )
-        }
+        warnRegistrationFailure(dir, error)
       }
     }
     return complete
   }
+}
 
-  if (await attempt()) return done
-
+/** Retry `attempt` in the background at most once a minute until it completes or is closed. */
+function retryInBackground(
+  attempt: () => Promise<boolean>,
+  options: Pick<RegisterNativePoolHolderOptions, 'retryIntervalMs'>,
+): NativeHolderRegistration {
   let timer: ReturnType<typeof setTimeout> | undefined
   let closed = false
   let settle: () => void = () => {}

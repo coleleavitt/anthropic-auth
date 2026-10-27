@@ -1,10 +1,19 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   HOLDER_FILE_NAME,
   LEGACY_STATE_LAYOUT,
+  nativeHolderDatasetFiles,
   resetNativeHolderRegistryForTests,
   resetProcessStateLayoutsForTests,
   resetStateLayoutDecisionsForTests,
@@ -36,17 +45,28 @@ for (const moveEnabled of [false, true]) {
     resetNativeHolderRegistryForTests()
     setRelocationMoveEnabledForTests(moveEnabled)
     const agent = join(root, 'agent')
-    const runtime = new PiNativeRuntime(join(agent, 'anthropic-auth.json'), {
-      vaultPoll: { intervalMs: 0 },
-    })
-    // Closing waits for initialization, which registers first.
-    await runtime.close()
     // Pi's own files, wherever its environment puts them.
     const paths = await resolveNativePoolPaths(
       join(agent, 'anthropic-auth.json'),
       undefined,
       LEGACY_STATE_LAYOUT,
     )
+    // One of Pi's dataset files already exists: with moving off,
+    // registration is best-effort as in 2.4.x, which records a process only
+    // in a folder that holds one of its files. The vault routing file is one
+    // that Pi's local mode never reads.
+    const routing = nativeHolderDatasetFiles(paths).find((file) =>
+      file.includes('vault-routing'),
+    )
+    if (!routing) throw new Error('Pi has no vault routing file')
+    await mkdir(dirname(routing), { recursive: true })
+    await writeFile(routing, '{}\n', { flag: 'wx' })
+    cleanups.push(() => rm(routing, { force: true }))
+    const runtime = new PiNativeRuntime(join(agent, 'anthropic-auth.json'), {
+      vaultPoll: { intervalMs: 0 },
+    })
+    // Closing waits for initialization, which registers first.
+    await runtime.close()
     const holders = JSON.parse(
       await readFile(join(dirname(paths.runtime), HOLDER_FILE_NAME), 'utf8'),
     ) as { entries: Array<Record<string, unknown>> }
