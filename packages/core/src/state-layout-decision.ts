@@ -312,12 +312,51 @@ async function admitFast(
   }
 }
 
+/**
+ * Read both relocation tombstones in the old folder. Refuses when one belongs
+ * to another config folder or names another state root; true when one
+ * points at this dataset's state-home folder.
+ */
+async function readPointers(dataset: RelocationDataset): Promise<boolean> {
+  let pointed = false
+  for (const runtime of [dataset.oldPaths.runtime, dataset.oldVault.runtime]) {
+    const pointer = await readRelocationPointer(runtime)
+    if (!pointer) continue
+    if (pointer.identity !== dataset.identity)
+      refuse(
+        'other-dataset',
+        `${runtime} says the state there belongs to ${pointer.identity}, not to ${dataset.identity}.`,
+        [runtime],
+      )
+    if (pointer.relocatedTo !== dataset.sub)
+      throw stateLayoutMovedElsewhere(
+        dataset.oldDir,
+        pointer.relocatedTo,
+        dataset.stateRoot,
+      )
+    pointed = true
+  }
+  return pointed
+}
+
+/**
+ * Keep the dataset in the old folder, while `ctx` holds the old folder's
+ * holder lock. The choice to stay was made from files read before that lock
+ * was held, and a mover under another `XDG_STATE_HOME` takes a different
+ * layout lock, so it may have committed meanwhile: its tombstones and its
+ * marker are read again first. `changed` means start the decision over.
+ */
 async function legacyHeld(
   dataset: RelocationDataset,
   options: DecideStateLayoutOptions,
   ctx: StateLayoutTransitionContext,
   reasons: string[],
-): Promise<StateLayoutDecision> {
+): Promise<StateLayoutDecision | 'changed'> {
+  const pointed = await readPointers(dataset)
+  const record = await readRecord(dataset.sub)
+  if (record) requireRecordMatches(record, dataset)
+  if (pointed && noMoveRecord(record)) markerUnreadable(dataset.sub)
+  if (pointed || !noMoveRecord(record)) return 'changed'
   await registerHeld(
     join(dataset.oldDir, HOLDER_FILE_NAME),
     dataset.oldPaths,
@@ -445,24 +484,7 @@ export async function decideOpenCodeStateLayout(
     )
 
   // 4. The pointer left in the old folder by a move.
-  let pointed = false
-  for (const runtime of [dataset.oldPaths.runtime, dataset.oldVault.runtime]) {
-    const pointer = await readRelocationPointer(runtime)
-    if (!pointer) continue
-    if (pointer.identity !== target.identity)
-      refuse(
-        'other-dataset',
-        `${runtime} says the state there belongs to ${pointer.identity}, not to ${target.identity}.`,
-        [runtime],
-      )
-    if (pointer.relocatedTo !== sub)
-      throw stateLayoutMovedElsewhere(
-        dataset.oldDir,
-        pointer.relocatedTo,
-        target.stateRoot,
-      )
-    pointed = true
-  }
+  const pointed = await readPointers(dataset)
 
   // 5. The marker, read without a lock.
   for (let round = 0; round < 3; round++) {
@@ -493,13 +515,15 @@ export async function decideOpenCodeStateLayout(
           timeoutMs: ctx.holderLockTimeoutMs,
         })
         const blockers = overrides.map((variable) => `${variable} is set`)
-        return await legacyHeld(dataset, options, ctx, blockers)
+        const decided = await legacyHeld(dataset, options, ctx, blockers)
+        if (decided !== 'changed') return decided
       } catch (error) {
         if (error instanceof LockContentionError) busy(dataset.configDir, error)
         throw error
       } finally {
         await ctx.stack.releaseAll()
       }
+      continue
     }
     break
   }
@@ -640,14 +664,15 @@ async function underLayoutLock(
   }
 
   // No move yet: decide whether to move now.
+  const stay = async (
+    reasons: string[],
+  ): Promise<StateLayoutDecision | 'again'> => {
+    const decided = await legacyHeld(dataset, options, ctx, reasons)
+    return decided === 'changed' ? 'again' : decided
+  }
   if (overrides.length) {
     await acquireHolderLocks(dataset, ctx)
-    return legacyHeld(
-      dataset,
-      options,
-      ctx,
-      overrides.map((variable) => `${variable} is set`),
-    )
+    return stay(overrides.map((variable) => `${variable} is set`))
   }
   await acquireHolderLocks(dataset, ctx)
   const holdersMark = ctx.stack.size
@@ -678,7 +703,7 @@ async function underLayoutLock(
     if (failure) blockers.push(failure)
   }
   await stateLayoutFenceStep(ctx)
-  if (blockers.length) return legacyHeld(dataset, options, ctx, blockers)
+  if (blockers.length) return stay(blockers)
 
   try {
     await drainCoalescedWrites(dataset)
@@ -687,13 +712,13 @@ async function underLayoutLock(
     if (error instanceof StateLayoutCrash) throw error
     await ctx.stack.releaseTo(holdersMark)
     const reason = error instanceof Error ? error.message : String(error)
-    return legacyHeld(dataset, options, ctx, [reason])
+    return stay([reason])
   }
   await ctx.onStep?.('locks-held')
   const failure = await movePreconditionFailure(dataset, ctx.fs.platform)
   if (failure) {
     await ctx.stack.releaseTo(holdersMark)
-    return legacyHeld(dataset, options, ctx, [failure])
+    return stay([failure])
   }
   let outcome: Awaited<ReturnType<typeof moveDataset>>
   try {
@@ -713,15 +738,14 @@ async function underLayoutLock(
     logger.error('state-layout', 'anthropic-auth could not move its state', {
       reason,
     })
-    if (noMoveRecord(await readRecord(dataset.sub)))
-      return legacyHeld(dataset, options, ctx, [reason])
+    if (noMoveRecord(await readRecord(dataset.sub))) return stay([reason])
     return 'again'
   }
   await ctx.stack.releaseTo(holdersMark)
   if (outcome.status === 'rolled-back') {
     // A rollback left to a fresh lock set (a lost lease) is done next round.
     if (!outcome.record) return 'again'
-    return legacyHeld(dataset, options, ctx, [outcome.reason])
+    return stay([outcome.reason])
   }
   const admitted = await admitHeld(dataset, options, ctx, true, true)
   return admitted === 'changed' ? 'again' : admitted

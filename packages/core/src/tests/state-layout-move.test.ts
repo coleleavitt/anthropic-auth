@@ -1187,6 +1187,46 @@ test('a changed XDG_STATE_HOME after a move refuses and names where the state we
   ).toBe(false)
 })
 
+test('a start under another XDG_STATE_HOME that waited for the old holder lock while a move committed refuses instead of staying legacy', async () => {
+  const m = await machine()
+  const otherRoot = join(m.root, 'other-state')
+  let paused!: () => void
+  const pausedAt = new Promise<void>((resolve) => {
+    paused = resolve
+  })
+  let resume!: () => void
+  const resumed = new Promise<void>((resolve) => {
+    resume = resolve
+  })
+  // The second start holds its own root's layout lock and has read no
+  // tombstone and no marker; it stops right before the old holder lock.
+  const second = decide(m, {
+    env: { XDG_STATE_HOME: otherRoot },
+    onStep: async (step) => {
+      if (step !== 'old-holders-locking') return
+      paused()
+      await resumed
+    },
+  })
+  second.catch(() => {})
+  await pausedAt
+  // Meanwhile the first start, under the usual root, moves the dataset.
+  expect((await decide(m)).kind).toBe('state-home')
+  // Each start is its own process: forget the first one's decision.
+  resetProcessStateLayoutsForTests()
+  resume()
+  await expect(second).rejects.toMatchObject({ code: 'moved-elsewhere' })
+  await expect(second).rejects.toThrow(m.sub)
+  expect(processStateLayout(m.oldPaths.legacyConfig)).toBe(LEGACY_STATE_LAYOUT)
+  const holders = await readFile(
+    join(m.configDir, HOLDER_FILE_NAME),
+    'utf8',
+  ).catch(() => '{"entries":[]}')
+  expect(JSON.parse(holders).entries).not.toContainEqual(
+    expect.objectContaining({ kind: 'legacy' }),
+  )
+})
+
 test('a state-home process whose registration fails refuses and never falls back to legacy', async () => {
   const m = await machine()
   expect((await decide(m)).kind).toBe('state-home')

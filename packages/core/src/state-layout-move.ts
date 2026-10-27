@@ -143,6 +143,7 @@ export async function resolveRelocationDataset(input: {
 
 /** The named points of a transition; the step hook runs at each. */
 export type StateLayoutStep =
+  | 'old-holders-locking'
   | 'locks-held'
   | 'fence-checked'
   | 'config-dir-written'
@@ -216,12 +217,15 @@ export async function acquireHolderLocks(
   dataset: RelocationDataset,
   ctx: StateLayoutTransitionContext,
 ): Promise<void> {
-  for (const file of transitionHolderFiles(dataset))
+  const oldHolders = join(dataset.oldDir, HOLDER_FILE_NAME)
+  for (const file of transitionHolderFiles(dataset)) {
+    if (file === oldHolders) await stateLayoutStep(ctx, 'old-holders-locking')
     await ctx.stack.acquire({
       name: 'holders',
       path: file,
       timeoutMs: ctx.holderLockTimeoutMs ?? HOLDER_LOCK_TIMEOUT_MS,
     })
+  }
 }
 
 /** A pool's rows changed between the unlocked snapshot and its locks. */
