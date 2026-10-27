@@ -1223,22 +1223,19 @@ export function useHostSidebarState(
   props: HostSidebarPropsState,
 ): () => SidebarState {
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
-  const schedule = createSidebarSchedule({
-    read: props.read,
-    sessionId: props.sessionId,
-    pollRate: () => ({
-      pollMs: props.controller.prefs().pollMs,
-      retryMaxMs: props.controller.retryMaxMs,
-    }),
-    onState: setState,
-    setTimeoutImpl: props.setTimeoutImpl,
-    clearTimeoutImpl: props.clearTimeoutImpl,
-  })
   createEffect(() => {
-    // Reading the poll rate here re-runs this effect when it changes, which
-    // restarts the schedule at the new rate. The previous run stops first.
-    void props.controller.prefs().pollMs
-    schedule.stop()
+    // Reading the poll rate here re-runs this effect when it changes. A
+    // stopped schedule never restarts, so each run builds a fresh one and the
+    // cleanup stops the run it belongs to.
+    const pollMs = props.controller.prefs().pollMs
+    const schedule = createSidebarSchedule({
+      read: props.read,
+      sessionId: props.sessionId,
+      pollRate: () => ({ pollMs, retryMaxMs: props.controller.retryMaxMs }),
+      onState: setState,
+      setTimeoutImpl: props.setTimeoutImpl,
+      clearTimeoutImpl: props.clearTimeoutImpl,
+    })
     schedule.start()
     onCleanup(() => schedule.stop())
   })
