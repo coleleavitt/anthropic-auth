@@ -13,15 +13,15 @@ import {
   withNativeLock,
 } from './native-lock-observer.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
-import type { NativePoolPaths } from './pool-paths.ts'
+import { type NativePoolPaths, stateLayoutOfPaths } from './pool-paths.ts'
 import {
   findRelocationTombstone,
   nativeRelocationRuntimePaths,
   RelocatedError,
 } from './relocation-guard.ts'
+import { StateLayoutRefusalError } from './state-layout-errors.ts'
 import {
   configFolderIdentity,
-  LEGACY_STATE_LAYOUT,
   STATE_HOME_FILE_NAMES,
 } from './state-layout-paths.ts'
 
@@ -123,7 +123,7 @@ export function writerStamp(): WriterStamp {
  * runtime, vault roster and vault routing, sorted.
  */
 export function nativeHolderDatasetFiles(paths: NativePoolPaths): string[] {
-  const vault = nativeVaultPaths(paths, LEGACY_STATE_LAYOUT)
+  const vault = nativeVaultPaths(paths, stateLayoutOfPaths(paths))
   return [
     ...new Set([
       paths.state,
@@ -218,12 +218,17 @@ export const HOLDER_REGISTRATION_ERROR_MESSAGES: readonly string[] =
  */
 export function stateRefusalCause(
   error: unknown,
-): RelocatedError | HolderRegistrationError | undefined {
+):
+  | RelocatedError
+  | HolderRegistrationError
+  | StateLayoutRefusalError
+  | undefined {
   let current = error
   for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
     if (
       current instanceof RelocatedError ||
-      current instanceof HolderRegistrationError
+      current instanceof HolderRegistrationError ||
+      current instanceof StateLayoutRefusalError
     )
       return current
     current = current.cause
@@ -317,7 +322,7 @@ export async function holderEntryIsLive(
   return current === null || current === entry.incarnation
 }
 
-interface HolderFileContents {
+export interface HolderFileContents {
   /** Entries as found, including any this version doesn't understand. */
   entries: unknown[]
 }
@@ -327,7 +332,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** An entry's pid and incarnation when it has a usable shape. */
-function entryLiveness(
+export function holderEntryLiveness(
   value: unknown,
 ): Pick<HolderEntry, 'pid' | 'incarnation'> | undefined {
   if (!isRecord(value)) return undefined
@@ -356,7 +361,7 @@ function sameRegistration(value: unknown, entry: HolderEntry): boolean {
  * Read a holder file. Undefined when it is absent. A file that exists but
  * doesn't parse throws: rewriting it would erase other processes' entries.
  */
-async function readHolderFile(
+export async function readHolderFile(
   path: string,
 ): Promise<HolderFileContents | undefined> {
   let text: string
@@ -491,24 +496,68 @@ async function publishEntry(
       await assertNoTombstone(options.paths)
       if (entry.kind !== 'legacy' && (await isManagedDirectory(dir)))
         throw new HolderRegistrationError('managed-folder', dir)
-      const current = await readHolderFile(holderFile)
-      const liveness = options.liveness ?? defaultLiveness
-      const kept: unknown[] = []
-      for (const value of current?.entries ?? []) {
-        const life = entryLiveness(value)
-        // An entry this version can't read is kept: it may be a live process.
-        if (!life || (await holderEntryIsLive(life, liveness))) kept.push(value)
-      }
-      if (kept.some((value) => sameRegistration(value, entry))) return
-      kept.push(entry)
-      await writeJsonAtomic(
-        holderFile,
-        { version: 1, entries: kept },
-        { beforeRename: () => lease.assertOwned() },
-      )
+      await publishHolderEntryLocked(holderFile, entry, {
+        liveness: options.liveness,
+        assertOwned: () => lease.assertOwned(),
+      })
     },
   )
   published.add(registrationKey(holderFile, entry))
+}
+
+/**
+ * Add `entry` to `holderFile`, pruning entries of dead processes, while the
+ * caller holds that file's `holders` lock. Writes nothing when a live entry
+ * for this process, kind and files is already there. A holder file that
+ * doesn't parse throws and is never overwritten.
+ */
+export async function publishHolderEntryLocked(
+  holderFile: string,
+  entry: HolderEntry,
+  options: { liveness?: HolderLiveness; assertOwned(): Promise<void> },
+): Promise<void> {
+  const current = await readHolderFile(holderFile)
+  const liveness = options.liveness ?? defaultLiveness
+  const kept: unknown[] = []
+  for (const value of current?.entries ?? []) {
+    const life = holderEntryLiveness(value)
+    // An entry this version can't read is kept: it may be a live process.
+    if (!life || (await holderEntryIsLive(life, liveness))) kept.push(value)
+  }
+  if (!kept.some((value) => sameRegistration(value, entry))) {
+    kept.push(entry)
+    await writeJsonAtomic(
+      holderFile,
+      { version: 1, entries: kept },
+      { beforeRename: () => options.assertOwned() },
+    )
+  }
+  published.add(registrationKey(holderFile, entry))
+}
+
+/** A holder entry for this process. */
+export async function buildHolderEntry(input: {
+  role: HolderRole
+  kind: HolderKind
+  identity: string | null
+  files: readonly string[]
+  liveness?: HolderLiveness
+  now?: () => number
+}): Promise<HolderEntry> {
+  ownIncarnation ??= (input.liveness ?? defaultLiveness)
+    .incarnation(process.pid)
+    .catch(() => null)
+  return Object.freeze({
+    pid: process.pid,
+    incarnation: await ownIncarnation,
+    instance,
+    role: input.role,
+    release: anthropicAuthRelease(),
+    kind: input.kind,
+    identity: input.identity,
+    files: Object.freeze([...input.files].sort()),
+    registeredAt: (input.now ?? Date.now)(),
+  })
 }
 
 async function buildEntry(

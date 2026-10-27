@@ -16,7 +16,8 @@ import {
   isNativeLocalPoolBinding,
   type NativeLocalPoolBinding,
 } from './pool-binding.ts'
-import type { NativePoolPaths } from './pool-paths.ts'
+import { type NativePoolPaths, stateLayoutOfPaths } from './pool-paths.ts'
+import { nativeRelocationGuard } from './relocation-guard.ts'
 
 /** Host adapters supply mode, account and quota policy for local OAuth authorization and refresh. */
 export type NativeLocalExternalPolicy = Exclude<
@@ -121,7 +122,16 @@ export function createNativeLocalRuntimeReaders(
     throw new TypeError('Native local external policy result is invalid')
   }
 
+  // In the state-home layout a refresh stops before its provider call once
+  // the dataset is in conflict: this read runs inside the refresh callback,
+  // under the row and provider locks.
+  const conflictGuard =
+    stateLayoutOfPaths(paths).kind === 'state-home'
+      ? nativeRelocationGuard(paths)
+      : undefined
+
   async function readEntry(subject: NativeRefreshSubject) {
+    await conflictGuard?.assertNotRelocated()
     if (!isNativeLocalPoolBinding(subject.binding))
       throw new NativeRuntimeError('invalid-runtime')
     const read = await readNativeRuntime(paths.runtime, paths.storageId)

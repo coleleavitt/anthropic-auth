@@ -1,0 +1,1145 @@
+import { randomUUID } from 'node:crypto'
+import { lstat, readdir, readFile, stat, unlink } from 'node:fs/promises'
+import { basename, dirname, join, sep } from 'node:path'
+import { drainVaultQuota } from '@cortexkit/common-auth/claustrum'
+import { writeJsonAtomic } from '@cortexkit/common-auth/fs'
+import { openPoolStore } from '@cortexkit/common-auth/store'
+
+import { HOLDER_FILE_NAME, HOLDER_LOCK_TIMEOUT_MS } from './holder-registry.ts'
+import { logger } from './logger.ts'
+import { nativeQuotaCodec } from './native-quota-codec.ts'
+import { nativeAccountProviderLock } from './native-refresh-coordinator.ts'
+import {
+  type NativeVaultPaths,
+  nativeVaultPaths,
+} from './native-vault-paths.ts'
+import {
+  nativeMigrationAuthorityPhase,
+  readNativeMigrationJournal,
+} from './pool-authority.ts'
+import { type NativePoolPaths, resolveNativePoolPaths } from './pool-paths.ts'
+import { drainNativePoolStores } from './pool-store.ts'
+import { forgetRelocationObservations } from './relocation-guard.ts'
+import {
+  createOwnerOnlyFile,
+  digestFile,
+  type FileDigest,
+  fileSha256,
+  publishOwned,
+  type StateLayoutFs,
+  type StateLayoutLockStack,
+  sha256Hex,
+  syncFile,
+} from './state-layout-io.ts'
+import {
+  readRelocationPointer,
+  STATE_HOME_FILE_NAMES,
+} from './state-layout-paths.ts'
+import {
+  CREDENTIAL_AUTHORITY_ROLES,
+  isLayoutRecordStage,
+  layoutRecordPath,
+  publishStateLayoutRecord,
+  RELOCATION_ROLES,
+  type RelocationFileRecord,
+  type RelocationRole,
+  readStateLayoutRecord,
+  type StateLayoutRecord,
+} from './state-layout-record.ts'
+
+const ACCOUNT_FILE = 'anthropic-auth.json'
+const ACCOUNT_STATE_FILE = 'anthropic-auth-state.json'
+
+/** Lock name of the layout lock on `<sub>/layout.json`. */
+export const LAYOUT_LOCK_NAME = 'runtime-layout'
+/** How long a process waits for the layout lock: a whole move at 15 s per contended lock. */
+export const LAYOUT_LOCK_TIMEOUT_MS = 120_000
+
+/** One file slot of a dataset in both layouts. */
+export interface RelocationSlot {
+  readonly role: RelocationRole
+  /** The legacy-layout path, in the config folder. */
+  readonly from: string
+  /** The state-home path, in `<sub>`. */
+  readonly to: string
+}
+
+/**
+ * OpenCode's default dataset of one config folder, resolved in both layouts.
+ * Only that dataset ever moves.
+ */
+export interface RelocationDataset {
+  /** The config folder as configured (not canonicalized). */
+  readonly configDir: string
+  readonly identity: string
+  readonly stateRoot: string
+  /** The canonical state-home folder. */
+  readonly sub: string
+  /** The canonical config folder holding the legacy files. */
+  readonly oldDir: string
+  readonly oldPaths: NativePoolPaths
+  readonly oldVault: NativeVaultPaths
+  readonly newPaths: NativePoolPaths
+  readonly newVault: NativeVaultPaths
+  readonly slots: readonly RelocationSlot[]
+  readonly storageIds: { readonly local: string; readonly vault: string }
+}
+
+export async function resolveRelocationDataset(input: {
+  configDir: string
+  identity: string
+  stateRoot: string
+  /** The canonical state-home folder. */
+  sub: string
+}): Promise<RelocationDataset> {
+  const legacyConfig = join(input.configDir, ACCOUNT_FILE)
+  const legacyState = join(input.configDir, ACCOUNT_STATE_FILE)
+  const oldPaths = await resolveNativePoolPaths(legacyConfig, legacyState, {
+    kind: 'legacy',
+  })
+  const stateHome = { kind: 'state-home', dir: input.sub } as const
+  const newPaths = await resolveNativePoolPaths(
+    legacyConfig,
+    legacyState,
+    stateHome,
+  )
+  const oldVault = nativeVaultPaths(oldPaths, { kind: 'legacy' })
+  const newVault = nativeVaultPaths(newPaths, stateHome)
+  const pairs: Record<RelocationRole, [string, string]> = {
+    localPoolState: [oldPaths.state, newPaths.state],
+    journal: [oldPaths.journal, newPaths.journal],
+    localRoster: [oldPaths.roster, newPaths.roster],
+    vaultStoreState: [oldVault.state, newVault.state],
+    vaultRoster: [oldVault.roster, newVault.roster],
+    vaultRouting: [oldVault.routing, newVault.routing],
+    localRuntime: [oldPaths.runtime, newPaths.runtime],
+    vaultRuntime: [oldVault.runtime, newVault.runtime],
+  }
+  return {
+    configDir: input.configDir,
+    identity: input.identity,
+    stateRoot: input.stateRoot,
+    sub: input.sub,
+    oldDir: dirname(oldPaths.state),
+    oldPaths,
+    oldVault,
+    newPaths,
+    newVault,
+    slots: RELOCATION_ROLES.map((role) => ({
+      role,
+      from: pairs[role][0],
+      to: pairs[role][1],
+    })),
+    storageIds: { local: oldPaths.storageId, vault: oldVault.storageId },
+  }
+}
+
+/** The named points of a transition; the step hook runs at each. */
+export type StateLayoutStep =
+  | 'locks-held'
+  | 'fence-checked'
+  | 'config-dir-written'
+  | 'preparing-written'
+  | `copied:${RelocationRole}`
+  | 'copies-flushed'
+  | 'artifacts-checked'
+  | 'journal-set-aside'
+  | 'local-runtime-tombstoned'
+  | 'vault-runtime-tombstoned'
+  | 'old-dir-flushed'
+  | 'verified'
+  | 'committed'
+  | `cleanup:${RelocationRole}`
+  | 'cleanup-recorded'
+  | 'rollback:journal'
+  | 'rollback:localRuntime'
+  | 'rollback:vaultRuntime'
+  | 'rollback:old-dir-flushed'
+  | 'rollback:destination-removed'
+  | 'rollback:sub-flushed'
+  | 'rolled-back'
+
+/**
+ * Thrown by a step hook to stop a transition exactly there, with no rollback
+ * and nothing else written, as a crash of the process would. Tests use it to
+ * leave every intermediate state on disk; the transition releases its locks
+ * so the next start needn't wait for their leases to expire.
+ */
+export class StateLayoutCrash extends Error {
+  constructor(readonly step: StateLayoutStep) {
+    super(`state layout transition stopped at ${step}`)
+    this.name = 'StateLayoutCrash'
+  }
+}
+
+/** Everything a transition needs besides the dataset. */
+export interface StateLayoutTransitionContext {
+  readonly fs: StateLayoutFs
+  readonly stack: StateLayoutLockStack
+  readonly release: string
+  readonly now: () => number
+  readonly onStep?: (step: StateLayoutStep) => void | Promise<void>
+  /** The longest wait for one data lock; the pool store's default otherwise. */
+  readonly dataLockTimeoutMs?: number
+  /** The longest wait for a holder lock. */
+  readonly holderLockTimeoutMs?: number
+}
+
+export async function stateLayoutStep(
+  ctx: StateLayoutTransitionContext,
+  step: StateLayoutStep,
+): Promise<void> {
+  await ctx.onStep?.(step)
+}
+
+function errorCode(error: unknown): unknown {
+  return error instanceof Error && 'code' in error ? error.code : undefined
+}
+
+/** The two holder files a transition locks, in the order it locks them. */
+export function transitionHolderFiles(dataset: RelocationDataset): string[] {
+  return [
+    join(dataset.oldDir, HOLDER_FILE_NAME),
+    join(dataset.sub, HOLDER_FILE_NAME),
+  ].sort()
+}
+
+/** Take the `holders` lock on both holder files, in sorted path order. */
+export async function acquireHolderLocks(
+  dataset: RelocationDataset,
+  ctx: StateLayoutTransitionContext,
+): Promise<void> {
+  for (const file of transitionHolderFiles(dataset))
+    await ctx.stack.acquire({
+      name: 'holders',
+      path: file,
+      timeoutMs: ctx.holderLockTimeoutMs ?? HOLDER_LOCK_TIMEOUT_MS,
+    })
+}
+
+/** A pool's rows changed between the unlocked snapshot and its locks. */
+export class PoolSnapshotChanged extends Error {
+  constructor(readonly statePath: string) {
+    super(`the pool at ${statePath} changed while its locks were taken`)
+    this.name = 'PoolSnapshotChanged'
+  }
+}
+
+/** A pool can't be read, so its row locks can't be named. */
+export class PoolUnreadable extends Error {
+  constructor(
+    readonly statePath: string,
+    readonly reason: string,
+  ) {
+    super(`the pool at ${statePath} can't be read (${reason})`)
+    this.name = 'PoolUnreadable'
+  }
+}
+
+interface PoolFiles {
+  readonly config: string
+  readonly state: string
+  readonly storageId: string
+}
+
+async function poolRows(
+  pool: PoolFiles,
+): Promise<{ id: string; identity?: string }[]> {
+  // A read-only handle: `read()` fires nothing and takes no lock.
+  const store = openPoolStore({
+    provider: 'anthropic',
+    configPath: pool.config,
+    statePath: pool.state,
+    quota: nativeQuotaCodec,
+    requireCredentialStamps: true,
+  })
+  const read = await store.read()
+  if (read.status === 'pending-migration') return []
+  if (read.status === 'error') throw new PoolUnreadable(pool.state, read.reason)
+  return read.rows.map((row) => ({
+    id: row.id,
+    ...(row.identity ? { identity: row.identity } : {}),
+  }))
+}
+
+function rowLockName(key: string) {
+  return `row-${encodeURIComponent(key)}`
+}
+
+/**
+ * The data locks of one pool, in order: every row lock (by id and by identity, since a
+ * refresh that started before the row learned its identity holds the id
+ * lock), the default provider lock, every per-identity provider lock, then
+ * the two store locks. These are the locks common-auth's refresh holds from
+ * before the token exchange until the successor is written, so once they are
+ * held no refresh of this pool is between its exchange and its write.
+ */
+async function acquirePoolLocks(
+  pool: PoolFiles,
+  ctx: StateLayoutTransitionContext,
+): Promise<void> {
+  const timeoutMs = ctx.dataLockTimeoutMs
+  const snapshot = await poolRows(pool)
+  const rowNames = [
+    ...new Set(
+      snapshot.flatMap((row) =>
+        row.identity
+          ? [rowLockName(row.id), rowLockName(row.identity)]
+          : [rowLockName(row.id)],
+      ),
+    ),
+  ].sort()
+  for (const name of rowNames)
+    await ctx.stack.acquire({ name, path: pool.state, timeoutMs })
+  await ctx.stack.acquire({
+    name: 'provider-anthropic',
+    path: pool.state,
+    timeoutMs,
+  })
+  const identities = [
+    ...new Set(snapshot.flatMap((row) => (row.identity ? [row.identity] : []))),
+  ].sort()
+  const providerLocks = identities.map(
+    (identity) =>
+      nativeAccountProviderLock(
+        { state: pool.state, storageId: pool.storageId } as NativePoolPaths,
+        identity,
+      ).name,
+  )
+  for (const name of [...providerLocks].sort())
+    await ctx.stack.acquire({ name, path: pool.state, timeoutMs })
+  await ctx.stack.acquire({ name: 'pool-config', path: pool.config, timeoutMs })
+  await ctx.stack.acquire({ name: 'pool-state', path: pool.state, timeoutMs })
+  const locked = new Set(rowNames)
+  const lockedIdentities = new Set(identities)
+  for (const row of await poolRows(pool)) {
+    if (
+      !locked.has(rowLockName(row.id)) ||
+      (row.identity !== undefined &&
+        (!locked.has(rowLockName(row.identity)) ||
+          !lockedIdentities.has(row.identity)))
+    )
+      throw new PoolSnapshotChanged(pool.state)
+  }
+}
+
+/**
+ * Every data lock of a move, in a fixed order, for the dataset's old
+ * files: `native-migration`, the local pool's locks, the custody roster and
+ * local runtime, the vault pool's locks, the vault roster, the vault runtime
+ * and the vault routing file. If a pool's rows changed while its locks were
+ * taken, everything is released and taken once more; a second change throws
+ * `PoolSnapshotChanged`.
+ */
+export async function acquireDataLocks(
+  dataset: RelocationDataset,
+  ctx: StateLayoutTransitionContext,
+): Promise<void> {
+  const mark = ctx.stack.size
+  const timeoutMs = ctx.dataLockTimeoutMs
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await ctx.stack.acquire({
+        name: 'native-migration',
+        path: dataset.oldPaths.journal,
+        ttlMs: 30_000,
+        timeoutMs,
+      })
+      await acquirePoolLocks(
+        {
+          config: dataset.oldPaths.config,
+          state: dataset.oldPaths.state,
+          storageId: dataset.oldPaths.storageId,
+        },
+        ctx,
+      )
+      await ctx.stack.acquire({
+        name: 'claustrum-roster-write',
+        path: dataset.oldPaths.roster,
+        timeoutMs,
+      })
+      await ctx.stack.acquire({
+        name: 'native-runtime',
+        path: dataset.oldPaths.runtime,
+        timeoutMs,
+      })
+      await acquirePoolLocks(
+        {
+          config: dataset.oldVault.config,
+          state: dataset.oldVault.state,
+          storageId: dataset.oldVault.storageId,
+        },
+        ctx,
+      )
+      await ctx.stack.acquire({
+        name: 'claustrum-roster',
+        path: dataset.oldVault.roster,
+        ttlMs: 30_000,
+        timeoutMs,
+      })
+      await ctx.stack.acquire({
+        name: 'claustrum-roster-write',
+        path: dataset.oldVault.roster,
+        timeoutMs,
+      })
+      await ctx.stack.acquire({
+        name: 'native-runtime',
+        path: dataset.oldVault.runtime,
+        timeoutMs,
+      })
+      await ctx.stack.acquire({
+        name: 'write',
+        path: dataset.oldVault.routing,
+        ttlMs: 30_000,
+        timeoutMs,
+      })
+      return
+    } catch (error) {
+      await ctx.stack.releaseTo(mark)
+      if (error instanceof PoolSnapshotChanged && attempt === 0) continue
+      throw error
+    }
+  }
+}
+
+/**
+ * Commit the coalesced writes this process has queued for the dataset before
+ * any lock is taken: close every pool store open on the old pool states (a
+ * bounded drain of their quota readings) and drain the vault roster's quota
+ * writer. Both commit under locks the mover is about to hold, so they must
+ * finish first. Afterwards forget every cached file observation, so nothing
+ * this process cached about the old files answers for them after the move.
+ */
+export async function drainCoalescedWrites(
+  dataset: RelocationDataset,
+): Promise<void> {
+  await drainNativePoolStores([dataset.oldPaths.state, dataset.oldVault.state])
+  await drainVaultQuota(dataset.oldVault.roster)
+  forgetRelocationObservations()
+}
+
+/** A relocation tombstone as written over an old runtime file. */
+export function relocationTombstone(
+  record: Pick<
+    StateLayoutRecord,
+    'sub' | 'stateRoot' | 'identity' | 'attempt' | 'by'
+  >,
+): string {
+  return `${JSON.stringify({
+    version: 0,
+    relocatedTo: record.sub,
+    stateRoot: record.stateRoot,
+    identity: record.identity,
+    attempt: record.attempt,
+    by: record.by,
+  })}\n`
+}
+
+async function tombstoneAttempt(path: string): Promise<string | undefined> {
+  try {
+    return (await readRelocationPointer(path))?.attempt
+  } catch {
+    return undefined
+  }
+}
+
+/** The name the journal is set aside under during a move. */
+export function movingJournalPath(journal: string, attempt: string): string {
+  return `${journal}.moving-${attempt}`
+}
+
+function relocatingPath(path: string, attempt: string): string {
+  return `${path}.relocating-${attempt}`
+}
+
+function restoringPath(path: string, attempt: string): string {
+  return `${path}.restoring-${attempt}`
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await lstat(path)
+    return true
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return false
+    throw error
+  }
+}
+
+async function removeOwnStaging(path: string): Promise<void> {
+  try {
+    const info = await lstat(path)
+    if (info.isFile()) await unlink(path)
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') throw error
+  }
+}
+
+/** Why a move may not start, or undefined when it may. */
+export async function movePreconditionFailure(
+  dataset: RelocationDataset,
+  platform: NodeJS.Platform,
+): Promise<string | undefined> {
+  // Same directory, or one inside the other: copying would overwrite sources.
+  const oldInfo = await stat(dataset.oldDir)
+  let subInfo: Awaited<ReturnType<typeof stat>> | undefined
+  try {
+    subInfo = await stat(dataset.sub)
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') throw error
+  }
+  if (subInfo && subInfo.dev === oldInfo.dev && subInfo.ino === oldInfo.ino)
+    return `${dataset.sub} is the config folder itself`
+  if (
+    dataset.sub.startsWith(dataset.oldDir + sep) ||
+    dataset.oldDir.startsWith(dataset.sub + sep)
+  )
+    return `${dataset.sub} and ${dataset.oldDir} contain one another`
+  let anyOld = false
+  for (const slot of dataset.slots) {
+    if (dirname(slot.from) !== dataset.oldDir)
+      return `${slot.from} is outside the config folder`
+    // The configured path is checked as given: the canonical path follows a
+    // leaf symlink, and a moved symlink would move someone else's file.
+    const configured = join(dataset.configDir, basename(slot.from))
+    for (const path of new Set([configured, slot.from])) {
+      let info: Awaited<ReturnType<typeof lstat>>
+      try {
+        info = await lstat(path)
+      } catch (error) {
+        if (errorCode(error) === 'ENOENT') continue
+        throw error
+      }
+      if (!info.isFile()) return `${path} is not a regular file`
+      if (
+        platform !== 'win32' &&
+        typeof process.getuid === 'function' &&
+        info.uid !== process.getuid()
+      )
+        return `${path} belongs to another user`
+    }
+    const fromExists = await exists(slot.from)
+    anyOld ||= fromExists
+    if (await exists(slot.to)) {
+      if (fromExists) {
+        const [a, b] = await Promise.all([lstat(slot.from), lstat(slot.to)])
+        if (a.dev === b.dev && a.ino === b.ino)
+          return `${slot.from} and ${slot.to} are the same file`
+      }
+      return `unexpected anthropic-auth data in ${dataset.sub}: ${slot.to}`
+    }
+  }
+  for (const role of ['localRuntime', 'vaultRuntime'] as const) {
+    const slot = dataset.slots.find((candidate) => candidate.role === role)
+    if (slot && (await tombstoneAttempt(slot.from)) !== undefined)
+      return `${slot.from} is already a relocation tombstone`
+  }
+  if (await exists(dataset.oldPaths.journal)) {
+    let phase: string | undefined
+    try {
+      phase = nativeMigrationAuthorityPhase(
+        await readNativeMigrationJournal(dataset.oldPaths),
+      )
+    } catch {
+      return `${dataset.oldPaths.journal} can't be read`
+    }
+    if (!phase)
+      return `the migration recorded in ${dataset.oldPaths.journal} is unfinished; run setup first`
+  }
+  // A dataset is consistent when nothing exists (a fresh install, which still
+  // gets its barriers) or when something authorizes its files: a runtime or
+  // a journal. Pool settings with neither mean state was deleted by hand.
+  const authorized =
+    (await exists(dataset.oldPaths.runtime)) ||
+    (await exists(dataset.oldVault.runtime)) ||
+    (await exists(dataset.oldPaths.journal))
+  if (!authorized && (anyOld || (await exists(dataset.oldPaths.config))))
+    return `${dataset.oldPaths.config} exists with no runtime and no journal`
+  return undefined
+}
+
+/** A rollback met a state no supported writer produces; it changed nothing more. */
+export class StateLayoutRollbackRefused extends Error {
+  constructor(
+    readonly path: string,
+    detail: string,
+  ) {
+    super(`anthropic-auth can't undo the unfinished move at ${path}: ${detail}`)
+    this.name = 'StateLayoutRollbackRefused'
+  }
+}
+
+/** Expect the layout record to be in `phase` for `attempt` (or absent for `undefined`). */
+function expectRecord(
+  sub: string,
+  want:
+    | { phase: StateLayoutRecord['phase']; attempt: string }
+    | 'absent-or-final',
+) {
+  return async (): Promise<string | undefined> => {
+    let current: StateLayoutRecord | undefined
+    try {
+      current = await readStateLayoutRecord(sub)
+    } catch {
+      return 'layout.json is unreadable'
+    }
+    if (want === 'absent-or-final') {
+      if (
+        current === undefined ||
+        current.phase === 'rolled-back' ||
+        (current.phase === 'restored' && current.restore?.cleanup === 'done')
+      )
+        return undefined
+      return `layout.json is ${current.phase}`
+    }
+    if (current?.phase === want.phase && current.attempt === want.attempt)
+      return undefined
+    return `layout.json is ${current?.phase ?? 'absent'}`
+  }
+}
+
+/** Expect `path` to hold bytes hashing to `sha256`, or to be absent for null. */
+function expectDigest(path: string, sha256: string | null) {
+  return async (): Promise<string | undefined> => {
+    const digest = await digestFile(path)
+    if (sha256 === null)
+      return digest.status === 'absent' ? undefined : 'it exists'
+    if (digest.status === 'file' && digest.sha256 === sha256) return undefined
+    return digest.status === 'absent' ? 'it is missing' : 'its bytes changed'
+  }
+}
+
+function expectTombstone(path: string, attempt: string) {
+  return async (): Promise<string | undefined> =>
+    (await tombstoneAttempt(path)) === attempt
+      ? undefined
+      : 'it is no longer this move’s tombstone'
+}
+
+function expectAbsent(path: string) {
+  return async (): Promise<string | undefined> =>
+    (await exists(path)) ? 'it exists' : undefined
+}
+
+/**
+ * Rename `from` to `to` (or unlink `from` when `to` is undefined) through
+ * `publishOwned`, treating a skipped retry as a failure.
+ */
+async function owned(
+  ctx: StateLayoutTransitionContext,
+  step: Parameters<typeof publishOwned>[0],
+  expect: () => Promise<string | undefined>,
+): Promise<void> {
+  const outcome = await publishOwned(
+    step,
+    { assertLeases: () => ctx.stack.assertAll(), expect },
+    ctx.fs,
+  )
+  if (outcome === 'skipped')
+    throw new Error(
+      `anthropic-auth stopped: ${step.kind === 'rename' ? step.to : step.path} changed while it was being replaced`,
+    )
+}
+
+/**
+ * Undo a `preparing` record, under the mover's full lock set. Only this
+ * attempt's own artifacts are undone; any other state is left alone because
+ * the old layout is still authoritative. Every step is a no-op once done, so
+ * recovery may run again from any point. Throws `StateLayoutRollbackRefused`
+ * when a slot is in a state no supported writer produces.
+ */
+export async function rollbackPreparing(
+  record: StateLayoutRecord,
+  dataset: RelocationDataset,
+  ctx: StateLayoutTransitionContext,
+): Promise<StateLayoutRecord> {
+  const { attempt } = record
+  const slot = (role: RelocationRole) => {
+    const found = record.files.find((file) => file.role === role)
+    if (!found)
+      throw new StateLayoutRollbackRefused(dataset.sub, `no ${role} entry`)
+    return found
+  }
+  // 1. The journal.
+  if (record.barriers.journal === 'present') {
+    const journal = slot('journal')
+    const moving = movingJournalPath(journal.from, attempt)
+    const movingThere = await exists(moving)
+    const journalThere = await exists(journal.from)
+    if (movingThere && journalThere)
+      throw new StateLayoutRollbackRefused(
+        journal.from,
+        `both ${journal.from} and ${moving} exist`,
+      )
+    if (!movingThere && !journalThere)
+      throw new StateLayoutRollbackRefused(
+        journal.from,
+        'the journal is missing',
+      )
+    if (movingThere)
+      await owned(
+        ctx,
+        { kind: 'rename', from: moving, to: journal.from },
+        expectAbsent(journal.from),
+      )
+  }
+  await stateLayoutStep(ctx, 'rollback:journal')
+  // 2. Both runtimes.
+  for (const role of ['localRuntime', 'vaultRuntime'] as const) {
+    const file = slot(role)
+    const original = record.barriers[role].original
+    await removeOwnStaging(relocatingPath(file.from, attempt))
+    const found = await tombstoneAttempt(file.from)
+    if (found !== undefined && found !== attempt)
+      throw new StateLayoutRollbackRefused(
+        file.from,
+        'it holds another move’s tombstone',
+      )
+    if (found === attempt) {
+      if (original === null) {
+        await owned(
+          ctx,
+          { kind: 'unlink', path: file.from },
+          expectTombstone(file.from, attempt),
+        )
+      } else {
+        let copy: Buffer
+        try {
+          copy = await readFile(file.to)
+        } catch {
+          throw new StateLayoutRollbackRefused(
+            file.to,
+            `its copy, needed to undo the tombstone over ${file.from}, is missing`,
+          )
+        }
+        if (sha256Hex(copy) !== original)
+          throw new StateLayoutRollbackRefused(
+            file.to,
+            `its copy changed, so the tombstone over ${file.from} can't be undone`,
+          )
+        const stage = restoringPath(file.from, attempt)
+        await removeOwnStaging(stage)
+        await createOwnerOnlyFile(ctx.fs, stage, copy)
+        if ((await fileSha256(stage)) !== original)
+          throw new StateLayoutRollbackRefused(
+            stage,
+            'the restored bytes differ',
+          )
+        await owned(
+          ctx,
+          { kind: 'rename', from: stage, to: file.from },
+          expectTombstone(file.from, attempt),
+        )
+      }
+    }
+    await stateLayoutStep(ctx, `rollback:${role}`)
+  }
+  // 3. The old side is final before any copy is removed.
+  await ctx.fs.syncDirectory(dataset.oldDir)
+  await stateLayoutStep(ctx, 'rollback:old-dir-flushed')
+  // 4. Destination cleanup over a closed allowlist.
+  for (const file of record.files) {
+    await removeOwnStaging(relocatingPath(file.to, attempt))
+    if (file.sha256 === null) continue
+    const digest = await digestFile(file.to)
+    if (digest.status !== 'file' || digest.sha256 !== file.sha256) continue
+    // A copy whose source is gone may be the only copy left: keep it.
+    if (!(await exists(file.from))) continue
+    await owned(
+      ctx,
+      { kind: 'unlink', path: file.to },
+      expectDigest(file.to, file.sha256),
+    )
+  }
+  for (const name of await readdir(dataset.sub))
+    if (isLayoutRecordStage(name, attempt))
+      await removeOwnStaging(join(dataset.sub, name))
+  await stateLayoutStep(ctx, 'rollback:destination-removed')
+  await ctx.fs.syncDirectory(dataset.sub)
+  await stateLayoutStep(ctx, 'rollback:sub-flushed')
+  const rolledBack: StateLayoutRecord = {
+    ...record,
+    phase: 'rolled-back',
+    rolledBackAt: ctx.now(),
+  }
+  await publishStateLayoutRecord(
+    rolledBack,
+    {
+      assertLeases: () => ctx.stack.assertAll(),
+      expect: expectRecord(dataset.sub, { phase: 'preparing', attempt }),
+    },
+    ctx.fs,
+  )
+  await stateLayoutStep(ctx, 'rolled-back')
+  forgetRelocationObservations()
+  return rolledBack
+}
+
+/**
+ * Remove the verified old copies, local pool state first, while
+ * every data lock is still held. A file is unlinked only if it still hashes
+ * to the recorded value. A changed or reappeared old pool state or journal is
+ * a conflict: both copies are kept and the record says `conflict`, which
+ * stops every state-home process. Any other changed file is kept and listed.
+ * Running it again after a conflict was resolved by hand finishes the
+ * cleanup.
+ */
+export async function cleanupOldCopies(
+  record: StateLayoutRecord,
+  dataset: RelocationDataset,
+  ctx: StateLayoutTransitionContext,
+): Promise<StateLayoutRecord> {
+  const kept: string[] = []
+  const conflict: { old: string; new: string }[] = []
+  // A journal at its legacy name after the commit is back from somewhere:
+  // the move set it aside before the commit.
+  const journalSlot = record.files.find((file) => file.role === 'journal')
+  if (journalSlot && (await exists(journalSlot.from)))
+    conflict.push({ old: journalSlot.from, new: journalSlot.to })
+  for (const role of RELOCATION_ROLES) {
+    if (role === 'localRuntime' || role === 'vaultRuntime') continue
+    const file = record.files.find((candidate) => candidate.role === role)
+    if (!file) continue
+    const path =
+      role === 'journal'
+        ? movingJournalPath(file.from, record.attempt)
+        : file.from
+    await ctx.stack.assertAll()
+    const digest: FileDigest = await digestFile(path)
+    const credential = CREDENTIAL_AUTHORITY_ROLES.includes(role)
+    if (digest.status === 'absent') {
+      // Already removed.
+    } else if (file.sha256 !== null && digest.sha256 === file.sha256) {
+      await owned(
+        ctx,
+        { kind: 'unlink', path },
+        expectDigest(path, file.sha256),
+      )
+    } else if (credential) {
+      conflict.push({ old: path, new: file.to })
+      logger.error(
+        'state-layout',
+        'an old copy of anthropic-auth credentials changed after the move; both copies were kept and anthropic-auth stopped using them',
+        { old: path, new: file.to },
+      )
+    } else if (file.sha256 !== null) {
+      kept.push(path)
+      logger.error(
+        'state-layout',
+        'an old anthropic-auth file changed after the move and was kept',
+        { path },
+      )
+    }
+    await stateLayoutStep(ctx, `cleanup:${role}`)
+  }
+  await ctx.fs.syncDirectory(dataset.oldDir)
+  const next: StateLayoutRecord = {
+    ...record,
+    cleanup: conflict.length ? 'conflict' : kept.length ? 'kept' : 'done',
+    ...(kept.length ? { kept } : {}),
+    ...(conflict.length ? { conflict } : {}),
+  }
+  if (!conflict.length) delete (next as { conflict?: unknown }).conflict
+  if (!kept.length) delete (next as { kept?: unknown }).kept
+  await publishStateLayoutRecord(
+    next,
+    {
+      assertLeases: () => ctx.stack.assertAll(),
+      expect: expectRecord(dataset.sub, {
+        phase: 'committed',
+        attempt: record.attempt,
+      }),
+    },
+    ctx.fs,
+  )
+  await stateLayoutStep(ctx, 'cleanup-recorded')
+  return next
+}
+
+/** How a move ended. */
+export type StateLayoutMoveOutcome =
+  | { readonly status: 'committed'; readonly record: StateLayoutRecord }
+  | {
+      readonly status: 'rolled-back'
+      readonly reason: string
+      readonly record?: StateLayoutRecord
+    }
+
+/** The move was stopped before its commit by a check, not by an error. */
+class MoveRefused extends Error {
+  constructor(readonly reason: string) {
+    super(reason)
+    this.name = 'MoveRefused'
+  }
+}
+
+/**
+ * The move itself, under the layout lock, both holder locks and every data
+ * lock, all held by `ctx.stack`. `checkArtifacts` repeats the fence's check
+ * for pid artifacts of older versions and returns a blocker description or
+ * undefined.
+ *
+ * Before the commit any failure rolls back and resolves `rolled-back`; a
+ * rollback that refuses throws `StateLayoutRollbackRefused`. A failure of the
+ * commit write itself is resolved from the record on disk. After the commit
+ * nothing goes back to legacy: a cleanup failure leaves cleanup `pending` and
+ * still resolves `committed`.
+ */
+export async function moveDataset(
+  dataset: RelocationDataset,
+  ctx: StateLayoutTransitionContext,
+  checkArtifacts: () => Promise<string | undefined>,
+): Promise<StateLayoutMoveOutcome> {
+  const attempt = randomUUID()
+  // Step 1: snapshot every old file of the closed list.
+  const files: RelocationFileRecord[] = []
+  for (const slot of dataset.slots)
+    files.push({ ...slot, sha256: await fileSha256(slot.from) })
+  const sha = (role: RelocationRole) =>
+    files.find((file) => file.role === role)?.sha256 ?? null
+  await ctx.stack.assertAll()
+  // Step 2: the subfolder's identity and holder files.
+  const configDirPath = join(dataset.sub, STATE_HOME_FILE_NAMES.configDirMarker)
+  if (!(await exists(configDirPath))) {
+    const stage = `${configDirPath}.${attempt}.tmp`
+    await createOwnerOnlyFile(
+      ctx.fs,
+      stage,
+      Buffer.from(
+        `${JSON.stringify({ version: 1, identity: dataset.identity })}\n`,
+      ),
+    )
+    try {
+      await owned(
+        ctx,
+        { kind: 'rename', from: stage, to: configDirPath },
+        expectAbsent(configDirPath),
+      )
+    } finally {
+      await removeOwnStaging(stage)
+    }
+  }
+  const holderFile = join(dataset.sub, HOLDER_FILE_NAME)
+  if (!(await exists(holderFile)))
+    await writeJsonAtomic(
+      holderFile,
+      { version: 1, entries: [] },
+      {
+        beforeRename: () => ctx.stack.assertAll(),
+        durable: ctx.fs.platform !== 'win32',
+      },
+    )
+  await ctx.fs.syncDirectory(dataset.sub)
+  await stateLayoutStep(ctx, 'config-dir-written')
+  // Step 3: the durable preparing record.
+  const preparing: StateLayoutRecord = {
+    version: 1,
+    phase: 'preparing',
+    attempt,
+    identity: dataset.identity,
+    stateRoot: dataset.stateRoot,
+    sub: dataset.sub,
+    oldDir: dataset.oldDir,
+    storageIds: dataset.storageIds,
+    by: ctx.release,
+    startedAt: ctx.now(),
+    files,
+    barriers: {
+      journal: sha('journal') === null ? 'absent' : 'present',
+      localRuntime: { original: sha('localRuntime') },
+      vaultRuntime: { original: sha('vaultRuntime') },
+    },
+  }
+  await publishStateLayoutRecord(
+    preparing,
+    {
+      assertLeases: () => ctx.stack.assertAll(),
+      expect: expectRecord(dataset.sub, 'absent-or-final'),
+    },
+    ctx.fs,
+  )
+  await stateLayoutStep(ctx, 'preparing-written')
+  try {
+    // Step 4: copy and verify each present file.
+    for (const file of files) {
+      if (file.sha256 === null) continue
+      const bytes = await readFile(file.from)
+      if (sha256Hex(bytes) !== file.sha256)
+        throw new MoveRefused(`${file.from} changed while it was copied`)
+      const stage = relocatingPath(file.to, attempt)
+      await createOwnerOnlyFile(ctx.fs, stage, bytes)
+      const back = await readFile(stage)
+      if (!back.equals(bytes))
+        throw new MoveRefused(`the copy of ${file.from} reads back differently`)
+      await owned(
+        ctx,
+        { kind: 'rename', from: stage, to: file.to },
+        expectAbsent(file.to),
+      )
+      await stateLayoutStep(ctx, `copied:${file.role}`)
+    }
+    await ctx.fs.syncDirectory(dataset.sub)
+    await stateLayoutStep(ctx, 'copies-flushed')
+    // Step 5: older versions take no lock we share, so look for them again.
+    const blocker = await checkArtifacts()
+    if (blocker) throw new MoveRefused(blocker)
+    await stateLayoutStep(ctx, 'artifacts-checked')
+    // Step 6: the old-layout barriers, durable before the commit.
+    const journal = files.find((file) => file.role === 'journal')
+    if (journal && journal.sha256 !== null) {
+      const moving = movingJournalPath(journal.from, attempt)
+      await owned(
+        ctx,
+        { kind: 'rename', from: journal.from, to: moving },
+        async () =>
+          (await expectDigest(journal.from, journal.sha256)()) ??
+          (await expectAbsent(moving)()),
+      )
+    }
+    await stateLayoutStep(ctx, 'journal-set-aside')
+    for (const role of ['localRuntime', 'vaultRuntime'] as const) {
+      const file = files.find((candidate) => candidate.role === role)
+      if (!file) continue
+      const stage = relocatingPath(file.from, attempt)
+      await createOwnerOnlyFile(
+        ctx.fs,
+        stage,
+        Buffer.from(relocationTombstone(preparing)),
+      )
+      await owned(
+        ctx,
+        { kind: 'rename', from: stage, to: file.from },
+        expectDigest(file.from, file.sha256),
+      )
+      await stateLayoutStep(
+        ctx,
+        role === 'localRuntime'
+          ? 'local-runtime-tombstoned'
+          : 'vault-runtime-tombstoned',
+      )
+    }
+    await ctx.fs.syncDirectory(dataset.oldDir)
+    await stateLayoutStep(ctx, 'old-dir-flushed')
+    // Step 7: compare everything again behind the barriers.
+    await ctx.stack.assertAll()
+    for (const file of files) {
+      if (file.role === 'localRuntime' || file.role === 'vaultRuntime') continue
+      const path =
+        file.role === 'journal' && file.sha256 !== null
+          ? movingJournalPath(file.from, attempt)
+          : file.from
+      const mismatch = await expectDigest(path, file.sha256)()
+      if (mismatch)
+        throw new MoveRefused(`${path} changed during the move: ${mismatch}`)
+    }
+    for (const file of files) {
+      const mismatch = await expectDigest(file.to, file.sha256)()
+      if (mismatch)
+        throw new MoveRefused(`${file.to} changed during the move: ${mismatch}`)
+    }
+    await stateLayoutStep(ctx, 'verified')
+  } catch (error) {
+    if (error instanceof StateLayoutCrash) throw error
+    const reason = error instanceof Error ? error.message : String(error)
+    logger.error(
+      'state-layout',
+      'anthropic-auth could not move its state; keeping the old folder',
+      {
+        reason,
+      },
+    )
+    const record = await rollbackAfterFailure(preparing, dataset, ctx)
+    return { status: 'rolled-back', reason, record }
+  }
+  // Step 8: the commit.
+  const committed: StateLayoutRecord = {
+    ...preparing,
+    phase: 'committed',
+    committedAt: ctx.now(),
+    cleanup: 'pending',
+  }
+  try {
+    await publishStateLayoutRecord(
+      committed,
+      {
+        assertLeases: () => ctx.stack.assertAll(),
+        expect: expectRecord(dataset.sub, { phase: 'preparing', attempt }),
+      },
+      ctx.fs,
+    )
+  } catch (error) {
+    if (error instanceof StateLayoutCrash) throw error
+    // Did the rename land before the failure? The record on disk decides.
+    const onDisk = await readStateLayoutRecord(dataset.sub)
+    if (onDisk?.phase === 'committed' && onDisk.attempt === attempt) {
+      await syncCommitted(dataset, ctx)
+    } else if (onDisk?.phase === 'preparing' && onDisk.attempt === attempt) {
+      const reason = error instanceof Error ? error.message : String(error)
+      const record = await rollbackAfterFailure(preparing, dataset, ctx)
+      return { status: 'rolled-back', reason, record }
+    } else throw error
+  }
+  await stateLayoutStep(ctx, 'committed')
+  forgetRelocationObservations()
+  // Step 9: cleanup, still under every data lock.
+  try {
+    return {
+      status: 'committed',
+      record: await cleanupOldCopies(committed, dataset, ctx),
+    }
+  } catch (error) {
+    if (error instanceof StateLayoutCrash) throw error
+    logger.warn(
+      'state-layout',
+      'anthropic-auth moved its state but could not remove every old copy yet; it retries at the next start',
+      { reason: error instanceof Error ? error.message : String(error) },
+    )
+    return { status: 'committed', record: committed }
+  }
+}
+
+/** Flush a committed record and `<sub>`. */
+export async function syncCommitted(
+  dataset: RelocationDataset,
+  ctx: Pick<StateLayoutTransitionContext, 'fs'>,
+): Promise<void> {
+  await syncFile(layoutRecordPath(dataset.sub))
+  await ctx.fs.syncDirectory(dataset.sub)
+}
+
+/**
+ * Roll back after a failure before the commit. When a lease was lost the
+ * locks are no longer proof of exclusion, so the rollback is left to the next
+ * start, which takes a fresh lock set; the record stays `preparing`.
+ */
+async function rollbackAfterFailure(
+  preparing: StateLayoutRecord,
+  dataset: RelocationDataset,
+  ctx: StateLayoutTransitionContext,
+): Promise<StateLayoutRecord | undefined> {
+  try {
+    await ctx.stack.assertAll()
+  } catch {
+    return undefined
+  }
+  return rollbackPreparing(preparing, dataset, ctx)
+}
+
+/** Old files that hold no credential and reappeared after a move. */
+export async function reappearedMetadataFiles(
+  record: StateLayoutRecord,
+): Promise<string[]> {
+  const found: string[] = []
+  for (const file of record.files) {
+    if (
+      CREDENTIAL_AUTHORITY_ROLES.includes(file.role) ||
+      file.role === 'localRuntime' ||
+      file.role === 'vaultRuntime'
+    )
+      continue
+    if (record.cleanup === 'pending' && file.sha256 !== null) continue
+    if (record.kept?.includes(file.from)) continue
+    if (await exists(file.from)) found.push(file.from)
+  }
+  return found
+}

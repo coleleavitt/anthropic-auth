@@ -29,14 +29,52 @@ export const LEGACY_STATE_LAYOUT: StateLayout = Object.freeze({
 })
 
 /**
+ * Layouts this process has decided, by the canonical path of the dataset's
+ * account file (`<config folder>/anthropic-auth.json`). Only the layout
+ * decision at start adds to it, and only for OpenCode's default dataset.
+ */
+const decidedLayouts = new Map<string, StateLayout>()
+
+/**
  * The layout a resolver uses when its caller passes none. A process decides it
  * once, before it resolves any pool path, and never switches: every
  * re-resolution must use the same layout as the first, or comparisons between
- * them fail. No process can choose the state-home layout yet, so this is
- * always the legacy layout.
+ * them fail. `legacyConfig` is the canonical account file the resolver works
+ * from. A dataset with no recorded decision, and every call without
+ * `legacyConfig`, uses the legacy layout.
  */
-export function processStateLayout(): StateLayout {
-  return LEGACY_STATE_LAYOUT
+export function processStateLayout(legacyConfig?: string): StateLayout {
+  if (legacyConfig === undefined) return LEGACY_STATE_LAYOUT
+  return decidedLayouts.get(legacyConfig) ?? LEGACY_STATE_LAYOUT
+}
+
+/**
+ * Record the layout decided for the dataset whose canonical account file is
+ * `legacyConfig`. A decision is final for the process: recording a different
+ * layout for the same dataset throws.
+ */
+export function recordProcessStateLayout(
+  legacyConfig: string,
+  layout: StateLayout,
+): void {
+  const current = decidedLayouts.get(legacyConfig)
+  if (current !== undefined) {
+    const same =
+      current.kind === layout.kind &&
+      (current.kind === 'legacy' ||
+        (layout.kind === 'state-home' && current.dir === layout.dir))
+    if (!same)
+      throw new Error(
+        'anthropic-auth already chose a different state layout for this folder in this process',
+      )
+    return
+  }
+  decidedLayouts.set(legacyConfig, Object.freeze({ ...layout }))
+}
+
+/** Forget every recorded layout decision; tests only. */
+export function resetProcessStateLayoutsForTests(): void {
+  decidedLayouts.clear()
 }
 
 /** The `node:path` functions the pure helpers use; tests pass `path.win32`. */
@@ -341,7 +379,12 @@ export const STATE_LAYOUT_PHASES = [
 ] as const
 export type StateLayoutPhase = (typeof STATE_LAYOUT_PHASES)[number]
 
-const CLEANUP_STATES = ['pending', 'done', 'kept'] as const
+/**
+ * `conflict`: cleanup found that an old copy of the local pool state or the
+ * journal changed after the move was verified, so both copies are kept and no
+ * process serves the dataset until a person removes one of them.
+ */
+const CLEANUP_STATES = ['pending', 'done', 'kept', 'conflict'] as const
 const RESTORE_CLEANUP_STATES = ['pending', 'done'] as const
 
 /** The fields of `layout.json` that decide whether a process may use a layout. */

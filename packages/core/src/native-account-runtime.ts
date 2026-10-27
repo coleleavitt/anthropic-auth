@@ -106,6 +106,7 @@ import {
 import {
   type NativePoolPaths,
   resolveLocalRoutingDestination,
+  stateLayoutOfPaths,
 } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
 import type { QuotaRequestDispatch } from './quota-manager.ts'
@@ -401,6 +402,9 @@ export function createNativeAccountRuntime(
   const env = { ...(options.vault?.env ?? process.env) }
   const vaultPaths = nativeVaultPaths(paths)
   const relocation = nativeRelocationGuard(paths)
+  // A state-home process stops serving once its dataset is in conflict; a
+  // legacy process keeps exactly the checks it had before.
+  const servesStateHome = stateLayoutOfPaths(paths).kind === 'state-home'
   const routingSeed: NativeVaultRoutingSeed = {
     legacyConfig: paths.legacyConfig,
     roster: vaultPaths.roster,
@@ -438,6 +442,7 @@ export function createNativeAccountRuntime(
     onLockEvent: options.local?.onLockEvent,
     onStep: async (point) => {
       if (point === 'before-config-write' || point === 'before-state-write') {
+        if (servesStateHome) await relocation.assertNotRelocated()
         if (options.beforePoolWrite) {
           await localAuthority()
           await options.beforePoolWrite()
@@ -459,6 +464,7 @@ export function createNativeAccountRuntime(
   let localRouting: { destination: string; source: string } | undefined
   async function authority(signal?: AbortSignal) {
     check(signal)
+    if (servesStateHome) await relocation.assertNotRelocated()
     let mode = await readNativeEnrollmentMode(options.host, env)
     if (mode === 'local') {
       // Reuse the authority read rather than opening the journal again for routing.

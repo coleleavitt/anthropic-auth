@@ -46,11 +46,80 @@ export function nativePoolStoreLocks(paths: NativePoolStorePaths) {
   ] as const
 }
 
+type DrainableStore = { close(): Promise<void> }
+
+/**
+ * Stores opened in this process, by state file, held weakly so a store that
+ * is dropped without being closed is not kept alive. A state layout move
+ * closes those of its dataset first, which commits their queued quota
+ * readings under the store locks before any byte is copied.
+ */
+const openStores = new Map<string, Set<WeakRef<DrainableStore>>>()
+
+function trackStore<T extends DrainableStore & { dispose(): Promise<void> }>(
+  statePath: string,
+  store: T,
+): T {
+  let refs = openStores.get(statePath)
+  if (!refs) {
+    refs = new Set()
+    openStores.set(statePath, refs)
+  }
+  for (const ref of refs) if (!ref.deref()) refs.delete(ref)
+  let tracked: T
+  const forget = () => {
+    for (const candidate of refs)
+      if (candidate.deref() === tracked) refs.delete(candidate)
+  }
+  tracked = {
+    ...store,
+    close: async () => {
+      forget()
+      await store.close()
+    },
+    dispose: async () => {
+      forget()
+      await store.dispose()
+    },
+  }
+  refs.add(new WeakRef(tracked))
+  return tracked
+}
+
+/**
+ * Close every store this process opened on one of `statePaths`. Closing
+ * drains the store's coalesced quota writes (bounded by common-auth's drain
+ * time) and makes later quota readings on it refuse. Returns how many were
+ * closed; a failed close rejects.
+ */
+export async function drainNativePoolStores(
+  statePaths: readonly string[],
+): Promise<number> {
+  let closed = 0
+  for (const path of new Set(statePaths)) {
+    const refs = openStores.get(path)
+    if (!refs) continue
+    for (const ref of [...refs]) {
+      const store = ref.deref()
+      refs.delete(ref)
+      if (!store) continue
+      await store.close()
+      closed++
+    }
+    if (refs.size === 0) openStores.delete(path)
+  }
+  return closed
+}
+
 /**
  * Storage machinery only. Callers must separately establish local migration
  * authority or vault enrollment authority before using these files.
  */
 export function createNativePoolStore(options: NativePoolStoreOptions) {
+  return trackStore(options.paths.state, openNativePoolStore(options))
+}
+
+function openNativePoolStore(options: NativePoolStoreOptions) {
   const store = openPoolStore({
     provider: 'anthropic',
     configPath: options.paths.config,

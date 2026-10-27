@@ -23,13 +23,11 @@ import {
   getAccountStoragePath,
   getRequestGzipLatch,
   getRequestGzipLatchPath,
-  type HolderRegistrationError,
   isDumpEnabled as isDumpEnabledCore,
   mergeAnthropicBetas,
   type ProviderErrorRedactor,
   type ProviderErrorResponseScope,
   type ProviderResponseMode,
-  type RelocatedError,
   type RequestGzipLatch,
   remapModelId,
   remapRequestBodyModel,
@@ -526,7 +524,7 @@ export class NativeAnthropicStateRefusal extends Error {
   readonly kind = 'state-relocated'
   readonly providerID = ANTHROPIC_PROVIDER_ID
 
-  constructor(cause: RelocatedError | HolderRegistrationError) {
+  constructor(cause: NonNullable<ReturnType<typeof stateRefusalCause>>) {
     super(cause.message, { cause })
     this.name = 'NativeAnthropicStateRefusal'
   }

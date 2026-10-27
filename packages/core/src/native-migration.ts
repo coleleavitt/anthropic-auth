@@ -308,7 +308,7 @@ export async function publishNativeEmptyInit(
         const resolved = await resolveNativePoolPaths(
           paths.legacyConfig,
           paths.legacyState,
-          processStateLayout(),
+          processStateLayout(paths.legacyConfig),
         )
         for (const key of Object.keys(resolved) as Array<keyof NativePoolPaths>)
           if (paths[key] !== resolved[key]) refuse()
@@ -375,7 +375,7 @@ async function capture(
   const resolved = await resolveNativePoolPaths(
     input.paths.legacyConfig,
     input.paths.legacyState,
-    processStateLayout(),
+    processStateLayout(input.paths.legacyConfig),
   )
   for (const key of Object.keys(resolved) as Array<keyof NativePoolPaths>)
     if (input.paths[key] !== resolved[key]) refuse()

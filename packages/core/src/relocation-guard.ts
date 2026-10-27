@@ -2,7 +2,11 @@ import { lstat } from 'node:fs/promises'
 
 import { logger } from './logger.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
-import type { NativePoolPaths } from './pool-paths.ts'
+import { type NativePoolPaths, stateLayoutOfPaths } from './pool-paths.ts'
+import {
+  createStateHomeServingGuard,
+  stateHomeServingFiles,
+} from './state-home-serving-guard.ts'
 import {
   LEGACY_STATE_LAYOUT,
   type RelocationPointer,
@@ -106,6 +110,14 @@ async function pointerAt(path: string): Promise<RelocationPointer | undefined> {
 }
 
 /** The first tombstone among `runtimePaths`, with the path that holds it. */
+/**
+ * Forget every runtime file observation, so the next check reads each file
+ * again. A move calls it after replacing files in this process.
+ */
+export function forgetRelocationObservations(): void {
+  observations.clear()
+}
+
 export async function findRelocationTombstone(
   runtimePaths: readonly string[],
 ): Promise<{ path: string; pointer: RelocationPointer } | undefined> {
@@ -156,7 +168,15 @@ export function nativeRelocationRuntimePaths(
   return [paths.runtime, nativeVaultPaths(paths, LEGACY_STATE_LAYOUT).runtime]
 }
 
-/** A guard over a dataset's two legacy runtime files. */
+/**
+ * The guard for a dataset's locked write callbacks. In the legacy layout it
+ * refuses once a newer version has moved the dataset (a tombstone over either
+ * legacy runtime file). In the state-home layout the tombstones are expected,
+ * and the same callbacks instead refuse once the dataset is in conflict: an
+ * old copy of the credentials or journal is back beside the moved one.
+ */
 export function nativeRelocationGuard(paths: NativePoolPaths): RelocationGuard {
+  if (stateLayoutOfPaths(paths).kind === 'state-home')
+    return createStateHomeServingGuard(stateHomeServingFiles(paths))
   return createRelocationGuard(nativeRelocationRuntimePaths(paths))
 }

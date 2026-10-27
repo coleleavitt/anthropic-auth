@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 
 import { getAccountStatePath, getAccountStoragePath } from './accounts.ts'
 import {
+  LEGACY_STATE_LAYOUT,
   processStateLayout,
   type StateLayout,
   stateHomeDatasetFiles,
@@ -19,6 +20,20 @@ export interface NativePoolPaths {
   journal: string
   roster: string
   storageId: string
+}
+
+/**
+ * The layout `paths` were resolved in. In the legacy and explicit layouts the
+ * runtime file sits beside the account state file; only the state-home layout
+ * puts it in another folder, which is then the state-home folder.
+ */
+export function stateLayoutOfPaths(
+  paths: Pick<NativePoolPaths, 'legacyState' | 'runtime'>,
+): StateLayout {
+  const dir = dirname(paths.runtime)
+  return dir === dirname(paths.legacyState)
+    ? LEGACY_STATE_LAYOUT
+    : { kind: 'state-home', dir }
 }
 
 /** Local hosts share the native pool's routing file unless explicitly overridden. */
@@ -82,12 +97,13 @@ function sibling(
 export async function resolveNativePoolPaths(
   legacyConfig = getAccountStoragePath(),
   legacyState = getAccountStatePath(legacyConfig),
-  layout: StateLayout = processStateLayout(),
+  layout?: StateLayout,
 ): Promise<NativePoolPaths> {
   const [sourceConfig, sourceState] = await Promise.all([
     canonicalPath(legacyConfig),
     canonicalPath(legacyState),
   ])
+  const chosen = layout ?? processStateLayout(sourceConfig)
   const config = await canonicalPath(
     sibling(
       sourceConfig,
@@ -129,8 +145,8 @@ export async function resolveNativePoolPaths(
       'roster',
     ),
   )
-  if (layout.kind === 'state-home') {
-    const moved = stateHomeDatasetFiles(layout, sourceConfig, sourceState)
+  if (chosen.kind === 'state-home') {
+    const moved = stateHomeDatasetFiles(chosen, sourceConfig, sourceState)
     ;[state, runtime, journal, roster] = await Promise.all([
       canonicalPath(moved.localPoolState),
       canonicalPath(moved.localRuntime),

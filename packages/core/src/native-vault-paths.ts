@@ -1,9 +1,8 @@
 import { createHash } from 'node:crypto'
 import { basename, dirname, join } from 'node:path'
 
-import type { NativePoolPaths } from './pool-paths.ts'
+import { type NativePoolPaths, stateLayoutOfPaths } from './pool-paths.ts'
 import {
-  processStateLayout,
   type StateLayout,
   stateHomeDatasetFiles,
 } from './state-layout-paths.ts'
@@ -28,15 +27,14 @@ function sibling(path: string, expected: string, name: string, suffix: string) {
 /**
  * Keep vault settings, metadata and affinity outside every local recovery file.
  *
- * `layout` must be the one `local` was resolved in: the local paths don't say
- * where the vault's state files are. It defaults to this process's layout
- * decision. Vault settings stay beside the account file in every layout, and
- * the storage id is always computed from the vault store state's
- * legacy-layout path.
+ * `layout` must be the one `local` was resolved in. It defaults to the layout
+ * `local` itself shows (see `stateLayoutOfPaths`). Vault settings stay beside
+ * the account file in every layout, and the storage id is always computed
+ * from the vault store state's legacy-layout path.
  */
 export function nativeVaultPaths(
   local: NativePoolPaths,
-  layout: StateLayout = processStateLayout(),
+  layout: StateLayout = stateLayoutOfPaths(local),
 ): NativeVaultPaths {
   const config = sibling(
     local.legacyConfig,
