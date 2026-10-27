@@ -136,21 +136,63 @@ export function createGuardedFetch(
 }
 
 const guardedFetch = createGuardedFetch()
+const nativeDateNow = Date.now
+
+function isDefaultFetchMock(value: typeof fetch | undefined): boolean {
+  return Boolean(
+    (value as (typeof fetch & { [DEFAULT_FETCH_MOCK]?: true }) | undefined)?.[
+      DEFAULT_FETCH_MOCK
+    ],
+  )
+}
+
+// Once an afterEach hook times out, Bun skips every later afterEach hook for
+// that test, including the leak check below. Check again before each test
+// starts: restore any leaked fetch mock (and, at a file boundary, a leaked
+// fake clock) and fail this test, so the leak stops at the next test boundary
+// instead of running on through later files. This cannot undo a change that a
+// timed-out body, which Bun does not cancel, makes after this check; the
+// owning test must cancel such a body itself.
+let currentTestFile: string | undefined
+beforeEach(() => {
+  const previousTestFile = currentTestFile
+  currentTestFile = Bun.main
+  const leaked: string[] = []
+  const currentFetch = globalThis.fetch as typeof fetch | undefined
+  if (isDefaultFetchMock(currentFetch)) globalThis.fetch = guardedFetch
+  else if (currentFetch !== guardedFetch) {
+    globalThis.fetch = guardedFetch
+    leaked.push('a fetch mock')
+  }
+  // Some files keep a fake clock between their own tests and reset it in
+  // their own beforeEach, so a fake clock is only a leak once the file
+  // that installed it has finished.
+  if (
+    previousTestFile !== undefined &&
+    previousTestFile !== currentTestFile &&
+    Date.now !== nativeDateNow
+  ) {
+    Date.now = nativeDateNow
+    leaked.push(`a fake Date.now from ${previousTestFile}`)
+  }
+  if (leaked.length)
+    throw new Error(
+      `${leaked.join(' and ')} outlived an earlier test whose teardown did not finish; restored before this test ran`,
+    )
+})
 
 afterEach(() => {
   // A destroyed global is itself a leak; read the tag only off a present value
   // so the report stays the named leak error rather than a raw TypeError.
-  const currentFetch = globalThis.fetch as
-    | (typeof fetch & { [DEFAULT_FETCH_MOCK]?: true })
-    | undefined
-  const isDefaultFetchMock = Boolean(currentFetch?.[DEFAULT_FETCH_MOCK])
-  if (currentFetch !== guardedFetch && !isDefaultFetchMock) {
+  const currentFetch = globalThis.fetch as typeof fetch | undefined
+  const defaultFetchMock = isDefaultFetchMock(currentFetch)
+  if (currentFetch !== guardedFetch && !defaultFetchMock) {
     globalThis.fetch = guardedFetch
     throw new Error(
       'fetch mock leaked past its owning test; Bun reports the offending test name above',
     )
   }
-  if (isDefaultFetchMock) globalThis.fetch = guardedFetch
+  if (defaultFetchMock) globalThis.fetch = guardedFetch
 })
 
 // Keep a data property so Bun's spyOn can replace fetch and tests can restore

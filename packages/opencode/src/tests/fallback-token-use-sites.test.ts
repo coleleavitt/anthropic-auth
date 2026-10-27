@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, mock } from 'bun:test'
+import { describe, expect, mock } from 'bun:test'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -64,23 +65,121 @@ const fixtureEnvKeys = [
   'OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE',
 ] as const
 
-const livePlugins = new Set<Set<PluginHooks>>()
-// Registered before the lifetime suite's own afterEach: dispose every plugin
-// (its timers and vault client) before that hook waits for a possibly
-// still-running body and removes the body's files.
-afterEach(async () => {
-  const plugins = [...livePlugins].flatMap((owned) => {
-    const current = [...owned]
-    owned.clear()
-    return current
-  })
-  await disposeAll(plugins, 'Fallback census plugin cancellation failed')
-})
+/**
+ * Everything one census body replaces or starts: the process-global fetch,
+ * clock and fixture environment, and the plugins it creates.
+ *
+ * Bun does not cancel a body that outlives its timeout, and once one
+ * afterEach hook times out it skips every later afterEach hook for that test,
+ * including the leak check in setup.ts. A hook therefore cannot be the only
+ * thing that puts these globals back. The body closes its own scope before it
+ * returns, and teardown's cancellation gate closes it the moment teardown
+ * starts, before teardown waits for a body that is still running. Closing
+ * restores the globals synchronously, before any await, and only then
+ * disposes the plugins, so a slow or stuck disposal can fail only its own
+ * test. Once closed, a body that is still running cannot install globals or
+ * keep a new plugin alive.
+ */
+class CensusScope {
+  private readonly plugins = new Set<PluginHooks>()
+  private readonly savedFetch = globalThis.fetch
+  private readonly savedNow = Date.now
+  private readonly savedEnv = new Map(
+    fixtureEnvKeys.map((key) => [key, process.env[key]]),
+  )
+  private closing: Promise<void> | undefined
+  /** Set when the body starts waiting for close, so teardown need not report a close failure the body already reports. */
+  joinedByBody = false
+
+  /** Call before replacing fetch, Date.now or a fixture env key, and between polls. */
+  assertOpen(): void {
+    if (this.closing)
+      throw new Error(
+        'Census body was cancelled by teardown and may not continue',
+      )
+  }
+
+  /** Track a plugin for disposal; a plugin created after cancellation is disposed at once. */
+  own(plugin: PluginHooks): void {
+    if (this.closing) {
+      lifetimes.trackDetached(
+        disposeAll([plugin], 'Late fallback census plugin cleanup failed'),
+      )
+      this.assertOpen()
+    }
+    this.plugins.add(plugin)
+  }
+
+  close(): Promise<void> {
+    if (!this.closing) {
+      this.restoreGlobals()
+      this.closing = this.disposeOwned()
+    }
+    return this.closing
+  }
+
+  private restoreGlobals(): void {
+    globalThis.fetch = this.savedFetch
+    Date.now = this.savedNow
+    for (const key of fixtureEnvKeys) {
+      const value = this.savedEnv.get(key)
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+
+  private async disposeOwned(): Promise<void> {
+    const plugins = [...this.plugins]
+    this.plugins.clear()
+    try {
+      await disposeAll(plugins, 'Fallback census plugin cleanup failed')
+    } finally {
+      await drainSidebarWrites()
+      resetCache1hState()
+      resetClaudeCodeIdentityCachesForTest()
+    }
+  }
+}
+
 const lifetimes = createTestLifetimeSuite()
+const censusScope = new AsyncLocalStorage<CensusScope>()
+
+function currentScope(): CensusScope {
+  const scope = censusScope.getStore()
+  if (!scope) throw new Error('Census fixture used outside a census test body')
+  return scope
+}
+
 // The lifetime suite registers ordinary Bun tests, which run one at a time
 // within this file unless Bun is started with --concurrent; the `serial` name
 // keeps the original call sites unchanged.
-const test = { serial: lifetimes.test }
+const test = {
+  serial(name: string, body: () => unknown, timeout?: number): void {
+    lifetimes.test(
+      name,
+      async () => {
+        const scope = new CensusScope()
+        // Teardown opens every gate as soon as its hook starts, before it
+        // waits for this body; closing then restores the globals even if
+        // the body is still running past its timeout. A disposal failure
+        // is reported by the body or by the cleanup below, not here.
+        void lifetimes.gate().wait.then(() => scope.close().catch(() => {}))
+        // Teardown joins a disposal the body did not wait for before it
+        // removes the body's files.
+        lifetimes.deferCleanup(() =>
+          scope.joinedByBody ? undefined : scope.close(),
+        )
+        try {
+          return await censusScope.run(scope, body)
+        } finally {
+          scope.joinedByBody = true
+          await scope.close()
+        }
+      },
+      timeout,
+    )
+  },
+}
 
 async function disposeAll(plugins: PluginHooks[], message: string) {
   const results = await Promise.allSettled(
@@ -94,48 +193,16 @@ async function disposeAll(plugins: PluginHooks[], message: string) {
     )
 }
 
-/**
- * Claim a fresh owner-only directory for this body. Teardown restores
- * fetch, the clock and the environment first, so a slow plugin disposal
- * cannot leak them into later tests, then disposes the body's plugins and
- * waits for sidebar writes, and only then removes the directory.
- */
+/** Claim a fresh owner-only directory for this body, removed after its plugins are disposed. */
 async function startBody(prefix: string) {
-  const savedFetch = globalThis.fetch
-  const savedNow = Date.now
-  const savedEnv = new Map(fixtureEnvKeys.map((key) => [key, process.env[key]]))
-  const plugins = new Set<PluginHooks>()
-  livePlugins.add(plugins)
-  lifetimes.deferCleanup(async () => {
-    const remaining = [...plugins]
-    plugins.clear()
-    livePlugins.delete(plugins)
-    // Restore the process-global doubles before awaiting disposal. Disposal
-    // waits on real plugin I/O, so on a slow runner disposal can exceed the
-    // teardown hook's timeout; a fetch mock or frozen clock left behind would poison every
-    // test file that runs after this one in the same process. Restoring
-    // first means a slow teardown fails only its own test.
-    globalThis.fetch = savedFetch
-    Date.now = savedNow
-    for (const key of fixtureEnvKeys) {
-      const value = savedEnv.get(key)
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
-    try {
-      await disposeAll(remaining, 'Fallback census plugin cleanup failed')
-    } finally {
-      await drainSidebarWrites()
-      resetCache1hState()
-      resetClaudeCodeIdentityCachesForTest()
-    }
-  })
+  const scope = currentScope()
+  scope.assertOpen()
   delete process.env.OPENCODE_AUTH_CONTENT
   const root = await mkdtemp(join(tmpdir(), prefix))
   // migrateNativeOpencodeFixture also removes the root once it accepts it;
   // this covers a body that fails before handing the root to it.
   lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
-  return { root, plugins }
+  return { root, scope }
 }
 
 function quota(now: number, fableRemaining = 90) {
@@ -198,6 +265,8 @@ async function waitFor(
   attempts = 50,
 ) {
   for (let attempt = 0; attempt < attempts; attempt++) {
+    // Stop polling once teardown has cancelled this body.
+    censusScope.getStore()?.assertOpen()
     if (predicate()) return
     await Bun.sleep(10)
   }
@@ -346,7 +415,7 @@ async function createFixture(
     ],
   }
 
-  const { root, plugins } = await startBody(`fallback-census-${site}-`)
+  const { root, scope } = await startBody(`fallback-census-${site}-`)
 
   const scopedClient: NativeCustodyClient = {
     listScoped: async () => ({
@@ -444,6 +513,7 @@ async function createFixture(
       enrollment: { token: 'ab'.repeat(32), token_generation: 1 },
     },
   })
+  scope.assertOpen()
   for (const [key, value] of Object.entries(fixture.env))
     process.env[key] = value
   if (options.profile)
@@ -505,6 +575,7 @@ async function createFixture(
 
   // Freeze the clock only after migration, so the migration journal and
   // locks see real time and only the plugin observes the test clock.
+  scope.assertOpen()
   if (options.now !== undefined) {
     let clock = now
     Date.now = mock(() => clock) as unknown as typeof Date.now
@@ -526,6 +597,7 @@ async function createFixture(
     'event: message_stop\ndata: {"type":"message_stop"}\n\n',
   ].join('')
 
+  scope.assertOpen()
   globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
     const url = extractUrl(input as string | URL | Request)
     const headers = new Headers(init?.headers)
@@ -668,6 +740,7 @@ async function createFixture(
   const clearInterval = mock(
     () => {},
   ) as unknown as typeof globalThis.clearInterval
+  scope.assertOpen()
   if (options.fallbackMode)
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
   mainRowState = options.mainState ?? 'active'
@@ -689,7 +762,7 @@ async function createFixture(
       clearInterval,
     },
   )) as any
-  plugins.add(plugin)
+  scope.own(plugin)
   const result = await plugin.auth.loader(
     // The OpenCode auth entry exactly as the migration left it in host auth.
     async () =>
@@ -1096,6 +1169,7 @@ describe('scoped maintenance rotation recovery', () => {
       reports.push(recordVersion)
     }
     const originalRequest = globalThis.fetch
+    currentScope().assertOpen()
     globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
       const authorization =
         new Headers(init?.headers).get('authorization') ?? ''
@@ -1204,6 +1278,7 @@ describe('scoped maintenance rotation recovery', () => {
         reports.push(recordVersion)
       }
       const originalRequest = globalThis.fetch
+      currentScope().assertOpen()
       globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
         const requestBody = typeof init?.body === 'string' ? init.body : ''
         if (
@@ -1297,6 +1372,7 @@ describe('scoped maintenance rotation recovery', () => {
         reports.push(recordVersion)
       }
       const originalRequest = globalThis.fetch
+      currentScope().assertOpen()
       globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
         const url = extractUrl(input as string | URL | Request)
         const authorization =
@@ -1367,6 +1443,7 @@ test.serial(
       reports.push(recordVersion)
     }
     const originalRequest = globalThis.fetch
+    currentScope().assertOpen()
     globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
       const url = extractUrl(input as string | URL | Request)
       const authorization =

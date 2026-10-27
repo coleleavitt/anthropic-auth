@@ -1,4 +1,8 @@
 import { describe, expect, mock, test } from 'bun:test'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   QUOTA_URL as CORE_QUOTA_URL,
   TOKEN_URL as CORE_TOKEN_URL,
@@ -607,5 +611,69 @@ describe('test network guard', () => {
     await expect(globalThis.fetch(MESSAGES_URL)).rejects.toThrow(
       `Blocked non-loopback fetch to ${MESSAGES_URL}; stub globalThis.fetch in the test`,
     )
+  })
+
+  // Once one afterEach hook times out, Bun skips the remaining afterEach hooks
+  // for that test, including setup.ts's own leak check. Run two files in a
+  // child `bun test`, so the timed-out hook cannot disturb this process, and
+  // check that the next file starts with the real fetch guard and clock.
+  test('stops a fetch mock and fake clock left by a timed-out teardown from reaching the next file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'setup-leak-guard-'))
+    try {
+      await writeFile(
+        join(dir, '1-leaks.test.ts'),
+        `import { afterEach, test } from 'bun:test'
+// Never settles, so Bun times this hook out and skips setup.ts's afterEach.
+afterEach(() => new Promise(() => {}))
+test('leaves a fetch mock and a fake clock behind', () => {
+  globalThis.fetch = Object.assign(() => Promise.reject(new Error('leaked mock')), { preconnect() {} }) as unknown as typeof fetch
+  Date.now = () => 1
+})
+`,
+      )
+      await writeFile(
+        join(dir, '2-next.test.ts'),
+        `import { expect, test } from 'bun:test'
+test('first test of the next file', () => {})
+test('later tests see the real fetch guard and clock', async () => {
+  expect(Date.now()).toBeGreaterThan(1)
+  await expect(fetch('https://example.invalid/')).rejects.toThrow('Blocked non-loopback fetch')
+})
+`,
+      )
+      const preload = (name: string) =>
+        fileURLToPath(new URL(`./${name}`, import.meta.url))
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          'test',
+          '--timeout',
+          '500',
+          '--preload',
+          preload('preload-sandbox.ts'),
+          '--preload',
+          preload('setup.ts'),
+          './1-leaks.test.ts',
+          './2-next.test.ts',
+        ],
+        { cwd: dir, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+      )
+      const [stdout, stderr] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ])
+      const output = `${stdout}${stderr}`
+      expect(output).toContain(
+        '(fail) leaves a fetch mock and a fake clock behind',
+      )
+      expect(output).toContain('a fetch mock and a fake Date.now from')
+      expect(output).toContain('(fail) first test of the next file')
+      expect(output).toContain(
+        '(pass) later tests see the real fetch guard and clock',
+      )
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
