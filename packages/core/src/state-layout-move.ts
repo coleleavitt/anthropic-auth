@@ -1350,13 +1350,26 @@ export async function moveDataset(
   }
 }
 
+/**
+ * Flush `<sub>/layout.json` and `<sub>`. A process that died after renaming
+ * a new record into place but before flushing `<sub>` leaves a record that
+ * power loss can still revert, so a process that acts on a record it found
+ * makes it durable first.
+ */
+export async function syncLayoutRecord(
+  dataset: Pick<RelocationDataset, 'sub'>,
+  ctx: Pick<StateLayoutTransitionContext, 'fs'>,
+): Promise<void> {
+  await (ctx.fs.syncFile ?? syncFile)(layoutRecordPath(dataset.sub))
+  await ctx.fs.syncDirectory(dataset.sub)
+}
+
 /** Flush a committed record and `<sub>`. */
 export async function syncCommitted(
   dataset: RelocationDataset,
   ctx: Pick<StateLayoutTransitionContext, 'fs'>,
 ): Promise<void> {
-  await syncFile(layoutRecordPath(dataset.sub))
-  await ctx.fs.syncDirectory(dataset.sub)
+  await syncLayoutRecord(dataset, ctx)
 }
 
 /**

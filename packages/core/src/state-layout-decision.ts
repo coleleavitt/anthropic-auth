@@ -91,6 +91,7 @@ import {
 import {
   discardAbandonedRestore,
   finishRestoreRetirement,
+  syncObservedRestoreRecord,
 } from './state-layout-restore.ts'
 
 const ACCOUNT_FILE = 'anthropic-auth.json'
@@ -948,7 +949,11 @@ async function underLayoutLock(
     await acquireHolderLocks(dataset, ctx)
     if (record.phase === 'restoring')
       await discardAbandonedRestore(record, dataset, ctx)
-    else await finishRestoreRetirement(record, dataset, ctx)
+    else {
+      // State-folder copies are retired only once `restored` is durable.
+      await syncObservedRestoreRecord(dataset, ctx)
+      await finishRestoreRetirement(record, dataset, ctx)
+    }
     return 'again'
   }
   if (record?.phase === 'committed') {

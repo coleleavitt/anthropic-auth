@@ -35,6 +35,8 @@ export interface StateLayoutFs {
    * metadata changes in the order they were made.
    */
   syncDirectory(dir: string): Promise<void>
+  /** Flush a file's bytes to disk. Defaults to `syncFile`. */
+  syncFile?: (path: string) => Promise<void>
   /**
    * Create a file owner-only and exclusively with `bytes`, flushed. Defaults
    * to `writeOwnerOnlyExclusive` for `platform`.
@@ -84,6 +86,7 @@ export function defaultStateLayoutFs(
     unlink: unlinkFile,
     syncDirectory: (dir) =>
       platform === 'win32' ? Promise.resolve() : syncDirectoryPosix(dir),
+    syncFile,
   }
 }
 

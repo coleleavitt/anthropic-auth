@@ -125,6 +125,7 @@ import {
   type StateLayoutStep,
   type StateLayoutTransitionContext,
   stateLayoutStep,
+  syncLayoutRecord,
   tombstoneAttempt,
 } from './state-layout-move.ts'
 import {
@@ -287,6 +288,31 @@ async function holderProblems(
       )
   }
   return problems
+}
+
+/**
+ * Make the record this run found durable, under the locks, before acting on
+ * it. The run that published it may have died after renaming it into place
+ * but before flushing `<sub>`: R3 or R5 acting on a record that power loss
+ * can still revert would leave legacy names or state-folder copies changed
+ * under an older phase, whose recovery goes the other way.
+ */
+export async function syncObservedRestoreRecord(
+  dataset: RelocationDataset,
+  ctx: StateLayoutTransitionContext,
+): Promise<void> {
+  try {
+    await syncLayoutRecord(dataset, ctx)
+  } catch (error) {
+    if (error instanceof StateLayoutCrash) throw error
+    const path = layoutRecordPath(dataset.sub)
+    throw new StateLayoutRefusalError(
+      'unsafe',
+      `anthropic-auth could not make ${path} durable, so it won't finish restoring its state; run ${RESTORE_LEGACY_COMMAND} again.`,
+      [path],
+      error,
+    )
+  }
 }
 
 /**
@@ -917,6 +943,8 @@ export async function restoreLegacyLayout(
           result = await startRestore(record, dataset, ctx, options)
           break
         case 'restore-staged': {
+          // R3 renames legacy names only once the boundary is durable.
+          await syncObservedRestoreRecord(dataset, ctx)
           const problems = await holderProblems(
             join(dataset.sub, HOLDER_FILE_NAME),
             options.liveness,
@@ -931,6 +959,8 @@ export async function restoreLegacyLayout(
           break
         }
         default:
+          // R5 retires state-folder copies only once `restored` is durable.
+          await syncObservedRestoreRecord(dataset, ctx)
           result = await finishRestoreRetirement(record, dataset, ctx)
       }
       return {

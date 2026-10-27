@@ -33,7 +33,11 @@ import {
   RELOCATION_MOVE_DISABLED_REASON,
   type StateLayoutDecision,
 } from '../state-layout-decision.ts'
-import { defaultStateLayoutFs, type StateLayoutFs } from '../state-layout-io.ts'
+import {
+  defaultStateLayoutFs,
+  type StateLayoutFs,
+  syncFile,
+} from '../state-layout-io.ts'
 import {
   resolveRelocationDataset,
   StateLayoutCrash,
@@ -712,3 +716,108 @@ test('a staging file changed after it was staged is never put in place: the reru
   })
   expect(await configTree(m)).toEqual(before)
 })
+
+/**
+ * A filesystem that runs every call for real and records, in order, each
+ * rename and unlink by its target and each flush of a file or folder.
+ */
+function recordingFs(): { fs: StateLayoutFs; events: string[] } {
+  const base = defaultStateLayoutFs()
+  const events: string[] = []
+  return {
+    events,
+    fs: {
+      ...base,
+      rename: async (from, to) => {
+        await base.rename(from, to)
+        events.push(`rename ${to}`)
+      },
+      unlink: async (path) => {
+        await base.unlink(path)
+        events.push(`unlink ${path}`)
+      },
+      syncDirectory: async (dir) => {
+        await base.syncDirectory(dir)
+        events.push(`sync-dir ${dir}`)
+      },
+      syncFile: async (path) => {
+        await syncFile(path)
+        events.push(`sync-file ${path}`)
+      },
+    },
+  }
+}
+
+/**
+ * A process that dies right after renaming a `phase` record into place,
+ * before it flushes `<sub>`: the rename stands, its flush never runs, so
+ * power loss could still take the record back to the phase before.
+ */
+function crashBeforeRecordFlush(
+  m: Machine,
+  phase: 'restore-staged' | 'restored',
+): StateLayoutFs {
+  const base = defaultStateLayoutFs()
+  let published = false
+  return {
+    ...base,
+    rename: async (from, to) => {
+      await base.rename(from, to)
+      if (
+        to === join(m.sub, 'layout.json') &&
+        (await readStateLayoutRecord(m.sub))?.phase === phase
+      )
+        published = true
+    },
+    syncDirectory: async (dir) => {
+      if (published && dir === m.sub)
+        throw new StateLayoutCrash(
+          phase === 'restore-staged'
+            ? 'restore:staged-written'
+            : 'restore:restored-written',
+        )
+      await base.syncDirectory(dir)
+    },
+  }
+}
+
+for (const variant of [
+  { phase: 'restore-staged', by: 'the command' },
+  { phase: 'restored', by: 'the command' },
+  { phase: 'restored', by: 'a start' },
+] as const)
+  test(`recovery by ${variant.by} flushes a ${variant.phase} record it found before it changes anything that record allows`, async () => {
+    const { m, before } = await moved()
+    await expect(
+      restore(m, { fs: crashBeforeRecordFlush(m, variant.phase) }),
+    ).rejects.toBeInstanceOf(StateLayoutCrash)
+    expect((await readStateLayoutRecord(m.sub))?.phase).toBe(variant.phase)
+    const { fs, events } = recordingFs()
+    if (variant.by === 'the command')
+      expect((await restore(m, { fs })).status).toBe('restored')
+    else {
+      // A live older version keeps the start from moving the dataset again
+      // once the retirement is done.
+      const cacheKeep = m.artifacts.cacheKeepDirs[0] as string
+      await mkdir(cacheKeep, { recursive: true })
+      await writeFile(
+        join(cacheKeep, '424242-older.json'),
+        JSON.stringify({ version: 1, updatedAt: 1, sessions: [] }),
+      )
+      expect((await decide(m, { fs })).kind).toBe('legacy')
+    }
+    // R3 renames into the config folder; R5 unlinks in the state folder.
+    const changes =
+      variant.phase === 'restore-staged'
+        ? new RegExp(`^(rename|unlink) ${m.configDir}/`)
+        : new RegExp(`^unlink ${m.sub}/`)
+    const first = events.findIndex((event) => changes.test(event))
+    expect(first).toBeGreaterThan(0)
+    const flushed = events.slice(0, first)
+    expect(flushed).toContain(`sync-file ${join(m.sub, 'layout.json')}`)
+    expect(flushed).toContain(`sync-dir ${m.sub}`)
+    // Nothing replaced the record between its flush and the first change.
+    expect(flushed).not.toContain(`rename ${join(m.sub, 'layout.json')}`)
+    expect(await configTree(m)).toEqual(before)
+    expect((await readStateLayoutRecord(m.sub))?.restore?.cleanup).toBe('done')
+  })
