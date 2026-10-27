@@ -382,7 +382,7 @@ function getPlugin(
   client?: ReturnType<typeof createMockClient>,
   directory?: string,
   runtimeOverrides: PluginRuntimeOverrides = {},
-) {
+): any {
   return getPluginWithCtx(testContext, client, directory, runtimeOverrides)
 }
 function setupExpiredTokenLoader(...issuedAccess: string[]) {

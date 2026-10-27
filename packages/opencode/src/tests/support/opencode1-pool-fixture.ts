@@ -23,7 +23,7 @@ import { AnthropicAuthPlugin } from '../../index'
 import { migrateNativeOpencodeFixture } from '../native-fixture.ts'
 import { getPluginTestHandles } from '../plugin-test-handles'
 import { extractUrl } from '../test-fetch'
-import { createMockClient } from './opencode1-client.ts'
+import { createMockClient, type TestPlugin } from './opencode1-client.ts'
 import {
   getBodyLifetime,
   type MigratedPool,
@@ -1078,7 +1078,7 @@ export async function getPlugin(
     },
   )
   ctx.testLifetime?.trackDetached(creation)
-  const plugin = (await creation) as any
+  const plugin = (await creation) as TestPlugin
   ctx.livePlugins.add(plugin)
   ctx.fallbackRefreshes.add(getPluginTestHandles(plugin).fallbackRefreshReady)
   const pool = ctx.migratedPool

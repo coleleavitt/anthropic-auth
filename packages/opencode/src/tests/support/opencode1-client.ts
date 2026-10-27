@@ -11,6 +11,43 @@ import {
   type Opencode1TestContext,
 } from './opencode1-test-context.ts'
 
+export type TestPlugin = {
+  auth: {
+    loader: (
+      hostGetAuth: () => Promise<Record<string, unknown>>,
+      provider: unknown,
+    ) => Promise<{ fetch: typeof fetch }>
+    methods: Array<{
+      label: string
+      type: string
+      authorize?: (...args: unknown[]) => unknown
+      provider?: string
+    }>
+    provider: string
+  }
+  provider?: {
+    id: string
+    models?: (...args: unknown[]) => unknown
+  }
+  event: (event: unknown) => Promise<unknown> | unknown
+  dispose?: () => unknown
+  'command.execute.before': (input: {
+    command: string
+    arguments: string
+    sessionID: string
+  }) => Promise<unknown>
+  'chat.headers': (input: unknown, output: unknown) => Promise<unknown>
+  'chat.message': (input: unknown, output: unknown) => Promise<unknown>
+  'experimental.chat.system.transform': (
+    input: unknown,
+    output: unknown,
+  ) => Promise<unknown>
+  'experimental.chat.messages.transform': (
+    input: unknown,
+    output: unknown,
+  ) => Promise<unknown>
+}
+
 // Minimal mock of the OpenCode plugin client
 export function createMockClient(
   messages?: unknown[],
@@ -72,7 +109,7 @@ export function latestIgnoredReply(
 }
 
 /** Open /claude for a TUI-connected session and return the menu payload. */
-export async function openClaudeMenu(plugin: any, sessionId: string) {
+export async function openClaudeMenu(plugin: TestPlugin, sessionId: string) {
   // The TUI polls its session's notifications; the plugin treats a recent
   // poll as a connected TUI, so draining here makes the session interactive.
   drainNotifications(0, sessionId)
@@ -97,7 +134,7 @@ export async function openClaudeMenu(plugin: any, sessionId: string) {
  */
 export async function applyMenuAction(
   ctx: Opencode1TestContext,
-  plugin: any,
+  plugin: TestPlugin,
   sessionId: string,
   request: Omit<CommandApplyRequest, 'command' | 'sessionId'>,
 ): Promise<CommandApplyResult> {

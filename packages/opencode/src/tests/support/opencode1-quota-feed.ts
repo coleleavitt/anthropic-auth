@@ -29,7 +29,8 @@ import {
 } from './opencode1-test-context.ts'
 
 export async function readFeedEntries() {
-  const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
+  const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
+  if (!directory) return []
   try {
     // The producer writes a complete .tmp before renaming it into a committed
     // .json lease. Match the real consumer: transient files are not published.
@@ -188,8 +189,10 @@ export async function expectNonOatMainRefused(
   ).rejects.toThrow(/API key/i)
   expect(modelRequests).toEqual([])
   expect(await readFeedEntries()).toEqual([])
+  const pool = ctx.migratedPool
+  if (!pool) throw new Error('Expected migrated pool for non-OAT refusal check')
   const runtime = createNativeAccountRuntime({
-    paths: ctx.migratedPool?.paths,
+    paths: pool.paths,
     host: 'opencode',
   })
   try {

@@ -88,10 +88,14 @@ export async function readAccountStorage(
   ctx: Opencode1TestContext,
 ): Promise<AccountStorage | null> {
   const pool = ctx.migratedPool
-  if (!pool)
-    return readLegacyJson<AccountStorage>(
-      process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-    )
+  if (!pool) {
+    const file = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    if (!file)
+      throw new Error(
+        'Missing OPENCODE_ANTHROPIC_AUTH_FILE for unmigrated storage read',
+      )
+    return readLegacyJson<AccountStorage>(file)
+  }
   const runtime = createNativeAccountRuntime({
     paths: pool.paths,
     host: 'opencode',
