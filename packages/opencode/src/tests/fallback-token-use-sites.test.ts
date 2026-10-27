@@ -94,10 +94,10 @@ async function disposeAll(plugins: PluginHooks[], message: string) {
 }
 
 /**
- * Claim a fresh owner-only directory for this body. Teardown first disposes
- * the body's plugins and waits for sidebar writes, then restores fetch, the
- * clock, the environment and the process-wide caches, and only then removes
- * the directory.
+ * Claim a fresh owner-only directory for this body. Teardown restores
+ * fetch, the clock and the environment first, so a slow plugin disposal
+ * cannot leak them into later tests, then disposes the body's plugins and
+ * waits for sidebar writes, and only then removes the directory.
  */
 async function startBody(prefix: string) {
   const savedFetch = globalThis.fetch
@@ -109,17 +109,22 @@ async function startBody(prefix: string) {
     const remaining = [...plugins]
     plugins.clear()
     livePlugins.delete(plugins)
+    // Restore the process-global doubles before awaiting disposal. Disposal
+    // waits on real plugin I/O, so on a slow runner disposal can exceed the
+    // teardown hook's timeout; a fetch mock or frozen clock left behind would poison every
+    // test file that runs after this one in the same process. Restoring
+    // first means a slow teardown fails only its own test.
+    globalThis.fetch = savedFetch
+    Date.now = savedNow
+    for (const key of fixtureEnvKeys) {
+      const value = savedEnv.get(key)
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
     try {
       await disposeAll(remaining, 'Fallback census plugin cleanup failed')
     } finally {
       await drainSidebarWrites()
-      globalThis.fetch = savedFetch
-      Date.now = savedNow
-      for (const key of fixtureEnvKeys) {
-        const value = savedEnv.get(key)
-        if (value === undefined) delete process.env[key]
-        else process.env[key] = value
-      }
       resetCache1hState()
       resetClaudeCodeIdentityCachesForTest()
     }
