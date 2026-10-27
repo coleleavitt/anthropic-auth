@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { readFileSync, writeFileSync } from 'node:fs'
 import {
   appendFile,
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -1356,6 +1357,48 @@ test('stores this process opened on the dataset are drained before a move', asyn
   expect(await drainNativePoolStores([m.oldPaths.state])).toBe(1)
   expect(await drainNativePoolStores([m.oldPaths.state])).toBe(0)
   await store.close()
+})
+
+test('an ordinary explicit start refuses when its registration fails: a malformed holder file, a held holder lock, an unwritable folder', async () => {
+  for (const failure of ['malformed', 'lock', 'unwritable'] as const) {
+    const m = await machine()
+    const dir = join(m.root, 'custom')
+    await mkdir(dir)
+    const holderFile = join(dir, HOLDER_FILE_NAME)
+    const env = {
+      ...m.env,
+      OPENCODE_ANTHROPIC_AUTH_FILE: join(dir, 'anthropic-auth.json'),
+    }
+    const start = () =>
+      decide(m, {
+        env,
+        timeouts: { layoutMs: 300, holderMs: 300, dataMs: 300 },
+      })
+    let result: Promise<StateLayoutDecision>
+    if (failure === 'malformed') {
+      await writeFile(holderFile, '{not json')
+      result = start()
+    } else if (failure === 'lock') {
+      result = withLock(
+        holderFile,
+        { name: 'holders', ttlMs: 10_000, timeoutMs: 1_000, renew: true },
+        start,
+      )
+    } else {
+      await chmod(dir, 0o500)
+      result = start().finally(() => chmod(dir, 0o700))
+    }
+    await expect(result).rejects.toBeInstanceOf(HolderRegistrationError)
+    await expect(result).rejects.toMatchObject({
+      code:
+        failure === 'malformed'
+          ? 'malformed'
+          : failure === 'lock'
+            ? 'lock-timeout'
+            : 'unavailable',
+      directory: dir,
+    })
+  }
 })
 
 test('an override into the moved state folder refuses at start', async () => {

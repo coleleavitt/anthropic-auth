@@ -422,6 +422,9 @@ export async function decideOpenCodeStateLayout(
       paths,
       role: options.role,
       kind: 'explicit',
+      // Every registration this release makes must succeed, whatever the
+      // folder looks like.
+      policy: 'mandatory',
       onLockEvent: options.onLockEvent,
       liveness: options.liveness,
       lockTimeoutMs: options.timeouts?.holderMs,
@@ -441,6 +444,7 @@ export async function decideOpenCodeStateLayout(
       paths,
       role: options.role,
       kind: 'legacy',
+      policy: 'mandatory',
       onLockEvent: options.onLockEvent,
       liveness: options.liveness,
       lockTimeoutMs: options.timeouts?.holderMs,

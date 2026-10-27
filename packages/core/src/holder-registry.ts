@@ -431,6 +431,16 @@ export interface RegisterNativePoolHolderOptions {
   retryIntervalMs?: number
   liveness?: HolderLiveness
   now?: () => number
+  /**
+   * `mandatory`: the entry is published in every holder file before the
+   * process serves, even before any dataset file exists there, and any
+   * failure to publish refuses with `HolderRegistrationError`. A release that
+   * decides the state layout at start passes it on every path. Without it,
+   * release N's rule applies: only an `explicit` or `pi` dataset with a file
+   * in a destination-shaped folder must be registered, and every other
+   * failure is retried in the background.
+   */
+  policy?: 'mandatory'
 }
 
 /** The outcome of a registration that did not refuse. */
@@ -598,7 +608,9 @@ async function buildEntry(
  * dataset lies in a folder anthropic-auth manages (`HolderRegistrationError`
  * with `managed-folder`).
  *
- * A failed write is handled by kind:
+ * A failed write is handled by `options.policy`. With `mandatory` the call
+ * throws `HolderRegistrationError` and the process must not serve. Without
+ * it, by kind:
  * - An `explicit` or `pi` dataset with a file in a destination-shaped folder
  *   (see `isDestinationShapedDirectory`) must be registered there, so the
  *   call throws `HolderRegistrationError` and the process must not serve it.
@@ -629,7 +641,8 @@ export async function registerNativePoolHolder(
       if (await isManagedDirectory(dir))
         throw new HolderRegistrationError('managed-folder', dir)
   const mandatory =
-    entry.kind !== 'legacy' && dirs.some(isDestinationShapedDirectory)
+    options.policy === 'mandatory' ||
+    (entry.kind !== 'legacy' && dirs.some(isDestinationShapedDirectory))
 
   /** Publish in every holder file not yet published; true when all are. */
   const attempt = async (): Promise<boolean> => {
