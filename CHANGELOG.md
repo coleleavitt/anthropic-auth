@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- The sidebar no longer says 'out in now' for a quota window that is already used up; it says the window is used up until its reset.
 - OpenCode: a turn is no longer refused with 'Mismatched … effort anchor token' when another plugin puts back an earlier effort marker that gives exactly the same efforts. Effort-marker errors no longer name Fable 5.1 on Opus 5.5 and Sonnet 5.5 requests.
 
 ## 2.4.0
