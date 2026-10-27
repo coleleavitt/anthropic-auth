@@ -143,6 +143,19 @@ function attemptId(value: unknown): value is string {
   )
 }
 
+/**
+ * Whether `name` is exactly the name a move sets the journal named
+ * `journalName` aside under: `<journalName>.moving-<attempt>`, with a valid
+ * attempt id and nothing after it.
+ */
+export function isMovingJournalName(
+  journalName: string,
+  name: string,
+): boolean {
+  const prefix = `${journalName}.moving-`
+  return name.startsWith(prefix) && attemptId(name.slice(prefix.length))
+}
+
 function parseRecord(value: unknown): StateLayoutRecord | undefined {
   if (!isRecord(value) || value.version !== 1) return undefined
   const {

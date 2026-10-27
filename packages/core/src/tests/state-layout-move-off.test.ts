@@ -608,3 +608,99 @@ test("a serving guard that can't look at the old folder refuses with the fixed t
   expectIoRefusal(direct, m)
   expect(await guard.check()).toBeUndefined()
 })
+
+/** The state folder's record can't be parsed, so any strict start refuses. */
+async function corruptRecord(m: Machine) {
+  await mkdir(stateSub(m), { recursive: true })
+  await writeFile(join(stateSub(m), 'layout.json'), '{ not json')
+}
+
+test('moving off: a leftover that only looks like a set-aside journal does not stop a legacy start', async () => {
+  for (const suffix of [
+    'backup',
+    '00000000-0000-4000-8000-000000000000.bak',
+    '00000000-0000-4000-8000-00000000000',
+  ]) {
+    const m = await machine()
+    await writeFile(`${m.legacy.journal}.moving-${suffix}`, '{}\n')
+    await corruptRecord(m)
+    const decision = await decide(m, { moveEnabled: false })
+    expect({ suffix, kind: decision.kind }).toEqual({ suffix, kind: 'legacy' })
+  }
+})
+
+/**
+ * Make the config folder searchable and writable but not listable, as a
+ * person may: every file in it can still be opened by name, so 2.4.x serves
+ * it. Returns a function that makes it listable again.
+ */
+async function unlistable(m: Machine) {
+  await chmod(m.configDir, 0o300)
+  return () => chmod(m.configDir, 0o700)
+}
+
+test('moving off: a config folder that can be searched but not listed serves legacy, journal-less vault-only datasets included', async () => {
+  for (const dataset of ['local', 'vault-only'] as const) {
+    const m = await machine()
+    if (dataset === 'vault-only') {
+      // Only the vault runtime: no local runtime and no journal.
+      await rm(m.legacy.runtime)
+      await writeFile(
+        join(m.configDir, 'anthropic-auth-vault-state.json'),
+        '{"version":1}\n',
+        { mode: 0o600 },
+      )
+    }
+    await corruptRecord(m)
+    for (const listable of [true, false]) {
+      const repair = listable ? async () => {} : await unlistable(m)
+      try {
+        const decision = await decide(m, { moveEnabled: false })
+        expect({ dataset, listable, kind: decision.kind }).toEqual({
+          dataset,
+          listable,
+          kind: 'legacy',
+        })
+        if (decision.kind === 'legacy' && decision.registration)
+          closers.push(decision.registration)
+      } finally {
+        await repair()
+      }
+    }
+  }
+})
+
+test('moving off: a journal a move set aside keeps the strict checks when the config folder can not be listed', async () => {
+  const m = await machine()
+  // A move that stopped right after setting the journal aside: a preparing
+  // record that says so, the set-aside journal, and no tombstone yet.
+  await decide(m, {
+    moveEnabled: true,
+    onStep: (step) => {
+      if (step === 'journal-set-aside') throw new StateLayoutCrash(step)
+    },
+  }).catch((error: unknown) => {
+    if (!(error instanceof StateLayoutCrash)) throw error
+  })
+  const layout = join(stateSub(m), 'layout.json')
+  const record = JSON.parse(await readFile(layout, 'utf8'))
+  expect(record.phase).toBe('preparing')
+  // This machine has no journal to set aside; record one as a move with a
+  // journal does.
+  record.barriers.journal = 'present'
+  for (const file of record.files)
+    if (file.role === 'journal') file.sha256 = 'a'.repeat(64)
+  await writeFile(layout, JSON.stringify(record))
+  await writeFile(`${m.legacy.journal}.moving-${record.attempt}`, '{}\n')
+  // The state folder's other marker can't be read, so the strict checks
+  // refuse; serving legacy would mean they never ran.
+  await rm(join(stateSub(m), 'config-dir.json'))
+  await mkdir(join(stateSub(m), 'config-dir.json'))
+  const repair = await unlistable(m)
+  const error = await decide(m, { moveEnabled: false }).then(
+    () => undefined,
+    (caught: unknown) => caught,
+  )
+  await repair()
+  expectFixedRefusal(error, m)
+})

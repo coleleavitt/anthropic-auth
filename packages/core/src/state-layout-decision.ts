@@ -87,7 +87,9 @@ import {
   stateHomeTargetFor,
 } from './state-layout-paths.ts'
 import {
+  isMovingJournalName,
   layoutRecordPath,
+  movingJournalPath,
   readStateLayoutRecord,
   type StateLayoutRecord,
 } from './state-layout-record.ts'
@@ -572,23 +574,65 @@ async function legacyHeld(
  * tombstones before it commits, and a restore removes them only once the
  * legacy files are back, so without either the config folder's copy is the
  * only one any process may serve, whatever the state folder holds.
+ *
+ * Only a file named exactly `<journal>.moving-<attempt>`, with a valid
+ * attempt id, is a set-aside journal; other leftovers are not. A folder that
+ * can't be listed but can be searched (so 2.4.x serves it) shows no move by
+ * that alone: `recordedMovingJournal` names the one file a recorded move
+ * could have set aside, and only that file is looked for.
  */
-async function oldFolderTransition(old: LegacyDatasetFiles): Promise<boolean> {
+async function oldFolderTransition(
+  old: LegacyDatasetFiles,
+  recordedMovingJournal: () => Promise<string | undefined>,
+): Promise<boolean> {
   for (const runtime of [old.oldPaths.runtime, old.oldVault.runtime])
     if (await readPointer(runtime)) return true
   // Only a journal that is absent can have been set aside.
   const journal = old.oldPaths.journal
-  let names: string[]
   try {
     if (await exists(journal)) return false
+  } catch {
+    // Whether the journal is there is unknown: let the full decision look.
+    return true
+  }
+  let names: string[]
+  try {
     names = await readdir(dirname(journal))
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false
-    // What the folder holds is unknown: let the full decision look.
-    return true
+    const moving = await recordedMovingJournal()
+    if (moving === undefined) return false
+    try {
+      return await exists(moving)
+    } catch {
+      return false
+    }
   }
-  const prefix = `${basename(journal)}.moving-`
-  return names.some((name) => name.startsWith(prefix))
+  return names.some((name) => isMovingJournalName(basename(journal), name))
+}
+
+/**
+ * The set-aside journal that the state folder's record of a move names, if
+ * the record says the move set the journal aside. Best-effort: when the
+ * state folder can't be named or the record can't be read there is no
+ * evidence of a move, and undefined is returned.
+ */
+async function recordedMovingJournal(
+  journal: string,
+  identity: string,
+  options: DecideStateLayoutOptions,
+): Promise<string | undefined> {
+  try {
+    const target = stateHomeTargetFor(identity, {
+      env: options.env ?? process.env,
+      home: options.home ?? homedir(),
+    })
+    const record = await readStateLayoutRecord(await canonicalPath(target.dir))
+    if (record?.barriers.journal !== 'present') return undefined
+    return movingJournalPath(journal, record.attempt)
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -625,7 +669,9 @@ async function legacyWhileMoveOff(
       error,
     )
   }
-  if (await oldFolderTransition(old)) return undefined
+  const recorded = () =>
+    recordedMovingJournal(old.oldPaths.journal, identity, options)
+  if (await oldFolderTransition(old, recorded)) return undefined
   try {
     await stateLayoutStep(ctx, 'old-holders-locking')
     let lockFailure: { error: unknown } | undefined
@@ -640,7 +686,7 @@ async function legacyWhileMoveOff(
     } catch (error) {
       lockFailure = { error }
     }
-    if (await oldFolderTransition(old)) return undefined
+    if (await oldFolderTransition(old, recorded)) return undefined
     const registration = lockFailure
       ? deferLegacyRegistration(
           old.oldPaths,
