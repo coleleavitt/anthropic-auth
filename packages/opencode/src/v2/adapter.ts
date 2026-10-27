@@ -33,6 +33,7 @@ import {
   remapRequestBodyModel,
   setDumpEnabled as setDumpEnabledCore,
   stateRefusalCause,
+  stateRefusalPublicMessage,
   stripEmptyTrailingAssistantMessages,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
@@ -525,12 +526,14 @@ export class NativeAnthropicStateRefusal extends Error {
   readonly providerID = ANTHROPIC_PROVIDER_ID
 
   constructor(cause: NonNullable<ReturnType<typeof stateRefusalCause>>) {
-    super(cause.message, { cause })
+    // A layout refusal's own message names files; show its fixed text.
+    super(stateRefusalPublicMessage(cause) ?? cause.message, { cause })
     this.name = 'NativeAnthropicStateRefusal'
   }
 }
 
-function stateRefusalFrom(error: unknown) {
+/** The refusal behind `error` as the adapter reports it, if there is one. */
+export function stateRefusalFrom(error: unknown) {
   const cause = stateRefusalCause(error)
   return cause ? new NativeAnthropicStateRefusal(cause) : undefined
 }

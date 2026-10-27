@@ -1,18 +1,21 @@
 import {
+  assertHostsStopped,
   createProcessFence,
+  decideOpenCodeStateLayoutOnce,
+  decidePiStateLayout,
   type NativeHolderRegistration,
   NativePiAuthSlotError,
-  openCodeHolderKind,
   openNativePiAuthSlot,
   publishNativeEmptyInit,
   readNativeEnrollmentMode,
-  registerNativePoolHolder,
   releaseNativeMigrationPreflight,
   requireNoSupervisedAuthContentSnapshot,
+  restoreLegacyLayout,
   runSetup,
   type SetupCallbackContext,
   type SetupIO,
   type SetupPlugin,
+  StateLayoutRefusalError,
   setupUsage,
 } from '@cortexkit/anthropic-auth-core'
 import { confirm } from '@cortexkit/common-auth/auth-menu'
@@ -56,13 +59,20 @@ import {
   OPENCODE_PACKAGE_NAME,
   PI_PACKAGE_NAME,
 } from './paths.ts'
-import { type HarnessKind, SetupRefusal, setupRefusalMessage } from './types.ts'
+import {
+  type HarnessKind,
+  SetupRefusal,
+  setupProcessInspectionMessage,
+  setupRefusalMessage,
+} from './types.ts'
 
 export interface SetupCommandOptions extends SetupIO {
   migrateLocal?: typeof migrateNativeLocalForHost
   localLogin?: typeof loginNativeOffline
   vaultPreflight?: typeof preflightNativeVaultForHost
   vaultActivate?: typeof completeNativeVaultActivation
+  /** Replaces the restore of the legacy layout; tests only. */
+  restoreLegacy?: typeof restoreLegacyLayout
 }
 
 const OPENCODE_VAULT_LOGIN_WARNING =
@@ -72,6 +82,7 @@ const OPENCODE_VAULT_LOGIN_WARNING =
 const SETUP_COMMAND = 'npx @cortexkit/opencode-anthropic-auth setup'
 
 const REMOVE_PI_AUTH = '--remove-pi-auth'
+const RESTORE_LEGACY = '--restore-legacy'
 const YES_ALIAS = '-y'
 const HELP_FLAGS = ['--help', '-h']
 
@@ -86,6 +97,11 @@ const COMMAND_FLAGS: ReadonlyArray<{ label: string; description: string }> = [
     label: REMOVE_PI_AUTH,
     description:
       'Agree in advance to move a stored Pi Anthropic login out of the way: into the local account pool, or aside privately for vault use (restored on disconnect).',
+  },
+  {
+    label: RESTORE_LEGACY,
+    description:
+      "Move anthropic-auth's state from the CortexKit state folder back into OpenCode's config folder, for example before going back to an older version. Close every OpenCode, OpenCode 2 server and Pi first. Use it on its own.",
   },
   { label: YES_ALIAS, description: 'Same as --yes.' },
   { label: HELP_FLAGS.join(', '), description: 'Show this help.' },
@@ -136,6 +152,8 @@ export async function runSetupCommand(
     print(setupHelpText())
     return 0
   }
+  if (argv.includes(RESTORE_LEGACY))
+    return runRestoreLegacy(argv, options, env, print)
   const args = argv
     .filter((arg) => arg !== REMOVE_PI_AUTH)
     .map((arg) => (arg === YES_ALIAS ? '--yes' : arg))
@@ -255,18 +273,30 @@ export async function runSetupCommand(
       phase = context.mode === 'claustrum' ? 'setup-activation' : 'cli-setup'
       if (!classified) {
         requireNoSupervisedAuthContentSnapshot(env)
+        // Decide where OpenCode's account state is before resolving any of
+        // its paths; every later resolution in this process uses the same
+        // answer. The decision also records that setup uses those files, so a
+        // later version never moves them while setup runs.
+        if (context.hosts.includes('opencode')) {
+          const decision = await decideOpenCodeStateLayoutOnce({
+            role: 'setup',
+            env,
+          })
+          if (decision.kind !== 'state-home' && decision.registration)
+            holderRegistrations.push(decision.registration)
+        }
         for (const selected of context.hosts)
           paths.set(selected, await resolveNativeSetupPaths(selected, env))
         await requireDisjointNativeSetupPaths([...paths.values()])
-        // Record that setup uses each host's files before it reads or writes
-        // them, so a later version never moves them while setup runs.
-        for (const selected of context.hosts)
+        // Pi's files never move; setup still records its use of them.
+        if (context.hosts.includes('pi'))
           holderRegistrations.push(
-            await registerNativePoolHolder({
-              paths: hostPlan(paths, selected).paths,
-              role: 'setup',
-              kind: selected === 'pi' ? 'pi' : openCodeHolderKind(env),
-            }),
+            (
+              await decidePiStateLayout({
+                paths: hostPlan(paths, 'pi').paths,
+                role: 'setup',
+              })
+            ).registration,
           )
         if (context.mode === 'claustrum') {
           const files = context.hosts.map((selected) =>
@@ -419,5 +449,61 @@ export async function runSetupCommand(
     for (const registration of holderRegistrations) registration.close()
     for (const plan of local.values())
       if (plan.preflight) releaseNativeMigrationPreflight(plan.preflight)
+  }
+}
+
+/**
+ * `setup --restore-legacy`: move OpenCode's account state from the state
+ * folder back into its config folder, or finish a restore that stopped. It
+ * runs only with every host stopped, behind setup's process fence. A refusal
+ * prints the restore's own message, which names the files to deal with.
+ */
+async function runRestoreLegacy(
+  argv: readonly string[],
+  options: SetupCommandOptions,
+  env: NodeJS.ProcessEnv,
+  print: (text: string) => void,
+): Promise<number> {
+  if (argv.some((arg) => arg !== RESTORE_LEGACY)) {
+    print(`${RESTORE_LEGACY} runs on its own; run it without other options.`)
+    return 1
+  }
+  const runner = options.runner ?? defaultCommandRunner
+  const fence =
+    options.fence ?? createProcessFence(runner, { platform: options.platform })
+  try {
+    await assertHostsStopped(fence, env)
+  } catch (error) {
+    const message =
+      setupProcessInspectionMessage(error) ?? knownFailureMessage(error)
+    print(
+      message ?? (await reportThrownFailure('setup-process-check', error, env)),
+    )
+    return 1
+  }
+  try {
+    const outcome = await (options.restoreLegacy ?? restoreLegacyLayout)({
+      env,
+    })
+    if (outcome.status === 'not-moved') {
+      print(`Nothing to restore: ${outcome.reason}.`)
+      return 0
+    }
+    print(`anthropic-auth's state is back in ${outcome.oldDir}.`)
+    for (const path of outcome.kept)
+      print(
+        `${path} changed after it was copied back and was left in place; delete it once you have checked it.`,
+      )
+    return 0
+  } catch (error) {
+    if (error instanceof StateLayoutRefusalError) {
+      print(error.message)
+      return 1
+    }
+    print(
+      knownFailureMessage(error) ??
+        (await reportThrownFailure('cli-setup', error, env)),
+    )
+    return 1
   }
 }

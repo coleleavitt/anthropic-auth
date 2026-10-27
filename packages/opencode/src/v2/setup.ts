@@ -2,12 +2,14 @@ import {
   acquireNativeAccountRuntime,
   authorize,
   createNativeUi,
+  decideOpenCodeStateLayoutOnce,
   disconnectNativeVaultForHost,
   exchange,
   isDumpPersistentlyEnabled,
   logger,
   type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
+  type NativeHolderRegistration,
   type NativePoolPaths,
   type NativeUiOptions,
   openCodeHolderKind,
@@ -28,6 +30,7 @@ import {
   CLAUDE_POOL_LOGIN_METHOD_LABEL,
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,
 } from './activation'
+import { stateRefusalFrom } from './adapter'
 import { createNativeCacheKeep, type NativeCacheKeepOptions } from './cachekeep'
 import { installNativeAnthropic } from './install'
 import { startNativeAnthropicLifecycle } from './lifecycle'
@@ -207,21 +210,51 @@ export function createAnthropicAuthPlugin(
   }
 }
 
+/**
+ * The pool files this setup serves, and the registration that records its use
+ * of them. Without injected paths, where the files are is decided once per
+ * process before any is resolved: the config folder, or the state folder once
+ * the state has moved there; the decision also registers this process. A
+ * refusal is reported with its fixed text, which names no folder; the log
+ * names them. Injected paths were chosen by the caller and are only
+ * registered.
+ */
+async function decideNativePaths(options: AnthropicAuthV2Options): Promise<{
+  paths: NativePoolPaths
+  holderRegistration: NativeHolderRegistration | undefined
+}> {
+  if (options.paths)
+    return {
+      paths: options.paths,
+      holderRegistration: await registerNativePoolHolder({
+        paths: options.paths,
+        role: 'opencode2',
+        kind: openCodeHolderKind(),
+        onLockEvent: options.local?.onLockEvent,
+      }),
+    }
+  let decision: Awaited<ReturnType<typeof decideOpenCodeStateLayoutOnce>>
+  try {
+    decision = await decideOpenCodeStateLayoutOnce({
+      role: 'opencode2',
+      onLockEvent: options.local?.onLockEvent,
+    })
+  } catch (error) {
+    throw stateRefusalFrom(error) ?? error
+  }
+  return {
+    paths: await resolveNativePoolPaths(undefined, undefined, decision.layout),
+    holderRegistration:
+      decision.kind === 'state-home' ? undefined : decision.registration,
+  }
+}
+
 /** Install request hooks before credential transfer to the shared pool finishes; requests must refuse until that transfer commits, never reuse old host tokens. */
 export async function setupAnthropicAuth(
   ctx: Plugin.Context,
   options: AnthropicAuthV2Options = {},
 ): Promise<Plugin.Cleanup> {
-  const paths = options.paths ?? (await resolveNativePoolPaths())
-  // Record that this process uses these files before any pool I/O, so a
-  // later version never moves them while it runs. This happens once per
-  // plugin setup, never on a request.
-  const holderRegistration = await registerNativePoolHolder({
-    paths,
-    role: 'opencode2',
-    kind: openCodeHolderKind(),
-    onLockEvent: options.local?.onLockEvent,
-  })
+  const { paths, holderRegistration } = await decideNativePaths(options)
   const runtime = acquireNativeAccountRuntime({
     paths,
     host: 'opencode',
@@ -312,7 +345,7 @@ export async function setupAnthropicAuth(
     },
     { credential: preparedAnthropicCredential },
   ).catch(async (error: unknown) => {
-    holderRegistration.close()
+    holderRegistration?.close()
     capabilities.close()
     await cacheKeep?.dispose()
     await source.close()
@@ -324,7 +357,7 @@ export async function setupAnthropicAuth(
   const dispose = () => {
     if (cleanup) return cleanup
     active = false
-    holderRegistration.close()
+    holderRegistration?.close()
     capabilities.close()
     source.close()
     cleanup = (async () => {

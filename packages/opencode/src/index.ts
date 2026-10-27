@@ -49,6 +49,7 @@ import {
   createStickyNoRouteResponse,
   custodyTombstoneOAuth,
   type DumpHandle,
+  decideOpenCodeStateLayoutOnce,
   decideStickyQuotaFailure,
   decodeSseFrame,
   detectClaustrumConnection,
@@ -144,7 +145,6 @@ import {
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
   oauthProfileMatchesIdentity,
-  openCodeHolderKind,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   PrimeManager,
   type PrimeManagerOptions,
@@ -182,7 +182,6 @@ import {
   readNativeHostAuthKind,
   readNativeMigrationJournal,
   refreshBackoffActive,
-  registerNativePoolHolder,
   remapRequestBodyModel,
   resetClaustrumEnrollmentState,
   resolveClaudeModelCapabilities,
@@ -198,6 +197,7 @@ import {
   setLogLevel,
   shouldFallbackStatus,
   snapshotHasServableLocalOAuth,
+  stateRefusalPublicMessage,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
   TrailingAssistantHistoryError,
@@ -1284,16 +1284,30 @@ const anthropicAuthPlugin = async (
     return entry
   }
 
-  const nativePaths = await resolveNativePoolPaths(accountStoragePath)
-  // Record that this process uses these files before any pool I/O, so a
-  // later version never moves them while it runs. This happens once per
-  // plugin start, never on a request.
-  const holderRegistration = await registerNativePoolHolder({
-    paths: nativePaths,
-    role: 'opencode1',
-    kind: openCodeHolderKind(),
-    onLockEvent: runtimeOverrides.nativeLocal?.onLockEvent,
-  })
+  // Decide where this process keeps the account state before any pool path
+  // is resolved: the config folder, or the state folder once it has moved
+  // there. The decision also records that this process uses those files, so
+  // a later version never moves them while it runs. It is made once per
+  // process; a re-initialised plugin gets the same answer without a lock.
+  let stateLayout: Awaited<ReturnType<typeof decideOpenCodeStateLayoutOnce>>
+  try {
+    stateLayout = await decideOpenCodeStateLayoutOnce({
+      role: 'opencode1',
+      onLockEvent: runtimeOverrides.nativeLocal?.onLockEvent,
+    })
+  } catch (error) {
+    // The refusal names no folder on screen; the log line names them.
+    const message = stateRefusalPublicMessage(error)
+    if (message) throw new Error(message, { cause: error })
+    throw error
+  }
+  const nativePaths = await resolveNativePoolPaths(
+    accountStoragePath,
+    undefined,
+    stateLayout.layout,
+  )
+  const holderRegistration =
+    stateLayout.kind === 'state-home' ? undefined : stateLayout.registration
   const nativeAccounts = acquireNativeAccountRuntime({
     paths: nativePaths,
     host: 'opencode',
@@ -4114,7 +4128,7 @@ const anthropicAuthPlugin = async (
 
   let rpcServerAdoption: RpcServerAdoption | null = null
   const dispose: NonNullable<Hooks['dispose']> = async () => {
-    holderRegistration.close()
+    holderRegistration?.close()
     profileHydrationShutdown.abort()
     while (profilePublications.size) await Promise.all([...profilePublications])
     try {

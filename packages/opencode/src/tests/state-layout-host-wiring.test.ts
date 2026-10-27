@@ -1,0 +1,257 @@
+import { afterEach, beforeEach, expect, test } from 'bun:test'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+} from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Writable } from 'node:stream'
+import {
+  HOLDER_FILE_NAME,
+  resetNativeHolderRegistryForTests,
+  resetProcessStateLayoutsForTests,
+  resetStateLayoutDecisionsForTests,
+  resolveStateHomeTarget,
+  setRelocationMoveEnabledForTests,
+  stateLayoutRefusalPublicMessage,
+} from '@cortexkit/anthropic-auth-core'
+import type { Plugin } from '@opencode/plugin'
+import { relaySetup } from '../cli'
+import { runSetupCommand } from '../setup/command'
+import { setupAnthropicAuth } from '../v2/setup'
+
+/**
+ * Environment variables a host start reads to find OpenCode's config folder
+ * and state folder, or that name anthropic-auth files. Each test sets its
+ * own and puts these back afterwards.
+ */
+const ENV_KEYS = [
+  'OPENCODE_CONFIG_DIR',
+  'XDG_STATE_HOME',
+  'TMPDIR',
+  'OPENCODE_ANTHROPIC_AUTH_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+  'OPENCODE_TUI_PREFERENCES_FILE',
+  'OPENCODE_AUTH_CONTENT',
+] as const
+
+const cleanups: Array<() => unknown> = []
+
+function resetDecisions() {
+  resetStateLayoutDecisionsForTests()
+  resetProcessStateLayoutsForTests()
+  resetNativeHolderRegistryForTests()
+}
+
+beforeEach(resetDecisions)
+
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  setRelocationMoveEnabledForTests(undefined)
+  resetDecisions()
+})
+
+/**
+ * An empty OpenCode config folder and a state folder beside it, named by the
+ * process environment the hosts read, with the move turned on or off.
+ */
+async function machine(moveEnabled: boolean) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'layout-wiring-')))
+  const saved = new Map(ENV_KEYS.map((key) => [key, process.env[key]]))
+  cleanups.push(async () => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    await rm(root, { recursive: true, force: true })
+  })
+  for (const key of ENV_KEYS) delete process.env[key]
+  const configDir = join(root, 'config')
+  const stateRoot = join(root, 'state')
+  await mkdir(configDir)
+  // Older versions' pid artifacts are looked for under the temporary folder;
+  // keep this test's own.
+  await mkdir(join(root, 'tmp'))
+  process.env.OPENCODE_CONFIG_DIR = configDir
+  process.env.XDG_STATE_HOME = stateRoot
+  process.env.TMPDIR = join(root, 'tmp')
+  setRelocationMoveEnabledForTests(moveEnabled)
+  return { root, configDir, stateRoot }
+}
+
+type Machine = Awaited<ReturnType<typeof machine>>
+
+/** The state-home subfolder this config folder has, if any. */
+async function subfolder(m: Machine) {
+  const parent = join(m.stateRoot, 'cortexkit', 'anthropic-auth')
+  const names = (await readdir(parent).catch(() => [] as string[])).filter(
+    (name) => /^opencode(-[0-9a-f]{16})?$/.test(name),
+  )
+  return names.length ? join(parent, names[0] as string) : undefined
+}
+
+async function holderEntries(dir: string) {
+  const text = await readFile(join(dir, HOLDER_FILE_NAME), 'utf8')
+  return (JSON.parse(text) as { entries: Array<Record<string, unknown>> })
+    .entries
+}
+
+/** What a start decided, as seen on disk. */
+async function expectDecided(m: Machine, role: string, moved: boolean) {
+  const sub = await subfolder(m)
+  if (!moved) {
+    // Nothing is created in the state folder, not even the subfolder.
+    expect(sub).toBeUndefined()
+    expect(await holderEntries(m.configDir)).toContainEqual(
+      expect.objectContaining({ pid: process.pid, role, kind: 'legacy' }),
+    )
+    return
+  }
+  if (!sub) throw new Error('the dataset was not moved')
+  const record = JSON.parse(await readFile(join(sub, 'layout.json'), 'utf8'))
+  expect(record).toMatchObject({ phase: 'committed', cleanup: 'done' })
+  expect(await holderEntries(sub)).toContainEqual(
+    expect.objectContaining({ pid: process.pid, role, kind: 'state-home' }),
+  )
+}
+
+/** OpenCode 2's plugin context with every registration accepted. */
+function openCode2Context() {
+  const registration = { dispose: async () => {} }
+  return {
+    session: {
+      get: async () => ({ parentID: undefined }),
+      hook: async () => registration,
+    },
+    model: { transform: async () => registration },
+    integration: { transform: async () => registration },
+    rpc: {
+      register: async () => ({
+        ...registration,
+        events: { emit: async () => {} },
+      }),
+    },
+    command: { transform: async () => registration },
+    event: { subscribe: async function* () {} },
+  } as unknown as Plugin.Context
+}
+
+for (const moveEnabled of [false, true]) {
+  const label = moveEnabled ? 'on' : 'off'
+
+  test(`OpenCode 2 decides the layout at setup with moving ${label}`, async () => {
+    const m = await machine(moveEnabled)
+    const dispose = await setupAnthropicAuth(openCode2Context(), {
+      vault: { env: { ...process.env } },
+    })
+    cleanups.push(() => dispose())
+    await expectDecided(m, 'opencode2', moveEnabled)
+  })
+
+  test(`the CLI decides the layout before its first pool read with moving ${label}`, async () => {
+    const m = await machine(moveEnabled)
+    // The command stops at its first prompt, after it has opened the pool.
+    await relaySetup({
+      prompt: async () => {
+        throw new Error('stop here')
+      },
+    }).catch(() => {})
+    await expectDecided(m, 'cli', moveEnabled)
+  })
+
+  test(`setup decides the layout before resolving OpenCode's paths with moving ${label}`, async () => {
+    const m = await machine(moveEnabled)
+    const chunks: string[] = []
+    const output = new Writable({
+      write(chunk, _encoding, done) {
+        chunks.push(String(chunk))
+        done()
+      },
+    })
+    // Setup may stop later for this empty folder; the decision comes first.
+    await runSetupCommand(['--yes', '--no-claustrum', '--opencode=1'], {
+      env: { ...process.env, PATH: join(m.root, 'bin') },
+      platform: 'linux',
+      fence: { listRunningHosts: async () => [] },
+      runner: {
+        run: async () => ({ exitCode: 0, stdout: '1.18.30\n', stderr: '' }),
+      },
+      terminal: { input: process.stdin, output },
+    })
+    await expectDecided(m, 'setup', moveEnabled)
+  })
+}
+
+test('OpenCode 2 refuses at setup with the fixed text of a layout refusal, naming no folder', async () => {
+  const m = await machine(false)
+  // A record of the move that can't be read: no copy may be served.
+  const target = resolveStateHomeTarget()
+  if (!target) throw new Error('the config folder has no identity')
+  await mkdir(target.dir, { recursive: true })
+  await Bun.write(join(target.dir, 'layout.json'), '{ not json')
+  const failure = await setupAnthropicAuth(openCode2Context(), {
+    vault: { env: { ...process.env } },
+  }).catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  const message = (failure as Error).message
+  expect(message).toBe(stateLayoutRefusalPublicMessage('marker-unreadable'))
+  expect(message).not.toContain(m.root)
+})
+
+test('setup --restore-legacy refuses while a host runs, and otherwise restores', async () => {
+  const m = await machine(true)
+  const output = () => {
+    const chunks: string[] = []
+    return {
+      chunks,
+      stream: new Writable({
+        write(chunk, _encoding, done) {
+          chunks.push(String(chunk))
+          done()
+        },
+      }),
+    }
+  }
+  // Move the empty dataset first, as a start with moving on does.
+  await relaySetup({
+    prompt: async () => {
+      throw new Error('stop here')
+    },
+  }).catch(() => {})
+  const sub = await subfolder(m)
+  if (!sub) throw new Error('the dataset was not moved')
+  const running = output()
+  expect(
+    await runSetupCommand(['--restore-legacy'], {
+      env: { ...process.env },
+      fence: {
+        listRunningHosts: async () => [{ pid: 1234, command: 'opencode' }],
+      },
+      terminal: { input: process.stdin, output: running.stream },
+    }),
+  ).toBe(1)
+  expect(
+    JSON.parse(await readFile(join(sub, 'layout.json'), 'utf8')).phase,
+  ).toBe('committed')
+  const stopped = output()
+  const calls: unknown[] = []
+  expect(
+    await runSetupCommand(['--restore-legacy'], {
+      env: { ...process.env },
+      fence: { listRunningHosts: async () => [] },
+      terminal: { input: process.stdin, output: stopped.stream },
+      restoreLegacy: async (options) => {
+        calls.push(options)
+        return { status: 'restored', oldDir: m.configDir, sub, kept: [] }
+      },
+    }),
+  ).toBe(0)
+  expect(calls).toHaveLength(1)
+  expect(stopped.chunks.join('')).toContain(m.configDir)
+})

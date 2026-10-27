@@ -5,15 +5,14 @@ import { createInterface } from 'node:readline/promises'
 import {
   authorize,
   createNativeAccountRuntime,
+  decideOpenCodeStateLayoutOnce,
   exchange,
   formatNativeAccountState,
   generateRelayToken,
   getAccountStoragePath,
   isValidApiBaseURL,
   type NativeAccountRuntime,
-  openCodeHolderKind,
   readNativeEnrollmentMode,
-  registerNativePoolHolder,
   resolveNativePoolPaths,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
@@ -26,20 +25,23 @@ async function withNativeAccounts<T>(
     throw new Error(
       'Native account changes require offline setup without OPENCODE_AUTH_CONTENT',
     )
-  const paths = await resolveNativePoolPaths()
-  // Record that this process uses these files before any pool I/O, so a
-  // later version never moves them while the command runs.
-  const holderRegistration = await registerNativePoolHolder({
-    paths,
-    role: 'cli',
-    kind: openCodeHolderKind(),
-  })
+  // Decide where the account state is before resolving any of its paths:
+  // the config folder, or the state folder once it has moved there. The
+  // decision also records that this command uses those files, so a later
+  // version never moves them while it runs. It is made once per process.
+  // A refusal reaches the failure handler, which prints its fixed text.
+  const decision = await decideOpenCodeStateLayoutOnce({ role: 'cli' })
+  const paths = await resolveNativePoolPaths(
+    undefined,
+    undefined,
+    decision.layout,
+  )
   const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
   try {
     await runtime.read()
     return await run(runtime)
   } finally {
-    holderRegistration.close()
+    if (decision.kind !== 'state-home') decision.registration?.close()
     await runtime.close()
   }
 }

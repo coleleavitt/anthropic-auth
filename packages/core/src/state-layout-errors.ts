@@ -49,6 +49,21 @@ const PUBLIC_MESSAGES: Record<StateLayoutRefusalCode, string> = {
   'restore-refused': `anthropic-auth can't restore the old layout yet. Run ${RESTORE_LEGACY_COMMAND} to see what to fix.`,
 }
 
+/** Every refusal code, for readers that check a code they were handed. */
+export const STATE_LAYOUT_REFUSAL_CODES = Object.freeze(
+  Object.keys(PUBLIC_MESSAGES) as StateLayoutRefusalCode[],
+)
+
+/** Whether `value` is one of `STATE_LAYOUT_REFUSAL_CODES`. */
+export function isStateLayoutRefusalCode(
+  value: unknown,
+): value is StateLayoutRefusalCode {
+  return (
+    typeof value === 'string' &&
+    (STATE_LAYOUT_REFUSAL_CODES as readonly string[]).includes(value)
+  )
+}
+
 /** Every fixed message `stateLayoutRefusalPublicMessage` can return. */
 export const STATE_LAYOUT_REFUSAL_PUBLIC_MESSAGES: readonly string[] = [
   ...new Set(Object.values(PUBLIC_MESSAGES)),

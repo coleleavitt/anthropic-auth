@@ -4,6 +4,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   stat,
@@ -20,8 +21,10 @@ import {
   createNativeAccountRuntime,
   createNativePoolStore,
   custodyTombstoneOAuth,
+  decideOpenCodeStateLayout,
   getClaudeCodeIdentityForVerifiedAccount,
   getLogLevel,
+  HOLDER_FILE_NAME,
   type LogTestRecord,
   type NativeCustodyClient,
   type NativeLockEvent,
@@ -29,11 +32,15 @@ import {
   type ProviderAccountUuid,
   publishNativeEmptyInit,
   resetClaudeCodeIdentityCachesForTest,
+  resetNativeHolderRegistryForTests,
+  resetProcessStateLayoutsForTests,
+  resetStateLayoutDecisionsForTests,
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
   runNativeMigration,
   StickySessionRouter,
   setLogLevel,
+  setRelocationMoveEnabledForTests,
   stickyRouteFamilyForModel,
 } from '@cortexkit/anthropic-auth-core'
 import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
@@ -84,6 +91,9 @@ const envKeys = [
   'OPENCODE_AUTH_CONTENT',
   'CLAUDE_CONFIG_DIR',
   'XDG_DATA_HOME',
+  'OPENCODE_CONFIG_DIR',
+  'XDG_STATE_HOME',
+  'TMPDIR',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN',
 ] as const
@@ -1368,6 +1378,145 @@ for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
       ).toBe(false)
   })
 }
+
+/** Forget every layout decision and registration this process made. */
+function forgetLayoutDecisions() {
+  resetStateLayoutDecisionsForTests()
+  resetProcessStateLayoutsForTests()
+  resetNativeHolderRegistryForTests()
+}
+
+for (const moveEnabled of [false, true]) {
+  test(`OC1 decides the layout at plugin start with moving ${moveEnabled ? 'on' : 'off'}`, async () => {
+    const configDir = join(directory, 'config')
+    const stateRoot = join(directory, 'state')
+    await mkdir(configDir)
+    await mkdir(join(directory, 'tmp'))
+    // OpenCode's own config folder, with no override naming its files.
+    for (const key of [
+      'OPENCODE_ANTHROPIC_AUTH_FILE',
+      'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
+      'OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE',
+      'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+    ])
+      delete process.env[key]
+    process.env.OPENCODE_CONFIG_DIR = configDir
+    process.env.XDG_STATE_HOME = stateRoot
+    // Older versions' pid artifacts are looked for under the temporary folder.
+    process.env.TMPDIR = join(directory, 'tmp')
+    forgetLayoutDecisions()
+    setRelocationMoveEnabledForTests(moveEnabled)
+    lifetimes.deferCleanup(() => {
+      setRelocationMoveEnabledForTests(undefined)
+      forgetLayoutDecisions()
+    })
+    await createPlugin()
+    const parent = join(stateRoot, 'cortexkit', 'anthropic-auth')
+    const subs = (await readdir(parent).catch(() => [] as string[])).filter(
+      (name) => name.startsWith('opencode-'),
+    )
+    const entries = async (dir: string) =>
+      (
+        JSON.parse(await readFile(join(dir, HOLDER_FILE_NAME), 'utf8')) as {
+          entries: Array<Record<string, unknown>>
+        }
+      ).entries
+    if (!moveEnabled) {
+      expect(subs).toEqual([])
+      expect(await entries(configDir)).toContainEqual(
+        expect.objectContaining({ role: 'opencode1', kind: 'legacy' }),
+      )
+      return
+    }
+    expect(subs).toHaveLength(1)
+    const sub = join(parent, subs[0] as string)
+    expect(
+      JSON.parse(await readFile(join(sub, 'layout.json'), 'utf8')),
+    ).toMatchObject({ phase: 'committed', cleanup: 'done' })
+    expect(await entries(sub)).toContainEqual(
+      expect.objectContaining({ role: 'opencode1', kind: 'state-home' }),
+    )
+  })
+}
+
+test('OC1 local-healthy request in the state-home layout observes no foreground lock', async () => {
+  const fixture = await migrateServingFixture('local')
+  // The dataset's config folder is the fixture folder; the state folder
+  // must lie outside it.
+  const stateRoot = `${directory}-state`
+  lifetimes.deferCleanup(() => rm(stateRoot, { recursive: true, force: true }))
+  forgetLayoutDecisions()
+  lifetimes.deferCleanup(forgetLayoutDecisions)
+  // An earlier start, with no override, moved the dataset.
+  const moved = await decideOpenCodeStateLayout({
+    role: 'opencode1',
+    env: { OPENCODE_CONFIG_DIR: directory, XDG_STATE_HOME: stateRoot },
+    moveEnabled: true,
+    // That start has exited; nothing else is running.
+    liveness: {
+      pidAlive: (pid) => pid !== process.pid,
+      incarnation: async () => null,
+    },
+    artifacts: { rpcRoots: [], rpcDirs: [], cacheKeepDirs: [] },
+  })
+  if (moved.kind !== 'state-home') throw new Error('the fixture did not move')
+  const paths = moved.dataset.newPaths
+  expect(paths.storageId).toBe(fixture.paths.storageId)
+  forgetLayoutDecisions()
+  // This start finds the dataset through OpenCode's config folder; its other
+  // overrides (routing, enrollment) never move, but serve a finished move.
+  delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+  delete process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
+  process.env.OPENCODE_CONFIG_DIR = directory
+  process.env.XDG_STATE_HOME = stateRoot
+  const probe = requestLockProbe()
+  const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+  lifetimes.deferCleanup(async () => {
+    await runtime.drainRoutingPublications()
+    runtime.close()
+  })
+  expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+  await runtime.fetchQuota(
+    'main',
+    Object.assign(fixture.fetchProvider, {
+      preconnect: originalFetch.preconnect,
+    }),
+  )
+  await runtime.drainQuotaPublications()
+  await runtime.updateSettings((settings) => {
+    settings.routing = { mode: 'sticky-balanced' }
+  })
+  await runtime.read()
+  await runtime.drainRoutingPublications()
+  await runtime.close()
+  network.mockImplementation((input, init) => {
+    const url = input instanceof Request ? input.url : input.toString()
+    if (url.includes('/v1/messages')) probe.dispatch()
+    return fixture.fetchProvider(input, init)
+  })
+  const plugin = await createPlugin({
+    nativeLocal: { onLockEvent: probe.onLockEvent },
+  })
+  // Plugin start recorded this process in the state folder; the request
+  // below must still take no foreground lock for it.
+  const holders = JSON.parse(
+    await readFile(join(dirname(paths.runtime), HOLDER_FILE_NAME), 'utf8'),
+  ) as { entries: Array<{ pid: number; role: string; kind: string }> }
+  expect(holders.entries).toContainEqual(
+    expect.objectContaining({
+      pid: process.pid,
+      role: 'opencode1',
+      kind: 'state-home',
+    }),
+  )
+  probe.begin()
+  const response = await sendNative(plugin)
+  expect(response.status).toBe(200)
+  await response.text()
+  expect(probe.foreground).toEqual([])
+  await plugin.dispose?.()
+  expect(probe.afterDispatch.length).toBeGreaterThan(0)
+})
 
 test('OC1 inconsistent relay pair refuses locally without any dispatch', async () => {
   const fixture = await migrateServingFixture('local')

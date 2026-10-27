@@ -28,6 +28,7 @@ import {
   HOLDER_REGISTRATION_ERROR_MESSAGES,
   isOwnerOnly,
   isSecretKey,
+  isStateLayoutRefusalCode,
   type NativeCustodyErrorCode,
   NativeMigrationError,
   NativePiAuthSlotError,
@@ -35,9 +36,12 @@ import {
   PRIVATE_FILES_UNAVAILABLE_MESSAGE,
   type ProviderErrorRedactor,
   RELOCATED_MESSAGE,
+  STATE_LAYOUT_REFUSAL_CODES,
+  STATE_LAYOUT_REFUSAL_PUBLIC_MESSAGES,
   // From Core, not common-auth: Core bundles its own copy of runSetup, and
   // only that copy's setupEnrollment can see the outcomes runSetup recorded.
   setupEnrollment,
+  stateLayoutRefusalPublicMessage,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   SetupCommandError,
@@ -183,6 +187,7 @@ const ERROR_FIELD_VALUES = {
     'ClaustrumCredentialError',
     'RelocatedError',
     'HolderRegistrationError',
+    'StateLayoutRefusalError',
   ]),
   code: new Set<string>([
     ...ACTIVATION_CODES,
@@ -241,6 +246,7 @@ const ERROR_FIELD_VALUES = {
     'lock-timeout',
     'managed-folder',
     'malformed',
+    ...STATE_LAYOUT_REFUSAL_CODES,
   ]),
   stage: new Set([
     'safe-parent',
@@ -305,6 +311,9 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
   // must succeed failed. Both carry fixed text that names no path.
   RELOCATED_MESSAGE,
   ...HOLDER_REGISTRATION_ERROR_MESSAGES,
+  // Where the account state is could not be decided safely. These are the
+  // fixed texts of those refusals; their own messages name files.
+  ...STATE_LAYOUT_REFUSAL_PUBLIC_MESSAGES,
   // Local sign-in is forbidden while vault custody remains connected.
   'Disconnect from the vault first.',
   // CLI input validation uses fixed messages rather than error codes.
@@ -485,6 +494,12 @@ export function knownFailureMessage(error: unknown): string | undefined {
     )
       return message
     if (CLOSED_MESSAGES.has(message)) return message
+    // A state layout refusal's message names files; show its fixed text.
+    if (ownData(error, 'name') === 'StateLayoutRefusalError') {
+      const code = ownData(error, 'code')
+      if (isStateLayoutRefusalCode(code))
+        return stateLayoutRefusalPublicMessage(code)
+    }
     if (
       ownData(error, 'name') === 'NativeVaultActivationError' &&
       ownData(error, 'code') === 'no-read-grant'

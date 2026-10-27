@@ -2,10 +2,12 @@ import { resolve } from 'node:path'
 import {
   acquireNativeAccountRuntime,
   createNativeUsagePublisher,
+  decidePiStateLayout,
   getAccountStatePath,
   getHostClaustrumEnrollmentPaths,
   isKillswitchEnabled,
   killswitchPassesPolicy,
+  LEGACY_STATE_LAYOUT,
   logger,
   type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
@@ -26,7 +28,6 @@ import {
   quotaSnapshotPassesPolicy,
   readNativeAccountsForRequest,
   readNativeMigrationJournal,
-  registerNativePoolHolder,
   resolveClaustrumConnectionPath,
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
@@ -196,19 +197,26 @@ export class PiNativeRuntime {
     this.env = env
     const poll = options.vaultPoll ?? { intervalMs: PI_VAULT_POLL_INTERVAL_MS }
     const identity = getPiClaustrumConnectionOptions(storagePath).identity
-    this.paths = resolveNativePoolPaths(storagePath)
-    // Record that this process uses these files before any pool I/O, so a
-    // later version never moves them while it runs. A refusal (the files
-    // were moved, or an override points into a managed folder) fails
+    // Pi's files never move, so they are always resolved in the legacy
+    // layout, whatever an OpenCode start in this process decided.
+    this.paths = resolveNativePoolPaths(
+      storagePath,
+      undefined,
+      LEGACY_STATE_LAYOUT,
+    )
+    // Pi's part of the layout decision records that this process uses these
+    // files before any pool I/O, so a later version never moves them while
+    // it runs. A refusal (the files were moved, an override points into a
+    // managed folder, or the record could not be written) fails
     // initialization, which every request then reports.
-    this.holderRegistration = this.paths.then((paths) =>
-      registerNativePoolHolder({
+    this.holderRegistration = this.paths.then(async (paths) => {
+      const decision = await decidePiStateLayout({
         paths,
         role: 'pi',
-        kind: 'pi',
         onLockEvent: options.local?.onLockEvent,
-      }),
-    )
+      })
+      return decision.registration
+    })
     void this.holderRegistration.catch(() => {})
     this.initialization = this.holderRegistration.then(async () => {
       const paths = await this.paths
