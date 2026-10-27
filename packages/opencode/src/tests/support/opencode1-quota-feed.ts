@@ -24,6 +24,7 @@ import {
 } from './opencode1-pool-fixture.ts'
 import { readAccountStorage } from './opencode1-state-observers.ts'
 import {
+  EMPTY_POST,
   type Opencode1TestContext,
   untilStateOrTestEnd,
 } from './opencode1-test-context.ts'
@@ -207,4 +208,49 @@ export async function expectNonOatMainRefused(
   } finally {
     runtime.close()
   }
+}
+
+/**
+ * Record a recent usage-API failure for the main account, load the plugin
+ * with a usage endpoint that keeps failing, and require the main request to
+ * be refused with 429. Callers pass storage whose quota policy is fail-closed.
+ */
+export async function expectUnknownQuotaAdmissionBlocked(
+  ctx: Opencode1TestContext,
+  storage: AccountStorage,
+) {
+  const now = Date.now()
+  storage.quota = {
+    ...storage.quota,
+    mainLastQuotaApiError: {
+      message: 'quota source unavailable',
+      checkedAt: now,
+      nextRetryAt: now + 60_000,
+      retryCount: 1,
+    },
+  }
+  // Import the configured usage-API failure into shared account storage.
+  // Migration retires the old state file; later writes use shared storage.
+  await useTempAccountFile(ctx, storage)
+  globalThis.fetch = mock(
+    withNativeAdmission(ctx, (input: Parameters<typeof fetch>[0]) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage'))
+        return Promise.reject(new Error('quota source unavailable'))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }),
+  ) as unknown as typeof fetch
+  const plugin = await getPlugin(ctx)
+  const result = await plugin.auth.loader(
+    () =>
+      Promise.resolve({
+        type: 'oauth' as const,
+        access: 'sk-ant-oat01-main-access',
+        refresh: 'main-refresh',
+        expires: Date.now() + 100000,
+      }),
+    { models: {} },
+  )
+  const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+  expect(response.status).toBe(429)
 }
