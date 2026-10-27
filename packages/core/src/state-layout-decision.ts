@@ -23,6 +23,7 @@ import {
   holderFenceBlockers,
   type PreNArtifactLocations,
   preNArtifactBlockers,
+  STATE_PATH_OVERRIDE_VARIABLES,
   statePathOverrides,
 } from './layout-fence.ts'
 import { logger } from './logger.ts'
@@ -39,6 +40,7 @@ import {
   warnReappearedMetadata,
 } from './state-home-serving-guard.ts'
 import {
+  RESTORE_LEGACY_COMMAND,
   StateLayoutRefusalError,
   stateLayoutMovedElsewhere,
 } from './state-layout-errors.ts'
@@ -81,9 +83,40 @@ import {
   readStateLayoutRecord,
   type StateLayoutRecord,
 } from './state-layout-record.ts'
+import {
+  discardAbandonedRestore,
+  finishRestoreRetirement,
+} from './state-layout-restore.ts'
 
 const ACCOUNT_FILE = 'anthropic-auth.json'
 const ACCOUNT_STATE_FILE = 'anthropic-auth-state.json'
+
+/**
+ * Whether a start may move OpenCode's dataset out of its config folder into
+ * the state folder. While it is false, a start the fence would let move keeps
+ * the legacy layout instead; everything else the decision does still runs:
+ * serving a dataset already moved, recovering an unfinished move or restore,
+ * the conflict and refusal checks, and the mandatory registration. The
+ * release that ships the move turns it on.
+ */
+export const RELOCATION_MOVE_ENABLED = false
+
+let moveEnabledOverride: boolean | undefined
+
+/** Turn the move on or off for this process, or back to the default; tests only. */
+export function setRelocationMoveEnabledForTests(
+  enabled: boolean | undefined,
+): void {
+  moveEnabledOverride = enabled
+}
+
+function relocationMoveEnabled(options: DecideStateLayoutOptions): boolean {
+  return options.moveEnabled ?? moveEnabledOverride ?? RELOCATION_MOVE_ENABLED
+}
+
+/** Why a start the fence would let move stays legacy while moving is off. */
+export const RELOCATION_MOVE_DISABLED_REASON =
+  'moving state out of the config folder is not enabled in this release'
 
 export interface DecideStateLayoutOptions {
   role: HolderRole
@@ -100,6 +133,8 @@ export interface DecideStateLayoutOptions {
   now?: () => number
   /** Tests shorten the waits; production uses the defaults. */
   timeouts?: { layoutMs?: number; holderMs?: number; dataMs?: number }
+  /** Overrides `RELOCATION_MOVE_ENABLED`; tests only. */
+  moveEnabled?: boolean
 }
 
 /** The layout a process uses for OpenCode's dataset, decided once at start. */
@@ -165,7 +200,7 @@ function busy(configDir: string, cause?: unknown): never {
 function restoreUnfinished(configDir: string): never {
   refuse(
     'restore-unfinished',
-    `A restore of anthropic-auth's state for ${configDir} did not finish; run \`anthropic-auth layout restore-legacy\` again.`,
+    `A restore of anthropic-auth's state for ${configDir} did not finish; run ${RESTORE_LEGACY_COMMAND} again.`,
     [configDir],
   )
 }
@@ -347,6 +382,7 @@ async function legacyHeld(
   options: DecideStateLayoutOptions,
   ctx: StateLayoutTransitionContext,
   reasons: string[],
+  log = true,
 ): Promise<StateLayoutDecision | 'changed'> {
   const pointed = await readPointers(dataset)
   const record = await readRecord(dataset.sub)
@@ -362,7 +398,7 @@ async function legacyHeld(
     ctx,
   )
   recordProcessStateLayout(dataset.oldPaths.legacyConfig, LEGACY_STATE_LAYOUT)
-  if (reasons.length)
+  if (reasons.length && log)
     logger.info(
       'state-layout',
       'anthropic-auth keeps its runtime files in OpenCode’s config folder until every running OpenCode or Pi using them has restarted on this version',
@@ -481,16 +517,15 @@ export async function decideOpenCodeStateLayout(
   const pointed = await readPointers(dataset)
 
   // 5. The marker, read without a lock.
+  const moveEnabled = relocationMoveEnabled(options)
   for (let round = 0; round < 3; round++) {
     const record = await readRecord(sub)
     if (record) requireRecordMatches(record, dataset)
     if (pointed && noMoveRecord(record)) markerUnreadable(sub)
-    if (
-      record?.phase === 'restoring' ||
-      record?.phase === 'restore-staged' ||
-      (record?.phase === 'restored' && record.restore?.cleanup !== 'done')
-    )
-      restoreUnfinished(dataset.oldDir)
+    // Only a rerun of the restore command may finish a restore past its
+    // staging boundary. An earlier restore phase is recovered under the
+    // layout lock below.
+    if (record?.phase === 'restore-staged') restoreUnfinished(dataset.oldDir)
     if (
       record?.phase === 'committed' &&
       (record.cleanup === 'done' || record.cleanup === 'kept')
@@ -499,12 +534,16 @@ export async function decideOpenCodeStateLayout(
       if (admitted !== 'changed') return admitted
       continue
     }
-    if ((overrides.length || neverMove.length) && noMoveRecord(record)) {
+    if (
+      (overrides.length || neverMove.length || !moveEnabled) &&
+      noMoveRecord(record)
+    ) {
       // A process with an override never moves and never writes the marker,
-      // and a start that found no config folder never moves: there is
-      // nothing to decide under the layout lock. The old holder lock is
-      // enough to stay legacy, because a mover holds it from before its fence
-      // read to its end, and the checks under it see a move that committed.
+      // a start that found no config folder never moves, and while moving is
+      // off no process does: there is nothing to decide under the layout
+      // lock. The old holder lock is enough to stay legacy, because a mover
+      // holds it from before its fence read to its end, and the checks under
+      // it see a move that committed.
       const ctx = newContext()
       try {
         await stateLayoutStep(ctx, 'old-holders-locking')
@@ -513,11 +552,18 @@ export async function decideOpenCodeStateLayout(
           path: join(dataset.oldDir, HOLDER_FILE_NAME),
           timeoutMs: ctx.holderLockTimeoutMs,
         })
-        const blockers = [
+        const stayReasons = [
           ...overrides.map((variable) => `${variable} is set`),
           ...neverMove,
         ]
-        const decided = await legacyHeld(dataset, options, ctx, blockers)
+        // Moving being off is not worth a log line; the other reasons are.
+        const decided = await legacyHeld(
+          dataset,
+          options,
+          ctx,
+          stayReasons.length ? stayReasons : [RELOCATION_MOVE_DISABLED_REASON],
+          stayReasons.length > 0,
+        )
         if (decided !== 'changed') return decided
       } catch (error) {
         if (error instanceof LockContentionError) busy(dataset.configDir, error)
@@ -611,13 +657,27 @@ async function underLayoutLock(
 ): Promise<StateLayoutDecision | 'again'> {
   const record = await readRecord(dataset.sub)
   if (record) requireRecordMatches(record, dataset)
+  if (record?.phase === 'restore-staged') restoreUnfinished(dataset.oldDir)
   if (
     record?.phase === 'restoring' ||
-    record?.phase === 'restore-staged' ||
     (record?.phase === 'restored' && record.restore?.cleanup !== 'done')
-  )
-    restoreUnfinished(dataset.oldDir)
-
+  ) {
+    // A restore that stopped before its staging boundary is discarded, so
+    // the state folder serves again; one that stopped while removing the
+    // state-folder copies has those removed. Either writes the marker, which
+    // a process with an override never does.
+    if (overrides.length)
+      refuse(
+        'restore-unfinished',
+        `A restore of anthropic-auth's state for ${dataset.oldDir} did not finish; start anthropic-auth without path overrides (${overrides.join(', ')}), or run ${RESTORE_LEGACY_COMMAND} again.`,
+        [layoutRecordPath(dataset.sub)],
+      )
+    await acquireHolderLocks(dataset, ctx)
+    if (record.phase === 'restoring')
+      await discardAbandonedRestore(record, dataset, ctx)
+    else await finishRestoreRetirement(record, dataset, ctx)
+    return 'again'
+  }
   if (record?.phase === 'committed') {
     // A mover may have died between its commit and its own flush.
     try {
@@ -676,8 +736,9 @@ async function underLayoutLock(
   // No move yet: decide whether to move now.
   const stay = async (
     reasons: string[],
+    log = true,
   ): Promise<StateLayoutDecision | 'again'> => {
-    const decided = await legacyHeld(dataset, options, ctx, reasons)
+    const decided = await legacyHeld(dataset, options, ctx, reasons, log)
     return decided === 'changed' ? 'again' : decided
   }
   if (overrides.length || neverMove.length) {
@@ -688,6 +749,8 @@ async function underLayoutLock(
     ])
   }
   await acquireHolderLocks(dataset, ctx)
+  if (!relocationMoveEnabled(options))
+    return stay([RELOCATION_MOVE_DISABLED_REASON], false)
   const holdersMark = ctx.stack.size
   const files = [...dataset.slots.flatMap((slot) => [slot.from, slot.to])]
   const artifacts =
@@ -766,4 +829,78 @@ async function underLayoutLock(
 
 async function stateLayoutFenceStep(ctx: StateLayoutTransitionContext) {
   await ctx.onStep?.('fence-checked')
+}
+
+/**
+ * Decisions made in this process, by everything that selects the dataset.
+ * A host may initialise its plugin more than once in one process; each
+ * initialisation gets the first decision, so the holder lock beside the
+ * watched config folder is taken once per process, not once per plugin.
+ */
+const processDecisions = new Map<string, Promise<StateLayoutDecision>>()
+
+function decisionKey(options: DecideStateLayoutOptions): string {
+  const env = options.env ?? process.env
+  const home = options.home ?? homedir()
+  return JSON.stringify([
+    getOpenCodeConfigDir(env, home),
+    home,
+    env.XDG_STATE_HOME ?? null,
+    ...STATE_PATH_OVERRIDE_VARIABLES.map((name) => env[name] ?? null),
+  ])
+}
+
+/**
+ * `decideOpenCodeStateLayout`, once per process for each dataset: every
+ * later call with the same config folder, state root and overrides gets the
+ * same decision. A refusal is not kept, so a later start in the same
+ * process (for example after "start again in a minute") decides afresh.
+ */
+export function decideOpenCodeStateLayoutOnce(
+  options: DecideStateLayoutOptions,
+): Promise<StateLayoutDecision> {
+  const key = decisionKey(options)
+  const known = processDecisions.get(key)
+  if (known) return known
+  const decision = decideOpenCodeStateLayout(options)
+  processDecisions.set(key, decision)
+  decision.catch(() => {
+    if (processDecisions.get(key) === decision) processDecisions.delete(key)
+  })
+  return decision
+}
+
+/** Forget the decisions this process made; tests only. */
+export function resetStateLayoutDecisionsForTests(): void {
+  processDecisions.clear()
+}
+
+/**
+ * Pi's part of the decision. Pi never moves: OpenCode doesn't watch its
+ * folder, so its dataset stays in the legacy layout. It still registers
+ * beside its files before any pool I/O, as every process of this release
+ * must, so a move of a dataset it aliases waits for it and an alias into a
+ * moved or managed folder refuses.
+ */
+export async function decidePiStateLayout(options: {
+  paths: NativePoolPaths
+  role: HolderRole
+  onLockEvent?: (event: NativeLockEvent) => void
+  liveness?: HolderLiveness
+  lockTimeoutMs?: number
+}): Promise<{
+  readonly kind: 'pi'
+  readonly layout: StateLayout
+  readonly registration: NativeHolderRegistration
+}> {
+  const registration = await registerNativePoolHolder({
+    paths: options.paths,
+    role: options.role,
+    kind: 'pi',
+    policy: 'mandatory',
+    onLockEvent: options.onLockEvent,
+    liveness: options.liveness,
+    lockTimeoutMs: options.lockTimeoutMs,
+  })
+  return { kind: 'pi', layout: LEGACY_STATE_LAYOUT, registration }
 }

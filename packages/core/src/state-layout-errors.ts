@@ -20,6 +20,46 @@ export type StateLayoutRefusalCode =
   | 'unsafe'
   /** The state folder holds data this process can't prove it wrote. */
   | 'unexpected-data'
+  /** A restore to the legacy layout can't start; the message names what to fix. */
+  | 'restore-refused'
+
+/** The command that restores the legacy layout, as users run it. */
+export const RESTORE_LEGACY_COMMAND =
+  'npx @cortexkit/opencode-anthropic-auth setup --restore-legacy'
+
+/**
+ * One fixed message per refusal, naming no file. Hosts show these where
+ * their output may be shared (OpenCode 2's error surface, the CLI); the
+ * refusal's own message, which names the files involved, goes to the log.
+ */
+const PUBLIC_MESSAGES: Record<StateLayoutRefusalCode, string> = {
+  conflict:
+    'anthropic-auth found two copies of the same account state and stopped using both so a refresh token is never used twice. The log names both files: keep the copy you trust, move the other one away, then restart OpenCode.',
+  'moved-elsewhere': `anthropic-auth state for this config folder was moved under another state folder (XDG_STATE_HOME). Restore XDG_STATE_HOME, or run ${RESTORE_LEGACY_COMMAND} with the old XDG_STATE_HOME first. The log names both folders.`,
+  'other-dataset':
+    "anthropic-auth's state folder belongs to another config folder. Check OPENCODE_CONFIG_DIR and any symlink to the config folder; the log names both folders.",
+  'marker-unreadable':
+    "anthropic-auth can't read the record of where its state is, so it won't use either copy. The log names the file; restore it from a backup or ask for help, and do not delete the state folder.",
+  'restore-unfinished': `A restore of anthropic-auth's state did not finish; run ${RESTORE_LEGACY_COMMAND} again.`,
+  busy: 'Another anthropic-auth process is moving or restoring state for this folder; start again in a minute.',
+  unsafe:
+    "anthropic-auth could not finish or undo a change of where its state is, so it won't use either copy. The log names the files involved.",
+  'unexpected-data':
+    "anthropic-auth's state folder holds files it did not write, so it won't use them. The log names the files.",
+  'restore-refused': `anthropic-auth can't restore the old layout yet. Run ${RESTORE_LEGACY_COMMAND} to see what to fix.`,
+}
+
+/** Every fixed message `stateLayoutRefusalPublicMessage` can return. */
+export const STATE_LAYOUT_REFUSAL_PUBLIC_MESSAGES: readonly string[] = [
+  ...new Set(Object.values(PUBLIC_MESSAGES)),
+]
+
+/** The fixed message, naming no file, for a refusal with `code`. */
+export function stateLayoutRefusalPublicMessage(
+  code: StateLayoutRefusalCode,
+): string {
+  return PUBLIC_MESSAGES[code]
+}
 
 /**
  * A refusal to serve a dataset from either layout. The process must not do
@@ -71,7 +111,7 @@ export function stateLayoutMovedElsewhere(
 ): StateLayoutRefusalError {
   return new StateLayoutRefusalError(
     'moved-elsewhere',
-    `anthropic-auth state for ${configDir} was moved to ${relocatedTo}, but this process uses state root ${stateRoot}. Restore XDG_STATE_HOME, or run \`anthropic-auth layout restore-legacy\` from the old root first.`,
+    `anthropic-auth state for ${configDir} was moved to ${relocatedTo}, but this process uses state root ${stateRoot}. Restore XDG_STATE_HOME, or run ${RESTORE_LEGACY_COMMAND} with the old XDG_STATE_HOME first.`,
     [configDir, relocatedTo, stateRoot],
   )
 }

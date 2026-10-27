@@ -53,6 +53,48 @@ export interface RelocationBarriers {
   readonly vaultRuntime: { readonly original: string | null }
 }
 
+/** One file a restore copies back: from `to` (state folder) to `from` (config folder). */
+export interface RestoreFileRecord {
+  readonly role: RelocationRole
+  /** The legacy-layout path the file goes back to. */
+  readonly from: string
+  /** The state-home copy it is read from. */
+  readonly to: string
+  readonly sha256: string
+  /** `<from>.restoring-<restore attempt>`: the name it is staged under. */
+  readonly staging: string
+}
+
+/**
+ * What a restore to the legacy layout records in `layout.json`. A restore
+ * done by hand (the documented manual procedure) writes only
+ * `{ cleanup: 'done' }` with phase `restored`; every restore made by the
+ * command records all fields.
+ */
+export interface StateLayoutRestoreRecord {
+  readonly attempt?: string
+  readonly startedAt?: number
+  readonly files?: readonly RestoreFileRecord[]
+  /**
+   * For each runtime: `copy` when the state folder holds one, which goes
+   * back over the tombstone; `unlink` when it holds none, so the tombstone
+   * is only removed.
+   */
+  readonly runtimes?: {
+    readonly local: 'copy' | 'unlink'
+    readonly vault: 'copy' | 'unlink'
+  }
+  /** Set from phase `restored` on: whether the state-folder copies are removed. */
+  readonly cleanup?: 'pending' | 'done'
+  /** State-folder copies that changed after they were staged; left in place. */
+  readonly kept?: readonly string[]
+}
+
+/** The staging name a restore uses for `from`. */
+export function restoreStagingPath(from: string, attempt: string): string {
+  return `${from}.restoring-${attempt}`
+}
+
 /** The full `layout.json` a move writes. */
 export interface StateLayoutRecord {
   readonly version: 1
@@ -75,7 +117,7 @@ export interface StateLayoutRecord {
   readonly conflict?: readonly { readonly old: string; readonly new: string }[]
   readonly rolledBackAt?: number
   /** Present while a restore is under way or finished; written by restore. */
-  readonly restore?: { readonly cleanup?: 'pending' | 'done' }
+  readonly restore?: StateLayoutRestoreRecord
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -197,16 +239,14 @@ function parseRecord(value: unknown): StateLayoutRecord | undefined {
     return undefined
   let restore: StateLayoutRecord['restore']
   if (value.restore !== undefined) {
-    if (!isRecord(value.restore)) return undefined
-    const restoreCleanup = value.restore.cleanup
-    if (
-      restoreCleanup !== undefined &&
-      restoreCleanup !== 'pending' &&
-      restoreCleanup !== 'done'
-    )
-      return undefined
-    restore = restoreCleanup === undefined ? {} : { cleanup: restoreCleanup }
-  }
+    restore = parseRestore(value.restore, phase as StateLayoutPhase)
+    if (!restore) return undefined
+  } else if (
+    phase === 'restoring' ||
+    phase === 'restore-staged' ||
+    phase === 'restored'
+  )
+    return undefined
   return {
     version: 1,
     phase: phase as StateLayoutPhase,
@@ -240,6 +280,88 @@ function parseRecord(value: unknown): StateLayoutRecord | undefined {
       ? { rolledBackAt: value.rolledBackAt }
       : {}),
     ...(restore === undefined ? {} : { restore }),
+  }
+}
+
+/**
+ * The `restore` part of a record in `phase`. A restore in progress, and a
+ * finished one whose state-folder copies are still to be removed, must carry
+ * the full detail its recovery acts on: the attempt id, every file with the
+ * staging name derived from it, and one runtime action per runtime that
+ * agrees with the file list. Only a restore that is `restored` and `done`
+ * may be the bare `{ cleanup: 'done' }` the manual procedure writes.
+ */
+function parseRestore(
+  value: unknown,
+  phase: StateLayoutPhase,
+): StateLayoutRestoreRecord | undefined {
+  if (!isRecord(value)) return undefined
+  if (
+    phase !== 'restoring' &&
+    phase !== 'restore-staged' &&
+    phase !== 'restored'
+  )
+    return undefined
+  const { cleanup, attempt, startedAt, files, runtimes, kept } = value
+  if (phase === 'restored') {
+    if (cleanup !== 'pending' && cleanup !== 'done') return undefined
+  } else if (cleanup !== undefined) return undefined
+  if (kept !== undefined && !(Array.isArray(kept) && kept.every(text)))
+    return undefined
+  const detailed =
+    attempt !== undefined || files !== undefined || runtimes !== undefined
+  if (!detailed) {
+    if (phase !== 'restored' || cleanup !== 'done') return undefined
+    return {
+      cleanup,
+      ...(kept === undefined ? {} : { kept: kept as string[] }),
+    }
+  }
+  if (
+    !attemptId(attempt) ||
+    typeof startedAt !== 'number' ||
+    !Array.isArray(files) ||
+    !isRecord(runtimes)
+  )
+    return undefined
+  const parsed: RestoreFileRecord[] = []
+  for (const file of files) {
+    if (
+      !isRecord(file) ||
+      !(RELOCATION_ROLES as readonly unknown[]).includes(file.role) ||
+      !text(file.from) ||
+      !text(file.to) ||
+      typeof file.sha256 !== 'string' ||
+      !hash(file.sha256) ||
+      file.staging !== restoreStagingPath(file.from, attempt)
+    )
+      return undefined
+    parsed.push({
+      role: file.role as RelocationRole,
+      from: file.from,
+      to: file.to,
+      sha256: file.sha256,
+      staging: file.staging,
+    })
+  }
+  if (new Set(parsed.map((file) => file.role)).size !== parsed.length)
+    return undefined
+  const action = (raw: unknown, role: RelocationRole) => {
+    const listed = parsed.some((file) => file.role === role)
+    if (raw === 'copy' && listed) return 'copy' as const
+    if (raw === 'unlink' && !listed) return 'unlink' as const
+    return undefined
+  }
+  const local = action(runtimes.local, 'localRuntime')
+  const vault = action(runtimes.vault, 'vaultRuntime')
+  if (!local || !vault) return undefined
+  return {
+    attempt,
+    startedAt,
+    files: parsed,
+    runtimes: { local, vault },
+    ...(cleanup === undefined ? {} : { cleanup }),
+    ...(kept === undefined ? {} : { kept: kept as string[] }),
   }
 }
 

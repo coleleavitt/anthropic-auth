@@ -23,7 +23,10 @@ import {
   nativeRelocationRuntimePaths,
   RelocatedError,
 } from './relocation-guard.ts'
-import { StateLayoutRefusalError } from './state-layout-errors.ts'
+import {
+  StateLayoutRefusalError,
+  stateLayoutRefusalPublicMessage,
+} from './state-layout-errors.ts'
 import {
   configFolderIdentity,
   STATE_HOME_FILE_NAMES,
@@ -238,6 +241,20 @@ export function stateRefusalCause(
     current = current.cause
   }
   return undefined
+}
+
+/**
+ * The fixed message, naming no file or folder, to show for the relocation,
+ * registration or layout refusal behind `error`, or undefined when there is
+ * none. Hosts show it where their output may be shared; the refusal's own
+ * message and the log name the files.
+ */
+export function stateRefusalPublicMessage(error: unknown): string | undefined {
+  const cause = stateRefusalCause(error)
+  if (!cause) return undefined
+  return cause instanceof StateLayoutRefusalError
+    ? stateLayoutRefusalPublicMessage(cause.code)
+    : cause.message
 }
 
 /** How liveness is read; tests replace it. */

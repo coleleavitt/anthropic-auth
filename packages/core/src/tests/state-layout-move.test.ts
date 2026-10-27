@@ -222,6 +222,9 @@ async function decide(
     // that have since "exited": earlier decisions in the same test.
     liveness: liveness([process.pid]),
     timeouts: { layoutMs: 3_000, holderMs: 3_000, dataMs: 3_000 },
+    // These tests exercise the move itself, which is off by default until
+    // the release that ships it; the gate has its own tests.
+    moveEnabled: true,
     ...options,
   })
 }

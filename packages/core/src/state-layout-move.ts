@@ -35,6 +35,7 @@ import {
   fileSha256,
   publishOwned,
   type StateLayoutFs,
+  type StateLayoutLockSpec,
   type StateLayoutLockStack,
   sha256Hex,
   syncFile,
@@ -179,6 +180,19 @@ export type StateLayoutStep =
   | 'rollback:destination-removed'
   | 'rollback:sub-flushed'
   | 'rolled-back'
+  | 'restore:locks-held'
+  | 'restore:discarded'
+  | 'restore:restoring-written'
+  | `restore:staged:${RelocationRole}`
+  | 'restore:staging-flushed'
+  | 'restore:staged-written'
+  | `restore:placed:${RelocationRole}`
+  | 'restore:data-flushed'
+  | 'restore:barriers-flushed'
+  | 'restore:restored-written'
+  | `restore:retired:${RelocationRole}`
+  | 'restore:sub-flushed'
+  | 'restore:done'
 
 /**
  * Thrown by a step hook to stop a transition exactly there, with no rollback
@@ -291,19 +305,24 @@ function rowLockName(key: string) {
 }
 
 /**
- * The data locks of one pool, in order: every row lock (by id and by identity, since a
- * refresh that started before the row learned its identity holds the id
- * lock), the default provider lock, every per-identity provider lock, then
- * the two store locks. These are the locks common-auth's refresh holds from
- * before the token exchange until the successor is written, so once they are
- * held no refresh of this pool is between its exchange and its write.
+ * The refresh locks of one pool: every row lock (by id and by identity, since
+ * a refresh that started before the row learned its identity holds the id
+ * lock) and every per-identity provider lock, each list in the order it is
+ * taken. With the default provider lock between them, these are the locks
+ * common-auth's refresh holds from before the token exchange until the
+ * successor is written, so once they are held no refresh of this pool is
+ * between its exchange and its write.
  */
-async function acquirePoolLocks(
+export interface PoolRefreshLocks {
+  readonly rows: readonly string[]
+  readonly providers: readonly string[]
+  readonly identities: readonly string[]
+}
+
+function poolRefreshLocks(
   pool: PoolFiles,
-  ctx: StateLayoutTransitionContext,
-): Promise<void> {
-  const timeoutMs = ctx.dataLockTimeoutMs
-  const snapshot = await poolRows(pool)
+  snapshot: readonly { id: string; identity?: string }[],
+): PoolRefreshLocks {
   // Sorted by the raw key, then encoded, exactly as common-auth's roster
   // publication orders the row locks it takes: encoding can reorder legal
   // ids (`a-b` sorts before `a:b`, but `a%3Ab` before `a-b`).
@@ -314,30 +333,130 @@ async function acquirePoolLocks(
       ),
     ),
   ].sort()
-  const rowNames = rowKeys.map(rowLockName)
-  for (const name of rowNames)
-    await ctx.stack.acquire({ name, path: pool.state, timeoutMs })
-  await ctx.stack.acquire({
-    name: 'provider-anthropic',
-    path: pool.state,
-    timeoutMs,
-  })
   const identities = [
     ...new Set(snapshot.flatMap((row) => (row.identity ? [row.identity] : []))),
   ].sort()
-  const providerLocks = identities.map(
-    (identity) =>
-      nativeAccountProviderLock(
-        { state: pool.state, storageId: pool.storageId } as NativePoolPaths,
-        identity,
-      ).name,
-  )
-  for (const name of [...providerLocks].sort())
-    await ctx.stack.acquire({ name, path: pool.state, timeoutMs })
-  await ctx.stack.acquire({ name: 'pool-config', path: pool.config, timeoutMs })
-  await ctx.stack.acquire({ name: 'pool-state', path: pool.state, timeoutMs })
-  const locked = new Set(rowNames)
-  const lockedIdentities = new Set(identities)
+  const providers = identities
+    .map(
+      (identity) =>
+        nativeAccountProviderLock(
+          { state: pool.state, storageId: pool.storageId } as NativePoolPaths,
+          identity,
+        ).name,
+    )
+    .sort()
+  return { rows: rowKeys.map(rowLockName), providers, identities }
+}
+
+function poolLockOrder(
+  pool: PoolFiles,
+  refresh: PoolRefreshLocks | undefined,
+  timeoutMs: number | undefined,
+): StateLayoutLockSpec[] {
+  const specs: StateLayoutLockSpec[] = []
+  if (refresh) {
+    for (const name of refresh.rows)
+      specs.push({ name, path: pool.state, timeoutMs })
+    specs.push({ name: 'provider-anthropic', path: pool.state, timeoutMs })
+    for (const name of refresh.providers)
+      specs.push({ name, path: pool.state, timeoutMs })
+  }
+  specs.push({ name: 'pool-config', path: pool.config, timeoutMs })
+  specs.push({ name: 'pool-state', path: pool.state, timeoutMs })
+  return specs
+}
+
+function localPool(dataset: RelocationDataset): PoolFiles {
+  return {
+    config: dataset.oldPaths.config,
+    state: dataset.oldPaths.state,
+    storageId: dataset.oldPaths.storageId,
+  }
+}
+
+function vaultPool(dataset: RelocationDataset): PoolFiles {
+  return {
+    config: dataset.oldVault.config,
+    state: dataset.oldVault.state,
+    storageId: dataset.oldVault.storageId,
+  }
+}
+
+/**
+ * The one order in which every layout transition takes the data locks of a
+ * dataset's old files, each lock once: `native-migration`, the local pool's
+ * locks, the custody roster and local runtime, the vault pool's locks, the
+ * vault roster, the vault runtime and the vault routing file.
+ *
+ * A move passes `refresh`, which adds each pool's row and provider locks
+ * before its store locks, so that no refresh is in flight while it copies.
+ * A restore passes none: the old pool states are absent after a move's
+ * cleanup and the old-layout barriers stop every refresh before its provider
+ * call, while no process may use the moved copy without a live registration,
+ * which restore refuses. The restore order is therefore a subsequence of the
+ * move order, and the two can't wait on each other in opposite orders.
+ */
+export function stateLayoutDataLockOrder(
+  dataset: RelocationDataset,
+  options: {
+    timeoutMs?: number
+    refresh?: {
+      readonly local: PoolRefreshLocks
+      readonly vault: PoolRefreshLocks
+    }
+  } = {},
+): StateLayoutLockSpec[] {
+  const { timeoutMs, refresh } = options
+  const order: StateLayoutLockSpec[] = [
+    {
+      name: 'native-migration',
+      path: dataset.oldPaths.journal,
+      ttlMs: 30_000,
+      timeoutMs,
+    },
+    ...poolLockOrder(localPool(dataset), refresh?.local, timeoutMs),
+    {
+      name: 'claustrum-roster-write',
+      path: dataset.oldPaths.roster,
+      timeoutMs,
+    },
+    { name: 'native-runtime', path: dataset.oldPaths.runtime, timeoutMs },
+    ...poolLockOrder(vaultPool(dataset), refresh?.vault, timeoutMs),
+    {
+      name: 'claustrum-roster',
+      path: dataset.oldVault.roster,
+      ttlMs: 30_000,
+      timeoutMs,
+    },
+    {
+      name: 'claustrum-roster-write',
+      path: dataset.oldVault.roster,
+      timeoutMs,
+    },
+    { name: 'native-runtime', path: dataset.oldVault.runtime, timeoutMs },
+    {
+      name: 'write',
+      path: dataset.oldVault.routing,
+      ttlMs: 30_000,
+      timeoutMs,
+    },
+  ]
+  const seen = new Set<string>()
+  return order.filter((spec) => {
+    const key = `${spec.name}\0${spec.path}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+/** Throw `PoolSnapshotChanged` when a row's locks were not all taken. */
+async function requireRowsLocked(
+  pool: PoolFiles,
+  locks: PoolRefreshLocks,
+): Promise<void> {
+  const locked = new Set(locks.rows)
+  const lockedIdentities = new Set(locks.identities)
   for (const row of await poolRows(pool)) {
     if (
       !locked.has(rowLockName(row.id)) ||
@@ -350,75 +469,45 @@ async function acquirePoolLocks(
 }
 
 /**
- * Every data lock of a move, in a fixed order, for the dataset's old
- * files: `native-migration`, the local pool's locks, the custody roster and
- * local runtime, the vault pool's locks, the vault roster, the vault runtime
- * and the vault routing file. If a pool's rows changed while its locks were
- * taken, everything is released and taken once more; a second change throws
- * `PoolSnapshotChanged`.
+ * Take every data lock of the dataset's old files in
+ * `stateLayoutDataLockOrder`. A move (`drainRefreshes`, the default) first
+ * reads each pool's rows without a lock to name their row and provider locks,
+ * then reads them again under the store locks: if a row changed while the
+ * locks were taken, everything is released and taken once more, and a second
+ * change throws `PoolSnapshotChanged`. A restore takes no row or provider
+ * lock.
  */
 export async function acquireDataLocks(
   dataset: RelocationDataset,
   ctx: StateLayoutTransitionContext,
+  options: { drainRefreshes?: boolean } = {},
 ): Promise<void> {
   const mark = ctx.stack.size
   const timeoutMs = ctx.dataLockTimeoutMs
+  const drain = options.drainRefreshes ?? true
   for (let attempt = 0; ; attempt++) {
     try {
-      await ctx.stack.acquire({
-        name: 'native-migration',
-        path: dataset.oldPaths.journal,
-        ttlMs: 30_000,
+      const refresh = drain
+        ? {
+            local: poolRefreshLocks(
+              localPool(dataset),
+              await poolRows(localPool(dataset)),
+            ),
+            vault: poolRefreshLocks(
+              vaultPool(dataset),
+              await poolRows(vaultPool(dataset)),
+            ),
+          }
+        : undefined
+      for (const spec of stateLayoutDataLockOrder(dataset, {
         timeoutMs,
-      })
-      await acquirePoolLocks(
-        {
-          config: dataset.oldPaths.config,
-          state: dataset.oldPaths.state,
-          storageId: dataset.oldPaths.storageId,
-        },
-        ctx,
-      )
-      await ctx.stack.acquire({
-        name: 'claustrum-roster-write',
-        path: dataset.oldPaths.roster,
-        timeoutMs,
-      })
-      await ctx.stack.acquire({
-        name: 'native-runtime',
-        path: dataset.oldPaths.runtime,
-        timeoutMs,
-      })
-      await acquirePoolLocks(
-        {
-          config: dataset.oldVault.config,
-          state: dataset.oldVault.state,
-          storageId: dataset.oldVault.storageId,
-        },
-        ctx,
-      )
-      await ctx.stack.acquire({
-        name: 'claustrum-roster',
-        path: dataset.oldVault.roster,
-        ttlMs: 30_000,
-        timeoutMs,
-      })
-      await ctx.stack.acquire({
-        name: 'claustrum-roster-write',
-        path: dataset.oldVault.roster,
-        timeoutMs,
-      })
-      await ctx.stack.acquire({
-        name: 'native-runtime',
-        path: dataset.oldVault.runtime,
-        timeoutMs,
-      })
-      await ctx.stack.acquire({
-        name: 'write',
-        path: dataset.oldVault.routing,
-        ttlMs: 30_000,
-        timeoutMs,
-      })
+        refresh,
+      }))
+        await ctx.stack.acquire(spec)
+      if (refresh) {
+        await requireRowsLocked(localPool(dataset), refresh.local)
+        await requireRowsLocked(vaultPool(dataset), refresh.vault)
+      }
       return
     } catch (error) {
       await ctx.stack.releaseTo(mark)
@@ -461,7 +550,9 @@ export function relocationTombstone(
   })}\n`
 }
 
-async function tombstoneAttempt(path: string): Promise<string | undefined> {
+export async function tombstoneAttempt(
+  path: string,
+): Promise<string | undefined> {
   try {
     return (await readRelocationPointer(path))?.attempt
   } catch {
@@ -477,7 +568,7 @@ function restoringPath(path: string, attempt: string): string {
   return `${path}.restoring-${attempt}`
 }
 
-async function exists(path: string): Promise<boolean> {
+export async function exists(path: string): Promise<boolean> {
   try {
     await lstat(path)
     return true
@@ -487,7 +578,7 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function removeOwnStaging(path: string): Promise<void> {
+export async function removeOwnStaging(path: string): Promise<void> {
   try {
     const info = await lstat(path)
     if (info.isFile()) await unlink(path)
@@ -503,7 +594,7 @@ async function removeOwnStaging(path: string): Promise<void> {
  * never acted on.
  */
 export function recordFilesProblem(
-  record: Pick<StateLayoutRecord, 'files'>,
+  record: Pick<StateLayoutRecord, 'files' | 'restore'>,
   dataset: Pick<RelocationDataset, 'slots'>,
 ): string | undefined {
   if (record.files.length !== dataset.slots.length)
@@ -513,6 +604,13 @@ export function recordFilesProblem(
     if (!file) return `it has no ${slot.role} entry`
     if (file.from !== slot.from || file.to !== slot.to)
       return `its ${slot.role} entry names ${file.from} and ${file.to}, not ${slot.from} and ${slot.to}`
+  }
+  // A restore's recovery renames and deletes the files it lists, so they
+  // must be this dataset's files too (their staging names follow from them).
+  for (const file of record.restore?.files ?? []) {
+    const slot = dataset.slots.find((candidate) => candidate.role === file.role)
+    if (!slot || file.from !== slot.from || file.to !== slot.to)
+      return `its restore lists ${file.from} and ${file.to} for ${file.role}`
   }
   return undefined
 }
@@ -644,7 +742,7 @@ function expectRecord(
 }
 
 /** Expect `path` to hold bytes hashing to `sha256`, or to be absent for null. */
-function expectDigest(path: string, sha256: string | null) {
+export function expectDigest(path: string, sha256: string | null) {
   return async (): Promise<string | undefined> => {
     const digest = await digestFile(path)
     if (sha256 === null)
@@ -654,14 +752,14 @@ function expectDigest(path: string, sha256: string | null) {
   }
 }
 
-function expectTombstone(path: string, attempt: string) {
+export function expectTombstone(path: string, attempt: string) {
   return async (): Promise<string | undefined> =>
     (await tombstoneAttempt(path)) === attempt
       ? undefined
       : 'it is no longer this move’s tombstone'
 }
 
-function expectAbsent(path: string) {
+export function expectAbsent(path: string) {
   return async (): Promise<string | undefined> =>
     (await exists(path)) ? 'it exists' : undefined
 }
@@ -670,7 +768,7 @@ function expectAbsent(path: string) {
  * Rename `from` to `to` (or unlink `from` when `to` is undefined) through
  * `publishOwned`, treating a skipped retry as a failure.
  */
-async function owned(
+export async function owned(
   ctx: StateLayoutTransitionContext,
   step: Parameters<typeof publishOwned>[0],
   expect: () => Promise<string | undefined>,
