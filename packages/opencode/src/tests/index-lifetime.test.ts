@@ -14,24 +14,27 @@ async function outerCleanupHook(): Promise<
   (cleanup: () => Promise<void>, lifetime: TestLifetime) => Promise<unknown>
 > {
   const source = await readFile(
-    new URL('./index.test.ts', import.meta.url),
+    new URL('./support/opencode1-test-context.ts', import.meta.url),
     'utf8',
   )
-  const marker = 'afterEach(async () => {\n  const lifetime = testLifetime\n'
+  const marker =
+    '  afterEach(async () => {\n    const lifetime = ctx.testLifetime\n'
   const start = source.indexOf(marker)
   if (start < 0 || source.indexOf(marker, start + marker.length) >= 0)
     throw new Error('Expected one outer fixture cleanup hook')
-  const bodyStart = start + 'afterEach(async () => {'.length
-  const end = source.indexOf('\n})', bodyStart)
+  const bodyStart = start + '  afterEach(async () => {'.length
+  const end = source.indexOf('\n  })', bodyStart)
   if (end < 0) throw new Error('Missing outer fixture cleanup hook terminator')
   const body = source.slice(bodyStart, end)
   const captured = new Function(
     'cleanupTempConfigDirs',
-    'testLifetime',
+    'ctx',
     `return (async () => {${body}\n})()`,
   )
   return (cleanup, lifetime) =>
-    Promise.resolve(Reflect.apply(captured, undefined, [cleanup, lifetime]))
+    Promise.resolve(
+      Reflect.apply(captured, undefined, [cleanup, { testLifetime: lifetime }]),
+    )
 }
 
 suite.test(

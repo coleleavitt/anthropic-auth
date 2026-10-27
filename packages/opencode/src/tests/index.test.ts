@@ -1,21 +1,6 @@
-import {
-  afterAll,
-  afterEach,
-  beforeEach,
-  test as bunTest,
-  describe,
-  expect,
-  mock,
-  spyOn,
-} from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn } from 'bun:test'
 import { createHash, randomUUID } from 'node:crypto'
-import {
-  existsSync,
-  readFileSync,
-  realpathSync,
-  statSync,
-  watch,
-} from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import * as filesystem from 'node:fs/promises'
 import {
   mkdir,
@@ -29,10 +14,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { gunzipSync } from 'node:zlib'
-import type {
-  NativeRefreshSubject,
-  PrimeManager,
-} from '@cortexkit/anthropic-auth-core'
+import type { PrimeManager } from '@cortexkit/anthropic-auth-core'
 import * as Core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
@@ -51,7 +33,6 @@ import {
   getDumpDirectory,
   getHostClaustrumEnrollmentPaths,
   hashRefreshToken,
-  isCustodyTombstoneOAuth,
   isDumpEnabled,
   isNativeLocalCredentialValidation,
   isOAuthAccount,
@@ -63,9 +44,7 @@ import {
   PROFILE_TTL_MS,
   type ProviderAccountUuid,
   resetCache1hState,
-  resetClaudeCodeIdentityCachesForTest,
   resetDumpState,
-  resetFastModeState,
   type SetupIO,
   setLogLevel,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
@@ -74,25 +53,20 @@ import {
 import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
 import { withLock } from '@cortexkit/common-auth/fs'
 import * as commonAuthSetup from '@cortexkit/common-auth/setup'
-import {
-  fromNativeQuotaMap,
-  nativeQuotaCodec,
-} from '../../../core/src/native-quota-codec.ts'
+import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import type { NativeRefreshObservation } from '../../../core/src/native-refresh-coordinator.ts'
 import {
   publishNativeLocalRefreshFailure,
   readNativeRuntime,
 } from '../../../core/src/native-runtime.ts'
-import { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
+import type { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
 import { EFFORT_MARKER_PREFIX } from '../effort-history'
-import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
   drainNotifications,
   resetNotificationsForTest,
 } from '../rpc/notifications'
 import { COMMAND_MODAL_NAMES } from '../rpc/protocol'
-import { createRpcClient } from '../rpc/rpc-client'
 import {
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
@@ -103,25 +77,367 @@ import {
   drainSidebarWrites,
   getSidebarState,
   getSidebarStateFile,
-  __setSidebarStateWriteTestHooks as installSidebarStateWriteHooks,
   resolveActiveAccount,
   setSidebarState,
 } from '../sidebar-state'
 import { rewriteRequestBody } from '../transform.ts'
-import {
-  migrateNativeOpencodeFixture,
-  type NativeOpencodeFixture,
-} from './native-fixture.ts'
 import { getPluginTestHandles } from './plugin-test-handles'
 import {
+  applyMenuAction as applyMenuActionWithCtx,
+  createMockClient,
+  expectHandledCommandResponse,
+  fireConcurrentFetches,
+  latestIgnoredReply,
+  openClaudeMenu,
+} from './support/opencode1-client.ts'
+import { installLoaderSetup } from './support/opencode1-loader-setup.ts'
+import {
+  addPoolOAuthAccount as addPoolOAuthAccountWithCtx,
+  bindMainAccount,
+  bindMainQuotaToAccount,
+  bindPoolAccounts,
+  createFallbackStorage,
+  expectHostActivationNonSecret as expectHostActivationNonSecretWithCtx,
+  expectNoCredentialFragment as expectNoCredentialFragmentWithCtx,
+  getPlugin as getPluginWithCtx,
+  loginIssues as loginIssuesWithCtx,
+  mainAccountIssues as mainAccountIssuesWithCtx,
+  mainOnlyVault,
+  migratedHostAuth as migratedHostAuthWithCtx,
+  nativeAdmissionAnswer as nativeAdmissionAnswerWithCtx,
+  nativeBootstrapAnswer as nativeBootstrapAnswerWithCtx,
+  nativeTokenAnswer as nativeTokenAnswerWithCtx,
+  poolMainAccess as poolMainAccessWithCtx,
+  poolMainIdentity as poolMainIdentityWithCtx,
+  publishNativeMainQuota as publishNativeMainQuotaWithCtx,
+  publishPoolMetadata as publishPoolMetadataWithCtx,
+  publishPoolQuota as publishPoolQuotaWithCtx,
+  readNativeRuntimeState as readNativeRuntimeStateWithCtx,
+  readNativeSettings as readNativeSettingsWithCtx,
+  refreshPoolLoginElsewhere as refreshPoolLoginElsewhereWithCtx,
+  refreshPoolMainElsewhere as refreshPoolMainElsewhereWithCtx,
+  registerPoolLogins as registerPoolLoginsWithCtx,
+  replacePoolMainLogin as replacePoolMainLoginWithCtx,
+  requireKnownPoolSubject,
+  setupExpiredTokenLoader as setupExpiredTokenLoaderWithCtx,
+  syntheticFallbackAccountUuid,
+  syntheticMainAccountUuid,
+  syntheticMainHostAuth,
+  syntheticMainIdentity,
+  updatePoolRelay as updatePoolRelayWithCtx,
+  updatePoolSettings as updatePoolSettingsWithCtx,
+  useTempAccountFile as useTempAccountFileWithCtx,
+  useUnmigratedAccountFile as useUnmigratedAccountFileWithCtx,
+  useVaultAccountFile as useVaultAccountFileWithCtx,
+  waitForPoolCredential as waitForPoolCredentialWithCtx,
+  withMainAdmission as withMainAdmissionWithCtx,
+  withNativeAdmission as withNativeAdmissionWithCtx,
+  withNativeBootstrap as withNativeBootstrapWithCtx,
+  withNativeTokenExchange as withNativeTokenExchangeWithCtx,
+} from './support/opencode1-pool-fixture.ts'
+import {
+  expectNonOatMainRefused as expectNonOatMainRefusedWithCtx,
+  loadMainAndFetch as loadMainAndFetchWithCtx,
+  readFeedEntries,
+  waitForFeedEntries as waitForFeedEntriesWithCtx,
+  waitForLogRecord as waitForLogRecordWithCtx,
+} from './support/opencode1-quota-feed.ts'
+import {
+  readAccountStorage as readAccountStorageWithCtx,
+  restoreProcessTestFiles,
+  seedSidebarRouting,
+  waitForAccountStorage as waitForAccountStorageWithCtx,
+  waitForMockCall,
+  waitForNativePoolQuota as waitForNativePoolQuotaWithCtx,
+  waitForSidebarState as waitForSidebarStateWithCtx,
+} from './support/opencode1-state-observers.ts'
+import type {
+  MigratedPool,
+  PluginRuntimeOverrides,
+  PoolLogin,
+} from './support/opencode1-test-context.ts'
+import {
+  cleanupTempConfigDirs as cleanupTempConfigDirsWithCtx,
+  createOpencode1Test,
+  createOpencode1TestContext,
+  drainBeforeReset,
+  EMPTY_POST,
+  getBodyLifetime,
+  heldResponse as heldResponseWithCtx,
+  installOpencode1TestHooks,
+  lifetimeSignal as lifetimeSignalWithCtx,
+  onSidebarWrite as onSidebarWriteWithCtx,
+  recordedCondition as recordedConditionWithCtx,
+  setSidebarWriteTestHooks as setSidebarWriteTestHooksWithCtx,
+  untilStateOrTestEnd as untilStateOrTestEndWithCtx,
+  withDeadlockGuard,
+} from './support/opencode1-test-context.ts'
+import {
   extractUrl,
-  installDefaultFetchMock,
   MESSAGES_URL,
   PROFILE_URL,
   QUOTA_URL,
   TOKEN_URL,
 } from './test-fetch'
 
+const testContext = createOpencode1TestContext()
+installOpencode1TestHooks(testContext)
+const test = createOpencode1Test(testContext)
+
+function bodyLifetime(): TestLifetime {
+  return getBodyLifetime(testContext)
+}
+function lifetimeSignal() {
+  return lifetimeSignalWithCtx(testContext)
+}
+function recordedCondition() {
+  return recordedConditionWithCtx(testContext)
+}
+function _untilStateOrTestEnd(pauseMs?: number) {
+  return untilStateOrTestEndWithCtx(testContext, pauseMs)
+}
+function heldResponse() {
+  return heldResponseWithCtx(testContext)
+}
+function _cleanupTempConfigDirs(drainTimeoutMs = 4_000) {
+  return cleanupTempConfigDirsWithCtx(testContext, drainTimeoutMs)
+}
+function __setSidebarStateWriteTestHooks(
+  hooks: Parameters<typeof setSidebarWriteTestHooksWithCtx>[1],
+  stateFile: string = getSidebarStateFile(),
+) {
+  return setSidebarWriteTestHooksWithCtx(testContext, hooks, stateFile)
+}
+function _onSidebarWrite(stateFile: string, listener: () => void) {
+  return onSidebarWriteWithCtx(testContext, stateFile, listener)
+}
+function useTempAccountFile(
+  storage: AccountStorage,
+  mainHostAuth: {
+    access: string
+    refresh: string
+    expires: number
+  } = syntheticMainHostAuth(),
+) {
+  return useTempAccountFileWithCtx(testContext, storage, mainHostAuth)
+}
+function useVaultAccountFile(
+  storage: AccountStorage,
+  client: NativeCustodyClient,
+) {
+  return useVaultAccountFileWithCtx(testContext, storage, client)
+}
+function useUnmigratedAccountFile(storage: AccountStorage) {
+  return useUnmigratedAccountFileWithCtx(testContext, storage)
+}
+function _registerPoolLogins(
+  storage: AccountStorage,
+  main: { access: string; refresh: string },
+) {
+  return registerPoolLoginsWithCtx(testContext, storage, main)
+}
+function _nativeTokenAnswer(
+  input: Parameters<typeof fetch>[0],
+  init?: RequestInit,
+  logins?: readonly PoolLogin[],
+) {
+  return nativeTokenAnswerWithCtx(testContext, input, init, logins)
+}
+function withNativeTokenExchange<Input, Init>(
+  handler: (input: Input, init: Init) => Response | Promise<Response>,
+) {
+  return withNativeTokenExchangeWithCtx(testContext, handler)
+}
+function poolMainIdentity(): string {
+  return poolMainIdentityWithCtx(testContext)
+}
+function mainAccountIssues(...accesses: string[]) {
+  return mainAccountIssuesWithCtx(testContext, ...accesses)
+}
+function loginIssues(current: string, ...accesses: string[]) {
+  return loginIssuesWithCtx(testContext, current, ...accesses)
+}
+function nativeAdmissionAnswer(
+  input: Parameters<typeof fetch>[0],
+  init?: RequestInit,
+) {
+  return nativeAdmissionAnswerWithCtx(testContext, input, init)
+}
+function nativeBootstrapAnswer(
+  input: Parameters<typeof fetch>[0],
+  init?: RequestInit,
+  logins?: readonly PoolLogin[],
+) {
+  return nativeBootstrapAnswerWithCtx(testContext, input, init, logins)
+}
+function withNativeAdmission<Input, Init>(
+  handler: (input: Input, init: Init) => unknown,
+) {
+  return withNativeAdmissionWithCtx(testContext, handler)
+}
+function withMainAdmission<Input, Init>(
+  handler: (input: Input, init: Init) => Response | Promise<Response>,
+) {
+  return withMainAdmissionWithCtx(testContext, handler)
+}
+function withNativeBootstrap<Input, Init>(
+  handler: (input: Input, init: Init) => unknown,
+) {
+  return withNativeBootstrapWithCtx(testContext, handler)
+}
+function replacePoolMainLogin(
+  credential: { access: string; refresh: string; expires: number },
+  options?: { sameAccount: boolean; accountIdentity?: string },
+) {
+  return replacePoolMainLoginWithCtx(
+    testContext,
+    credential,
+    options as { sameAccount: boolean; accountIdentity?: string },
+  )
+}
+function refreshPoolMainElsewhere(successor: {
+  access: string
+  refresh: string
+  expires: number
+}) {
+  return refreshPoolMainElsewhereWithCtx(testContext, successor)
+}
+function waitForPoolCredential(routeId: string, access: string) {
+  return waitForPoolCredentialWithCtx(testContext, routeId, access)
+}
+function refreshPoolLoginElsewhere(
+  routeId: string,
+  successor: { access: string; refresh: string; expires: number },
+) {
+  return refreshPoolLoginElsewhereWithCtx(testContext, routeId, successor)
+}
+function updatePoolSettings(
+  mutator: (settings: Record<string, unknown>) => Record<string, unknown>,
+) {
+  return updatePoolSettingsWithCtx(testContext, mutator)
+}
+function addPoolOAuthAccount(
+  routeId: string,
+  credential: { access: string; refresh: string; expires: number },
+  accountIdentity?: string,
+) {
+  return accountIdentity === undefined
+    ? addPoolOAuthAccountWithCtx(testContext, routeId, credential)
+    : addPoolOAuthAccountWithCtx(
+        testContext,
+        routeId,
+        credential,
+        accountIdentity,
+      )
+}
+function updatePoolRelay(
+  patch: Parameters<
+    ReturnType<
+      typeof import('@cortexkit/anthropic-auth-core').createNativeAccountRuntime
+    >['updateRelay']
+  >[0],
+) {
+  return updatePoolRelayWithCtx(testContext, patch)
+}
+function publishPoolQuota(routeId: string, quota: OAuthQuotaSnapshot) {
+  return publishPoolQuotaWithCtx(testContext, routeId, quota)
+}
+function publishPoolMetadata(
+  routeId: string,
+  patch: (
+    identity: string,
+  ) => Parameters<
+    ReturnType<
+      typeof import('@cortexkit/anthropic-auth-core').createNativeAccountRuntime
+    >['publishLocal']
+  >[1],
+) {
+  return publishPoolMetadataWithCtx(testContext, routeId, patch)
+}
+function expectHostActivationNonSecret(...tokens: string[]) {
+  return expectHostActivationNonSecretWithCtx(testContext, ...tokens)
+}
+function poolMainAccess(): Promise<string> {
+  return poolMainAccessWithCtx(testContext)
+}
+function _migratedHostAuth(
+  pool: MigratedPool,
+  testAuth: () => Promise<Record<string, unknown>>,
+) {
+  return migratedHostAuthWithCtx(testContext, pool, testAuth)
+}
+function expectNoCredentialFragment(value: unknown) {
+  return expectNoCredentialFragmentWithCtx(testContext, value)
+}
+function readNativeSettings(): Promise<Record<string, unknown>> {
+  return readNativeSettingsWithCtx(testContext)
+}
+function publishNativeMainQuota(quota: OAuthQuotaSnapshot) {
+  return publishNativeMainQuotaWithCtx(testContext, quota)
+}
+function readNativeRuntimeState() {
+  return readNativeRuntimeStateWithCtx(testContext)
+}
+function getPlugin(
+  client?: ReturnType<typeof createMockClient>,
+  directory?: string,
+  runtimeOverrides: PluginRuntimeOverrides = {},
+) {
+  return getPluginWithCtx(testContext, client, directory, runtimeOverrides)
+}
+function setupExpiredTokenLoader(...issuedAccess: string[]) {
+  return setupExpiredTokenLoaderWithCtx(testContext, ...issuedAccess)
+}
+function waitForSidebarState(
+  predicate: (state: Awaited<ReturnType<typeof getSidebarState>>) => boolean,
+) {
+  return waitForSidebarStateWithCtx(testContext, predicate)
+}
+function readAccountStorage(): Promise<AccountStorage | null> {
+  return readAccountStorageWithCtx(testContext)
+}
+function waitForAccountStorage(
+  predicate: (storage: AccountStorage | null) => boolean,
+) {
+  return waitForAccountStorageWithCtx(testContext, predicate)
+}
+function waitForNativePoolQuota(
+  routeId: string,
+  predicate: (quota: OAuthQuotaSnapshot | undefined) => boolean,
+  options?: { keepAliveUntil?: Promise<unknown> },
+) {
+  return waitForNativePoolQuotaWithCtx(testContext, routeId, predicate, options)
+}
+function applyMenuAction(
+  plugin: any,
+  sessionId: string,
+  request: Omit<CommandApplyRequest, 'command' | 'sessionId'>,
+): Promise<CommandApplyResult> {
+  return applyMenuActionWithCtx(testContext, plugin, sessionId, request)
+}
+function waitForFeedEntries(
+  predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
+  description: string,
+) {
+  return waitForFeedEntriesWithCtx(testContext, predicate, description)
+}
+function waitForLogRecord(
+  records: LogTestRecord[],
+  predicate: (record: LogTestRecord) => boolean,
+  description: string,
+) {
+  return waitForLogRecordWithCtx(testContext, records, predicate, description)
+}
+function loadMainAndFetch(
+  storage: AccountStorage,
+  response: Response | (() => Response),
+  requestHeaders?: Record<string, string>,
+) {
+  return loadMainAndFetchWithCtx(testContext, storage, response, requestHeaders)
+}
+function expectNonOatMainRefused(access: string) {
+  return expectNonOatMainRefusedWithCtx(testContext, access)
+}
 async function assertPrimeWithPublicDiagnostics(
   manager: PrimeManager,
   requestStages: readonly string[],
@@ -151,615 +467,6 @@ async function freshPrimeQuotaResponse(
 ): Promise<Response> {
   await Bun.sleep(2)
   return new Response(JSON.stringify(body), init)
-}
-
-// Minimal mock of the OpenCode plugin client
-function createMockClient(
-  messages?: unknown[],
-  getSessionStatuses?: () =>
-    | Record<string, { type: string }>
-    | Promise<Record<string, { type: string }>>,
-) {
-  return {
-    auth: {
-      set: mock(() => Promise.resolve()),
-    },
-    session: {
-      messages: messages
-        ? mock(() => Promise.resolve({ data: messages }))
-        : undefined,
-      status: getSessionStatuses
-        ? mock(async () => ({ data: await getSessionStatuses() }))
-        : undefined,
-      promptAsync: mock((_input: unknown) => Promise.resolve()),
-    },
-  }
-}
-
-const EMPTY_POST = { method: 'POST', body: '{}' } as const
-let tempConfigDir: string | undefined
-const tempConfigDirs = new Set<string>()
-const allTempConfigDirs = new Set<string>()
-const fallbackRefreshes = new Set<Promise<unknown>>()
-
-// Environment variables a test sets to point the plugin at its migrated
-// account pool; each test's cleanup puts back their previous values.
-const nativeEnvKeys = [
-  'OPENCODE_ANTHROPIC_AUTH_FILE',
-  'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
-  'OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE',
-  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
-  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
-  'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
-  'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
-  'CLAUDE_CONFIG_DIR',
-  'OPENCODE_AUTH_CONTENT',
-] as const
-
-/**
- * One lifetime per test. It is created before the describe-level beforeEach
- * hooks run, so a pool migrated in a hook and one migrated in the body share
- * it. Teardown waits for the whole body and registered work, disposes the
- * plugins it created, then removes the directories it migrated.
- */
-let testLifetime: TestLifetime | undefined
-/** The pool the current test migrated most recently, if any. */
-let migratedPool: MigratedPool | undefined
-const livePlugins = new Set<{ dispose?: () => unknown }>()
-
-type MigratedPool = NativeOpencodeFixture & {
-  /** The Anthropic OAuth credential transferred from OpenCode's auth.json to the shared credential pool. */
-  mainHostAuth: { access: string; refresh: string; expires: number }
-}
-
-function bodyLifetime(): TestLifetime {
-  if (!testLifetime) throw new Error('Test fixture has no body lifetime')
-  return testLifetime
-}
-
-type TestBody = () => unknown
-
-async function drainBeforeReset(
-  lifetime: TestLifetime | undefined,
-  reset: () => void | Promise<void>,
-) {
-  // Bun can time out the test before its async body finishes. Keep its
-  // transport and environment intact until that body and its work drain.
-  await lifetime?.finish()
-  await reset()
-}
-
-/** Bun's test, with the body run inside this test's fixture lifetime. */
-function test(name: string, body: TestBody, timeout?: number) {
-  bunTest(name, () => bodyLifetime().runBody(body), timeout)
-}
-test.serial = (name: string, body: TestBody, timeout?: number) => {
-  bunTest.serial(name, () => bodyLifetime().runBody(body), timeout)
-}
-test.each =
-  <T>(cases: readonly T[]) =>
-  (name: string, body: (row: T) => unknown, timeout?: number) => {
-    bunTest.each(cases as T[])(
-      name,
-      (row: T) => bodyLifetime().runBody(() => body(row)),
-      timeout,
-    )
-  }
-
-beforeEach(() => {
-  installDefaultFetchMock()
-  const lifetime = new TestLifetime()
-  testLifetime = lifetime
-  const savedEnv = new Map(
-    nativeEnvKeys.map((key) => [key, process.env[key]] as const),
-  )
-  // Registered first, so it runs before any migrated directory is removed:
-  // plugins stop and pending sidebar writes land while their files exist.
-  lifetime.deferCleanup(async () => {
-    const plugins = [...livePlugins]
-    livePlugins.clear()
-    const results = await Promise.allSettled(
-      plugins.map((plugin) => Promise.resolve().then(() => plugin.dispose?.())),
-    )
-    try {
-      await drainSidebarWrites()
-    } finally {
-      migratedPool = undefined
-      poolLogins.length = 0
-      successorAccess.clear()
-      for (const [key, value] of savedEnv) {
-        if (value === undefined) delete process.env[key]
-        else process.env[key] = value
-      }
-    }
-    const failed = results.filter((result) => result.status === 'rejected')
-    if (failed.length)
-      throw new AggregateError(
-        failed.map((result) => result.reason),
-        'Plugin disposal failed',
-      )
-  })
-})
-
-afterEach(async () => {
-  const lifetime = testLifetime
-  testLifetime = undefined
-  try {
-    await lifetime?.finish()
-  } finally {
-    await cleanupTempConfigDirs()
-  }
-})
-
-afterAll(async () => {
-  await cleanupTempConfigDirs()
-  await Bun.sleep(100)
-  await cleanupTempConfigDirs()
-  await Promise.all(
-    [...allTempConfigDirs].map((directory) =>
-      rm(directory, { recursive: true, force: true }).catch(() => {}),
-    ),
-  )
-  allTempConfigDirs.clear()
-})
-
-async function cleanupTempConfigDirs(drainTimeoutMs = 4_000) {
-  const refreshesSettled = await Promise.race([
-    Promise.allSettled(fallbackRefreshes).then(() => true),
-    Bun.sleep(drainTimeoutMs).then(() => false),
-  ])
-  if (refreshesSettled) fallbackRefreshes.clear()
-  await drainSidebarWrites()
-  // tempConfigDir is a migrated root; the test's lifetime removes it after
-  // disposing the plugins that use it.
-  const directories = [...tempConfigDirs]
-  tempConfigDirs.clear()
-  tempConfigDir = undefined
-  await Promise.all(
-    directories.map((directory) =>
-      rm(directory, { recursive: true, force: true }).catch(() => {}),
-    ),
-  )
-}
-
-function deferred() {
-  let resolve!: () => void
-  const promise = new Promise<void>((next) => {
-    resolve = next
-  })
-  return { promise, resolve }
-}
-
-/**
- * A signal a test's mock raises when the plugin reaches a point the body
- * waits for. Teardown raises it as well, so a body still waiting for a point
- * the plugin never reached resumes and finishes (failing on its assertions)
- * instead of holding its plugin and every later test's teardown.
- */
-function lifetimeSignal() {
-  const gate = bodyLifetime().gate()
-  return { raised: gate.wait, raise: gate.open }
-}
-
-/**
- * Waits on values a test's mocks record. A mock calls `changed()` after each
- * update, which wakes every waiter whose condition now holds; the test waits
- * for the update itself instead of sleeping a fixed time or polling a fixed
- * number of times. Teardown wakes the rest, so the caller's assertion then
- * reports what was actually recorded.
- */
-function recordedCondition() {
-  const waiters = new Set<{ holds: () => boolean; open: () => void }>()
-  return {
-    changed() {
-      for (const waiter of [...waiters])
-        if (waiter.holds()) {
-          waiters.delete(waiter)
-          waiter.open()
-        }
-    },
-    until(holds: () => boolean): Promise<void> {
-      if (holds()) return Promise.resolve()
-      const gate = bodyLifetime().gate()
-      waiters.add({ holds, open: gate.open })
-      return gate.wait
-    },
-  }
-}
-
-/**
- * Paces a helper that re-reads state until it matches. `notify` wakes the
- * current wait (an event source calls it after each write that may matter).
- * Without an event source, pass `pauseMs` and each wait is that short pause.
- * There is no attempt count or deadline: the helper keeps reading until its
- * state arrives or the test ends, so the test's own timeout is the only
- * limit. Teardown ends the wait, so a test whose state never arrives fails on
- * its own mismatch error instead of hanging.
- */
-function untilStateOrTestEnd(pauseMs?: number) {
-  // A body that outlived its test has no lifetime left: make one final check.
-  const ended = testLifetime?.gate() ?? {
-    wait: Promise.resolve(),
-    open() {},
-  }
-  let over = false
-  void ended.wait.then(() => {
-    over = true
-  })
-  // The first wait returns at once so the caller reads the current state.
-  // With an event source, a write landing between reads is never missed.
-  let changed = true
-  let wake: (() => void) | undefined
-  return {
-    /** True once the test has ended; the caller makes its final check. */
-    get ended() {
-      return over
-    },
-    notify() {
-      changed = true
-      wake?.()
-    },
-    async next(): Promise<void> {
-      if (!changed && !over)
-        await Promise.race([
-          new Promise<void>((resolve) => {
-            wake = resolve
-          }),
-          ...(pauseMs === undefined ? [] : [Bun.sleep(pauseMs)]),
-          ended.wait,
-        ])
-      wake = undefined
-      changed = false
-    },
-    close() {
-      ended.open()
-    },
-  }
-}
-
-// Sidebar write hooks are installed per state file and replace each other.
-// Tests set their own hooks through the wrapper below, so a helper waiting for
-// sidebar writes can listen on the same file without removing a test's hooks.
-type SidebarWriteHooks = NonNullable<
-  Parameters<typeof installSidebarStateWriteHooks>[0]
->
-const testSidebarWriteHooks = new Map<string, SidebarWriteHooks>()
-const sidebarWriteListeners = new Map<string, Set<() => void>>()
-
-function syncSidebarWriteHooks(stateFile: string) {
-  const own = testSidebarWriteHooks.get(stateFile)
-  const listeners = sidebarWriteListeners.get(stateFile)
-  if (!listeners?.size) {
-    installSidebarStateWriteHooks(own ?? null, stateFile)
-    return
-  }
-  installSidebarStateWriteHooks(
-    {
-      ...own,
-      afterRename: async (file) => {
-        try {
-          await own?.afterRename?.(file)
-        } finally {
-          for (const listener of [...listeners]) listener()
-        }
-      },
-    },
-    stateFile,
-  )
-}
-
-/** Sidebar-state's test hook setter, keeping any helper's write listener. */
-function __setSidebarStateWriteTestHooks(
-  hooks: SidebarWriteHooks | null,
-  stateFile = getSidebarStateFile(),
-) {
-  if (hooks) testSidebarWriteHooks.set(stateFile, hooks)
-  else testSidebarWriteHooks.delete(stateFile)
-  syncSidebarWriteHooks(stateFile)
-}
-
-/** Call `listener` after each completed write of `stateFile`; returns removal. */
-function onSidebarWrite(stateFile: string, listener: () => void) {
-  let listeners = sidebarWriteListeners.get(stateFile)
-  if (!listeners) {
-    listeners = new Set()
-    sidebarWriteListeners.set(stateFile, listeners)
-  }
-  listeners.add(listener)
-  syncSidebarWriteHooks(stateFile)
-  return () => {
-    listeners.delete(listener)
-    if (!listeners.size) sidebarWriteListeners.delete(stateFile)
-    syncSidebarWriteHooks(stateFile)
-  }
-}
-
-/**
- * A provider response the test releases when it chooses. If the test ends
- * first, teardown rejects it with an AbortError, so plugin work waiting on
- * this response settles before the plugin is disposed and its files removed.
- */
-function heldResponse() {
-  const released = bodyLifetime().gate()
-  let response: Response | undefined
-  const held = released.wait.then(
-    () =>
-      response ??
-      Promise.reject(
-        new DOMException(
-          'The test ended before releasing this response',
-          'AbortError',
-        ),
-      ),
-  )
-  // A test that fails before its mock hands this response to the plugin
-  // must not also report the teardown rejection as an unhandled error.
-  held.catch(() => {})
-  return {
-    response: held,
-    release(value: Response) {
-      response = value
-      released.open()
-    },
-  }
-}
-
-async function withDeadlockGuard<T>(
-  promise: Promise<T>,
-  ms: number,
-  message: string,
-  timers: Pick<typeof globalThis, 'setTimeout' | 'clearTimeout'> = globalThis,
-): Promise<T> {
-  let timeout: ReturnType<typeof setTimeout> | undefined
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeout = timers.setTimeout(() => reject(new Error(message)), ms)
-  })
-  try {
-    return await Promise.race([promise, timeoutPromise])
-  } finally {
-    if (timeout !== undefined) timers.clearTimeout(timeout)
-  }
-}
-
-test('withDeadlockGuard clears its timeout after the primary settles', async () => {
-  // Count only the timer injected into this guard so concurrent suites cannot
-  // affect the probe.
-  const sentinelDelayMs = 47
-  const guardTimers = new Set<unknown>()
-  let timeoutFired = 0
-  let timeoutCleared = 0
-  let unhandled = 0
-  const guardMessage = 'late guard'
-  const onUnhandled = (reason: unknown) => {
-    if (reason instanceof Error && reason.message === guardMessage) {
-      unhandled += 1
-    }
-  }
-  const setTimeoutImpl = ((
-    callback: (...args: any[]) => void,
-    delay?: number,
-  ) => {
-    const isGuardTimer = delay === sentinelDelayMs
-    const handle = globalThis.setTimeout(() => {
-      if (isGuardTimer) timeoutFired += 1
-      callback()
-    }, delay)
-    if (isGuardTimer) guardTimers.add(handle)
-    return handle
-  }) as typeof globalThis.setTimeout
-  const clearTimeoutImpl = ((
-    timeout: ReturnType<typeof globalThis.setTimeout>,
-  ) => {
-    if (guardTimers.delete(timeout)) timeoutCleared += 1
-    globalThis.clearTimeout(timeout)
-  }) as typeof globalThis.clearTimeout
-  process.on('unhandledRejection', onUnhandled)
-  try {
-    await withDeadlockGuard(
-      Promise.resolve('primary'),
-      sentinelDelayMs,
-      guardMessage,
-      { setTimeout: setTimeoutImpl, clearTimeout: clearTimeoutImpl },
-    )
-    await Bun.sleep(100)
-    expect(timeoutFired).toBe(0)
-    expect(timeoutCleared).toBe(1)
-    expect(unhandled).toBe(0)
-  } finally {
-    process.off('unhandledRejection', onUnhandled)
-  }
-})
-
-test('withDeadlockGuard rejects with its message at the deadline', async () => {
-  await expect(
-    withDeadlockGuard(new Promise<never>(() => {}), 20, 'deadline'),
-  ).rejects.toThrow('deadline')
-})
-
-test('cleanup retries a fallback refresh that outlives its bounded wait', async () => {
-  const slowRefresh = deferred()
-  let settled = false
-  const refresh = slowRefresh.promise.then(() => {
-    settled = true
-  })
-  fallbackRefreshes.add(refresh)
-
-  const firstStartedAt = Date.now()
-  await cleanupTempConfigDirs(50)
-  expect(Date.now() - firstStartedAt).toBeLessThan(500)
-  expect(settled).toBe(false)
-  expect(fallbackRefreshes.has(refresh)).toBe(true)
-
-  const releaseTimer = setTimeout(() => slowRefresh.resolve(), 20)
-  try {
-    await cleanupTempConfigDirs(50)
-  } finally {
-    clearTimeout(releaseTimer)
-  }
-  expect(settled).toBe(true)
-  expect(fallbackRefreshes.size).toBe(0)
-})
-
-test('extractUrl uses canonical fetch URLs and preserves raw invalid strings', () => {
-  expect(extractUrl('https://example.com/a/../b')).toBe('https://example.com/b')
-  expect(extractUrl('/relative')).toBe('/relative')
-  expect(extractUrl('not a URL')).toBe('not a URL')
-})
-
-async function expectHandledCommandResponse(promise: Promise<unknown>) {
-  try {
-    await promise
-    throw new Error('Expected handled command sentinel')
-  } catch (error) {
-    expect(String(error)).toContain(
-      '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__',
-    )
-    const value = error as Record<string, unknown>
-    expect(value['~effect/http/HttpServerResponse']).toBe(
-      '~effect/http/HttpServerResponse',
-    )
-    expect(value['~effect/ErrorReporter/ignore']).toBe(true)
-    expect(value.status).toBe(204)
-    expect((value.body as { _tag?: unknown })?._tag).toBe('Empty')
-    expect((value.cookies as { cookies?: unknown })?.cookies).toEqual({})
-  }
-}
-
-function createFallbackStorage(
-  overrides?: Partial<AccountStorage>,
-): AccountStorage {
-  return {
-    version: 1,
-    main: { type: 'opencode', provider: 'anthropic' },
-    fallbackOn: [401, 403, 429],
-    refresh: {
-      enabled: true,
-      intervalMinutes: 10,
-      refreshBeforeExpiryMinutes: 30,
-    },
-    quota: {
-      enabled: true,
-      checkIntervalMinutes: 5,
-      minimumRemaining: { five_hour: 10, seven_day: 20 },
-      failClosedOnUnknownQuota: true,
-    },
-    accounts: [
-      {
-        id: 'fallback-1',
-        type: 'oauth',
-        access: 'sk-ant-oat01-fallback-access',
-        refresh: 'fallback-refresh',
-        expires: Date.now() + 5 * 60 * 60 * 1000,
-        quota: {
-          five_hour: {
-            usedPercent: 25,
-            remainingPercent: 75,
-            checkedAt: Date.now(),
-          },
-          seven_day: {
-            usedPercent: 30,
-            remainingPercent: 70,
-            checkedAt: Date.now(),
-          },
-        },
-      },
-    ],
-    ...overrides,
-  }
-}
-
-/** Default Anthropic account UUID for the main OAuth credential in these fixtures. */
-const syntheticMainAccountUuid =
-  '00000000-0000-4000-8000-000000000001' as ProviderAccountUuid
-
-/**
- * Record in a legacy store which Claude account the main login belongs to: a
- * main profile observed for that login's access token. Migration then gives
- * the pool's main login a known account, which the native runtime confirms
- * with bootstrap alone instead of first exchanging the refresh token.
- */
-function bindMainAccount(
-  storage: AccountStorage,
-  access = 'sk-ant-oat01-main-access',
-  identity: ProviderAccountUuid = syntheticMainAccountUuid,
-): AccountStorage {
-  storage.main = {
-    type: 'opencode',
-    provider: 'anthropic',
-    ...storage.main,
-    profile: {
-      tier: 'default_claude_max_20x',
-      orgType: 'claude_max',
-      checkedAt: Date.now(),
-      ...storage.main?.profile,
-      providerAccountUuid: identity,
-      tokenFingerprint: tokenFingerprint(access),
-    },
-  }
-  return storage
-}
-
-/**
- * Name the Claude account behind a legacy store's main quota snapshot, the
- * only form of it that migration imports. Migration keeps a main quota only
- * when the store recorded which account produced it: a main profile observed
- * for the migrated access token, and a snapshot carrying that account. A
- * snapshot keyed by nothing or by the slot label "main" is dropped, and
- * quota-based routing then waits for a fresh snapshot instead.
- */
-function bindMainQuotaToAccount(
-  storage: AccountStorage,
-  access = 'sk-ant-oat01-main-access',
-  identity: ProviderAccountUuid = syntheticMainAccountUuid,
-): AccountStorage {
-  const quota = storage.quota?.mainQuota
-  if (!storage.quota || !quota)
-    throw new Error('This store has no main quota to bind')
-  bindMainAccount(storage, access, identity)
-  storage.quota.mainQuota = { ...quota, accountIdentity: identity }
-  storage.quota.mainQuotaToken = tokenFingerprint(access)
-  return storage
-}
-
-/** The Claude account a synthetic fallback login at `index` belongs to. */
-function syntheticFallbackAccountUuid(index: number) {
-  return `00000000-0000-4000-8000-${String(index + 2).padStart(12, '0')}` as ProviderAccountUuid
-}
-
-/**
- * Give a legacy store the account identities migration needs to carry its
- * quota into the native pool: the main login's account (see
- * bindMainQuotaToAccount, or bindMainAccount when there is no main quota),
- * and a Claude account UUID for each OAuth fallback that has none. Quota
- * snapshots and errors a fallback recorded under its slot id, or under no
- * account, are re-keyed to that UUID, as the legacy writer would have keyed
- * them had it known the account.
- */
-function bindPoolAccounts(
-  storage: AccountStorage,
-  access = 'sk-ant-oat01-main-access',
-): AccountStorage {
-  if (storage.quota?.mainQuota) bindMainQuotaToAccount(storage, access)
-  else bindMainAccount(storage, access)
-  storage.accounts.forEach((account, index) => {
-    if (account.type !== 'oauth') return
-    const uuid =
-      account.anthropicAccountUuid ?? syntheticFallbackAccountUuid(index)
-    account.anthropicAccountUuid = uuid
-    const rebind = <T extends { accountIdentity?: string }>(value: T) =>
-      value.accountIdentity === undefined ||
-      value.accountIdentity === account.id
-        ? { ...value, accountIdentity: uuid }
-        : value
-    if (account.quota) account.quota = rebind(account.quota)
-    if (account.lastRefreshError)
-      account.lastRefreshError = rebind(account.lastRefreshError)
-    if (account.lastQuotaRefreshError)
-      account.lastQuotaRefreshError = rebind(account.lastQuotaRefreshError)
-  })
-  return storage
 }
 
 async function runStickyDnsBackoffScenario(options: {
@@ -836,7 +543,7 @@ async function runStickyDnsBackoffScenario(options: {
       }),
     ),
   )
-  const pool = migratedPool
+  const pool = testContext.migratedPool
   if (!pool) throw new Error('DNS routing fixture did not migrate')
   const accountRuntime = createNativeAccountRuntime({
     paths: pool.paths,
@@ -972,1246 +679,6 @@ async function expectUnknownQuotaAdmissionBlocked(storage: AccountStorage) {
   )
   const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
   expect(response.status).toBe(429)
-}
-
-/**
- * Main OAuth credential stored in the fixture's OpenCode auth.json.
- * The Anthropic OAuth access-token prefix enables the bootstrap request that
- * verifies its account UUID. Arbitrary token strings must not gain access.
- */
-function syntheticMainHostAuth() {
-  return {
-    access: 'sk-ant-oat01-main-access',
-    refresh: 'main-refresh',
-    expires: Date.now() + 8 * 60 * 60_000,
-  }
-}
-
-/**
- * Serialize raw old-installation input without interpreting or merging it.
- * Migration, not this fixture writer, owns its meaning.
- */
-async function legacyAccountFiles(storage: AccountStorage) {
-  const scratch = await mkdtemp(join(tmpdir(), 'anthropic-plugin-legacy-'))
-  const configPath = join(scratch, 'anthropic-auth.json')
-  const statePath = join(scratch, 'anthropic-auth-state.json')
-  try {
-    await writeLegacyAccountFiles(configPath, storage, statePath, {
-      version: 1,
-      main: {},
-      accounts: {},
-    })
-    return {
-      config: await readFile(configPath, 'utf8'),
-      state: await readFile(statePath, 'utf8').catch(() => undefined),
-    }
-  } finally {
-    await rm(scratch, { recursive: true, force: true })
-  }
-}
-
-/**
- * Run offline migration to transfer the fixture's old account files and
- * OpenCode OAuth credential into shared storage. Construct plugins afterwards
- * so their startup reads see the committed authority journal and pool.
- */
-async function useTempAccountFile(
-  storage: AccountStorage,
-  mainHostAuth = syntheticMainHostAuth(),
-) {
-  const lifetime = bodyLifetime()
-  const root = await mkdtemp(join(tmpdir(), 'anthropic-plugin-test-'))
-  // Register removal before migration can reject the directory. Cleanup
-  // otherwise would not know about a directory created by failed setup.
-  lifetime.deferCleanup(() => rm(root, { recursive: true, force: true }))
-  const legacy = await legacyAccountFiles(storage)
-  const fixture = await migrateNativeOpencodeFixture({
-    root,
-    lifetime,
-    legacyConfig: legacy.config,
-    ...(legacy.state !== undefined && { legacyState: legacy.state }),
-    hostAuth: { anthropic: { type: 'oauth', ...mainHostAuth } },
-  })
-  migratedPool = { ...fixture, mainHostAuth }
-  registerPoolLogins(storage, mainHostAuth)
-  // TestLifetime removes this directory after disposing its plugin instances
-  // and joining their asynchronous work.
-  tempConfigDir = fixture.root
-  for (const [key, value] of Object.entries(fixture.env))
-    process.env[key] = value
-  delete process.env.OPENCODE_AUTH_CONTENT
-}
-
-/**
- * Credentials and account UUIDs accepted by this test's OAuth server mocks.
- * Unknown credentials must not receive a successful bootstrap or exchange.
- */
-type PoolLogin = { access: string; refresh: string; identity: string }
-const poolLogins: PoolLogin[] = []
-
-function registerPoolLogins(
-  storage: AccountStorage,
-  main: { access: string; refresh: string },
-) {
-  poolLogins.length = 0
-  successorAccess.clear()
-  const identityFor = (index: number) =>
-    `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
-  // Migration learns the main account UUID from its token-bound profile.
-  // The bootstrap mock must return that same UUID for the migrated credential.
-  poolLogins.push({
-    ...main,
-    identity: storage.main?.profile?.providerAccountUuid ?? identityFor(0),
-  })
-  storage.accounts.forEach((account, index) => {
-    if (account.type !== 'oauth' || !account.access || !account.refresh) return
-    poolLogins.push({
-      access: account.access,
-      refresh: account.refresh,
-      identity: account.anthropicAccountUuid ?? identityFor(index + 1),
-    })
-  })
-}
-
-async function requestText(
-  input: Parameters<typeof fetch>[0],
-  init?: RequestInit,
-): Promise<string> {
-  if (typeof init?.body === 'string') return init.body
-  return input instanceof Request ? input.clone().text() : ''
-}
-
-/**
- * Synthetic Anthropic OAuth answers a migrated pool needs before it serves.
- * The native runtime checks the account behind a local OAuth login before
- * serving it. When the pool does not yet know that account, it exchanges the
- * login's refresh token first and reads the account of the new access token
- * (bootstrap); when it does, bootstrap alone confirms it. For a login this
- * test migrated, the token endpoint returns the same access and refresh tokens
- * with a fresh expiry, and bootstrap names the login's account; every other
- * request is left to the test's own mock.
- */
-async function nativeAdmissionAnswer(
-  input: Parameters<typeof fetch>[0],
-  init?: RequestInit,
-): Promise<Response | undefined> {
-  return (
-    (await nativeTokenAnswer(input, init)) ??
-    (await nativeBootstrapAnswer(input, init))
-  )
-}
-
-/** The token-endpoint half of nativeAdmissionAnswer. */
-async function nativeTokenAnswer(
-  input: Parameters<typeof fetch>[0],
-  init?: RequestInit,
-  logins: readonly PoolLogin[] = poolLogins,
-): Promise<Response | undefined> {
-  if (!extractUrl(input).includes('/v1/oauth/token')) return undefined
-  let refresh: unknown
-  try {
-    refresh = JSON.parse(await requestText(input, init)).refresh_token
-  } catch {
-    return undefined
-  }
-  const login = logins.find((entry) => entry.refresh === refresh)
-  if (!login) return undefined
-  return Response.json({
-    access_token: login.access,
-    refresh_token: login.refresh,
-    expires_in: 8 * 60 * 60,
-  })
-}
-
-/**
- * Like withNativeAdmission, but for a test whose own mock answers bootstrap
- * (it checks which account bootstrap reports): only the token endpoint is
- * answered here.
- */
-function withNativeTokenExchange<Input, Init>(
-  handler: (input: Input, init: Init) => Response | Promise<Response>,
-): (input: Input, init: Init) => Promise<Response> {
-  return async (input, init) =>
-    (await nativeTokenAnswer(
-      input as Parameters<typeof fetch>[0],
-      init as RequestInit | undefined,
-    )) ?? (await handler(input, init))
-}
-
-/**
- * Later access tokens of an account already in this test's pool, mapped to
- * that account: tokens the test's own token endpoint issues on refresh, or a
- * re-login of the same account. The native runtime reads the account behind
- * every new access token before it serves it, so bootstrap must name the
- * same account for these as for the login they replace.
- */
-const successorAccess = new Map<string, string>()
-
-/** The Claude account the main login of this test's pool belongs to. */
-function poolMainIdentity(): string {
-  const main = poolLogins[0]
-  if (!main) throw new Error('This test has no migrated local main login')
-  return main.identity
-}
-
-/** Record that `accesses` are later tokens of the pool's main account. */
-function mainAccountIssues(...accesses: string[]) {
-  const identity = poolMainIdentity()
-  for (const access of accesses) successorAccess.set(access, identity)
-}
-
-/**
- * Record that `accesses` are later tokens of the account whose migrated
- * login has the access token `current`.
- */
-function loginIssues(current: string, ...accesses: string[]) {
-  const login = poolLogins.find((entry) => entry.access === current)
-  if (!login) throw new Error(`No migrated login has access token ${current}`)
-  for (const access of accesses) successorAccess.set(access, login.identity)
-}
-
-/**
- * Bootstrap's answer for an access token of this test's pool, or for a
- * later token of one of its accounts; undefined for anything else, which the
- * test's own mock then answers.
- */
-async function nativeBootstrapAnswer(
-  input: Parameters<typeof fetch>[0],
-  init?: RequestInit,
-  logins: readonly PoolLogin[] = poolLogins,
-): Promise<Response | undefined> {
-  if (!extractUrl(input).includes('/api/claude_cli/bootstrap')) return undefined
-  const headers = new Headers(
-    init?.headers ?? (input instanceof Request ? input.headers : undefined),
-  )
-  const bearer = headers.get('authorization')?.replace(/^Bearer /, '')
-  const known = new Set(logins.map((entry) => entry.identity))
-  const successor =
-    bearer === undefined ? undefined : successorAccess.get(bearer)
-  const identity =
-    logins.find((entry) => entry.access === bearer)?.identity ??
-    (successor !== undefined && known.has(successor) ? successor : undefined)
-  if (!identity) return undefined
-  return Response.json({ oauth_account: { account_uuid: identity } })
-}
-
-function withNativeAdmission<Input, Init>(
-  handler: (input: Input, init: Init) => unknown,
-): (input: Input, init: Init) => Promise<unknown> {
-  return async (input, init) =>
-    (await nativeAdmissionAnswer(
-      input as Parameters<typeof fetch>[0],
-      init as RequestInit | undefined,
-    )) ?? handler(input, init)
-}
-
-/**
- * Answer exchange and bootstrap requests for the primary account only.
- * Let the test's handler control these endpoints for its fallback accounts.
- */
-function withMainAdmission<Input, Init>(
-  handler: (input: Input, init: Init) => Response | Promise<Response>,
-): (input: Input, init: Init) => Promise<Response> {
-  return async (input, init) => {
-    const main = poolLogins.slice(0, 1)
-    const request = input as Parameters<typeof fetch>[0]
-    const options = init as RequestInit | undefined
-    return (
-      (await nativeTokenAnswer(request, options, main)) ??
-      (await nativeBootstrapAnswer(request, options, main)) ??
-      handler(input, init)
-    )
-  }
-}
-
-/**
- * Answer account-bootstrap requests, but leave OAuth exchange requests to
- * the test's handler so it can count refreshes or return rotated tokens.
- */
-function withNativeBootstrap<Input, Init>(
-  handler: (input: Input, init: Init) => unknown,
-): (input: Input, init: Init) => Promise<unknown> {
-  return async (input, init) =>
-    (await nativeBootstrapAnswer(
-      input as Parameters<typeof fetch>[0],
-      init as RequestInit | undefined,
-    )) ?? handler(input, init)
-}
-
-/**
- * Replace the primary OAuth credential through a separate account runtime.
- * With sameAccount=true, register the new access token under the existing
- * account UUID; otherwise the test supplies its own bootstrap response.
- * accountIdentity supplies an already known UUID; token validation still
- * runs before serving. The plugin discovers the change from shared storage.
- */
-async function replacePoolMainLogin(
-  credential: { access: string; refresh: string; expires: number },
-  options: { sameAccount: boolean; accountIdentity?: string } = {
-    sameAccount: true,
-  },
-) {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  if (options.sameAccount) {
-    mainAccountIssues(credential.access)
-    poolLogins.push({ ...credential, identity: poolMainIdentity() })
-  }
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  try {
-    await runtime.loginOAuth({
-      routeId: 'main',
-      replace: true,
-      credential,
-      ...(options.accountIdentity
-        ? { accountIdentity: options.accountIdentity }
-        : {}),
-    })
-  } finally {
-    runtime.close()
-  }
-}
-
-/** Require all stored fields that a known-account publication must carry. */
-function requireKnownPoolSubject(
-  subject: NativeRefreshSubject,
-): Parameters<
-  ReturnType<typeof createNativeAccountRuntime>['publishLocal']
->[0] {
-  const { binding, credentialFingerprint, version } = subject
-  if (
-    !binding.identity ||
-    !credentialFingerprint ||
-    !version?.accessFingerprint ||
-    version.expires === undefined
-  )
-    throw new Error('Expected a complete known pool credential subject')
-  return {
-    binding: { ...binding, identity: binding.identity },
-    credentialFingerprint,
-    version: {
-      ...version,
-      accessFingerprint: version.accessFingerprint,
-      expires: version.expires,
-    },
-  }
-}
-
-/**
- * Refresh the pool's main login in another plugin process; see
- * refreshPoolLoginElsewhere.
- */
-async function refreshPoolMainElsewhere(successor: {
-  access: string
-  refresh: string
-  expires: number
-}) {
-  mainAccountIssues(successor.access)
-  await refreshPoolLoginElsewhere('main', successor)
-}
-
-/**
- * The pause between reads of state that no in-process event reports (shared
- * files, a test's log sink). It paces the reads; it is not a budget, since the
- * wait lasts until the state arrives or the test ends.
- */
-const STATE_READ_PAUSE_MS = 10
-
-/**
- * Wait for an account-bound credential write without changing test deadlines:
- * re-read the pool until the successor lands or the test ends.
- */
-async function waitForPoolCredential(routeId: string, access: string) {
-  const pool = migratedPool
-  if (!pool) throw new Error('Expected migrated pool')
-  const reader = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  const store = createNativePoolStore({
-    paths: pool.paths,
-    quota: nativeQuotaCodec,
-  })
-  const changes = untilStateOrTestEnd(STATE_READ_PAUSE_MS)
-  try {
-    while (!changes.ended) {
-      await changes.next()
-      const subject = await reader.captureLocalSubject(routeId)
-      const read = await store.read()
-      const row =
-        read.status === 'ready'
-          ? read.rows.find((row) => row.id === subject.binding.rowId)
-          : undefined
-      const credential = row?.credential
-      if (
-        row?.stamp === 'bound' &&
-        row.identity === subject.binding.identity &&
-        row.credentialEpoch === subject.binding.credentialEpoch &&
-        credential?.type === 'oauth' &&
-        credential.access === access &&
-        subject.version?.accessFingerprint === tokenFingerprint(access)
-      )
-        return { subject, credential }
-    }
-    throw new Error(
-      `Expected a persisted native OAuth successor for ${routeId}`,
-    )
-  } finally {
-    changes.close()
-    reader.close()
-  }
-}
-
-/**
- * Rotate the chosen account's tokens using a separate account runtime.
- * Register the returned access token with loginIssues or mainAccountIssues
- * before calling this helper, so bootstrap confirms its account UUID.
- * The injected exchange returns successor directly; the tested plugin's
- * exchange mock must see no request for this externally completed rotation.
- */
-async function refreshPoolLoginElsewhere(
-  routeId: string,
-  successor: { access: string; refresh: string; expires: number },
-) {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-    local: {
-      refreshToken: async () => ({
-        ...successor,
-        expiresIn: Math.round((successor.expires - Date.now()) / 1000),
-      }),
-    },
-  })
-  try {
-    const result = await runtime.authorizeLocal(routeId, { intent: 'refresh' })
-    if (result.status !== 'usable' || result.access !== successor.access)
-      throw new Error(
-        `Refresh of ${routeId} elsewhere did not complete: ${result.status} ${'reason' in result ? result.reason : ''}`,
-      )
-  } finally {
-    runtime.close()
-  }
-}
-
-/**
- * Commit the caller's settings update using a separate account runtime.
- * The tested plugin must discover the change by rereading shared storage.
- */
-async function updatePoolSettings(
-  mutator: (settings: Record<string, unknown>) => Record<string, unknown>,
-) {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  try {
-    await runtime.updateSettings(mutator)
-  } finally {
-    runtime.close()
-  }
-}
-
-/**
- * Add an alternative OAuth account through a separate account runtime.
- * Its tokens belong only in shared storage, never in OpenCode's auth.json.
- * Sign-in verifies which Claude account the access token belongs to; here
- * that lookup answers `accountIdentity` (a new synthetic account by default)
- * instead of calling the bootstrap endpoint.
- */
-async function addPoolOAuthAccount(
-  routeId: string,
-  credential: { access: string; refresh: string; expires: number },
-  accountIdentity: string = randomUUID(),
-) {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-    local: {
-      resolveIdentity: async () => ({
-        deviceId: 'synthetic-device',
-        sessionId: 'synthetic-session',
-        accountUuid: accountIdentity as ProviderAccountUuid,
-      }),
-    },
-  })
-  try {
-    await runtime.loginOAuth({ routeId, credential, replace: false })
-  } finally {
-    runtime.close()
-  }
-}
-
-/**
- * Commit relay configuration using the account runtime's updateRelay API.
- * This keeps the relay secret outside the public settings projection.
- */
-async function updatePoolRelay(
-  patch: Parameters<
-    ReturnType<typeof createNativeAccountRuntime>['updateRelay']
-  >[0],
-) {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  try {
-    await runtime.updateRelay(patch)
-  } finally {
-    runtime.close()
-  }
-}
-
-/**
- * Publish a usage reading from a separate account runtime, tagged with the
- * account UUID verified for the credential that authorized the reading.
- */
-function publishPoolQuota(routeId: string, quota: OAuthQuotaSnapshot) {
-  return publishPoolMetadata(routeId, (identity) => ({
-    quota: { ...quota, accountIdentity: identity },
-  }))
-}
-
-/**
- * Authorize the account using a separate runtime, then publish quota or error
- * metadata for that exact credential version. A concurrent credential change
- * must make publication refuse rather than attach metadata to the new login.
- */
-async function publishPoolMetadata(
-  routeId: string,
-  patch: (
-    identity: string,
-  ) => Parameters<
-    ReturnType<typeof createNativeAccountRuntime>['publishLocal']
-  >[1],
-) {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  try {
-    const authorization = await runtime.authorizeLocal(routeId)
-    if (authorization.status !== 'usable')
-      throw new Error(`Pool ${routeId} login is not usable`)
-    const identity = authorization.binding.identity
-    if (identity === undefined)
-      throw new Error(`Pool ${routeId} login has no confirmed account`)
-    const published = await runtime.publishLocal(
-      authorization.subject,
-      patch(identity),
-    )
-    if (!published) throw new Error(`Metadata for ${routeId} was not published`)
-  } finally {
-    runtime.close()
-  }
-}
-
-/**
- * Check that OpenCode's auth store still holds only the placeholder login
- * migration wrote for Anthropic: no access or refresh token reached it.
- */
-async function expectHostActivationNonSecret(...tokens: string[]) {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const text = await readFile(pool.hostAuthPath, 'utf8')
-  expect(isCustodyTombstoneOAuth(JSON.parse(text).anthropic, 'anthropic')).toBe(
-    true,
-  )
-  for (const token of tokens) expect(text).not.toContain(token)
-}
-
-/**
- * The access token the pool would hand a new caller for its main login, read
- * through a separate native runtime the way another plugin process would.
- */
-async function poolMainAccess(): Promise<string> {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  try {
-    const result = await runtime.authorizeLocal('main')
-    if (result.status !== 'usable')
-      throw new Error(`Pool main login is not usable: ${result.status}`)
-    return result.access
-  } finally {
-    runtime.close()
-  }
-}
-
-/**
- * Return the non-secret activation marker written to OpenCode's auth.json.
- * Reject fixture credentials that differ from those imported by migration;
- * the host loader cannot supply an unrelated login as pool authority.
- */
-async function migratedHostAuth(
-  pool: MigratedPool,
-  testAuth: () => Promise<Record<string, unknown>>,
-) {
-  const supplied = await testAuth()
-  if (
-    supplied.type !== 'oauth' ||
-    isCustodyTombstoneOAuth(supplied, 'anthropic')
-  )
-    return supplied
-  const migrated = pool.mainHostAuth
-  if (
-    supplied.access !== migrated.access ||
-    supplied.refresh !== migrated.refresh ||
-    (typeof supplied.expires === 'number' && supplied.expires <= Date.now()) !==
-      migrated.expires <= Date.now()
-  )
-    throw new Error(
-      `Test host OAuth ${String(supplied.access)} is not the login migrated into this pool (${migrated.access})`,
-    )
-  return JSON.parse(await readFile(pool.hostAuthPath, 'utf8')).anthropic
-}
-
-const syntheticMainIdentity = '11111111-1111-4111-8111-111111111111'
-
-/** A synthetic vault whose listing holds only the main account's credential
- * row; any attempt to read that credential's token makes the test fail. */
-function mainOnlyVault(): NativeCustodyClient {
-  return {
-    async listScoped() {
-      return {
-        view: 'synthetic-native-view',
-        rows: [
-          {
-            id: 'oauth:anthropic',
-            accountId: syntheticMainIdentity,
-            credentialType: 'oauth',
-            state: 'active',
-            categories: ['anthropic-native'],
-            serves: ['anthropic'],
-            providerIds: [],
-            refreshAdapter: 'anthropic',
-            recordVersion: 1,
-            operations: ['read', 'invalidate'],
-            createdAtMs: 1,
-          },
-        ],
-        grants: undefined,
-        grantTuples: undefined,
-      }
-    },
-    async getScoped() {
-      throw new Error('Status tests must not read vault credential material')
-    },
-    async reportAuthFailureScoped() {
-      throw new Error('Status tests must not report vault failures')
-    },
-    close() {},
-  }
-}
-
-/**
- * Run setup migration for accounts whose credentials remain in the vault.
- * The fixture's enrollment token permits listing vault accounts for this host.
- * Plugin startup then reads the committed, credential-free account inventory.
- */
-async function useVaultAccountFile(
-  storage: AccountStorage,
-  client: NativeCustodyClient,
-) {
-  const lifetime = bodyLifetime()
-  const root = await mkdtemp(join(tmpdir(), 'anthropic-plugin-vault-'))
-  lifetime.deferCleanup(() => rm(root, { recursive: true, force: true }))
-  const legacy = await legacyAccountFiles(storage)
-  const fixture = await migrateNativeOpencodeFixture({
-    root,
-    lifetime,
-    legacyConfig: legacy.config,
-    ...(legacy.state !== undefined && { legacyState: legacy.state }),
-    hostAuth: { anthropic: custodyTombstoneOAuth('anthropic') },
-    custody: {
-      connect: async () => client,
-      enrollment: { token: 'ab'.repeat(32), token_generation: 1 },
-    },
-  })
-  poolLogins.length = 0
-  // In vault custody auth.json never held the main tokens; it already holds
-  // the placeholder login, so there is no local main login to compare.
-  migratedPool = {
-    ...fixture,
-    mainHostAuth: { access: '', refresh: '', expires: 0 },
-  }
-  tempConfigDir = fixture.root
-  for (const [key, value] of Object.entries(fixture.env))
-    process.env[key] = value
-  delete process.env.OPENCODE_AUTH_CONTENT
-  return fixture
-}
-
-/**
- * Keep the old account files without running migration. Tests can then
- * verify that plugin startup neither adopts their credentials nor rewrites them.
- */
-async function useUnmigratedAccountFile(storage: AccountStorage) {
-  const root = await mkdtemp(join(tmpdir(), 'anthropic-plugin-unmigrated-'))
-  bodyLifetime().deferCleanup(() => rm(root, { recursive: true, force: true }))
-  migratedPool = undefined
-  poolLogins.length = 0
-  tempConfigDir = root
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(root, 'anthropic-auth.json')
-  process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = join(
-    root,
-    'anthropic-auth-state.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-    root,
-    'sidebar-state.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-    root,
-    'opencode-enrollment.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
-    root,
-    'missing-connection.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
-    root,
-    'cachekeep-registry',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(
-    root,
-    'quota-header-feed',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(root, 'rpc')
-  await writeLegacyAccountFiles(
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-    storage,
-  )
-}
-
-// The fetch installed by the test preload (setup.ts), which only allows
-// 127.0.0.1 requests; captured before any test mock replaces it.
-const loopbackFetch = globalThis.fetch
-
-/**
- * Records without Anthropic's sk-ant-oat access-token prefix must refuse
- * before sending a model request, even if bootstrap supplies an account UUID.
- * The error directs API-key users to OpenCode's stock Anthropic authentication.
- */
-async function expectNonOatMainRefused(access: string) {
-  await useTempAccountFile(
-    createFallbackStorage({ accounts: [], quotaHeaderFeed: { enabled: true } }),
-    { access, refresh: `refresh-${access}`, expires: Date.now() + 100_000 },
-  )
-  const modelRequests: string[] = []
-  globalThis.fetch = mock(
-    withNativeTokenExchange((input: Parameters<typeof fetch>[0]) => {
-      const url = extractUrl(input)
-      if (url.includes('/claude_cli/bootstrap'))
-        return Promise.resolve(
-          Response.json({
-            oauth_account: { account_uuid: syntheticMainAccountUuid },
-          }),
-        )
-      if (url.includes('/v1/messages')) modelRequests.push(url)
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }),
-  ) as unknown as typeof fetch
-  const plugin = await getPlugin()
-  const result = await plugin.auth.loader(
-    () =>
-      Promise.resolve({
-        type: 'oauth' as const,
-        access,
-        refresh: `refresh-${access}`,
-        expires: Date.now() + 100_000,
-      }),
-    { models: {} },
-  )
-  await expect(
-    result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
-    }),
-  ).rejects.toThrow(/API key/i)
-  expect(modelRequests).toEqual([])
-  expect(await readFeedEntries()).toEqual([])
-  const runtime = createNativeAccountRuntime({
-    paths: migratedPool!.paths,
-    host: 'opencode',
-  })
-  try {
-    expect(await runtime.authorizeLocal('main')).toEqual({
-      status: 'refused',
-      reason: 'unsupported-access',
-      persisted: false,
-    })
-    expect(
-      (await readAccountStorage())?.refresh?.mainLastRefreshError,
-    ).toBeUndefined()
-  } finally {
-    runtime.close()
-  }
-}
-
-/**
- * Fail if `value` (stored account metadata, a recorded error) carries any
- * part of an OAuth token or API key this test's pool knows: an access or
- * refresh token of a migrated login or of a later login of its accounts, or
- * any `sk-ant-` token prefix.
- */
-function expectNoCredentialFragment(value: unknown) {
-  const text = JSON.stringify(value ?? null)
-  expect(text).not.toContain('sk-ant-')
-  for (const login of poolLogins) {
-    expect(text).not.toContain(login.access)
-    expect(text).not.toContain(login.refresh)
-  }
-  for (const access of successorAccess.keys())
-    expect(text).not.toContain(access)
-}
-
-/** Settings as the native runtime reads them back from the migrated pool. */
-async function readNativeSettings(): Promise<Record<string, unknown>> {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  try {
-    return (await runtime.read()).settings
-  } finally {
-    runtime.close()
-  }
-}
-
-/** Publish a poll through the current native credential's guarded writer. */
-async function publishNativeMainQuota(quota: OAuthQuotaSnapshot) {
-  if (!migratedPool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: migratedPool.paths,
-    host: 'opencode',
-  })
-  try {
-    const authorization = await runtime.authorizeLocal('main')
-    if (authorization.status !== 'usable')
-      throw new Error(
-        `Main quota publication cannot authorize: ${authorization.status}`,
-      )
-    if (!authorization.binding.identity)
-      throw new Error('Main quota publication requires an account UUID')
-    if (
-      !(await runtime.publishLocal(authorization.subject, {
-        quota: { ...quota, accountIdentity: authorization.binding.identity },
-      }))
-    )
-      throw new Error('Main quota publication refused the current credential')
-    return authorization.subject
-  } finally {
-    await runtime.close()
-  }
-}
-
-/**
- * Per-account runtime state as the native pool records it, in the shape of
- * the retired legacy state file: `main` and `accounts[routeId]`, each with
- * its account identity, quota, profile, prime counters and recorded errors. The main
- * account's quota error keeps its legacy name, `lastQuotaApiError`. Native
- * reads carry no credential material.
- */
-async function readNativeRuntimeState() {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  try {
-    const snapshot = await runtime.read()
-    const project = (account: (typeof snapshot.accounts)[number]) => ({
-      accountIdentity: account.accountIdentity,
-      quota: account.quota,
-      profile: account.profile,
-      prime: account.prime,
-      lastRefreshError: account.lastRefreshError,
-      lastQuotaRefreshError: account.lastQuotaRefreshError,
-    })
-    const main = snapshot.accounts.find((account) => account.id === 'main')
-    return {
-      main: main && {
-        ...project(main),
-        lastQuotaApiError: main.lastQuotaRefreshError,
-      },
-      accounts: Object.fromEntries(
-        snapshot.accounts
-          .filter((account) => account.id !== 'main')
-          .map((account) => [account.id, project(account)]),
-      ),
-    }
-  } finally {
-    runtime.close()
-  }
-}
-
-/** The latest ignored reply text sent to a session without a connected TUI. */
-function latestIgnoredReply(client: ReturnType<typeof createMockClient>) {
-  const calls = (
-    client.session.promptAsync as unknown as {
-      mock: {
-        calls: Array<
-          [{ body: { parts: Array<{ text: string; ignored?: boolean }> } }]
-        >
-      }
-    }
-  ).mock.calls
-  const part = calls.at(-1)?.[0]?.body.parts[0]
-  expect(part?.ignored).toBe(true)
-  return part?.text ?? ''
-}
-
-/** Open /claude for a TUI-connected session and return the menu payload. */
-async function openClaudeMenu(plugin: any, sessionId: string) {
-  // The TUI polls its session's notifications; the plugin treats a recent
-  // poll as a connected TUI, so draining here makes the session interactive.
-  drainNotifications(0, sessionId)
-  await expectHandledCommandResponse(
-    plugin['command.execute.before']({
-      command: 'claude',
-      arguments: '',
-      sessionID: sessionId,
-    }),
-  )
-  const notice = drainNotifications(0, sessionId).at(-1)
-  if (notice?.type !== 'open-menu')
-    throw new Error('Expected the /claude menu notification')
-  drainNotifications(notice.id, sessionId)
-  return notice.payload
-}
-
-/**
- * Open /claude, then submit one menu action through the plugin's RPC server
- * the way the TUI renderer does. The plugin starts that server only when it
- * is given a project directory, so create it with the migrated root.
- */
-async function applyMenuAction(
-  plugin: any,
-  sessionId: string,
-  request: Omit<CommandApplyRequest, 'command' | 'sessionId'>,
-): Promise<CommandApplyResult> {
-  await openClaudeMenu(plugin, sessionId)
-  const rpcDir = process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR
-  if (!rpcDir) throw new Error('Missing isolated RPC directory')
-  // Provider mocks reject loopback URLs; only the RPC request goes to the
-  // preload's loopback-only fetch.
-  const providerFetch = globalThis.fetch
-  globalThis.fetch = Object.assign(
-    (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
-      new URL(input instanceof Request ? input.url : String(input)).hostname ===
-      '127.0.0.1'
-        ? loopbackFetch(input, init)
-        : providerFetch(input, init),
-    { preconnect: providerFetch.preconnect },
-  ) as typeof fetch
-  try {
-    return await createRpcClient(rpcDir, process.pid).applyMenu({
-      command: 'claude',
-      sessionId,
-      ...request,
-    })
-  } finally {
-    globalThis.fetch = providerFetch
-  }
-}
-
-function restoreProcessTestFiles() {
-  const testDir = process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
-  if (!testDir) return
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(
-    testDir,
-    'anthropic-auth.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-    testDir,
-    'sidebar-state.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-    testDir,
-    'opencode-enrollment.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
-    testDir,
-    'cachekeep-registry',
-  )
-}
-
-/**
- * Wait for the plugin's sidebar write that satisfies `predicate`: the state
- * file is re-read after each completed sidebar write (sidebar-state's
- * after-rename hook), never after a fixed number of polls.
- */
-async function waitForSidebarState(
-  predicate: (state: Awaited<ReturnType<typeof getSidebarState>>) => boolean,
-) {
-  const changes = untilStateOrTestEnd()
-  const stopListening = onSidebarWrite(getSidebarStateFile(), changes.notify)
-  try {
-    while (!changes.ended) {
-      await changes.next()
-      const state = await getSidebarState()
-      if (predicate(state)) return state
-    }
-  } finally {
-    stopListening()
-    changes.close()
-  }
-  const state = await getSidebarState()
-  throw new Error(`Sidebar state did not match: ${JSON.stringify(state)}`)
-}
-
-/**
- * The account storage a plugin process sees. For a migrated pool this is the
- * native runtime's AccountStorage-shaped projection (settings, account
- * metadata and quota, never credential material), the same view the plugin
- * reads; migration retires the legacy files. Without a migrated pool it is
- * the unmigrated legacy store.
- */
-async function readAccountStorage(): Promise<AccountStorage | null> {
-  const pool = migratedPool
-  if (!pool)
-    return readLegacyJson<AccountStorage>(
-      process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-    )
-  const runtime = createNativeAccountRuntime({
-    paths: pool.paths,
-    host: 'opencode',
-  })
-  try {
-    return (await runtime.read()).policyStorage
-  } finally {
-    runtime.close()
-  }
-}
-
-/**
- * Wait for an account storage write that satisfies `predicate`, re-reading
- * the pool (or the unmigrated legacy store) until it matches or the test ends.
- */
-async function waitForAccountStorage(
-  predicate: (storage: AccountStorage | null) => boolean,
-) {
-  const changes = untilStateOrTestEnd(STATE_READ_PAUSE_MS)
-  try {
-    while (!changes.ended) {
-      await changes.next()
-      const storage = await readAccountStorage()
-      if (predicate(storage)) return storage
-    }
-  } finally {
-    changes.close()
-  }
-  const storage = await readAccountStorage()
-  throw new Error(`Account storage did not match: ${JSON.stringify(storage)}`)
-}
-
-/** Wait on pool file changes, not a cache/feed event, when asserting disk quota. */
-async function waitForNativePoolQuota(
-  routeId: string,
-  predicate: (quota: OAuthQuotaSnapshot | undefined) => boolean,
-  options: { keepAliveUntil?: Promise<unknown> } = {},
-): Promise<OAuthQuotaSnapshot | undefined> {
-  const pool = migratedPool
-  if (!pool) throw new Error('This test has no migrated pool')
-  const changes = untilStateOrTestEnd()
-  const directories = new Set([
-    dirname(pool.paths.config),
-    dirname(pool.paths.state),
-  ])
-  const watchers: Array<ReturnType<typeof watch>> = []
-  const reader = createNativePoolStore({
-    paths: pool.paths,
-    quota: nativeQuotaCodec,
-  })
-  let quota: OAuthQuotaSnapshot | undefined
-  try {
-    // Keep a live event source while waiting for the store's unref'ed flush timer.
-    for (const directory of directories)
-      watchers.push(watch(directory, changes.notify))
-    while (!changes.ended) {
-      await changes.next()
-      const [loaded, settings] = await Promise.all([
-        reader.read(),
-        reader.readSettings(),
-      ])
-      const id =
-        routeId === 'main' && settings.status === 'ready'
-          ? settings.settings.mainAccountId
-          : routeId
-      const raw =
-        loaded.status === 'ready'
-          ? loaded.rows.find((row) => row.id === id)?.quota
-          : undefined
-      quota = raw === undefined ? undefined : fromNativeQuotaMap(raw)
-      if (predicate(quota)) {
-        // The quota commit can precede another publication the caller awaits.
-        // Keep the live event source until that publication has also finished.
-        if (options.keepAliveUntil) await options.keepAliveUntil
-        return quota
-      }
-    }
-  } finally {
-    for (const watcher of watchers) watcher.close()
-    changes.close()
-    await reader.close()
-  }
-  throw new Error(`Pool quota did not match: ${JSON.stringify(quota)}`)
-}
-
-async function seedSidebarRouting(
-  activeId: string,
-  route: string,
-  lastUpdated: number,
-) {
-  await setSidebarState({
-    ...(await getSidebarState()),
-    activeId,
-    route,
-    lastUpdated,
-  })
-}
-
-async function waitForMockCall(fn: { mock?: { calls: unknown[] } }) {
-  for (let attempt = 0; attempt < 50; attempt++) {
-    if ((fn.mock?.calls.length ?? 0) > 0) return
-    await Bun.sleep(10)
-  }
-}
-
-/**
- * Set up the common test scaffolding for concurrent refresh tests:
- * mocks setTimeout to be synchronous and creates a plugin loader
- * whose migrated main login has an already-expired access token.
- * The tokens the test's token endpoint issues are later tokens of that
- * same account. Quota routing is off, so every request is actually sent
- * with the refreshed token rather than answered locally for unknown quota.
- */
-async function setupExpiredTokenLoader(...issuedAccess: string[]) {
-  const expiredLogin = {
-    access: 'sk-ant-oat01-expired-token',
-    refresh: 'old-refresh',
-    expires: Date.now() - 1000,
-  }
-  await useTempAccountFile(
-    createFallbackStorage({ accounts: [], quota: { enabled: false } }),
-    expiredLogin,
-  )
-  mainAccountIssues(...issuedAccess)
-  const setTimeoutMock = mock((handler: () => unknown) => {
-    handler()
-    return 0 as unknown as ReturnType<typeof setTimeout>
-  }) as unknown as typeof setTimeout
-
-  const mockClient = createMockClient()
-  const plugin = await getPlugin(mockClient, undefined, {
-    setTimeout: setTimeoutMock,
-  })
-  const result = await plugin.auth.loader(
-    () => Promise.resolve({ type: 'oauth', ...expiredLogin }),
-    { models: {} },
-  )
-
-  return { mockClient, result }
-}
-
-/** Fire 5 concurrent fetch requests against /v1/messages. */
-function fireConcurrentFetches(result: { fetch: typeof fetch }) {
-  return Promise.all(
-    Array.from({ length: 5 }, () => result.fetch(MESSAGES_URL, EMPTY_POST)),
-  )
-}
-
-type PluginRuntimeOverrides = Partial<{
-  authorize: typeof import('@cortexkit/anthropic-auth-core').authorize
-  setTimeout: typeof globalThis.setTimeout
-  clearTimeout: typeof globalThis.clearTimeout
-  setInterval: typeof globalThis.setInterval
-  clearInterval: typeof globalThis.clearInterval
-  scopedRosterPollIntervalMs: number
-  claustrumScopedConnect: () => Promise<NativeCustodyClient>
-  cacheKeepAggregateRefreshIntervalMs: number
-  tuiPickupTimeoutMs: number
-}>
-
-function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
-  return {
-    // Background intervals must not outlive the test-scoped fetch mock they captured.
-    setInterval: mock(
-      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-    ) as unknown as typeof setInterval,
-    clearInterval: mock(() => {}) as unknown as typeof clearInterval,
-    scopedRosterPollIntervalMs: 0,
-    cacheKeepAggregateRefreshIntervalMs: 0,
-    // /claude without a polling TUI replies in the chat at once instead of
-    // waiting the real two seconds for a TUI to take the menu.
-    tuiPickupTimeoutMs: 0,
-  }
-}
-
-let pluginRuntimeOverrides: PluginRuntimeOverrides = {}
-
-beforeEach(() => {
-  resetClaudeCodeIdentityCachesForTest()
-})
-
-async function getPlugin(
-  client?: ReturnType<typeof createMockClient>,
-  directory?: string,
-  runtimeOverrides: PluginRuntimeOverrides = {},
-) {
-  const defaultTimerOverrides = disabledPluginRuntimeOverrides()
-  const creation = (
-    AnthropicAuthPlugin as unknown as (
-      ctx: Parameters<typeof AnthropicAuthPlugin>[0],
-      runtimeOverrides?: PluginRuntimeOverrides,
-    ) => ReturnType<typeof AnthropicAuthPlugin>
-  )(
-    {
-      // @ts-expect-error: minimal mock for testing
-      client: client ?? createMockClient(),
-      ...(directory && { directory }),
-    },
-    {
-      ...defaultTimerOverrides,
-      ...pluginRuntimeOverrides,
-      ...runtimeOverrides,
-    },
-  )
-  testLifetime?.trackDetached(creation)
-  const plugin = (await creation) as any
-  livePlugins.add(plugin)
-  fallbackRefreshes.add(getPluginTestHandles(plugin).fallbackRefreshReady)
-  const pool = migratedPool
-  const loader = plugin.auth?.loader
-  if (pool && loader) {
-    // After migration, OpenCode's auth store answers with the inert
-    // activation, not the test's literal OAuth tokens.
-    plugin.auth.loader = (
-      hostGetAuth: () => Promise<Record<string, unknown>>,
-      provider: unknown,
-    ) => loader(() => migratedHostAuth(pool, hostGetAuth), provider)
-  }
-  return plugin
 }
 
 describe('scoped enrollment is explicit', () => {
@@ -2391,14 +858,18 @@ describe('scoped enrollment is explicit', () => {
 
   test('enrollment-reset only clears terminal state; setup owns the next proposal', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
-    if (!tempConfigDir) throw new Error('Missing local fixture directory')
+    if (!testContext.tempConfigDir)
+      throw new Error('Missing local fixture directory')
     process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-      tempConfigDir,
+      testContext.tempConfigDir,
       'opencode-enrollment.json',
     )
     // A terminal refused ceremony has no approved token. Local custody can
     // clear that record without proposing another enrollment.
-    const stateFile = join(tempConfigDir, 'opencode-enrollment-state.json')
+    const stateFile = join(
+      testContext.tempConfigDir,
+      'opencode-enrollment-state.json',
+    )
     await writeFile(
       stateFile,
       JSON.stringify({
@@ -2410,7 +881,10 @@ describe('scoped enrollment is explicit', () => {
       }),
       { mode: 0o600 },
     )
-    const plugin = await getPlugin(createMockClient(), tempConfigDir)
+    const plugin = await getPlugin(
+      createMockClient(),
+      testContext.tempConfigDir,
+    )
     const result = await applyMenuAction(plugin, 'ses_reset_only', {
       sectionId: 'Accounts',
       actionId: 'enrollment-reset',
@@ -2424,15 +898,19 @@ describe('scoped enrollment is explicit', () => {
 
   test('enrollment-reset keeps a pending request and tells the user to rerun setup', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
-    if (!tempConfigDir) throw new Error('Missing local fixture directory')
+    if (!testContext.tempConfigDir)
+      throw new Error('Missing local fixture directory')
     process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-      tempConfigDir,
+      testContext.tempConfigDir,
       'opencode-enrollment.json',
     )
     // Setup saves the request secret before it proposes, so a pending state
     // without a request id may still match a request the vault stored. The
     // menu must leave it for setup to resume.
-    const stateFile = join(tempConfigDir, 'opencode-enrollment-state.json')
+    const stateFile = join(
+      testContext.tempConfigDir,
+      'opencode-enrollment-state.json',
+    )
     const pending = JSON.stringify({
       version: 1,
       phase: 'pending',
@@ -2442,7 +920,10 @@ describe('scoped enrollment is explicit', () => {
       updatedAt: 1,
     })
     await writeFile(stateFile, pending, { mode: 0o600 })
-    const plugin = await getPlugin(createMockClient(), tempConfigDir)
+    const plugin = await getPlugin(
+      createMockClient(),
+      testContext.tempConfigDir,
+    )
     const result = await applyMenuAction(plugin, 'ses_reset_pending', {
       sectionId: 'Accounts',
       actionId: 'enrollment-reset',
@@ -2453,53 +934,6 @@ describe('scoped enrollment is explicit', () => {
       'An enrollment request may still be in progress. Quit OpenCode and run setup again; it picks up the same request.',
     )
     expect(result.text).not.toContain('refused-pending')
-  })
-})
-describe('desktop notice identity (#230)', () => {
-  test('orders repeated notices before the same assistant with bounded IDs', async () => {
-    const plugin = await getPlugin()
-    const mint =
-      getPluginTestHandles(plugin).notificationMessageIdBeforeAssistant
-    const assistant = 'msg_0000000f0000BBBBBBBBBBBBBB'
-    let previous = 'msg_0000000efffeAAAAAAAAAAAAAA'
-    for (let index = 0; index < 20; index++) {
-      const next = mint(assistant, previous)
-      if (next === undefined) throw new Error('Expected an ordered notice ID')
-      expect(typeof next).toBe('string')
-      expect(next > previous).toBe(true)
-      expect(next < assistant).toBe(true)
-      previous = next
-    }
-    expect(mint(assistant, assistant)).toBeUndefined()
-    expect(mint(assistant, 'msg_ffffffffffffAAAAAAAAAAAAAA')).toBeUndefined()
-    expect(mint('invalid', previous)).toBeUndefined()
-    expect(mint('msg_000000000000AAAAAAAAAAAAAA')).toBeUndefined()
-    expect(
-      mint(assistant, `msg_0000000effff${'z'.repeat(112)}`),
-    ).toBeUndefined()
-  })
-
-  test('bounds notice identities by session and message, retaining recently used sessions', async () => {
-    const plugin = await getPlugin()
-    const track = getPluginTestHandles(plugin).trackDesktopNoticeMessageId
-    const has = getPluginTestHandles(plugin).isDesktopNoticeMessage
-    for (let index = 0; index < 128; index++) track(`ses_${index}`, 'msg_first')
-    track('ses_0', 'msg_recent')
-    track('ses_128', 'msg_first')
-    expect(has('ses_0', 'msg_recent')).toBe(true)
-    expect(has('ses_1', 'msg_first')).toBe(false)
-    expect(has('ses_128', 'msg_first')).toBe(true)
-    for (let index = 0; index < 5; index++) track('ses_128', `msg_${index}`)
-    expect(has('ses_128', 'msg_0')).toBe(false)
-    expect(has('ses_128', 'msg_1')).toBe(true)
-    expect(has('ses_128', 'msg_4')).toBe(true)
-    await plugin.event?.({
-      event: {
-        type: 'session.deleted',
-        properties: { info: { id: 'ses_128' } },
-      },
-    })
-    expect(has('ses_128', 'msg_4')).toBe(false)
   })
 })
 
@@ -2628,13 +1062,14 @@ describe('fallback quota persistence ordering', () => {
       ),
     )
 
-    if (!migratedPool) throw new Error('Missing native quota fixture')
-    const identity = poolLogins.find(
+    if (!testContext.migratedPool)
+      throw new Error('Missing native quota fixture')
+    const identity = testContext.poolLogins.find(
       (login) => login.access === 'sk-ant-oat01-fallback-access',
     )?.identity
     if (!identity) throw new Error('Missing fallback fixture identity')
     const runtime = createNativeAccountRuntime({
-      paths: migratedPool.paths,
+      paths: testContext.migratedPool.paths,
       host: 'opencode',
       local: {
         refreshToken: async () => ({
@@ -2711,108 +1146,6 @@ describe('fallback quota persistence ordering', () => {
   })
 })
 
-async function readFeedEntries() {
-  const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
-  try {
-    // The producer writes a complete .tmp before renaming it into a committed
-    // .json lease. Match the real consumer: transient files are not published.
-    const files = (await readdir(directory)).filter((name) =>
-      name.endsWith('.json'),
-    )
-    const records = await Promise.all(
-      files.map(async (file) =>
-        JSON.parse(await readFile(join(directory, file), 'utf8')),
-      ),
-    )
-    return records.flatMap((record) => Object.values(record.entries ?? {}))
-  } catch {
-    return []
-  }
-}
-
-/**
- * Wait for the committed feed leases to satisfy `predicate`, re-reading them
- * until they match or the test ends instead of polling to a fixed wall-clock
- * deadline.
- */
-async function waitForFeedEntries(
-  predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
-  description: string,
-) {
-  const changes = untilStateOrTestEnd(STATE_READ_PAUSE_MS)
-  try {
-    while (!changes.ended) {
-      await changes.next()
-      const entries = await readFeedEntries()
-      if (predicate(entries)) return entries
-    }
-  } finally {
-    changes.close()
-  }
-  const entries = await readFeedEntries()
-  throw new Error(
-    `Quota header feed did not match ${description}: ${JSON.stringify(entries)}`,
-  )
-}
-
-/**
- * Wait for a log record matching `predicate`, re-checking the test's sink
- * until one arrives or the test ends rather than to a fixed wall-clock
- * deadline.
- */
-async function waitForLogRecord(
-  records: LogTestRecord[],
-  predicate: (record: LogTestRecord) => boolean,
-  description: string,
-) {
-  const changes = untilStateOrTestEnd(STATE_READ_PAUSE_MS)
-  try {
-    while (!changes.ended) {
-      await changes.next()
-      if (records.some(predicate)) return
-    }
-  } finally {
-    changes.close()
-  }
-  if (!records.some(predicate)) {
-    throw new Error(
-      `Expected log record ${description}: ${JSON.stringify(records)}`,
-    )
-  }
-}
-
-async function loadMainAndFetch(
-  storage: AccountStorage,
-  response: Response | (() => Response),
-  requestHeaders?: Record<string, string>,
-) {
-  await useTempAccountFile(storage)
-  globalThis.fetch = mock(
-    withNativeAdmission(() =>
-      Promise.resolve(
-        typeof response === 'function' ? response() : response.clone(),
-      ),
-    ),
-  ) as unknown as typeof fetch
-  const plugin = await getPlugin()
-  const result = await plugin.auth.loader(
-    () =>
-      Promise.resolve({
-        type: 'oauth',
-        access: 'sk-ant-oat01-main-access',
-        refresh: 'main-refresh',
-        expires: Date.now() + 100000,
-      }),
-    { models: {} },
-  )
-  const fetched = await result.fetch(MESSAGES_URL, {
-    method: 'POST',
-    headers: requestHeaders,
-    body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
-  })
-  return { plugin, response: fetched }
-}
-
 describe('quota header feed integration', () => {
   const originalFetch = globalThis.fetch
 
@@ -2887,7 +1220,7 @@ describe('quota header feed integration', () => {
         { preconnect: originalFetch.preconnect },
       )
       const runtime = createNativeAccountRuntime({
-        paths: migratedPool!.paths,
+        paths: testContext.migratedPool!.paths,
         host: 'opencode',
       })
       try {
@@ -3188,13 +1521,13 @@ describe('quota header feed integration', () => {
         }),
       ) as unknown as typeof fetch
       const pollSubject = await publishNativeMainQuota(initialPollQuota)
-      if (!migratedPool) throw new Error('Missing migrated fixture')
+      if (!testContext.migratedPool) throw new Error('Missing migrated fixture')
       const entered = bodyLifetime().gate()
       const release = bodyLifetime().gate()
       // Pause a real poll flush while a header is accepted. A later harvest
       // must retain the poll's fields once that flush has reached disk.
       const writer = createNativeAccountRuntime({
-        paths: migratedPool.paths,
+        paths: testContext.migratedPool.paths,
         host: 'opencode',
         beforePoolWrite: async () => {
           entered.open()
@@ -3553,9 +1886,9 @@ describe('quota header feed integration', () => {
         },
       })
 
-      if (!migratedPool) throw new Error('Missing migrated pool')
+      if (!testContext.migratedPool) throw new Error('Missing migrated pool')
       const replacementRuntime = createNativeAccountRuntime({
-        paths: migratedPool.paths,
+        paths: testContext.migratedPool.paths,
         host: 'opencode',
       })
       const newAccess = 'sk-ant-oat01-fallback-lineage-b-access'
@@ -3776,9 +2109,9 @@ describe('quota header feed integration', () => {
         quotaManager.getAllFallbacks().get('fallback-1')?.quota.five_hour
           ?.usedPercent,
       ).toBe(25)
-      if (!migratedPool) throw new Error('Missing migrated pool')
+      if (!testContext.migratedPool) throw new Error('Missing migrated pool')
       const replacementRuntime = createNativeAccountRuntime({
-        paths: migratedPool.paths,
+        paths: testContext.migratedPool.paths,
         host: 'opencode',
       })
       try {
@@ -4452,7 +2785,8 @@ describe('quota header feed integration', () => {
       ),
       { access, refresh, expires: now + 8 * 60 * 60_000 },
     )
-    if (!migratedPool) throw new Error('This test has no migrated pool')
+    if (!testContext.migratedPool)
+      throw new Error('This test has no migrated pool')
     let refreshCalls = 0
     globalThis.fetch = Object.assign(
       mock((input: Parameters<typeof fetch>[0]) => {
@@ -4472,7 +2806,7 @@ describe('quota header feed integration', () => {
       },
     )
     const runtime = createNativeAccountRuntime({
-      paths: migratedPool.paths,
+      paths: testContext.migratedPool.paths,
       host: 'opencode',
     })
     try {
@@ -4689,9 +3023,10 @@ describe('quota header feed integration', () => {
         ?.accountIdentity,
     ).toBe(uuidA)
     expect(getPluginTestHandles(plugin).quotaManager.isBackedOff()).toBe(true)
-    if (!migratedPool) throw new Error('This test has no migrated pool')
+    if (!testContext.migratedPool)
+      throw new Error('This test has no migrated pool')
     const runtime = createNativeAccountRuntime({
-      paths: migratedPool.paths,
+      paths: testContext.migratedPool.paths,
       host: 'opencode',
     })
     try {
@@ -4943,9 +3278,10 @@ describe('main identity boot order', () => {
     }
     const plugin = await getPlugin(undefined, undefined, {
       setInterval: ((callback: () => void) => {
-        if (!migratedPool) throw new Error('Missing native main fixture')
+        if (!testContext.migratedPool)
+          throw new Error('Missing native main fixture')
         const runtime = JSON.parse(
-          readFileSync(migratedPool.paths.runtime, 'utf8'),
+          readFileSync(testContext.migratedPool.paths.runtime, 'utf8'),
         ) as {
           accounts: Record<
             string,
@@ -4964,9 +3300,10 @@ describe('main identity boot order', () => {
     })
     await plugin.auth.loader(auth, { models: {} })
     const first = (await readAccountStorage())?.mainAccountId
-    if (!first || !migratedPool) throw new Error('Missing native main identity')
+    if (!first || !testContext.migratedPool)
+      throw new Error('Missing native main identity')
     const runtime = createNativeAccountRuntime({
-      paths: migratedPool.paths,
+      paths: testContext.migratedPool.paths,
       host: 'opencode',
       local: {
         refreshToken: async () => ({
@@ -4995,7 +3332,7 @@ describe('main identity boot order', () => {
     } finally {
       runtime.close()
     }
-    const mainLogin = poolLogins[0]
+    const mainLogin = testContext.poolLogins[0]
     if (!mainLogin) throw new Error('Missing main mock account')
     mainLogin.access = 'sk-ant-oat01-main-boot-rotated'
     mainLogin.refresh = 'main-boot-rotated-refresh'
@@ -5010,40 +3347,6 @@ describe('main identity boot order', () => {
     expect(timerObservedIds.length).toBeGreaterThan(0)
     expect(timerObservedIds.every((identity) => identity === first)).toBe(true)
     expect(observedIds).toContain(first)
-  })
-})
-
-describe('package metadata', () => {
-  test('exports a runtime-loadable TUI entrypoint', async () => {
-    const packageJson = JSON.parse(
-      await readFile(new URL('../../package.json', import.meta.url), 'utf8'),
-    ) as {
-      exports?: Record<string, { import?: string; types?: string }>
-      files?: string[]
-      'oc-plugin'?: string[]
-      scripts?: Record<string, string>
-      dependencies?: Record<string, string>
-    }
-
-    expect(packageJson.exports?.['./tui']).toEqual({
-      types: './dist/tui.d.ts',
-      import: './src/tui/entry.mjs',
-    })
-    expect(packageJson.files).toContain('src/tui.tsx')
-    expect(packageJson.files).toContain('src/tui')
-    expect(packageJson.files).toContain('src/tui-compiled')
-    expect(packageJson.files).toContain('src/sidebar-state.ts')
-    expect(packageJson['oc-plugin']).toEqual(['server', 'tui'])
-    expect(packageJson.scripts?.build).toContain('bun run build:tui')
-    for (const dependency of ['@opentui/core', '@opentui/solid', 'solid-js']) {
-      expect(packageJson.dependencies?.[dependency]).toMatch(/^\d/)
-    }
-  })
-
-  test('raw TUI fallback is loadable for development hosts', async () => {
-    const mod = await import('../tui.tsx')
-    expect(mod.default?.id).toBe('cortexkit.anthropic-auth')
-    expect(mod.default?.tui).toBeFunction()
   })
 })
 
@@ -5105,8 +3408,9 @@ describe('AnthropicAuthPlugin', () => {
         }),
       ),
     )
-    if (!migratedPool) throw new Error('Missing native refresh fixture')
-    const paths = migratedPool.paths
+    if (!testContext.migratedPool)
+      throw new Error('Missing native refresh fixture')
+    const paths = testContext.migratedPool.paths
     const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
     try {
       const subject = await runtime.captureLocalSubject(accountId)
@@ -5383,7 +3687,7 @@ describe('quota header feed extended integration', () => {
       expires: Date.now() + 100_000,
     })
 
-    const pool = migratedPool
+    const pool = testContext.migratedPool
     if (!pool) throw new Error('Expected migrated pool')
     const reader = createNativeAccountRuntime({
       paths: pool.paths,
@@ -5955,19 +4259,6 @@ describe('auth.methods', () => {
     expect(method.type).toBe('api')
     expect(method.provider).toBe('anthropic')
   })
-})
-
-test('test setup keeps sidebar state off the production default path', () => {
-  const testDir = process.env.OPENCODE_ANTHROPIC_AUTH_TEST_DIR
-  expect(typeof testDir).toBe('string')
-  if (!testDir) throw new Error('missing test directory')
-  restoreProcessTestFiles()
-  expect(getSidebarStateFile().startsWith(`${testDir}/`)).toBe(true)
-  expect(
-    process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR?.startsWith(
-      `${testDir}/`,
-    ),
-  ).toBe(true)
 })
 
 describe('OAuth billing lineage', () => {
@@ -6876,9 +5167,9 @@ describe('provider.models', () => {
   afterEach(async () => {
     await drainSidebarWrites()
     restoreProcessTestFiles()
-    // Clear tempConfigDir without deleting the account files used by plugins.
+    // Clear testContext.tempConfigDir without deleting the account files used by plugins.
     // TestLifetime disposes those plugins and joins their work before removal.
-    tempConfigDir = undefined
+    testContext.tempConfigDir = undefined
   })
 
   test('zeros out Anthropic model costs for OAuth auth', async () => {
@@ -7144,59 +5435,7 @@ describe('provider.models', () => {
 })
 
 describe('auth.loader', () => {
-  const originalFetch = globalThis.fetch
-  const originalRandom = Math.random
-  const originalDateNow = Date.now
-
-  beforeEach(async () => {
-    pluginRuntimeOverrides = {}
-    Math.random = originalRandom
-    Date.now = originalDateNow
-    resetCache1hState()
-    resetDumpState()
-    resetFastModeState()
-    resetNotificationsForTest()
-    __setInitialSidebarRoutingTestHooks(null)
-    __setSidebarStateWriteTestHooks(null)
-    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = 'legacy'
-    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
-  })
-
-  afterEach(async () => {
-    await drainBeforeReset(testLifetime, async () => {
-      globalThis.fetch = originalFetch
-      pluginRuntimeOverrides = {}
-      Math.random = originalRandom
-      Date.now = originalDateNow
-      resetNotificationsForTest()
-      __setInitialSidebarRoutingTestHooks(null)
-      __setSidebarStateWriteTestHooks(null)
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
-      await drainSidebarWrites()
-      restoreProcessTestFiles()
-      tempConfigDir = undefined
-    })
-  })
-
-  test('teardown drains an interrupted body before resetting its request transport', async () => {
-    const scope = new TestLifetime()
-    const resume = scope.gate()
-    const events: string[] = []
-    let transport = () => events.push('owned-request')
-    const body = scope.runBody(async () => {
-      await resume.wait
-      events.push('body-resumed')
-      transport()
-    })
-    await drainBeforeReset(scope, () => {
-      events.push('transport-reset')
-      transport = () => events.push('network-guard')
-    })
-    await body
-    expect(events).toEqual(['body-resumed', 'owned-request', 'transport-reset'])
-  })
+  installLoaderSetup(testContext)
 
   test('returns empty object for non-oauth auth', async () => {
     const plugin = await getPlugin()
@@ -7681,7 +5920,7 @@ describe('auth.loader', () => {
         4_000,
         'fallback refresh never reached the token stub; the eager refresh did not start',
       )
-      const pool = migratedPool
+      const pool = testContext.migratedPool
       if (!pool) throw new Error('Expected migrated pool')
       // Sign-in verifies the account behind each new access token; answer
       // that lookup from this map instead of the bootstrap endpoint.
@@ -7905,7 +6144,10 @@ describe('auth.loader', () => {
       }),
     ) as unknown as typeof fetch
 
-    const plugin = await getPlugin(createMockClient(), tempConfigDir)
+    const plugin = await getPlugin(
+      createMockClient(),
+      testContext.tempConfigDir,
+    )
     const loaded = await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -7965,7 +6207,7 @@ describe('auth.loader', () => {
       await getPluginTestHandles(plugin).scopedRuntime.drainQuotaPublications()
       // Replace the shared pool config JSON file with a directory so later
       // account reads fail instead of returning an outdated snapshot.
-      const accountFile = migratedPool?.paths.config
+      const accountFile = testContext.migratedPool?.paths.config
       if (!accountFile) throw new Error('Expected a migrated pool')
       await rm(accountFile)
       await mkdir(accountFile)
@@ -8565,9 +6807,10 @@ describe('auth.loader', () => {
         createFallbackStorage({ routing: { mode: 'fallback-first' } }),
       ),
     )
-    if (!migratedPool) throw new Error('Sidebar fixture did not migrate')
+    if (!testContext.migratedPool)
+      throw new Error('Sidebar fixture did not migrate')
     const fixtureRuntime = createNativeAccountRuntime({
-      paths: migratedPool.paths,
+      paths: testContext.migratedPool.paths,
       host: 'opencode',
     })
     try {
@@ -10498,7 +8741,7 @@ describe('auth.loader', () => {
       url: 'wss://relay.example.test',
       transport: 'websocket',
     })
-    const pool = migratedPool
+    const pool = testContext.migratedPool
     if (!pool) throw new Error('This test has no migrated pool')
     await createNativePoolStore({
       paths: pool.paths,
@@ -10645,7 +8888,7 @@ describe('auth.loader', () => {
   test('registers /claude and handles cache settings with ignored status replies', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
     const config: { command?: Record<string, unknown> } = {}
 
     await plugin.config(config)
@@ -10910,7 +9153,7 @@ describe('auth.loader', () => {
   test('handles /claude-start by injecting one visible synthetic prompt', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
 
     const result = await applyMenuAction(plugin, 'session-start', {
       sectionId: 'Extras',
@@ -10958,7 +9201,7 @@ describe('auth.loader', () => {
       }),
     )
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
 
     const windowed = await applyMenuAction(plugin, 'session-1', {
       sectionId: 'Cache',
@@ -10991,7 +9234,7 @@ describe('auth.loader', () => {
   test('registers and handles /claude-fast slash command with ignored status replies', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
 
     // The menu action's reply is the apply result the TUI shows.
     const enabled = await applyMenuAction(plugin, 'session-menu', {
@@ -11018,7 +9261,7 @@ describe('auth.loader', () => {
   test('handles /claude-routing slash command and persists routing mode', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
 
     const updated = await applyMenuAction(plugin, 'session-menu', {
       sectionId: 'Routing',
@@ -11114,7 +9357,7 @@ describe('auth.loader', () => {
   test('handles /claude-dump slash command and persists dump capture', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
 
     const result = await applyMenuAction(plugin, 'session-1', {
       sectionId: 'Diagnostics',
@@ -11131,7 +9374,7 @@ describe('auth.loader', () => {
       createFallbackStorage({ accounts: [], claudeCache: { enabled: true } }),
     )
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
 
     const result = await applyMenuAction(plugin, 'session-1', {
       sectionId: 'Cache',
@@ -11150,8 +9393,8 @@ describe('auth.loader', () => {
 
   test('persistent cache, dump, fast and logging replies show the selected settings file', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
-    const plugin = await getPlugin(undefined, tempConfigDir)
-    const settingsPath = migratedPool!.paths.config
+    const plugin = await getPlugin(undefined, testContext.tempConfigDir)
+    const settingsPath = testContext.migratedPool!.paths.config
     const actions = [
       { sectionId: 'Cache', actionId: 'cache-on' },
       { sectionId: 'Diagnostics', actionId: 'dump-on' },
@@ -11288,7 +9531,7 @@ describe('auth.loader', () => {
       ),
     ) as unknown as typeof fetch
 
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
     await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -11471,7 +9714,7 @@ describe('auth.loader', () => {
     )
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
 
-    const pool = migratedPool
+    const pool = testContext.migratedPool
     if (!pool) throw new Error('Expected migrated pool')
     const reader = createNativeAccountRuntime({
       paths: pool.paths,
@@ -11972,7 +10215,7 @@ describe('auth.loader', () => {
     await profileStarted.raised
     await drainSidebarWrites()
 
-    const pool = migratedPool
+    const pool = testContext.migratedPool
     if (!pool) throw new Error('Expected migrated pool')
     const reader = createNativeAccountRuntime({
       paths: pool.paths,
@@ -12790,7 +11033,7 @@ describe('auth.loader', () => {
             }),
           { models: {} },
         )
-        const pool = migratedPool
+        const pool = testContext.migratedPool
         if (!pool) throw new Error('Expected migrated pool')
         const reader = createNativeAccountRuntime({
           paths: pool.paths,
@@ -13061,7 +11304,7 @@ describe('auth.loader', () => {
       }),
     ) as unknown as typeof fetch
 
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
     expect(
       (
         await applyMenuAction(plugin, 'session-1', {
@@ -13355,7 +11598,7 @@ describe('auth.loader', () => {
 
     expect(intervalHandlers.length).toBeGreaterThanOrEqual(2)
     for (const handler of intervalHandlers) handler()
-    const pool = migratedPool
+    const pool = testContext.migratedPool
     if (!pool) throw new Error('Expected migrated pool')
     // Wait for the background refresh's write itself, not a fixed poll count.
     const { subject } = await waitForPoolCredential(
@@ -13521,7 +11764,7 @@ describe('auth.loader', () => {
     ) as unknown as typeof fetch
 
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir, {
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir, {
       setInterval: setIntervalMock,
       clearInterval: mock(() => {}) as unknown as typeof clearInterval,
     })
@@ -13691,7 +11934,7 @@ describe('auth.loader', () => {
     ).rejects.toThrow('Claude OAuth refresh is backed off')
 
     expect(tokenRefreshCalls).toBe(1)
-    const pool = migratedPool
+    const pool = testContext.migratedPool
     if (!pool) throw new Error('Expected migrated pool')
     const savedConfig = await createNativePoolStore({
       paths: pool.paths,
@@ -13769,7 +12012,7 @@ describe('auth.loader', () => {
         const identity = sameAccount
           ? syntheticMainAccountUuid
           : ('88888888-2222-4333-8444-555555555555' as ProviderAccountUuid)
-        successorAccess.set(successor.access, identity)
+        testContext.successorAccess.set(successor.access, identity)
         let tokenRefreshCalls = 0
         const modelAuthorizations: Array<string | null> = []
         globalThis.fetch = mock(
@@ -14390,7 +12633,7 @@ describe('auth.loader', () => {
           ),
           login,
         )
-        const pool = migratedPool
+        const pool = testContext.migratedPool
         if (!pool) throw new Error('Expected migrated pool')
         const hostAuthPath = pool.hostAuthPath
         const messageAuthorizations: string[] = []
@@ -14516,7 +12759,7 @@ describe('auth.loader', () => {
       ),
       login,
     )
-    const pool = migratedPool
+    const pool = testContext.migratedPool
     if (!pool) throw new Error('Expected migrated pool')
     const store = createNativePoolStore({
       paths: pool.paths,
@@ -18845,10 +17088,10 @@ describe('auth.loader', () => {
           ),
         ) as unknown as typeof fetch
         const result = await loadFetch()
-        if (!servingRuntime || !migratedPool)
+        if (!servingRuntime || !testContext.migratedPool)
           throw new Error('Missing serving pool')
         const runtime = servingRuntime
-        const runtimePath = migratedPool.paths.runtime
+        const runtimePath = testContext.migratedPool.paths.runtime
         const realOpen = filesystem.open
         let intercepted = false
         const openSpy = spyOn(filesystem, 'open').mockImplementation(
@@ -19098,9 +17341,10 @@ describe('auth.loader', () => {
       try {
         await result.fetch(MESSAGES_URL, EMPTY_POST)
         await pause.entered.wait
-        if (!migratedPool) throw new Error('This test has no migrated pool')
+        if (!testContext.migratedPool)
+          throw new Error('This test has no migrated pool')
         const reader = createNativeAccountRuntime({
-          paths: migratedPool.paths,
+          paths: testContext.migratedPool.paths,
           host: 'opencode',
         })
         try {
@@ -19559,9 +17803,9 @@ describe('auth.loader', () => {
       globalThis.fetch = mock(
         withNativeAdmission(async () => Response.json({})),
       ) as unknown as typeof fetch
-      if (!migratedPool) throw new Error('Expected migrated pool')
+      if (!testContext.migratedPool) throw new Error('Expected migrated pool')
       const reader = createNativeAccountRuntime({
-        paths: migratedPool.paths,
+        paths: testContext.migratedPool.paths,
         host: 'opencode',
       })
       try {
@@ -19663,9 +17907,9 @@ describe('auth.loader', () => {
             throw new Error('Expected a held main model request')
           }),
         ])
-        if (!migratedPool) throw new Error('Expected migrated pool')
+        if (!testContext.migratedPool) throw new Error('Expected migrated pool')
         const reader = createNativeAccountRuntime({
-          paths: migratedPool.paths,
+          paths: testContext.migratedPool.paths,
           host: 'opencode',
         })
         try {
@@ -19798,9 +18042,9 @@ describe('auth.loader', () => {
             throw new Error('Expected a held fallback request')
           }),
         ])
-        if (!migratedPool) throw new Error('Expected migrated pool')
+        if (!testContext.migratedPool) throw new Error('Expected migrated pool')
         const reader = createNativeAccountRuntime({
-          paths: migratedPool.paths,
+          paths: testContext.migratedPool.paths,
           host: 'opencode',
         })
         try {
@@ -20355,7 +18599,7 @@ describe('claude-start integration', () => {
   const originalFetch = globalThis.fetch
 
   beforeEach(async () => {
-    pluginRuntimeOverrides = {
+    testContext.pluginRuntimeOverrides = {
       setInterval: mock(
         () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
       ) as unknown as typeof setInterval,
@@ -20378,14 +18622,14 @@ describe('claude-start integration', () => {
   afterEach(async () => {
     __setLogTestSink(null)
     globalThis.fetch = originalFetch
-    pluginRuntimeOverrides = {}
+    testContext.pluginRuntimeOverrides = {}
     resetDumpState()
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await drainSidebarWrites()
     restoreProcessTestFiles()
-    // Clear tempConfigDir without deleting the account files used by plugins.
+    // Clear testContext.tempConfigDir without deleting the account files used by plugins.
     // TestLifetime disposes those plugins and joins their work before removal.
-    tempConfigDir = undefined
+    testContext.tempConfigDir = undefined
   })
 
   test('claude-start request shapes only its correlated OAuth turn and emits diagnostics', async () => {
@@ -20969,7 +19213,7 @@ describe('cache diagnostics', () => {
   beforeEach(async () => {
     globalThis.fetch = originalFetch
     Date.now = originalDateNow
-    pluginRuntimeOverrides = {
+    testContext.pluginRuntimeOverrides = {
       setInterval: mock(
         () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
       ) as unknown as typeof setInterval,
@@ -20988,14 +19232,14 @@ describe('cache diagnostics', () => {
     __setLogTestSink(null)
     globalThis.fetch = originalFetch
     Date.now = originalDateNow
-    pluginRuntimeOverrides = {}
+    testContext.pluginRuntimeOverrides = {}
     resetDumpState()
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await drainSidebarWrites()
     restoreProcessTestFiles()
-    // Clear tempConfigDir without deleting the account files used by plugins.
+    // Clear testContext.tempConfigDir without deleting the account files used by plugins.
     // TestLifetime disposes those plugins and joins their work before removal.
-    tempConfigDir = undefined
+    testContext.tempConfigDir = undefined
   })
 
   test('cache diagnostics binds the provider predecessor at request time', async () => {
@@ -21183,7 +19427,7 @@ describe('cache diagnostics', () => {
     __setLogTestSink((record) => records.push(record))
 
     const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient, tempConfigDir)
+    const plugin = await getPlugin(mockClient, testContext.tempConfigDir)
     const result = await plugin.auth.loader(oauthLoader, { models: {} })
     expect(
       (
@@ -21298,7 +19542,7 @@ describe('cache diagnostics', () => {
       }
     })
     Date.now = mock(() => now) as unknown as typeof Date.now
-    pluginRuntimeOverrides = {
+    testContext.pluginRuntimeOverrides = {
       setInterval: mock((callback: () => unknown, ms: number) => {
         intervals.push({ callback, ms })
         return { unref() {} } as unknown as ReturnType<typeof setInterval>
@@ -21653,7 +19897,7 @@ describe('killswitch fetch gate', () => {
     process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     // Prevent this plugin instance's background intervals from leaking into
     // later tests without mutating process-global timers used by other files.
-    pluginRuntimeOverrides = {
+    testContext.pluginRuntimeOverrides = {
       setInterval: mock(
         () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
       ) as unknown as typeof setInterval,
@@ -21662,9 +19906,9 @@ describe('killswitch fetch gate', () => {
   })
 
   afterEach(async () => {
-    await drainBeforeReset(testLifetime, () => {
+    await drainBeforeReset(testContext.testLifetime, () => {
       globalThis.fetch = originalFetch
-      pluginRuntimeOverrides = {}
+      testContext.pluginRuntimeOverrides = {}
       delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     })
   })
@@ -21917,9 +20161,10 @@ describe('killswitch fetch gate', () => {
     if (!servedAuth?.includes('sk-ant-oat01-main-access')) {
       // Capture policy state only after a wrong route; diagnostics must not
       // change the ordering of a successful quota preflight.
-      if (!migratedPool) throw new Error('Missing native killswitch fixture')
+      if (!testContext.migratedPool)
+        throw new Error('Missing native killswitch fixture')
       const reader = createNativeAccountRuntime({
-        paths: migratedPool.paths,
+        paths: testContext.migratedPool.paths,
         host: 'opencode',
       })
       try {
@@ -23226,7 +21471,7 @@ describe('claude-prime sidebar on toggle', () => {
     })
     await useTempAccountFile(fixture)
     sidebarStateFile = process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
-    const plugin = await getPlugin(undefined, tempConfigDir)
+    const plugin = await getPlugin(undefined, testContext.tempConfigDir)
     await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -23262,7 +21507,7 @@ describe('claude-prime sidebar on toggle', () => {
     })
     await useTempAccountFile(fixture)
     sidebarStateFile = process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
-    const plugin = await getPlugin(undefined, tempConfigDir)
+    const plugin = await getPlugin(undefined, testContext.tempConfigDir)
     await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -23708,10 +21953,10 @@ async function expirePoolCredentialForPrime(
   runtime: ReturnType<typeof createNativeAccountRuntime>,
   routeId: string,
 ) {
-  if (!migratedPool) throw new Error('Missing native Prime fixture')
+  if (!testContext.migratedPool) throw new Error('Missing native Prime fixture')
   const before = await runtime.captureLocalSubject(routeId)
   const store = createNativePoolStore({
-    paths: migratedPool.paths,
+    paths: testContext.migratedPool.paths,
     quota: nativeQuotaCodec,
   })
   const rotated = await store.refresh(
@@ -23800,7 +22045,7 @@ async function primeWarningsAfterQuotaCheck(
   const plugin = await getPlugin()
   await plugin.auth.loader(getHostAuth, { models: {} })
   const runtime = createNativeAccountRuntime({
-    paths: migratedPool!.paths,
+    paths: testContext.migratedPool!.paths,
     host: 'opencode',
   })
   const manager = getPluginTestHandles(plugin).primeManager
@@ -23935,8 +22180,3 @@ describe('claude-prime — warn dedup (R3)', () => {
     ).toHaveLength(0)
   })
 })
-
-import {
-  readLegacyJson,
-  writeLegacyAccountFiles,
-} from '../../../core/src/tests/legacy-account-fixture.ts'
