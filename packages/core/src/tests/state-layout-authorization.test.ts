@@ -237,3 +237,20 @@ test('migration refuses paths resolved in a layout other than the process layout
   const legacy = await resolveNativePoolPaths(config, state)
   await expect(migrate(legacy, dir)).resolves.toBeDefined()
 })
+test('an already serving state-home runtime refuses authorization and refresh once an old copy of the credentials is back, and serves again once it is gone', async () => {
+  const { oldPaths, newPaths } = await moved()
+  const { runtime, refreshes } = serve(newPaths)
+  expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+  // An old copy of the credentials is back in the config folder.
+  await writeFile(oldPaths.state, await Bun.file(newPaths.state).text())
+  await expect(runtime.authorizeLocal('main')).rejects.toMatchObject({
+    code: 'conflict',
+    paths: [oldPaths.state, newPaths.state],
+  })
+  await expect(
+    runtime.authorizeLocal('main', { intent: 'refresh' }),
+  ).rejects.toMatchObject({ code: 'conflict' })
+  expect(refreshes.count).toBe(0)
+  await rm(oldPaths.state)
+  expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+})

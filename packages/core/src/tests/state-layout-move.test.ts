@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import {
   appendFile,
   chmod,
@@ -18,7 +18,8 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { withLock } from '@cortexkit/common-auth/fs'
-
+import type { OAuthQuotaSnapshot } from '../accounts.ts'
+import type { ProviderAccountUuid } from '../claude-code.ts'
 import {
   HOLDER_FILE_NAME,
   type HolderLiveness,
@@ -29,14 +30,20 @@ import type { PreNArtifactLocations } from '../layout-fence.ts'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { createNativeLocalRuntimeReaders } from '../native-local-runtime-readers.ts'
 import type { NativeLockEvent } from '../native-lock-observer.ts'
-import { nativeQuotaCodec } from '../native-quota-codec.ts'
+import { nativeQuotaCodec, toNativeQuotaMap } from '../native-quota-codec.ts'
+import {
+  createNativeRefreshCoordinator,
+  type NativeRefreshObservation,
+  nativeAccountProviderLock,
+} from '../native-refresh-coordinator.ts'
 import { nativeVaultPaths } from '../native-vault-paths.ts'
 import {
   beginNativeEmptyInit,
   readNativeMigrationJournal,
 } from '../pool-authority.ts'
+import { captureNativeLocalPoolBinding } from '../pool-binding.ts'
 import { type NativePoolPaths, resolveNativePoolPaths } from '../pool-paths.ts'
-import { createNativePoolStore, drainNativePoolStores } from '../pool-store.ts'
+import { createNativePoolStore } from '../pool-store.ts'
 import { nativeRelocationGuard } from '../relocation-guard.ts'
 import { resetStateHomeServingGuardForTests } from '../state-home-serving-guard.ts'
 import {
@@ -53,7 +60,10 @@ import {
   readRelocationPointer,
   resetProcessStateLayoutsForTests,
 } from '../state-layout-paths.ts'
-import { readStateLayoutRecord } from '../state-layout-record.ts'
+import {
+  RELOCATION_ROLES,
+  readStateLayoutRecord,
+} from '../state-layout-record.ts'
 
 const roots: string[] = []
 
@@ -401,7 +411,11 @@ test('a process with a path override never moves and never writes the marker', a
 })
 
 test('the fence: a live holder, a malformed holder file, or a live older-version artifact keeps the dataset in place', async () => {
-  const cases: [string, (m: Machine) => Promise<void>][] = [
+  const cases: [
+    string,
+    (m: Machine) => Promise<void>,
+    Partial<DecideStateLayoutOptions>?,
+  ][] = [
     [
       'live holder of another process',
       async (m) => {
@@ -432,8 +446,10 @@ test('the fence: a live holder, a malformed holder file, or a live older-version
             version: 1,
             entries: [
               {
-                pid: OLDER_PID,
+                // This very process, registered by another copy of the code.
+                pid: process.pid,
                 incarnation: null,
+                instance: 'another-copy',
                 role: 'cli',
                 kind: 'explicit',
                 files: [m.newPaths.state],
@@ -442,6 +458,8 @@ test('the fence: a live holder, a malformed holder file, or a live older-version
           }),
         )
       },
+      // This process is alive: a mover never excludes its own pid.
+      { liveness: liveness([]) },
     ],
     [
       'live unregistered older version (CacheKeep record)',
@@ -465,11 +483,11 @@ test('the fence: a live holder, a malformed holder file, or a live older-version
       },
     ],
   ]
-  for (const [name, arrange] of cases) {
+  for (const [name, arrange, options] of cases) {
     const m = await machine()
     await arrange(m)
     const before = await oldTree(m)
-    const decision = await decide(m)
+    const decision = await decide(m, options)
     expect({ name, kind: decision.kind }).toEqual({ name, kind: 'legacy' })
     expect(await oldTree(m)).toEqual(before)
     expect(await exists(join(m.sub, 'layout.json'))).toBe(false)
@@ -624,56 +642,188 @@ test('locks are taken in the order of the refresh drain', async () => {
   )
 })
 
-for (const identity of [undefined, 'account-a'])
-  test(`a refresh in progress (${identity ? 'identified' : 'identity-less'} row) is drained: the move waits and copies the successor`, async () => {
-    const m = await machine({ identity })
-    const store = createNativePoolStore({
-      paths: m.oldPaths,
-      quota: nativeQuotaCodec,
-    })
-    let holding!: () => void
-    const held = new Promise<void>((resolve) => {
-      holding = resolve
-    })
-    let releaseRefresh!: () => void
-    const release = new Promise<void>((resolve) => {
-      releaseRefresh = resolve
-    })
-    const holdStore = createNativePoolStore({
-      paths: m.oldPaths,
-      quota: nativeQuotaCodec,
-      hold: async (point) => {
-        if (point !== 'refresh-before-provider') return
-        holding()
-        await release
+/**
+ * Core's refresh coordinator over the old pool, with every policy hook
+ * allowing the refresh. `exchange` stands in for the provider's token
+ * endpoint and `learn` for the account lookup after it.
+ */
+function coordinatorFor(
+  m: Machine,
+  options: {
+    exchange: () => Promise<void>
+    learn: string
+    onLockEvent?: (event: NativeLockEvent) => void
+  },
+) {
+  const observations: NativeRefreshObservation[] = []
+  const coordinator = createNativeRefreshCoordinator({
+    paths: m.oldPaths,
+    quota: nativeQuotaCodec,
+    onLockEvent: options.onLockEvent,
+    refreshToken: async () => {
+      await options.exchange()
+      return { ...credential('successor'), expiresIn: 3600 }
+    },
+    resolveIdentity: async () => ({
+      deviceId: 'device',
+      sessionId: 'session',
+      accountUuid: options.learn as ProviderAccountUuid,
+    }),
+    readRestrictions: async (subject) => ({
+      restriction: { status: 'allowed' },
+      context: {
+        subject,
+        runtimeBinding: subject.binding,
+        refreshErrorClearedAt: null,
+        quotaErrorClearedAt: null,
+        quotaErrorGeneration: null,
       },
-    })
-    const refreshing = holdStore.refresh('a', async () =>
-      credential('successor'),
-    )
-    await held
-    let contended: NativeLockEvent | undefined
-    const deciding = decide(m, {
-      onLockEvent: (event) => {
-        if (event.type === 'contended' && !contended) {
-          contended = event
-          releaseRefresh()
-        }
-      },
-      timeouts: { layoutMs: 10_000, holderMs: 10_000, dataMs: 10_000 },
-    })
-    await expect(refreshing).resolves.toMatchObject({ status: 'rotated' })
-    const decision = await deciding
-    expect(contended?.name).toMatch(
-      /^(row-a|row-account-a|provider-anthropic)$/,
-    )
-    expect(decision.kind).toBe('state-home')
-    const moved = await readFile(m.newPaths.state, 'utf8')
-    expect(moved).toContain('refresh-successor')
-    expect(moved).not.toContain('refresh-a"')
-    await store.close()
-    await holdStore.close()
+    }),
+    readAdmission: async () => ({ status: 'unproven' }),
+    reconcile: async (event) => {
+      observations.push(event)
+    },
   })
+  return {
+    observations,
+    async refresh() {
+      const store = createNativePoolStore({
+        paths: m.oldPaths,
+        quota: nativeQuotaCodec,
+      })
+      const read = await store.read()
+      await store.close()
+      if (read.status !== 'ready') throw new Error('the pool is not ready')
+      const row = read.rows.find((candidate) => candidate.id === 'a')
+      if (!row) throw new Error('row a is missing')
+      return coordinator.authorize({
+        intent: 'refresh',
+        mode: 'local',
+        binding: captureNativeLocalPoolBinding(m.oldPaths, row),
+      })
+    },
+  }
+}
+
+/** The moved pool state, as compact JSON. */
+async function movedRow(m: Machine) {
+  return JSON.stringify(JSON.parse(await readFile(m.newPaths.state, 'utf8')))
+}
+
+test("a refresh of an identified row through Core's coordinator, under Core's per-account provider lock, is drained: the move waits and copies the successor", async () => {
+  const m = await machine({ identity: 'account-a' })
+  const provider = nativeAccountProviderLock(m.oldPaths, 'account-a')
+  let exchanging!: () => void
+  const inExchange = new Promise<void>((resolve) => {
+    exchanging = resolve
+  })
+  let finish!: () => void
+  const finished = new Promise<void>((resolve) => {
+    finish = resolve
+  })
+  const acquired: string[] = []
+  const c = coordinatorFor(m, {
+    learn: 'account-a',
+    exchange: async () => {
+      exchanging()
+      await finished
+    },
+    onLockEvent: (event) => {
+      if (event.type === 'acquired') acquired.push(event.name)
+    },
+  })
+  const refreshing = c.refresh()
+  await inExchange
+  // The refresh is in its token exchange under Core's provider lock for the
+  // account, not the default provider lock.
+  expect(acquired).toContain(provider.name)
+  expect(acquired).not.toContain('provider-anthropic')
+  let contended: NativeLockEvent | undefined
+  const deciding = decide(m, {
+    onLockEvent: (event) => {
+      if (event.type === 'contended' && !contended) {
+        contended = event
+        finish()
+      }
+    },
+    timeouts: { layoutMs: 10_000, holderMs: 10_000, dataMs: 10_000 },
+  })
+  await refreshing
+  const decision = await deciding
+  expect(contended?.name).toBe('row-account-a')
+  expect(c.observations).toContainEqual(
+    expect.objectContaining({ status: 'persisted' }),
+  )
+  expect(decision.kind).toBe('state-home')
+  const moved = await movedRow(m)
+  expect(moved).toContain('refresh-successor')
+  expect(moved).not.toContain('refresh-a"')
+})
+
+test("a refresh that learns its row's identity waits for Core's handoff lock while holding the row; the move waits for it and copies the successor with its identity", async () => {
+  const m = await machine()
+  const learned = 'account-learned'
+  const handoff = nativeAccountProviderLock(m.oldPaths, learned)
+  // Another refresh of the learned account holds its provider lock, so this
+  // refresh, after its exchange, waits for the handoff while it still holds
+  // row-a and the default provider lock.
+  let releaseHandoff!: () => void
+  const handoffReleased = new Promise<void>((resolve) => {
+    releaseHandoff = resolve
+  })
+  let handoffHeld!: () => void
+  const holdingHandoff = new Promise<void>((resolve) => {
+    handoffHeld = resolve
+  })
+  const holder = withLock(
+    handoff.path,
+    { name: handoff.name, ttlMs: 10_000, timeoutMs: 1_000, renew: true },
+    async () => {
+      handoffHeld()
+      await handoffReleased
+    },
+  )
+  await holdingHandoff
+  let waiting!: () => void
+  const waitingForHandoff = new Promise<void>((resolve) => {
+    waiting = resolve
+  })
+  const c = coordinatorFor(m, {
+    learn: learned,
+    exchange: async () => {},
+    onLockEvent: (event) => {
+      if (event.type === 'contended' && event.name === handoff.name) waiting()
+    },
+  })
+  const refreshing = c.refresh()
+  await waitingForHandoff
+  let contended: NativeLockEvent | undefined
+  const deciding = decide(m, {
+    onLockEvent: (event) => {
+      if (event.type === 'contended' && !contended) {
+        contended = event
+        releaseHandoff()
+      }
+    },
+    timeouts: { layoutMs: 10_000, holderMs: 10_000, dataMs: 10_000 },
+  })
+  await refreshing
+  const decision = await deciding
+  await holder
+  expect(contended?.name).toBe('row-a')
+  expect(c.observations).toContainEqual(
+    expect.objectContaining({
+      status: 'persisted',
+      handoff: 'acquired',
+      identity: learned,
+    }),
+  )
+  expect(decision.kind).toBe('state-home')
+  const moved = await movedRow(m)
+  expect(moved).toContain('refresh-successor')
+  expect(moved).toContain(learned)
+  expect(moved).not.toContain('refresh-a"')
+})
 
 test('after a move, a late refresh against the old paths finds no credential and makes no provider call', async () => {
   const m = await machine()
@@ -693,16 +843,13 @@ test('after a move, a late refresh against the old paths finds no credential and
   await late.close()
 })
 
+/** Every named step of a move, in order: every copy and every cleanup role. */
 const MOVE_STEPS: StateLayoutStep[] = [
   'fence-checked',
   'locks-held',
   'config-dir-written',
   'preparing-written',
-  'copied:localPoolState',
-  'copied:journal',
-  'copied:vaultRouting',
-  'copied:localRuntime',
-  'copied:vaultRuntime',
+  ...RELOCATION_ROLES.map((role) => `copied:${role}` as const),
   'copies-flushed',
   'artifacts-checked',
   'journal-set-aside',
@@ -711,9 +858,9 @@ const MOVE_STEPS: StateLayoutStep[] = [
   'old-dir-flushed',
   'verified',
   'committed',
-  'cleanup:localPoolState',
-  'cleanup:journal',
-  'cleanup:vaultRouting',
+  ...RELOCATION_ROLES.filter(
+    (role) => role !== 'localRuntime' && role !== 'vaultRuntime',
+  ).map((role) => `cleanup:${role}` as const),
   'cleanup-recorded',
 ]
 
@@ -738,6 +885,65 @@ test('a crash at every step of the move recovers to exactly one usable copy hold
     expect(await readFile(m.newPaths.runtime, 'utf8')).toBe(
       m.original.localRuntime as string,
     )
+    expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('done')
+  }
+})
+
+test('a crash after a rename landed but before its folder was flushed, at every flush of the move, recovers to exactly one usable copy', async () => {
+  const base = defaultStateLayoutFs()
+  // Count the flushes of an undisturbed move.
+  let total = 0
+  const probe = await machine()
+  const counting: StateLayoutFs = {
+    ...base,
+    syncDirectory: async (dir) => {
+      total++
+      await base.syncDirectory(dir)
+    },
+  }
+  expect((await decide(probe, { fs: counting })).kind).toBe('state-home')
+  expect(total).toBeGreaterThan(5)
+  for (let flush = 1; flush <= total; flush++) {
+    const m = await machine()
+    let calls = 0
+    let last: StateLayoutStep = 'old-holders-locking'
+    // The process dies at the flush: every rename before it has landed and
+    // none since the previous flush is durable yet.
+    const fs: StateLayoutFs = {
+      ...base,
+      syncDirectory: async (dir) => {
+        if (++calls === flush) throw new StateLayoutCrash(last)
+        await base.syncDirectory(dir)
+      },
+    }
+    await expect(
+      decide(m, {
+        fs,
+        onStep: (step) => {
+          last = step
+        },
+      }),
+    ).rejects.toBeInstanceOf(StateLayoutCrash)
+    expect({
+      flush,
+      at: last,
+      copies: (await usableCopies(m)).length <= 1,
+    }).toEqual({
+      flush,
+      at: last,
+      copies: true,
+    })
+    const decision = await decide(m)
+    expect({ flush, at: last, kind: decision.kind }).toEqual({
+      flush,
+      at: last,
+      kind: 'state-home',
+    })
+    expect({ flush, copies: await usableCopies(m) }).toEqual({
+      flush,
+      copies: ['state-home'],
+    })
+    expect(await servedPoolState(m)).toBe(m.original.localPoolState as string)
     expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('done')
   }
 })
@@ -923,42 +1129,85 @@ test('a failed commit write rolls back to legacy', async () => {
   expect((await readStateLayoutRecord(m.sub))?.phase).toBe('rolled-back')
 })
 
-test('Windows: no directory flush, sharing violations retried, and exhausted cleanup leaves it pending in state-home', async () => {
-  const m = await machine()
+/**
+ * A move on a Windows filesystem seam: no directory flush, and the old pool
+ * state's unlink fails with a sharing violation as `busy` says. Counts the
+ * unlink attempts on the old pool state.
+ */
+function windowsFs(
+  m: Machine,
+  busy: (attempt: number) => Promise<boolean>,
+): { fs: StateLayoutFs; attempts: () => number; flushes: () => number } {
   let clock = 0
   let flushes = 0
+  let attempts = 0
   const base = defaultStateLayoutFs('win32')
-  const fs: StateLayoutFs = {
-    ...base,
-    // Owner-only files are created the POSIX way on the test machine.
-    createOwnerOnly: async (path, bytes) => {
-      await writeFile(path, bytes, { flag: 'wx', mode: 0o600 })
-    },
-    syncDirectory: async (dir) => {
-      flushes++
-      await base.syncDirectory(dir)
-    },
-    unlink: async (path) => {
-      if (path === m.oldPaths.state)
-        throw Object.assign(new Error('busy'), { code: 'EBUSY' })
-      await defaultStateLayoutFs().unlink(path)
-    },
-    now: () => clock,
-    sleep: async (ms) => {
-      clock += ms
+  return {
+    attempts: () => attempts,
+    flushes: () => flushes,
+    fs: {
+      ...base,
+      // Owner-only files are created the POSIX way on the test machine.
+      createOwnerOnly: async (path, bytes) => {
+        await writeFile(path, bytes, { flag: 'wx', mode: 0o600 })
+      },
+      syncDirectory: async (dir) => {
+        flushes++
+        await base.syncDirectory(dir)
+      },
+      unlink: async (path) => {
+        if (path === m.oldPaths.state && (await busy(++attempts)))
+          throw Object.assign(new Error('busy'), { code: 'EBUSY' })
+        await defaultStateLayoutFs().unlink(path)
+      },
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms
+      },
     },
   }
+}
+
+test('Windows: no directory flush, and a transient sharing violation is retried until the unlink succeeds', async () => {
   // The win32 flush is a no-op even for a folder that doesn't exist.
   await expect(
-    base.syncDirectory(join(m.root, 'missing')),
+    defaultStateLayoutFs('win32').syncDirectory(join(tmpdir(), 'missing')),
   ).resolves.toBeUndefined()
-  const decision = await decide(m, { fs })
-  expect(flushes).toBeGreaterThan(0)
-  expect(decision.kind).toBe('state-home')
+  const m = await machine()
+  const win = windowsFs(m, async (attempt) => attempt <= 2)
+  expect((await decide(m, { fs: win.fs })).kind).toBe('state-home')
+  expect(win.flushes()).toBeGreaterThan(0)
+  expect(win.attempts()).toBe(3)
+  expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('done')
+  expect(await exists(m.oldPaths.state)).toBe(false)
+})
+
+test('Windows: a retry checks the file again first, so a file changed between attempts is kept and refused', async () => {
+  const m = await machine()
+  const changed = `${m.original.localPoolState} `
+  const win = windowsFs(m, async (attempt) => {
+    if (attempt > 2) return false
+    // Another writer replaces the old copy while the unlink is refused.
+    await writeFile(m.oldPaths.state, changed)
+    return true
+  })
+  await expect(decide(m, { fs: win.fs })).rejects.toMatchObject({
+    code: 'conflict',
+    paths: [m.oldPaths.state, m.newPaths.state],
+  })
+  // The retry saw the change and did not unlink again.
+  expect(win.attempts()).toBe(1)
+  expect(await readFile(m.oldPaths.state, 'utf8')).toBe(changed)
+})
+
+test('Windows: an exhausted sharing-violation retry leaves cleanup pending in state-home, and the next start finishes it', async () => {
+  const m = await machine()
+  const win = windowsFs(m, async () => true)
+  expect((await decide(m, { fs: win.fs })).kind).toBe('state-home')
+  expect(win.attempts()).toBeGreaterThan(1)
   expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('pending')
   // The kept old copy is the verified one, behind the barriers: not a conflict.
   expect(await usableCopies(m)).toEqual(['state-home'])
-  // The next start finishes the cleanup.
   expect((await decide(m)).kind).toBe('state-home')
   expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('done')
 })
@@ -993,6 +1242,18 @@ test('each phase is flushed before the next begins', async () => {
     },
   }
   expect((await decide(m, { fs })).kind).toBe('state-home')
+  // Every event the order below compares happened.
+  for (const entry of [
+    'rename old/anthropic-auth-native-state.json',
+    'rename old/anthropic-auth-vault-state.json',
+    'rename sub/anthropic-auth-pool-state.json',
+    'rename sub/anthropic-auth-vault-state.json',
+    'rename sub/layout.json',
+    'unlink old/anthropic-auth-pool-state.json',
+    'flush old',
+    'flush sub',
+  ])
+    expect(log).toContain(entry)
   const at = (entry: string, from = 0) => log.indexOf(entry, from)
   const commit = log.findIndex(
     (entry, index) =>
@@ -1051,31 +1312,30 @@ test('changed old pool-state bytes at cleanup are a fatal conflict: both copies 
   expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('done')
 })
 
-test('the conflict stops a process that is already serving', async () => {
+test("a local refresh's in-callback runtime read refuses once the dataset is in conflict, before any provider call", async () => {
   const m = await machine()
   expect((await decide(m)).kind).toBe('state-home')
-  const guard = nativeRelocationGuard(m.newPaths)
-  await expect(guard.assertNotRelocated()).resolves.toBeUndefined()
-  expect(await guard.isRelocated()).toBe(false)
-  // An old copy of the credentials is back in the config folder.
-  await writeFile(m.oldPaths.state, m.original.localPoolState as string)
-  await expect(guard.assertNotRelocated()).rejects.toMatchObject({
-    code: 'conflict',
-    paths: [m.oldPaths.state, m.newPaths.state],
-  })
-  expect(await guard.isRelocated()).toBe(true)
-  // A local refresh's in-callback policy read refuses before any provider call.
+  // The read a refresh makes inside its callback, under the row and provider
+  // locks. The serving runtime's own refusal is tested with a real runtime in
+  // state-layout-authorization.test.ts.
   const readers = createNativeLocalRuntimeReaders({
     paths: m.newPaths,
     externalPolicy: () => ({ status: 'allowed' }),
   } as Parameters<typeof createNativeLocalRuntimeReaders>[0])
-  await expect(
+  const read = () =>
     readers.readRestrictions({
       binding: { kind: 'local', storageId: m.newPaths.storageId, rowId: 'a' },
-    } as never),
-  ).rejects.toMatchObject({ code: 'conflict' })
+    } as never)
+  // An old copy of the credentials is back in the config folder.
+  await writeFile(m.oldPaths.state, m.original.localPoolState as string)
+  await expect(read()).rejects.toMatchObject({
+    code: 'conflict',
+    paths: [m.oldPaths.state, m.newPaths.state],
+  })
   await rm(m.oldPaths.state)
-  await expect(guard.assertNotRelocated()).resolves.toBeUndefined()
+  await expect(
+    nativeRelocationGuard(m.newPaths).assertNotRelocated(),
+  ).resolves.toBeUndefined()
 })
 
 test('a changed set-aside journal found by cleanup survives a later failed unlink: recorded as a conflict and refused', async () => {
@@ -1281,29 +1541,52 @@ test('a state-home process whose registration fails refuses and never falls back
   expect(await readFile(join(m.sub, HOLDER_FILE_NAME), 'utf8')).toBe('{broken')
 })
 
-test('a layout-lock timeout refuses an unfinished move and admits a finished one', async () => {
-  const unfinished = await machine()
-  await expect(
-    decide(unfinished, { onStep: crashAt('preparing-written') }),
-  ).rejects.toBeInstanceOf(StateLayoutCrash)
-  const finished = await machine()
-  expect((await decide(finished)).kind).toBe('state-home')
-  for (const [m, expected] of [
-    [unfinished, 'busy'],
-    [finished, 'state-home'],
-  ] as const) {
+test('a layout-lock timeout refuses a move still unfinished, and admits one another process finished while this start waited for the lock', async () => {
+  for (const meanwhile of ['nothing', 'cleanup finished'] as const) {
+    const m = await machine()
+    // A commit whose cleanup is still pending: the start can't admit it
+    // without the layout lock, so it waits for that lock.
+    await expect(
+      decide(m, { onStep: crashAt('committed') }),
+    ).rejects.toBeInstanceOf(StateLayoutCrash)
+    const layout = join(m.sub, 'layout.json')
+    let waited = false
     await withLock(
-      join(m.sub, 'layout.json'),
+      layout,
       { name: 'runtime-layout', ttlMs: 10_000, timeoutMs: 1_000, renew: true },
       async () => {
         const result = decide(m, {
-          timeouts: { layoutMs: 200, holderMs: 1_000, dataMs: 1_000 },
+          timeouts: { layoutMs: 500, holderMs: 1_000, dataMs: 1_000 },
+          onLockEvent: (event) => {
+            if (event.name !== 'runtime-layout' || event.type !== 'contended')
+              return
+            waited = true
+            if (meanwhile !== 'cleanup finished') return
+            // The lock holder finishes the cleanup while this start waits.
+            const record = JSON.parse(readFileSync(layout, 'utf8'))
+            const runtimes = [
+              m.oldPaths.runtime,
+              nativeVaultPaths(m.oldPaths, LEGACY_STATE_LAYOUT).runtime,
+            ]
+            for (const path of [
+              `${m.oldPaths.journal}.moving-${record.attempt}`,
+              ...Object.values(oldFiles(m.oldPaths)).filter(
+                (file) => !runtimes.includes(file),
+              ),
+            ])
+              rmSync(path, { force: true })
+            writeFileSync(
+              layout,
+              JSON.stringify({ ...record, cleanup: 'done' }),
+            )
+          },
         })
-        if (expected === 'busy')
+        if (meanwhile === 'nothing')
           await expect(result).rejects.toMatchObject({ code: 'busy' })
         else expect((await result).kind).toBe('state-home')
       },
     )
+    expect({ meanwhile, waited }).toEqual({ meanwhile, waited: true })
   }
 })
 
@@ -1463,15 +1746,77 @@ test('a row added while the row locks are taken is retried once, and a second ch
   }
 })
 
-test('stores this process opened on the dataset are drained before a move', async () => {
-  const m = await machine()
-  const store = createNativePoolStore({
-    paths: m.oldPaths,
-    quota: nativeQuotaCodec,
-  })
-  expect(await drainNativePoolStores([m.oldPaths.state])).toBe(1)
-  expect(await drainNativePoolStores([m.oldPaths.state])).toBe(0)
-  await store.close()
+/** A response-header quota reading for account `acct-a`. */
+function headerReading(checkedAt: number, usedPercent: number) {
+  const window = { usedPercent, remainingPercent: 100 - usedPercent, checkedAt }
+  return toNativeQuotaMap({
+    accountIdentity: 'acct-a',
+    source: 'headers',
+    checkedAt,
+    five_hour: window,
+    seven_day: window,
+  } as OAuthQuotaSnapshot)
+}
+
+/** Whether the old pool settings hold a reading with `usedPercent`. */
+async function settingsHold(m: Machine, usedPercent: number) {
+  const text = JSON.stringify(
+    JSON.parse(await readFile(m.oldPaths.config, 'utf8')),
+  )
+  return text.includes(`"usedPercent":${usedPercent}`)
+}
+
+test('a move first drains the quota writes this process queued for the dataset, and a failed drain keeps the dataset in place', async () => {
+  for (const drain of ['succeeds', 'fails'] as const) {
+    const m = await machine({ identity: 'acct-a' })
+    const store = createNativePoolStore({
+      paths: m.oldPaths,
+      quota: nativeQuotaCodec,
+    })
+    const attribution = { credentialEpoch: 1, identity: 'acct-a' }
+    // The first reading is written at once; the next waits for the
+    // coalescing interval, so it is still queued when the move starts.
+    await store.recordQuota('a', attribution, headerReading(1_000, 11))
+    const deadline = Date.now() + 5_000
+    while (!(await settingsHold(m, 11)) && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(await settingsHold(m, 11)).toBe(true)
+    await store.recordQuota('a', attribution, headerReading(2_000, 37.5))
+    expect(await settingsHold(m, 37.5)).toBe(false)
+    const order: string[] = []
+    const close = store.close
+    store.close = async () => {
+      order.push('drained')
+      if (drain === 'fails') throw new Error('injected drain failure')
+      await close()
+    }
+    const before = await oldTree(m)
+    const decision = await decide(m, {
+      onLockEvent: (event) => {
+        if (event.type === 'acquiring') order.push(event.name)
+      },
+    })
+    if (drain === 'succeeds') {
+      expect(decision.kind).toBe('state-home')
+      // The queued reading was committed, under the store locks, before the
+      // mover took its first data lock.
+      expect(await settingsHold(m, 37.5)).toBe(true)
+      expect(order.indexOf('drained')).toBeGreaterThan(-1)
+      expect(order.indexOf('drained')).toBeLessThan(
+        order.indexOf('native-migration'),
+      )
+    } else {
+      expect(decision.kind).toBe('legacy')
+      if (decision.kind === 'legacy')
+        expect(decision.reasons.join(' ')).toContain('injected drain failure')
+      // Nothing was locked for the move, copied or written.
+      expect(order).not.toContain('native-migration')
+      expect(await exists(join(m.sub, 'layout.json'))).toBe(false)
+      expect(await subDataFiles(m)).toEqual([])
+      expect(await oldTree(m)).toEqual(before)
+      await close()
+    }
+  }
 })
 
 test('an ordinary explicit start refuses when its registration fails: a malformed holder file, a held holder lock, an unwritable folder', async () => {
