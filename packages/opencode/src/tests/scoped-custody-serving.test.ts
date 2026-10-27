@@ -941,6 +941,8 @@ describe('OpenCode scoped custody serving', () => {
     // instead of racing that rename. A released lock file still reads as
     // empty (it held no persistent data); any other vanished file retries
     // the whole listing, and a directory that never settles fails the test.
+    // The listing itself can race too: a lock's `.evicting` marker directory
+    // can be removed while the recursive listing walks into it.
     // Staging files are never skipped: skipping them would let a first-time
     // write's content escape the leak check.
     async function scanWrittenFiles() {
@@ -948,10 +950,10 @@ describe('OpenCode scoped custody serving', () => {
       let passes = 0
       for (;;) {
         passes++
-        const written = (await filesUnder(fixture.root)).filter(
-          (path) => path !== fixture.enrollmentPath,
-        )
         try {
+          const written = (await filesUnder(fixture.root)).filter(
+            (path) => path !== fixture.enrollmentPath,
+          )
           const serialized = (
             await Promise.all(
               written.map((path) =>
