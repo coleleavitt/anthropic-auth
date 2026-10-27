@@ -436,9 +436,9 @@ export interface RegisterNativePoolHolderOptions {
    * process serves, even before any dataset file exists there, and any
    * failure to publish refuses with `HolderRegistrationError`. A release that
    * decides the state layout at start passes it on every path. Without it,
-   * release N's rule applies: only an `explicit` or `pi` dataset with a file
-   * in a destination-shaped folder must be registered, and every other
-   * failure is retried in the background.
+   * a failed write refuses only for an `explicit` or `pi` dataset with a file
+   * in a destination-shaped folder; every other failure is retried in the
+   * background.
    */
   policy?: 'mandatory'
 }
