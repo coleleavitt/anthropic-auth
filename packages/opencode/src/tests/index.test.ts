@@ -15342,45 +15342,52 @@ describe('auth.loader', () => {
       )
       try {
         let usageCalls = 0
-        let committedQuota:
-          | ReturnType<typeof waitForNativePoolQuota>
-          | undefined
         globalThis.fetch = mock(
           withNativeAdmission((input: string | URL | Request) => {
-            const url = extractUrl(input)
-            if (url.includes('/api/oauth/usage')) usageCalls++
-            if (url.includes('/v1/messages'))
-              expect(committedQuota).toBeDefined()
+            if (extractUrl(input).includes('/api/oauth/usage')) usageCalls++
             return Promise.resolve(
               new Response('ok', { headers: quotaHeaders }),
             )
           }),
         ) as unknown as typeof fetch
-        const result = await loadFetch()
-        // Listen before starting the request. Both the quota flush timer and
-        // background sidebar work must make progress without sibling tests'
-        // handles, even if the pool commit precedes the sidebar publication.
-        committedQuota = waitForNativePoolQuota(
-          'main',
-          (quota) =>
-            quota?.source === 'headers' && quota.five_hour?.usedPercent === 78,
-          { keepAliveUntil: published.wait },
+        const plugin = await getPlugin()
+        const result = await plugin.auth.loader(
+          () =>
+            Promise.resolve({
+              type: 'oauth' as const,
+              access: 'sk-ant-oat01-main-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 100000,
+            }),
+          { models: {} },
         )
-        bodyLifetime().trackDetached(committedQuota)
 
         const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
         expect(response.status).toBe(200)
+        await response.text()
         await published.wait
-        await committedQuota
+        // The plugin's own views take the accepted reading at once: its quota
+        // cache and the sidebar it just published.
+        expect(
+          getPluginTestHandles(plugin).quotaManager.getMain(poolMainIdentity())
+            ?.quota.five_hour?.usedPercent,
+        ).toBe(78)
         const state = await getSidebarState(sidebarPath)
-        const storage = await readAccountStorage()
-
         expect(state.main.quota?.five_hour?.usedPercent).toBe(78)
         expect(state.lastUpdated).toBeGreaterThan(0)
+
+        // The pool store queues quota readings and commits them to disk later
+        // (about 100 ms after the first reading, then at most once per 30 s per
+        // store handle), so the file need not hold the reading yet, and a file
+        // watcher can miss the commit's final rename. Closing the plugin's
+        // account runtime commits the queued readings at once; a fresh reader
+        // then finds them on disk.
+        await getPluginTestHandles(plugin).scopedRuntime.close()
+        const storage = await readAccountStorage()
         expect(storage?.quota?.mainQuota?.source).toBe('headers')
+        expect(storage?.quota?.mainQuota?.five_hour?.usedPercent).toBe(78)
         expect(storage?.quota?.mainQuotaCheckedAt).toBeGreaterThan(0)
         expect(usageCalls).toBe(0)
-        await response.text()
       } finally {
         __setSidebarStateWriteTestHooks(null, sidebarPath)
       }
