@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import {
   appendFile,
@@ -608,10 +609,11 @@ test('locks are taken in the order of the refresh drain', async () => {
     .map((event) => `${event.name}@${event.path.split('/').pop()}`)
   const local = 'anthropic-auth-pool-state.json'
   const vault = 'anthropic-auth-vault-store-state.json'
-  const providerLocal = acquired.find(
-    (name) =>
-      name.startsWith('native-account-provider-') && name.endsWith(local),
-  )
+  // Core's per-account provider lock for the one identified row, named by
+  // its own rule: sha256 of the storage id and the identity.
+  const providerLocal = `native-account-provider-${createHash('sha256')
+    .update(JSON.stringify([m.oldPaths.storageId, 'account-a']))
+    .digest('hex')}@${local}`
   expect(acquired).toEqual([
     'runtime-layout@layout.json',
     `holders@${HOLDER_FILE_NAME}`,
@@ -620,7 +622,7 @@ test('locks are taken in the order of the refresh drain', async () => {
     `row-a@${local}`,
     `row-account-a@${local}`,
     `provider-anthropic@${local}`,
-    providerLocal as string,
+    providerLocal,
     'pool-config@anthropic-auth-pool.json',
     `pool-state@${local}`,
     'claustrum-roster-write@anthropic-auth-custody-roster.json',
@@ -917,18 +919,40 @@ test('a crash at every step of the move recovers to exactly one usable copy hold
 
 test('a crash after a rename landed but before its folder was flushed, at every flush of the move, recovers to exactly one usable copy', async () => {
   const base = defaultStateLayoutFs()
-  // Count the flushes of an undisturbed move.
-  let total = 0
+  /**
+   * Every folder flush of an undisturbed move, in order. The list is written
+   * out from the design rather than counted from the code, so a flush that
+   * goes missing fails here instead of shrinking the matrix.
+   */
+  const flushSites = (m: Machine) => {
+    const anthropic = join(m.root, 'state', 'cortexkit', 'anthropic-auth')
+    return [
+      // The new subfolder's entry in each parent it was created in.
+      anthropic,
+      join(m.root, 'state', 'cortexkit'),
+      join(m.root, 'state'),
+      m.root,
+      m.sub, // config-dir.json and the holder file
+      m.sub, // the preparing record
+      m.sub, // the copies
+      m.configDir, // the barriers
+      m.sub, // the commit
+      m.configDir, // the removal of the old copies
+      m.sub, // the record of that removal
+    ]
+  }
   const probe = await machine()
-  const counting: StateLayoutFs = {
+  const flushed: string[] = []
+  const recording: StateLayoutFs = {
     ...base,
     syncDirectory: async (dir) => {
-      total++
+      flushed.push(dir)
       await base.syncDirectory(dir)
     },
   }
-  expect((await decide(probe, { fs: counting })).kind).toBe('state-home')
-  expect(total).toBeGreaterThan(5)
+  expect((await decide(probe, { fs: recording })).kind).toBe('state-home')
+  expect(flushed).toEqual(flushSites(probe))
+  const total = flushSites(probe).length
   for (let flush = 1; flush <= total; flush++) {
     const m = await machine()
     let calls = 0
@@ -1966,4 +1990,55 @@ test('a start that found no config folder and waited for its holder lock while a
   expect(other?.kind).toBe('state-home')
   expect(decision.kind).toBe('state-home')
   expect(decision.layout).toEqual({ kind: 'state-home', dir: m.sub })
+})
+
+/**
+ * A filesystem whose `nth` rename onto `layout.json` fails: with `nth` set
+ * to the cleanup's record write, cleanup ends with a failure after it found
+ * a conflict.
+ */
+function failingRecordWrite(m: Machine, nth: number): StateLayoutFs {
+  const base = defaultStateLayoutFs()
+  let writes = 0
+  return {
+    ...base,
+    rename: async (from, to) => {
+      if (to === join(m.sub, 'layout.json') && ++writes === nth)
+        throw Object.assign(new Error('injected'), { code: 'EIO' })
+      await base.rename(from, to)
+    },
+  }
+}
+
+test("cleanup's conflict refusal reaches the moving start even when the serving check alone would admit it", async () => {
+  const m = await machine()
+  const changed = `${m.original.localPoolState} `
+  const attempt = decide(m, {
+    // Records: preparing, committed, then the cleanup's.
+    fs: failingRecordWrite(m, 3),
+    onStep: async (step) => {
+      // The old credentials change after the commit, so cleanup finds a
+      // conflict; then the changed copy goes away before the admission,
+      // so only cleanup's own refusal can stop this start.
+      if (step === 'committed') await writeFile(m.oldPaths.state, changed)
+      if (step === 'cleanup:vaultRouting') await rm(m.oldPaths.state)
+    },
+  })
+  await expect(attempt).rejects.toMatchObject({ code: 'conflict' })
+})
+
+test("cleanup's conflict refusal reaches a start that retries a pending cleanup even when the serving check alone would admit it", async () => {
+  const m = await machine()
+  await expect(
+    decide(m, { onStep: crashAt('committed') }),
+  ).rejects.toBeInstanceOf(StateLayoutCrash)
+  expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('pending')
+  await writeFile(m.oldPaths.state, `${m.original.localPoolState} `)
+  const attempt = decide(m, {
+    fs: failingRecordWrite(m, 1),
+    onStep: async (step) => {
+      if (step === 'cleanup:vaultRouting') await rm(m.oldPaths.state)
+    },
+  })
+  await expect(attempt).rejects.toMatchObject({ code: 'conflict' })
 })

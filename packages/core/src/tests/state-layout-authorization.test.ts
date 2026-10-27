@@ -254,3 +254,31 @@ test('an already serving state-home runtime refuses authorization and refresh on
   await rm(oldPaths.state)
   expect((await runtime.authorizeLocal('main')).status).toBe('usable')
 })
+
+test('two serving datasets: a conflict in one stops only that one, and it serves again once repaired', async () => {
+  const first = await moved()
+  const second = await moved()
+  const a = serve(first.newPaths).runtime
+  const b = serve(second.newPaths).runtime
+  const bothUsable = async () => {
+    for (let round = 0; round < 2; round++) {
+      expect((await a.authorizeLocal('main')).status).toBe('usable')
+      expect((await b.authorizeLocal('main')).status).toBe('usable')
+    }
+  }
+  await bothUsable()
+  // An old copy of the first dataset's credentials is back.
+  await writeFile(
+    first.oldPaths.state,
+    await Bun.file(first.newPaths.state).text(),
+  )
+  for (let round = 0; round < 2; round++) {
+    await expect(a.authorizeLocal('main')).rejects.toMatchObject({
+      code: 'conflict',
+      paths: [first.oldPaths.state, first.newPaths.state],
+    })
+    expect((await b.authorizeLocal('main')).status).toBe('usable')
+  }
+  await rm(first.oldPaths.state)
+  await bothUsable()
+})
