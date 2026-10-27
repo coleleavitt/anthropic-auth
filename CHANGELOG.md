@@ -2,10 +2,9 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.4.0
 
 - OpenCode 2: CacheKeep keeps warming idle sessions when OpenCode reloads or evicts the plugin for a directory and the directory starts again before the session's cache expires, instead of dropping them after about an hour. Tracked sessions are shared by every OpenCode 2 directory using the same accounts, so while any one of them is open, all of them keep being warmed. If nothing opens an evicted directory again and no other directory is open, OpenCode does not restart it and its sessions are no longer warmed. A server restart still clears them. Addresses #504.
-
 - `npx @cortexkit/opencode-anthropic-auth setup --help` lists every setup option, and `--host pi` works as well as `--host=pi`.
 - `@cortexkit/common-auth` moves to 0.28.0.
 - Each OpenCode, Pi and setup process now records which account files it uses, ahead of moving the plugin's state files out of OpenCode's config folder in a later release. Nothing moves yet.
