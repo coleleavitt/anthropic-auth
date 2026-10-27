@@ -17,6 +17,7 @@ import {
   migrateNativeOpencodeFixture,
   type NativeOpencodeFixture,
 } from './native-fixture.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 
 type PluginHooks = Awaited<ReturnType<typeof AnthropicAuthPlugin>>
 
@@ -298,7 +299,7 @@ test('/claude-quota polls main through scoped custody and persists its scoped wi
   expect(usageAuthorizations).toContain('Bearer scoped-access-main')
   // Wait for that queued write itself, then read the file through a fresh
   // runtime that has none of the plugin's in-memory readings.
-  await (plugin as any).__scopedRuntime.drainQuotaPublications()
+  await getPluginTestHandles(plugin).scopedRuntime.drainQuotaPublications()
   const quota = await readMainQuota(fixture)
   expect(quota?.accountIdentity).toBe(PRIMARY_ACCOUNT_ID)
   expect(quota?.scoped?.map((window) => window.id)).toEqual([
@@ -453,7 +454,7 @@ test('a scoped main receipt never binds its quota to a roster primary that chang
   )
   // Let the startup roster discovery finish so it cannot hold the roster
   // lease when the mid-request refresh above runs.
-  await (plugin as any).__fallbackRefreshReady
+  await getPluginTestHandles(plugin).fallbackRefreshReady
   const result = await (plugin as any).auth.loader(
     migratedActivation(fixture),
     {

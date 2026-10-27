@@ -25,7 +25,15 @@ describe('plugin module exports', () => {
       ) => Promise<Record<string, unknown>>
     )({ client: { auth: { set: async () => {} } } })
 
-    expect('__ensureScopedCustodyForTest' in plugin).toBe(false)
-    await (plugin.dispose as (() => Promise<void>) | undefined)?.()
+    try {
+      expect('__ensureScopedCustodyForTest' in plugin).toBe(false)
+      expect(
+        Object.getOwnPropertyNames(plugin).filter((name) =>
+          name.startsWith('__'),
+        ),
+      ).toEqual([])
+    } finally {
+      await (plugin.dispose as (() => Promise<void>) | undefined)?.()
+    }
   })
 })

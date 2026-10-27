@@ -27,6 +27,7 @@ import { AnthropicAuthPlugin } from '../index'
 import { drainSidebarWrites } from '../sidebar-state'
 import { setOAuthHeaders } from '../transform'
 import { migrateNativeOpencodeFixture } from './native-fixture'
+import { getPluginTestHandles } from './plugin-test-handles'
 import { extractUrl, TOKEN_URL } from './test-fetch'
 
 const fixtureDir = join(import.meta.dir, 'fixtures', 'claustrum-golden')
@@ -758,10 +759,7 @@ describe('Claustrum custody tombstones', () => {
       // Let startup discovery commit and release its cross-runtime lease before
       // disposal aborts its wait. A peer refresh may otherwise serve the old
       // committed roster while that cancelled discovery still holds the lease.
-      const startup =
-        '__fallbackRefreshReady' in stale
-          ? stale.__fallbackRefreshReady
-          : undefined
+      const startup = getPluginTestHandles(stale).fallbackRefreshReady
       if (!(startup instanceof Promise))
         throw new Error('Plugin did not expose its startup fallback refresh')
       await startup

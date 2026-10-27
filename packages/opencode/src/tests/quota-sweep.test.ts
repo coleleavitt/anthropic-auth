@@ -15,6 +15,7 @@ import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.t
 import { AnthropicAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { migrateNativeOpencodeFixture } from './native-fixture.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 
 /*
  * Fallback quota sweeps decide which accounts are due from a pool snapshot,
@@ -460,8 +461,7 @@ async function startBody(options: BodyOptions) {
     )
   const backgroundSweep = sweepTicks[0]?.run
   if (!backgroundSweep) throw new Error('Missing background sweep interval')
-  const startupSweep = (plugin as { __fallbackRefreshReady?: Promise<void> })
-    .__fallbackRefreshReady
+  const startupSweep = getPluginTestHandles(plugin).fallbackRefreshReady
   if (!startupSweep) throw new Error('Plugin exposed no startup sweep')
   const loader: AuthLoader | undefined = plugin.auth?.loader
   if (!loader) throw new Error('Plugin did not install its auth loader')

@@ -255,6 +255,7 @@ import {
   isAllowedOAuthDestination,
   requireOAuthDestination,
 } from './oauth-destination.ts'
+import { pluginTestHandles } from './plugin-test-handles.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import { logFallbackQuotaPreflightWarning } from './quota-preflight.ts'
@@ -5967,7 +5968,7 @@ const anthropicAuthPlugin = async (
     }
   }
 
-  return {
+  const plugin = {
     'experimental.chat.messages.transform': async (
       _input: Record<string, never>,
       output: { messages: { info?: unknown }[] },
@@ -10228,24 +10229,24 @@ const anthropicAuthPlugin = async (
       },
     },
     dispose,
-    __primeManager: primeManager,
-    __quotaManager: quotaManager,
-    __cacheKeepManager: cacheKeepManager,
-    __resolveMainQuotaIdentityForTest: resolveMainQuotaAccountIdentity,
-    __resolveSidebarQuotaAccessForTest: resolveSidebarQuotaAccess,
-    __refreshSidebarQuotaForTest: refreshSidebarQuota,
-    __mainProviderAccountUuidForTest: () => mainProviderAccountUuid,
-    __fallbackRefreshReady: fallbackRefreshReady,
-    get __scopedRuntime() {
-      return getOpenCodeScopedRuntime(accountStoragePath, ctx.directory)
-    },
-    __notificationMessageIdBeforeAssistantForTest:
-      notificationMessageIdBeforeAssistant,
-    __trackDesktopNoticeMessageIdForTest: trackDesktopNoticeMessageId,
-    __isDesktopNoticeMessageForTest: isDesktopNoticeMessage,
-
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
+  pluginTestHandles?.set(plugin, {
+    primeManager,
+    quotaManager,
+    cacheKeepManager,
+    resolveMainQuotaIdentity: resolveMainQuotaAccountIdentity,
+    resolveSidebarQuotaAccess,
+    refreshSidebarQuota,
+    fallbackRefreshReady,
+    get scopedRuntime() {
+      return getOpenCodeScopedRuntime(accountStoragePath, ctx.directory)
+    },
+    notificationMessageIdBeforeAssistant,
+    trackDesktopNoticeMessageId,
+    isDesktopNoticeMessage,
+  })
+  return plugin
 }
 
 export const AnthropicAuthPlugin: Plugin = anthropicAuthPlugin

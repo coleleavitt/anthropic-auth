@@ -34,6 +34,7 @@ import {
   createStrippedStream,
   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
 } from '../transform.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 
 // Provider errors can repeat the credential a send used. These tests drive the
 // OpenCode 1 plugin's own request handler with synthetic accounts and check
@@ -1065,7 +1066,7 @@ async function runPrime(
   const loader = plugin.auth?.loader
   if (!loader) throw new Error('Plugin did not install its auth loader')
   await loader(async () => custodyTombstoneOAuth('anthropic'), provider)
-  const prime: unknown = Reflect.get(plugin, '__primeManager')
+  const prime: unknown = getPluginTestHandles(plugin).primeManager
   if (!(prime instanceof PrimeManager))
     throw new Error('Native host Prime manager is unavailable')
   // Prime's failure reason never reaches a log or the UI: PrimeManager logs

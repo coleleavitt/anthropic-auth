@@ -21,6 +21,7 @@ import { AnthropicAuthPlugin } from '../index'
 import { adoptPrimeManager } from '../prime-manager-registry.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { migrateNativeOpencodeFixture } from './native-fixture.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 import { installDefaultFetchMock } from './test-fetch'
 import {
   createTimerTracking,
@@ -148,8 +149,7 @@ function hostContext(directory: string): PluginInput {
 
 /** Plugin construction starts a fallback-account refresh and exposes its promise for tests. */
 function fallbackRefreshReady(hooks: Hooks): Promise<unknown> {
-  const ready =
-    '__fallbackRefreshReady' in hooks ? hooks.__fallbackRefreshReady : undefined
+  const ready = getPluginTestHandles(hooks).fallbackRefreshReady
   if (!(ready instanceof Promise))
     throw new Error('Plugin did not expose its startup fallback refresh')
   return ready
@@ -294,8 +294,7 @@ describe('dispose stops per-instance background services', () => {
     }
     try {
       const plugin = await pool.getPlugin()
-      const own =
-        '__cacheKeepManager' in plugin ? plugin.__cacheKeepManager : undefined
+      const own = getPluginTestHandles(plugin).cacheKeepManager
       if (!(own instanceof CacheKeepManager))
         throw new Error('Plugin did not expose its CacheKeep manager')
       stopCalls = 0

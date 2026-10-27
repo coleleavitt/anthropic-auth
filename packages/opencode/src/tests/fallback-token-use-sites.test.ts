@@ -21,6 +21,7 @@ import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
 import { drainSidebarWrites, getSidebarState } from '../sidebar-state'
 import { migrateNativeOpencodeFixture } from './native-fixture'
+import { getPluginTestHandles } from './plugin-test-handles'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
 
 type Site =
@@ -695,7 +696,7 @@ async function createFixture(
       JSON.parse(await readFile(fixture.hostAuthPath, 'utf8')).anthropic,
     { models: {} },
   )
-  await plugin.__fallbackRefreshReady
+  await getPluginTestHandles(plugin).fallbackRefreshReady
 
   return {
     accountId,
@@ -772,7 +773,7 @@ describe('vault-served fallback outbound token census', () => {
 
   test.serial('fallback-manager quota poll', async () => {
     const fixture = await createFixture('quota', { quotaEnabled: true })
-    await fixture.plugin.__fallbackRefreshReady
+    await getPluginTestHandles(fixture.plugin).fallbackRefreshReady
     const usage = fixture.records.filter((record) =>
       record.url.includes('/api/oauth/usage'),
     )
@@ -791,7 +792,7 @@ describe('vault-served fallback outbound token census', () => {
       prime: true,
     })
     fixture.records.length = 0
-    await fixture.plugin.__primeManager.tick()
+    await getPluginTestHandles(fixture.plugin).primeManager.tick()
 
     const fallbackRecords = fixture.records.filter(
       (record) => record.authorization === `Bearer ${vaultToken('prime')}`,
@@ -801,7 +802,9 @@ describe('vault-served fallback outbound token census', () => {
       fallbackRecords.some((record) => record.url.includes('/v1/messages')),
       JSON.stringify({
         fallbackRecords,
-        stats: fixture.plugin.__primeManager.stats(fixture.storage),
+        stats: getPluginTestHandles(fixture.plugin).primeManager.stats(
+          fixture.storage,
+        ),
       }),
     ).toBe(true)
   })
@@ -938,7 +941,7 @@ describe('vault-served fallback outbound token census', () => {
               messages: [{ role: 'user', content: 'hello' }],
             }),
           }
-          const manager = fixture.plugin.__cacheKeepManager
+          const manager = getPluginTestHandles(fixture.plugin).cacheKeepManager
           const immediateWarm = mock(manager.prewarmNow.bind(manager))
           manager.prewarmNow = immediateWarm
           const messages = () =>
@@ -1319,7 +1322,7 @@ describe('scoped maintenance rotation recovery', () => {
         }
         return originalRequest(input as Parameters<typeof fetch>[0], init)
       }) as unknown as typeof fetch
-      await fixture.plugin.__primeManager.tick()
+      await getPluginTestHandles(fixture.plugin).primeManager.tick()
       expect(sent).toEqual([
         'Bearer scoped-prime-v103',
         'Bearer scoped-prime-v104',
@@ -1380,7 +1383,7 @@ test.serial(
       }
       return originalRequest(input as Parameters<typeof fetch>[0], init)
     }) as unknown as typeof fetch
-    await fixture.plugin.__primeManager.tick()
+    await getPluginTestHandles(fixture.plugin).primeManager.tick()
     expect(sent).toEqual([
       'Bearer scoped-prime-quota-v103',
       'Bearer scoped-prime-quota-v104',

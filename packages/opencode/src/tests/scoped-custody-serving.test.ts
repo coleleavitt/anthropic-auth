@@ -21,6 +21,7 @@ import {
   migrateNativeOpencodeFixture,
   type NativeOpencodeFixture,
 } from './native-fixture.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 
 type PluginHooks = Awaited<ReturnType<typeof AnthropicAuthPlugin>>
 
@@ -377,7 +378,7 @@ describe('OpenCode scoped custody serving', () => {
         { root: join(root, `project-${index}`) },
         overrides,
       )
-      await (plugin as any).__fallbackRefreshReady
+      await getPluginTestHandles(plugin).fallbackRefreshReady
       instances.push(plugin)
     }
     expect(counts.connects).toBe(1)
@@ -405,7 +406,7 @@ describe('OpenCode scoped custody serving', () => {
     await sent.text()
     const entered = lifetimes.gate()
     const release = lifetimes.gate()
-    const vault = (predecessor as any).__scopedRuntime
+    const vault = getPluginTestHandles(predecessor).scopedRuntime
     const originalPublish = vault.publish.bind(vault)
     const publication = spyOn(vault, 'publish').mockImplementation(
       async (...args: Parameters<typeof vault.publish>) => {
@@ -429,7 +430,7 @@ describe('OpenCode scoped custody serving', () => {
       { root: join(root, 'project-2') },
       overrides,
     )
-    await (successor as any).__fallbackRefreshReady
+    await getPluginTestHandles(successor).fallbackRefreshReady
     expect(disposed).toBe(false)
     release.open()
     await disposing
@@ -487,7 +488,7 @@ describe('OpenCode scoped custody serving', () => {
         setInterval: timers.setInterval,
         clearInterval: timers.clearInterval,
       })
-      await (plugin as any).__fallbackRefreshReady
+      await getPluginTestHandles(plugin).fallbackRefreshReady
       const watch = await vault.nth(0)
       const poll = timers.created.find((timer) => timer.ms === 2_000)
       expect(poll && timers.live(poll.handle)).toBe(true)
@@ -536,10 +537,8 @@ describe('OpenCode scoped custody serving', () => {
       claustrumScopedConnect: async () => client,
       scopedRosterPollIntervalMs: 0,
     })
-    const resolveIdentity = Reflect.get(
-      plugin,
-      '__resolveMainQuotaIdentityForTest',
-    )
+    const resolveIdentity =
+      getPluginTestHandles(plugin).resolveMainQuotaIdentity
     if (typeof resolveIdentity !== 'function')
       throw new Error('missing identity test hook')
     expect(await resolveIdentity('unbound-access')).toMatchObject({
@@ -661,7 +660,7 @@ describe('OpenCode scoped custody serving', () => {
       if (!loader.fetch) throw new Error('missing fetch')
       await entered.wait
       const requestWaiting = lifetimes.gate()
-      const vault = Reflect.get(plugin, '__scopedRuntime')
+      const vault = getPluginTestHandles(plugin).scopedRuntime
       const refresh = Reflect.get(vault, 'refresh')
       if (typeof refresh !== 'function')
         throw new Error('missing vault refresh')
@@ -698,7 +697,7 @@ describe('OpenCode scoped custody serving', () => {
           expect(performance.now() - started).toBeGreaterThanOrEqual(1900)
           expect(sends).toBe(0)
           discovery.open()
-          await Reflect.get(plugin, '__fallbackRefreshReady')
+          await getPluginTestHandles(plugin).fallbackRefreshReady
           expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(
             200,
           )
@@ -980,11 +979,11 @@ describe('OpenCode scoped custody serving', () => {
     }
     // Wait for startup discovery before adding the row; otherwise a refresh
     // could reuse the earlier results and miss the added account.
-    await (plugin as any).__fallbackRefreshReady
+    await getPluginTestHandles(plugin).fallbackRefreshReady
     rows.push(personalRow)
 
     // Trigger discovery refresh (simulating background poll)
-    const runtime = (plugin as any).__scopedRuntime
+    const runtime = getPluginTestHandles(plugin).scopedRuntime
     expect(runtime).toBeDefined()
     await runtime.refresh()
 
@@ -1213,7 +1212,7 @@ async function serveWhileLeaseHeld(
     { models: {} },
   )
   // The startup discovery found the lease held and kept the committed roster.
-  await (plugin as any).__fallbackRefreshReady
+  await getPluginTestHandles(plugin).fallbackRefreshReady
   expect(lists).toBe(0)
   expect(gets).toBe(0)
   expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)

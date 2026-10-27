@@ -26,6 +26,7 @@ import {
   migrateNativeOpencodeFixture,
   type NativeOpencodeFixtureInput,
 } from './native-fixture.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 
 // The unified /claude menu fetches missing or stale OAuth profiles before it
 // shows the account and quota sections. These tests run the real plugin on a
@@ -994,8 +995,9 @@ test('sidebar keeps a failed-save tier through refresh and drops it after replac
     const state = await waitForSidebarMainTier('Max 20x')
     expect(state.main.tierLabel).toBe('Max 20x')
 
-    const refreshSidebarQuota = (s.plugin as any)
-      .__refreshSidebarQuotaForTest as () => Promise<void>
+    const refreshSidebarQuota = getPluginTestHandles(
+      s.plugin,
+    ).refreshSidebarQuota
     await refreshSidebarQuota()
     await drainSidebarWrites()
     expect((await getSidebarState()).main.tierLabel).toBe('Max 20x')

@@ -62,6 +62,7 @@ import { MockRelayServer } from '../../../e2e-tests/src/mock-relay.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { drainNotifications } from '../rpc/notifications.ts'
 import { COMMAND_MODAL_NAMES } from '../rpc/protocol.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 
 type PluginHooks = Awaited<ReturnType<typeof AnthropicAuthPlugin>>
 type PluginFetch = (
@@ -1554,7 +1555,7 @@ test('native CacheKeep background prewarm cannot reuse a stored legacy bearer', 
     claustrumScopedConnect: async () => fixture.scopedClient,
   })
   await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
-  const cacheKeep: unknown = Reflect.get(plugin, '__cacheKeepManager')
+  const cacheKeep: unknown = getPluginTestHandles(plugin).cacheKeepManager
   if (!(cacheKeep instanceof CacheKeepManager))
     throw new Error('Native host CacheKeep manager is unavailable')
   cacheKeep.track({
@@ -1699,7 +1700,7 @@ test('native Prime performs one fresh usage poll before one minimal Haiku send',
     claustrumScopedConnect: async () => fixture.scopedClient,
   })
   await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
-  const prime: unknown = Reflect.get(plugin, '__primeManager')
+  const prime: unknown = getPluginTestHandles(plugin).primeManager
   if (!(prime instanceof PrimeManager))
     throw new Error('Native host Prime manager is unavailable')
   await prime.tick()
@@ -2598,7 +2599,7 @@ async function enablePrime(fixture: ServingFixture) {
 
 async function tickPrime(plugin: PluginHooks) {
   await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
-  const prime: unknown = Reflect.get(plugin, '__primeManager')
+  const prime: unknown = getPluginTestHandles(plugin).primeManager
   if (!(prime instanceof PrimeManager))
     throw new Error('Native host Prime manager is unavailable')
   try {
@@ -2730,7 +2731,7 @@ for (const scenario of final401Cases) {
       claustrumScopedConnect: async () => fixture.scopedClient,
     })
     await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
-    const cacheKeep: unknown = Reflect.get(plugin, '__cacheKeepManager')
+    const cacheKeep: unknown = getPluginTestHandles(plugin).cacheKeepManager
     if (!(cacheKeep instanceof CacheKeepManager))
       throw new Error('Native host CacheKeep manager is unavailable')
     const target = {
@@ -3482,7 +3483,7 @@ for (const admitted of [false, true]) {
       claustrumScopedConnect: async () => fixture.scopedClient,
     })
     await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
-    const cacheKeep: unknown = Reflect.get(plugin, '__cacheKeepManager')
+    const cacheKeep: unknown = getPluginTestHandles(plugin).cacheKeepManager
     if (!(cacheKeep instanceof CacheKeepManager))
       throw new Error('Native host CacheKeep manager is unavailable')
     const gets = fixture.authorizedGets.length

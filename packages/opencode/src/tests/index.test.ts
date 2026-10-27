@@ -112,6 +112,7 @@ import {
   migrateNativeOpencodeFixture,
   type NativeOpencodeFixture,
 } from './native-fixture.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 import {
   extractUrl,
   installDefaultFetchMock,
@@ -2199,9 +2200,7 @@ async function getPlugin(
   testLifetime?.trackDetached(creation)
   const plugin = (await creation) as any
   livePlugins.add(plugin)
-  if (plugin.__fallbackRefreshReady) {
-    fallbackRefreshes.add(plugin.__fallbackRefreshReady)
-  }
+  fallbackRefreshes.add(getPluginTestHandles(plugin).fallbackRefreshReady)
   const pool = migratedPool
   const loader = plugin.auth?.loader
   if (pool && loader) {
@@ -2459,11 +2458,13 @@ describe('scoped enrollment is explicit', () => {
 describe('desktop notice identity (#230)', () => {
   test('orders repeated notices before the same assistant with bounded IDs', async () => {
     const plugin = await getPlugin()
-    const mint = plugin.__notificationMessageIdBeforeAssistantForTest
+    const mint =
+      getPluginTestHandles(plugin).notificationMessageIdBeforeAssistant
     const assistant = 'msg_0000000f0000BBBBBBBBBBBBBB'
     let previous = 'msg_0000000efffeAAAAAAAAAAAAAA'
     for (let index = 0; index < 20; index++) {
       const next = mint(assistant, previous)
+      if (next === undefined) throw new Error('Expected an ordered notice ID')
       expect(typeof next).toBe('string')
       expect(next > previous).toBe(true)
       expect(next < assistant).toBe(true)
@@ -2480,8 +2481,8 @@ describe('desktop notice identity (#230)', () => {
 
   test('bounds notice identities by session and message, retaining recently used sessions', async () => {
     const plugin = await getPlugin()
-    const track = plugin.__trackDesktopNoticeMessageIdForTest
-    const has = plugin.__isDesktopNoticeMessageForTest
+    const track = getPluginTestHandles(plugin).trackDesktopNoticeMessageId
+    const has = getPluginTestHandles(plugin).isDesktopNoticeMessage
     for (let index = 0; index < 128; index++) track(`ses_${index}`, 'msg_first')
     track('ses_0', 'msg_recent')
     track('ses_128', 'msg_first')
@@ -3237,13 +3238,7 @@ describe('quota header feed integration', () => {
         firstRequest = Promise.resolve(result.fetch(MESSAGES_URL, EMPTY_POST))
         bodyLifetime().trackDetached(firstRequest)
         await entered.wait
-        const cache = (
-          plugin as unknown as {
-            __quotaManager: {
-              getMain(identity: string): { quota: OAuthQuotaSnapshot } | null
-            }
-          }
-        ).__quotaManager
+        const cache = getPluginTestHandles(plugin).quotaManager
         await waitForLogRecord(
           records,
           (record) =>
@@ -3518,7 +3513,7 @@ describe('quota header feed integration', () => {
           }),
         { models: {} },
       )
-      const quotaManager = plugin.__quotaManager
+      const quotaManager = getPluginTestHandles(plugin).quotaManager
       __setLogTestSink((record) => {
         records.push(record)
         if (
@@ -3763,7 +3758,7 @@ describe('quota header feed integration', () => {
           }),
         { models: {} },
       )
-      const quotaManager = plugin.__quotaManager
+      const quotaManager = getPluginTestHandles(plugin).quotaManager
       responsePromise = Promise.resolve(
         result.fetch(MESSAGES_URL, {
           method: 'POST',
@@ -4125,7 +4120,7 @@ describe('quota header feed integration', () => {
         }),
       { models: {} },
     )
-    const quotaManager = plugin.__quotaManager
+    const quotaManager = getPluginTestHandles(plugin).quotaManager
     try {
       const oldRequest = quotaManager.refreshMain(uuidA, accessA)
       priorPoll = oldRequest
@@ -4271,7 +4266,7 @@ describe('quota header feed integration', () => {
     expect(Number(response.headers.get('retry-after'))).toBeGreaterThan(0)
     expect(messageCalls).toBe(0)
     expect(credentialCalls).toBe(0)
-    expect(plugin.__quotaManager.isBackedOff()).toBe(true)
+    expect(getPluginTestHandles(plugin).quotaManager.isBackedOff()).toBe(true)
     expect(
       (await readAccountStorage())?.quota?.mainLastQuotaApiError
         ?.accountIdentity,
@@ -4616,7 +4611,7 @@ describe('quota header feed integration', () => {
     expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
     expect(bootstrapCalls).toBeGreaterThan(0)
     expect(modelCalls).toBe(1)
-    expect(plugin.__quotaManager.isBackedOff()).toBe(false)
+    expect(getPluginTestHandles(plugin).quotaManager.isBackedOff()).toBe(false)
   })
 
   test('confirmed account replacement clears the prior account backoff', async () => {
@@ -4693,7 +4688,7 @@ describe('quota header feed integration', () => {
       (await readAccountStorage())?.quota?.mainLastQuotaApiError
         ?.accountIdentity,
     ).toBe(uuidA)
-    expect(plugin.__quotaManager.isBackedOff()).toBe(true)
+    expect(getPluginTestHandles(plugin).quotaManager.isBackedOff()).toBe(true)
     if (!migratedPool) throw new Error('This test has no migrated pool')
     const runtime = createNativeAccountRuntime({
       paths: migratedPool.paths,
@@ -4714,7 +4709,9 @@ describe('quota header feed integration', () => {
       const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
       expect(response.status).toBe(200)
       expect(messageCalls).toBe(1)
-      expect(plugin.__quotaManager.isBackedOff()).toBe(false)
+      expect(getPluginTestHandles(plugin).quotaManager.isBackedOff()).toBe(
+        false,
+      )
       expect(
         (await readAccountStorage())?.quota?.mainLastQuotaApiError,
       ).toBeUndefined()
@@ -4865,7 +4862,8 @@ describe('quota header feed integration', () => {
         'new account observation before old response release',
       )
       expect(
-        plugin.__quotaManager.getMain(uuidB)?.quota.five_hour?.usedPercent,
+        getPluginTestHandles(plugin).quotaManager.getMain(uuidB)?.quota
+          .five_hour?.usedPercent,
       ).toBe(60)
       release.open()
       expect((await inFlight).status).toBe(200)
@@ -4879,9 +4877,12 @@ describe('quota header feed integration', () => {
       expect(await readFeedEntries()).not.toContainEqual(
         expect.objectContaining({ anthropic_account_uuid: uuidA }),
       )
-      expect(plugin.__quotaManager.getMain(uuidA)).toBeNull()
       expect(
-        plugin.__quotaManager.getMain(uuidB)?.quota.five_hour?.usedPercent,
+        getPluginTestHandles(plugin).quotaManager.getMain(uuidA),
+      ).toBeNull()
+      expect(
+        getPluginTestHandles(plugin).quotaManager.getMain(uuidB)?.quota
+          .five_hour?.usedPercent,
       ).toBe(60)
       expect(
         (
@@ -5400,7 +5401,8 @@ describe('quota header feed extended integration', () => {
       (storage) => storage?.quota?.mainQuota?.five_hour?.usedPercent === 25,
     )
     const requestsBeforeDisplay = fetchSpy.mock.calls.length
-    const resolved = await plugin.__resolveSidebarQuotaAccessForTest()
+    const resolved =
+      await getPluginTestHandles(plugin).resolveSidebarQuotaAccess()
     expect(resolved.access).toBeUndefined()
     expect(resolved.storage?.quota?.mainQuota?.accountIdentity).toBe(
       '44444444-4444-4444-4444-444444444444',
@@ -7674,9 +7676,8 @@ describe('auth.loader', () => {
       return Promise.reject(new Error(`Unexpected test fetch: ${url}`))
     }) as unknown as typeof fetch
     const plugin = await getPlugin()
-    const backgroundRefreshReady = (
-      plugin as unknown as { __fallbackRefreshReady?: Promise<void> }
-    ).__fallbackRefreshReady
+    const backgroundRefreshReady =
+      getPluginTestHandles(plugin).fallbackRefreshReady
     expect(backgroundRefreshReady).toBeInstanceOf(Promise)
     try {
       await withDeadlockGuard(
@@ -7922,7 +7923,7 @@ describe('auth.loader', () => {
     // Establish the plugin's actual route before testing a quota-only write.
     const response = await loaded.fetch(MESSAGES_URL, EMPTY_POST)
     expect(response.status).toBe(200)
-    await plugin.__fallbackRefreshReady
+    await getPluginTestHandles(plugin).fallbackRefreshReady
     await drainSidebarWrites()
     expect((await getSidebarState()).activeId).toBe('fallback-1')
     if (clearExistingRouting) {
@@ -7965,7 +7966,7 @@ describe('auth.loader', () => {
       expect(refreshed.ok).toBe(true)
       // Quota polls return before publishing to the pool config. Drain those
       // writes so a pending rename cannot recreate the file during the swap.
-      await plugin.__scopedRuntime.drainQuotaPublications()
+      await getPluginTestHandles(plugin).scopedRuntime.drainQuotaPublications()
       // Replace the shared pool config JSON file with a directory so later
       // account reads fail instead of returning an outdated snapshot.
       const accountFile = migratedPool?.paths.config
@@ -17513,7 +17514,7 @@ describe('auth.loader', () => {
         }
         noticeWasTrackedAtDispatch.push(
           typeof notice.body.messageID === 'string' &&
-            plugin.__isDesktopNoticeMessageForTest(
+            getPluginTestHandles(plugin).isDesktopNoticeMessage(
               notice.path.id,
               notice.body.messageID,
             ),
@@ -18661,7 +18662,8 @@ describe('auth.loader', () => {
       () => Promise.resolve({ type: 'oauth', ...main }),
       { models: {} },
     )
-    const display = await plugin.__resolveSidebarQuotaAccessForTest()
+    const display =
+      await getPluginTestHandles(plugin).resolveSidebarQuotaAccess()
     expect(display.storage?.quota?.enabled).toBe(false)
     expect(display.access).toBeUndefined()
     expect(requests).toEqual([])
@@ -18733,7 +18735,7 @@ describe('auth.loader', () => {
       { models: {} },
     )
 
-    await plugin.__fallbackRefreshReady
+    await getPluginTestHandles(plugin).fallbackRefreshReady
     expect(usageAuthorizations).toContain('Bearer sk-ant-oat01-fallback-access')
     expect(
       (await readNativeRuntimeState()).accounts['fallback-1']?.quota?.five_hour
@@ -18945,7 +18947,9 @@ describe('auth.loader', () => {
       try {
         expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
         await pause.entered.wait
-        expect(plugin.__quotaManager.getMain(poolMainIdentity())).toBeNull()
+        expect(
+          getPluginTestHandles(plugin).quotaManager.getMain(poolMainIdentity()),
+        ).toBeNull()
         expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
         expect(authorizations).toEqual([
           'Bearer sk-ant-oat01-main-access',
@@ -22226,11 +22230,7 @@ describe('claude-prime direct request', () => {
     // already in place: the manager has been constructed with sendPrime wired
     // to a closure that calls the auth loader. Trigger an explicit tick via
     // the manager factory on `plugin`.
-    const mgr = (
-      plugin as unknown as {
-        __primeManager?: { tick: () => Promise<void> }
-      }
-    ).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     expect(mgr).toBeDefined()
     await mgr!.tick()
 
@@ -22354,11 +22354,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    const mgr = (
-      plugin as unknown as {
-        __primeManager?: { tick: () => Promise<void> }
-      }
-    ).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     if (!(mgr instanceof Core.PrimeManager))
       throw new Error('Expected the native Prime manager')
     await mgr.tick()
@@ -22441,11 +22437,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    await (
-      firstPlugin as unknown as {
-        __primeManager: { tick: () => Promise<void> }
-      }
-    ).__primeManager.tick()
+    await getPluginTestHandles(firstPlugin).primeManager.tick()
     const firstLineage = (await readAccountStorage())?.prime?.mainAuthLineageId
 
     // The main login's tokens rotate for the same account (a refresh in
@@ -22466,11 +22458,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    await (
-      secondPlugin as unknown as {
-        __primeManager: { tick: () => Promise<void> }
-      }
-    ).__primeManager.tick()
+    await getPluginTestHandles(secondPlugin).primeManager.tick()
 
     expect(sends).toBe(1)
     expect(firstLineage).toMatch(/^[0-9a-f-]{36}$/)
@@ -22569,9 +22557,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    const manager = (
-      plugin as unknown as { __primeManager: { tick(): Promise<void> } }
-    ).__primeManager
+    const manager = getPluginTestHandles(plugin).primeManager
     await manager.tick()
     const before = (await readAccountStorage())?.prime?.mainAuthLineageId
     expect(before).toMatch(/^[0-9a-f-]{36}$/)
@@ -22818,11 +22804,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    const mgr = (
-      plugin as unknown as {
-        __primeManager?: { tick: () => Promise<void> }
-      }
-    ).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     await mgr!.tick()
 
     const primeCall = calls.find(
@@ -22908,11 +22890,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    const mgr = (
-      plugin as unknown as {
-        __primeManager?: { tick: () => Promise<void> }
-      }
-    ).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
 
     await mgr!.tick()
     // Another process refreshes the fallback; its refresh token rotates.
@@ -22986,11 +22964,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    const mgr = (
-      plugin as unknown as {
-        __primeManager?: { tick: () => Promise<void> }
-      }
-    ).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     await mgr!.tick()
     await mgr!.tick()
 
@@ -23069,11 +23043,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    const mgr = (
-      plugin as unknown as {
-        __primeManager?: { tick: () => Promise<void> }
-      }
-    ).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     if (!(mgr instanceof Core.PrimeManager))
       throw new Error('Expected the native Prime manager')
     await mgr.tick()
@@ -23179,9 +23149,7 @@ describe('claude-prime direct request', () => {
         }),
       { models: {} },
     )
-    const mgr = (
-      plugin as unknown as { __primeManager?: { tick: () => Promise<void> } }
-    ).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     expect(mgr).toBeDefined()
     await mgr!.tick()
 
@@ -23200,12 +23168,12 @@ describe('claude-prime direct request', () => {
     })
     await useTempAccountFile(fixture)
     const plugin1 = await getPlugin()
-    const mgr1 = (plugin1 as any).__primeManager
+    const mgr1 = getPluginTestHandles(plugin1).primeManager
     const firstLoadStorage = mgr1.options.loadStorage
     expect(mgr1).toBeDefined()
     expect(mgr1.isStopped?.()).toBeFalsy()
     const plugin2 = await getPlugin()
-    const mgr2 = (plugin2 as any).__primeManager
+    const mgr2 = getPluginTestHandles(plugin2).primeManager
     expect(mgr2).toBeDefined()
     expect(mgr2).toBe(mgr1)
     expect(mgr2.options.loadStorage).not.toBe(firstLoadStorage)
@@ -23216,11 +23184,11 @@ describe('claude-prime direct request', () => {
     const fixture = createFallbackStorage({ prime: { enabled: true } })
     await useTempAccountFile(fixture)
     const plugin1 = await getPlugin(undefined, '/project/one')
-    const mgr1 = (plugin1 as any).__primeManager
+    const mgr1 = getPluginTestHandles(plugin1).primeManager
 
     await useTempAccountFile(fixture)
     const plugin2 = await getPlugin(undefined, '/project/two')
-    const mgr2 = (plugin2 as any).__primeManager
+    const mgr2 = getPluginTestHandles(plugin2).primeManager
 
     expect(mgr2).not.toBe(mgr1)
     expect(mgr1.isStopped()).toBe(false)
@@ -23422,7 +23390,7 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
         }),
       { models: {} },
     )
-    const mgr = Reflect.get(plugin, '__primeManager')
+    const mgr = getPluginTestHandles(plugin).primeManager
     if (!(mgr instanceof Core.PrimeManager))
       throw new Error('Expected the native Prime manager')
     let freshChecks = 0
@@ -23501,7 +23469,7 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
         }),
       { models: {} },
     )
-    const mgr = (plugin as any).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     mgr.options.refreshQuota = async () => ({
       quota: freshQuota,
       fresh: true,
@@ -23610,7 +23578,7 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
         }),
       { models: {} },
     )
-    const mgr = (plugin as any).__primeManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     await mgr.tick()
 
     // Exactly ONE usage-API call per tick — the redundant second
@@ -23697,8 +23665,8 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
         }),
       { models: {} },
     )
-    const quotaManager = Reflect.get(plugin, '__quotaManager')
-    const mgr = Reflect.get(plugin, '__primeManager')
+    const quotaManager = getPluginTestHandles(plugin).quotaManager
+    const mgr = getPluginTestHandles(plugin).primeManager
     if (
       !(quotaManager instanceof Core.QuotaManager) ||
       !(mgr instanceof Core.PrimeManager)
@@ -23839,8 +23807,7 @@ async function primeWarningsAfterQuotaCheck(
     paths: migratedPool!.paths,
     host: 'opencode',
   })
-  const manager = (plugin as unknown as { __primeManager: PrimeManager })
-    .__primeManager
+  const manager = getPluginTestHandles(plugin).primeManager
   let changed = false
   // Change account availability after the manager obtained its claim identity.
   // Keep the real send adapter to verify its failure classification and logs.

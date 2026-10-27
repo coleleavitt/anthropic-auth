@@ -17,6 +17,7 @@ import { discoverPortFile } from '../rpc/port-file'
 import { getRpcDir } from '../rpc/rpc-dir'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { migrateNativeOpencodeFixture } from './native-fixture.ts'
+import { getPluginTestHandles } from './plugin-test-handles'
 import { installDefaultFetchMock } from './test-fetch'
 import {
   createTimerTracking,
@@ -112,8 +113,7 @@ function hostContext(directory: string): PluginInput {
 
 /** Plugin construction starts a fallback-account refresh and exposes its promise for tests. */
 function fallbackRefreshReady(hooks: Hooks): Promise<unknown> {
-  const ready =
-    '__fallbackRefreshReady' in hooks ? hooks.__fallbackRefreshReady : undefined
+  const ready = getPluginTestHandles(hooks).fallbackRefreshReady
   if (!(ready instanceof Promise))
     throw new Error('Plugin did not expose its startup fallback refresh')
   return ready
