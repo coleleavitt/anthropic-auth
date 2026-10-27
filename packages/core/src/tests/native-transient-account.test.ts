@@ -313,13 +313,14 @@ test('a healthy authorization takes no pool lock and reads the pool files no mor
     status: 'fulfilled',
     value: { status: 'usable' },
   })
-  // The read counts are those measured for the same call before the join
+  // The ceilings are the reads measured for the same call before the join
   // existed (base 2637c812), so the join adds no I/O to a healthy route.
-  expect({ lockWrites, configReads, stateReads }).toEqual({
-    lockWrites: 0,
-    configReads: 10,
-    stateReads: 5,
-  })
+  // common-auth 0.27.1 caches unchanged files by identity on POSIX, so the
+  // real counts are lower there; Windows still reads in full and meets the
+  // ceilings exactly.
+  expect(lockWrites).toBe(0)
+  expect(configReads).toBeLessThanOrEqual(10)
+  expect(stateReads).toBeLessThanOrEqual(5)
   expect(logs.records).toEqual([])
 })
 
