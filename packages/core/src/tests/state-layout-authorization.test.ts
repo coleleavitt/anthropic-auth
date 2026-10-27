@@ -1,9 +1,10 @@
 import { expect } from 'bun:test'
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { ProviderAccountUuid } from '../claude-code.ts'
 import { createNativeAccountRuntime } from '../native-account-runtime.ts'
+import type { NativeLockEvent } from '../native-lock-observer.ts'
 import {
   NativeMigrationError,
   runNativeMigration,
@@ -15,7 +16,17 @@ import {
   resolveNativePoolPaths,
 } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
-import { LEGACY_STATE_LAYOUT } from '../state-layout-paths.ts'
+import {
+  probeStateHomeServingForTests,
+  resetStateHomeServingGuardForTests,
+  type StateHomeServingProbe,
+} from '../state-home-serving-guard.ts'
+import { decideOpenCodeStateLayout } from '../state-layout-decision.ts'
+import {
+  LEGACY_STATE_LAYOUT,
+  resetProcessStateLayoutsForTests,
+} from '../state-layout-paths.ts'
+import { requestLockProbe } from './native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup } = createTestLifetimeSuite()
@@ -63,7 +74,7 @@ function migrate(paths: NativePoolPaths, dir: string) {
   })
 }
 
-async function authorize(paths: NativePoolPaths) {
+async function addMain(paths: NativePoolPaths) {
   const store = createNativePoolStore({
     paths,
     quota: nativeQuotaCodec,
@@ -83,6 +94,14 @@ async function authorize(paths: NativePoolPaths) {
   await store.updateSettings((settings) => {
     settings.mainAccountId = 'imported-main'
   })
+  await store.close()
+}
+
+function serve(
+  paths: NativePoolPaths,
+  local: { onLockEvent?: (event: NativeLockEvent) => void } = {},
+) {
+  const refreshes = { count: 0 }
   const runtime = createNativeAccountRuntime({
     paths,
     host: 'opencode',
@@ -103,16 +122,84 @@ async function authorize(paths: NativePoolPaths) {
         accountUuid: uuid,
       }),
       refreshToken: async () => {
+        refreshes.count++
         throw new Error('No refresh expected')
       },
+      ...local,
     },
   })
   deferCleanup(async () => {
     await runtime.drainQuotaPublications()
     runtime.close()
   })
-  return runtime.authorizeLocal('main')
+  return { runtime, refreshes }
 }
+
+async function authorize(paths: NativePoolPaths) {
+  await addMain(paths)
+  return serve(paths).runtime.authorizeLocal('main')
+}
+
+/**
+ * A home folder whose OpenCode config folder holds a migrated local pool
+ * with one main account, moved into the state folder by a layout decision.
+ * Returns both layouts' paths.
+ */
+async function moved() {
+  const dir = await root()
+  const home = join(dir, 'home')
+  const configDir = join(home, '.config', 'opencode')
+  await mkdir(configDir, { recursive: true })
+  const env = { XDG_STATE_HOME: join(dir, 'state') }
+  const oldPaths = await resolveNativePoolPaths(
+    join(configDir, 'anthropic-auth.json'),
+    join(configDir, 'anthropic-auth-state.json'),
+    LEGACY_STATE_LAYOUT,
+  )
+  await migrate(oldPaths, dir)
+  await addMain(oldPaths)
+  resetProcessStateLayoutsForTests()
+  resetStateHomeServingGuardForTests()
+  deferCleanup(() => {
+    resetProcessStateLayoutsForTests()
+    resetStateHomeServingGuardForTests()
+  })
+  const decision = await decideOpenCodeStateLayout({
+    role: 'opencode2',
+    env,
+    home,
+    artifacts: {
+      rpcRoots: [join(dir, 'rpc')],
+      rpcDirs: [],
+      cacheKeepDirs: [join(dir, 'cachekeep')],
+    },
+  })
+  if (decision.kind !== 'state-home')
+    throw new Error(`the fixture did not move: ${JSON.stringify(decision)}`)
+  return { oldPaths, newPaths: decision.dataset.newPaths }
+}
+
+test('a serving state-home runtime checks for a conflict with lstat only: no marker read and no lock across healthy authorizations', async () => {
+  const { newPaths } = await moved()
+  const locks = requestLockProbe()
+  const { runtime } = serve(newPaths, { onLockEvent: locks.onLockEvent })
+  // The first authorization records its credential proof.
+  expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+  const events: Parameters<StateHomeServingProbe>[0][] = []
+  probeStateHomeServingForTests((event) => events.push(event))
+  deferCleanup(() => probeStateHomeServingForTests(undefined))
+  locks.begin()
+  for (let round = 0; round < 2; round++)
+    expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+  probeStateHomeServingForTests(undefined)
+  expect(locks.foreground).toEqual([])
+  // Both the runtime's own guard and each authorization's fresh runtime
+  // readers checked, and none of them read layout.json again.
+  expect(
+    events.filter((event) => event.type === 'lstat').length,
+  ).toBeGreaterThanOrEqual(4)
+  expect(events.filter((event) => event.type === 'read')).toEqual([])
+})
 
 test('legacy-layout paths keep the eight captured keys and authorize locally', async () => {
   const dir = await root()

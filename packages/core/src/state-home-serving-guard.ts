@@ -205,41 +205,68 @@ function markerRefusal(sub: string, cause?: unknown) {
 /** Conflicts already logged by this process, so each is logged once. */
 const reported = new Set<string>()
 
+interface ServingObservation {
+  /** The `lstat` identities the result was computed from. */
+  readonly key: string
+  /** The set-aside journal of the record's attempt. */
+  readonly moving: string | undefined
+  readonly refusal: StateLayoutRefusalError | undefined
+}
+
+/**
+ * The last full check of each dataset, by its serving files, shared by every
+ * guard over that dataset in this process. A guard made for one request (a
+ * local authorization builds fresh runtime readers each time) therefore
+ * starts from what earlier guards read, and a healthy check costs only
+ * `lstat`s.
+ */
+const observations = new Map<string, ServingObservation>()
+
+/** What a test observes of the guard's file access. */
+export type StateHomeServingProbe = (
+  event: { type: 'lstat'; paths: number } | { type: 'read' },
+) => void
+let probe: StateHomeServingProbe | undefined
+
+/** Observe the guard's `lstat` calls and its full reads; tests only. */
+export function probeStateHomeServingForTests(
+  next: StateHomeServingProbe | undefined,
+): void {
+  probe = next
+}
+
 /**
  * A guard that stops an already serving state-home process once its dataset
  * is in conflict. It has the relocation guard's shape so every locked write
  * callback that checks for a move (vault store, roster, routing, authorize)
- * checks for a conflict instead. It reads files again only when the `lstat`
- * identity of the marker, an old file or the set-aside journal changed, so a
- * check costs four `lstat`s while nothing changes.
+ * checks for a conflict instead. It takes no lock, and reads files again
+ * only when the `lstat` identity of the marker, an old file or the set-aside
+ * journal changed, so a check costs four `lstat`s while nothing changes.
  */
 export function createStateHomeServingGuard(
   files: StateHomeServingFiles,
 ): RelocationGuard & { check(): Promise<StateLayoutRefusalError | undefined> } {
   const marker = join(files.sub, STATE_HOME_FILE_NAMES.layoutMarker)
-  let last:
-    | {
-        key: string
-        moving: string | undefined
-        refusal: StateLayoutRefusalError | undefined
-      }
-    | undefined
+  const dataset = JSON.stringify(files)
   async function check() {
+    const last = observations.get(dataset)
     // Every identity is taken before the file it describes is read, so a
     // change after this point always shows up as a new key next time.
     const watched = [marker, files.oldJournal, files.oldPoolState]
     const moving = last?.moving
-    const identities = await Promise.all(
-      (moving ? [...watched, moving] : watched).map(identityOf),
-    )
+    const paths = moving ? [...watched, moving] : watched
+    probe?.({ type: 'lstat', paths: paths.length })
+    const identities = await Promise.all(paths.map(identityOf))
     const before = identities.slice(0, watched.length)
     if (
       last &&
-      last.key === JSON.stringify([before, moving ?? null, identities[3]])
+      last.key ===
+        JSON.stringify([before, moving ?? null, identities[watched.length]])
     )
       return last.refusal
+    probe?.({ type: 'read' })
     const result = await evaluate(files)
-    last = {
+    observations.set(dataset, {
       key: JSON.stringify([
         before,
         result.moving ?? null,
@@ -247,7 +274,7 @@ export function createStateHomeServingGuard(
       ]),
       moving: result.moving,
       refusal: result.refusal,
-    }
+    })
     const refusal = result.refusal
     if (refusal && !reported.has(refusal.message)) {
       reported.add(refusal.message)
@@ -270,7 +297,8 @@ export function createStateHomeServingGuard(
   }
 }
 
-/** Forget logged conflicts; tests only. */
+/** Forget logged conflicts and shared observations; tests only. */
 export function resetStateHomeServingGuardForTests() {
   reported.clear()
+  observations.clear()
 }
