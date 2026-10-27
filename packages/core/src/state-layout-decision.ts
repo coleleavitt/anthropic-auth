@@ -52,6 +52,7 @@ import {
 } from './state-layout-io.ts'
 import {
   acquireDataLocks,
+  acquireHolderLock,
   acquireHolderLocks,
   cleanupOldCopies,
   drainCoalescedWrites,
@@ -428,11 +429,11 @@ async function admitFast(
   ctx: StateLayoutTransitionContext,
 ): Promise<StateLayoutDecision | 'changed'> {
   try {
-    await ctx.stack.acquire({
-      name: 'holders',
-      path: join(dataset.sub, HOLDER_FILE_NAME),
-      timeoutMs: ctx.holderLockTimeoutMs,
-    })
+    await acquireHolderLock(
+      ctx,
+      join(dataset.sub, HOLDER_FILE_NAME),
+      ctx.holderLockTimeoutMs,
+    )
   } catch (error) {
     if (error instanceof LockContentionError) busy(dataset.configDir, error)
     throw error
@@ -571,11 +572,13 @@ async function legacyWhileMoveOff(
     await stateLayoutStep(ctx, 'old-holders-locking')
     let lockFailure: { error: unknown } | undefined
     try {
-      await ctx.stack.acquire({
-        name: 'holders',
-        path: join(old.oldDir, HOLDER_FILE_NAME),
-        timeoutMs: ctx.holderLockTimeoutMs,
-      })
+      // Any failure to take the lock is tolerated here: this path runs only
+      // while registration is best-effort.
+      await acquireHolderLock(
+        ctx,
+        join(old.oldDir, HOLDER_FILE_NAME),
+        ctx.holderLockTimeoutMs,
+      )
     } catch (error) {
       lockFailure = { error }
     }
@@ -800,25 +803,21 @@ export async function decideOpenCodeStateLayout(
       try {
         await stateLayoutStep(ctx, 'old-holders-locking')
         try {
-          await ctx.stack.acquire({
-            name: 'holders',
-            path: join(dataset.oldDir, HOLDER_FILE_NAME),
-            timeoutMs: ctx.holderLockTimeoutMs,
-          })
-        } catch (error) {
-          if (
-            !(error instanceof LockContentionError) ||
-            unmovedRegistrationPolicy(options) === 'mandatory'
+          await acquireHolderLock(
+            ctx,
+            join(dataset.oldDir, HOLDER_FILE_NAME),
+            ctx.holderLockTimeoutMs,
           )
-            throw error
+        } catch (error) {
+          if (unmovedRegistrationPolicy(options) === 'mandatory') throw error
           // While registration is best-effort a start serves, as 2.4.x
-          // does, when the holder lock stays taken, provided the files read
-          // again still show no move; the background retry registers it.
+          // does, when the holder lock can't be taken, provided the files
+          // read again still show no move; the background retry registers it.
           if (
             (await readPointers(dataset)) ||
             !noMoveRecord(await readRecord(sub))
           )
-            busy(dataset.configDir, error)
+            throw error
           return chooseLegacy(
             dataset.oldPaths,
             reasons,

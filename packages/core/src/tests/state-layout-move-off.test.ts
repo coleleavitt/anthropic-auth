@@ -14,6 +14,7 @@ import { join } from 'node:path'
 import { withLock } from '@cortexkit/common-auth/fs'
 import {
   HOLDER_FILE_NAME,
+  HOLDER_REGISTRATION_ERROR_MESSAGES,
   type HolderLiveness,
   HolderRegistrationError,
   type NativeHolderRegistration,
@@ -359,3 +360,61 @@ test('moving off: a journal a move set aside keeps the strict checks', async () 
   )
   expectFixedRefusal(error, m)
 })
+
+/** A host's view of a refusal: the fixed text, naming no file or folder. */
+function expectFixedRegistrationRefusal(error: unknown, m: Machine) {
+  expect(error).toBeInstanceOf(HolderRegistrationError)
+  expect(error).toMatchObject({ code: 'unavailable' })
+  const shown = stateRefusalPublicMessage(error)
+  expect(shown).toBe((error as Error).message)
+  expect(HOLDER_REGISTRATION_ERROR_MESSAGES).toContain(shown as string)
+  expect(shown).not.toContain(m.root)
+}
+
+for (const branch of ['override', 'layout-lock', 'state-home'] as const)
+  test(`a holder lock that fails with an I/O error, not contention, refuses with the fixed registration text once moving is on, and serves with moving off when no move is in sight (${branch})`, async () => {
+    for (const moveEnabled of [false, true]) {
+      const m = await machine()
+      const env =
+        branch === 'override'
+          ? {
+              ...m.env,
+              OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE: join(
+                m.root,
+                'routing.json',
+              ),
+            }
+          : m.env
+      if (branch === 'state-home') {
+        // A moved dataset, admitted through the state folder's holder lock.
+        expect((await decide(m, { moveEnabled: true })).kind).toBe('state-home')
+      }
+      // The folder whose holder lock is taken can't take new files, so the
+      // lock file can't be created (EACCES).
+      const locked = branch === 'state-home' ? stateSub(m) : m.configDir
+      await chmod(locked, 0o500)
+      const result = await decide(m, { env, moveEnabled }).then(
+        (decision) => ({ decision }),
+        (error: unknown) => ({ error }),
+      )
+      await chmod(locked, 0o700)
+      if ('decision' in result && result.decision.kind !== 'state-home') {
+        const registration = result.decision.registration
+        if (registration) closers.push(registration)
+      }
+      if (branch === 'layout-lock' && !moveEnabled) {
+        // Moving off with no move in sight never takes the state folder's
+        // locks: a legacy start serves, its registration retried later.
+        if ('error' in result) throw result.error
+        expect(result.decision.kind).toBe('legacy')
+        continue
+      }
+      if (branch === 'override' && !moveEnabled) {
+        if ('error' in result) throw result.error
+        expect(result.decision.kind).toBe('legacy')
+        continue
+      }
+      if (!('error' in result)) throw new Error('the start was admitted')
+      expectFixedRegistrationRefusal(result.error, m)
+    }
+  })

@@ -2,10 +2,15 @@ import { randomUUID } from 'node:crypto'
 import { lstat, readdir, readFile, stat, unlink } from 'node:fs/promises'
 import { basename, dirname, join, sep } from 'node:path'
 import { drainVaultQuota } from '@cortexkit/common-auth/claustrum'
-import { writeJsonAtomic } from '@cortexkit/common-auth/fs'
+import { LockContentionError, writeJsonAtomic } from '@cortexkit/common-auth/fs'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 
-import { HOLDER_FILE_NAME, HOLDER_LOCK_TIMEOUT_MS } from './holder-registry.ts'
+import {
+  HOLDER_FILE_NAME,
+  HOLDER_LOCK_NAME,
+  HOLDER_LOCK_TIMEOUT_MS,
+  HolderRegistrationError,
+} from './holder-registry.ts'
 import { logger } from './logger.ts'
 import { nativeQuotaCodec } from './native-quota-codec.ts'
 import { nativeAccountProviderLock } from './native-refresh-coordinator.ts'
@@ -266,6 +271,31 @@ export function transitionHolderFiles(dataset: RelocationDataset): string[] {
   ].sort()
 }
 
+/**
+ * Take the `holders` lock on `holderFile`. Waiting too long throws
+ * `LockContentionError`, which callers report as busy. Any other failure to
+ * take it (the lock file can't be created: EACCES, EROFS, ENOSPC) throws
+ * `HolderRegistrationError('unavailable')`, whose fixed message names no
+ * file, so a host never shows the lock file's path. `timeoutMs` undefined
+ * waits the lock stack's default.
+ */
+export async function acquireHolderLock(
+  ctx: Pick<StateLayoutTransitionContext, 'stack'>,
+  holderFile: string,
+  timeoutMs: number | undefined,
+): Promise<void> {
+  try {
+    await ctx.stack.acquire({
+      name: HOLDER_LOCK_NAME,
+      path: holderFile,
+      timeoutMs,
+    })
+  } catch (error) {
+    if (error instanceof LockContentionError) throw error
+    throw new HolderRegistrationError('unavailable', dirname(holderFile), error)
+  }
+}
+
 /** Take the `holders` lock on both holder files, in sorted path order. */
 export async function acquireHolderLocks(
   dataset: RelocationDataset,
@@ -274,11 +304,11 @@ export async function acquireHolderLocks(
   const oldHolders = join(dataset.oldDir, HOLDER_FILE_NAME)
   for (const file of transitionHolderFiles(dataset)) {
     if (file === oldHolders) await stateLayoutStep(ctx, 'old-holders-locking')
-    await ctx.stack.acquire({
-      name: 'holders',
-      path: file,
-      timeoutMs: ctx.holderLockTimeoutMs ?? HOLDER_LOCK_TIMEOUT_MS,
-    })
+    await acquireHolderLock(
+      ctx,
+      file,
+      ctx.holderLockTimeoutMs ?? HOLDER_LOCK_TIMEOUT_MS,
+    )
   }
 }
 
