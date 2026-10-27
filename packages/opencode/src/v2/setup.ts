@@ -4,6 +4,7 @@ import {
   createNativeUi,
   disconnectNativeVaultForHost,
   exchange,
+  isDumpPersistentlyEnabled,
   logger,
   type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
@@ -13,6 +14,7 @@ import {
   readNativeEnrollmentMode,
   registerNativePoolHolder,
   resolveNativePoolPaths,
+  setDumpEnabled,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type PoolLoginMethod,
@@ -231,6 +233,14 @@ export async function setupAnthropicAuth(
   const enrollment = nativeEnrollmentCallbacks(
     options.vault?.env ?? process.env,
   )
+  // Mirror the persisted dump switch for the current custody mode into this
+  // process's Core dump flag, as OpenCode 1 does at startup. The adapter still
+  // reads the persisted switch per send; this covers background Core dumps
+  // before the first request.
+  try {
+    const initial = await runtime.read()
+    setDumpEnabled(isDumpPersistentlyEnabled(initial.policyStorage))
+  } catch {}
   let active = true
   const wire = createNativeWirePolicy()
   const models = createNativeClaudeModelRules()

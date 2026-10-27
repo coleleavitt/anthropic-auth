@@ -13,12 +13,18 @@ import {
   classifyGzipRejection,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
+  type DumpHandle,
+  type DumpTag,
   decideRequestGzip,
+  dumpDirectRequest,
+  dumpRelayRequest,
+  dumpResponseArtifact,
   encodeGzipRequestBody,
   getAccountStoragePath,
   getRequestGzipLatch,
   getRequestGzipLatchPath,
   type HolderRegistrationError,
+  isDumpEnabled as isDumpEnabledCore,
   mergeAnthropicBetas,
   type ProviderErrorRedactor,
   type ProviderErrorResponseScope,
@@ -27,6 +33,7 @@ import {
   type RequestGzipLatch,
   remapModelId,
   remapRequestBodyModel,
+  setDumpEnabled as setDumpEnabledCore,
   stateRefusalCause,
   stripEmptyTrailingAssistantMessages,
   TrailingAssistantHistoryError,
@@ -93,6 +100,9 @@ export const INTERNAL_REQUEST_HEADERS: readonly string[] = [
 
 /** Headers that carry a credential; on the OAuth route only the adapter sets them. */
 const CREDENTIAL_HEADERS = new Set(['authorization', 'x-api-key'])
+
+/** Fixed error label for a dump whose send never reached Anthropic. */
+const DUMP_PHYSICAL_SEND_FAILED = 'physical send before a response'
 
 /**
  * Fixed text of the refusal raised when the source has no credential for a
@@ -365,6 +375,14 @@ export interface NativeAnthropicSource<Q, P> {
     input: NativeAnthropicAttemptContext<P>,
     outcome: NativeAnthropicAttemptOutcome,
   ) => Promise<void> | void
+  /**
+   * Whether request dumps are enabled in the current custody mode's settings.
+   * The adapter consults this before writing any dump, so a stale global flag
+   * from another host mode never decides. Sources backed by the native runtime
+   * read `dump.enabled` from the current snapshot; synthetic test sources may
+   * omit it, in which case the adapter falls back to the Core global flag.
+   */
+  readonly isDumpEnabled?: () => Promise<boolean> | boolean
   /**
    * Called by the adapter's `forgetSession`; drops whatever the source keeps
    * for the session.
@@ -797,6 +815,51 @@ export function createNativeAnthropicAdapter<Q, P>(
   }
   let disposed = false
 
+  // Request-dump state for OpenCode 2. One entry per physical send, keyed by
+  // the send's per-attempt data object. The entry holds the final signed
+  // request body (never the gzipped wire bytes), the URL, method and headers
+  // as sent, and for HTTP-relay sends the envelope actually posted. Entries
+  // are written in `rewriteResponse` once the status is known, or in
+  // `onAttemptEnd` with a fixed error label when no response arrived. They
+  // hold a credential-bearing headers copy only until that dump finishes, and
+  // are dropped on `forgetSession` and `dispose`. Background CacheKeep and
+  // Prime sends never store an entry here: CacheKeep prewarms are dumped by
+  // Core's manager with the `cachekeep` tag, and Prime has no OpenCode 1 dump.
+  type DumpContext = {
+    readonly affinity: string
+    readonly route: string
+    readonly bodyText: string
+    readonly url: string
+    readonly method: string
+    readonly headers: Headers
+    readonly dispatch: 'direct' | 'http-relay'
+    readonly relayUrl?: string
+    readonly envelope?: Record<string, unknown>
+    readonly relayBytes?: number
+    readonly tag?: DumpTag
+  }
+  const dumpContexts = new Map<Data, DumpContext>()
+  const dumpHandles = new WeakMap<Data, DumpHandle>()
+  const dumpMessageStarts = new WeakMap<Data, Record<string, unknown>>()
+  const dumpWrites = new WeakMap<Data, Promise<void>>()
+  const isBackgroundDumpScope = (attempt: Attempt<Data>) =>
+    attempt.agent === 'cachekeep' || attempt.agent === 'prime'
+  const dumpEnabledForSend = async (): Promise<boolean> => {
+    try {
+      if (source.isDumpEnabled) return await source.isDumpEnabled()
+    } catch {
+      return false
+    }
+    try {
+      return isDumpEnabledCore()
+    } catch {
+      return false
+    }
+  }
+  const dropDumpContext = (data: Data) => {
+    dumpContexts.delete(data)
+  }
+
   // The headers object of each failed response this adapter rewrote, mapped
   // to its send. Holding no secret and only weak references, it lets the
   // response classifier recognize that exact rewritten response: its body
@@ -1154,6 +1217,31 @@ export function createNativeAnthropicAdapter<Q, P>(
         body: upstreamBody,
         next_hash: `sha256:${createHash('sha256').update(upstreamBody).digest('hex')}`,
       }
+      // Remember the final signed upstream body for the request dump. The
+      // dump is written in `rewriteResponse` once the status is known, so a
+      // 401 retry writes one dump per physical attempt. Background CacheKeep
+      // and Prime sends never store an entry: the manager dumps prewarms with
+      // the `cachekeep` tag and Prime has no OpenCode 1 dump.
+      if (messages && body !== undefined && !isBackgroundDumpScope(attempt)) {
+        const tag: DumpTag | undefined =
+          correlation[LANE_START_REQUEST_HEADER] === '1' ? 'start' : undefined
+        const envelopeText = JSON.stringify(envelope)
+        dumpContexts.set(data, {
+          affinity: input.sessionID,
+          route: input.accountId,
+          bodyText: upstreamBody,
+          url,
+          method: request.method,
+          headers: new Headers(headers),
+          dispatch: 'http-relay',
+          relayUrl: send.dispatch.url,
+          envelope: envelope as Record<string, unknown>,
+          relayBytes: envelopeText.length,
+          ...(tag ? { tag } : {}),
+        })
+      } else {
+        dropDumpContext(data)
+      }
       return new Request(send.dispatch.url, {
         method: 'POST',
         headers: {
@@ -1181,6 +1269,25 @@ export function createNativeAnthropicAdapter<Q, P>(
         ensureLive()
       }
     }
+    // Remember the final signed body for the request dump. `body` stays the
+    // signed uncompressed text even when the wire carries gzipped bytes, as
+    // on OpenCode 1, so the dump always holds the identity text.
+    if (messages && body !== undefined && !isBackgroundDumpScope(attempt)) {
+      const tag: DumpTag | undefined =
+        correlation[LANE_START_REQUEST_HEADER] === '1' ? 'start' : undefined
+      dumpContexts.set(data, {
+        affinity: input.sessionID,
+        route: input.accountId,
+        bodyText: body,
+        url,
+        method: request.method,
+        headers: new Headers(headers),
+        dispatch: 'direct',
+        ...(tag ? { tag } : {}),
+      })
+    } else {
+      dropDumpContext(data)
+    }
     return new Request(url, {
       method: request.method,
       headers,
@@ -1207,9 +1314,10 @@ export function createNativeAnthropicAdapter<Q, P>(
     rewriteHandshakeURL() {
       throw new NativeAnthropicTransportRefusal()
     },
-    rewriteResponse({ response, attempt }) {
+    async rewriteResponse({ response, attempt }) {
       const data = attempt.data
       if (data && !fromUpstream(response.headers, data)) {
+        if (data) dropDumpContext(data)
         // Relay authentication errors must not appear as an OAuth 401 to the
         // host or the native credential service.
         if (response.status === 401) {
@@ -1248,31 +1356,198 @@ export function createNativeAnthropicAdapter<Q, P>(
           () => {},
         )
       }
+      // Write the request dump now that the status is known, as OpenCode 1
+      // does after its fetch. Dumping never blocks or fails the request: any
+      // filesystem error leaves no handle and the response is still served.
+      // The stored headers copy (which carries the bearer) is dropped once the
+      // dump finishes, and the body dumped is always the signed uncompressed
+      // text, never the gzipped wire bytes.
+      let dumpHandle: DumpHandle | null = null
+      const pendingDump = data ? dumpContexts.get(data) : undefined
+      if (data && pendingDump) {
+        let enabled = false
+        try {
+          enabled = await dumpEnabledForSend()
+        } catch {
+          enabled = false
+        }
+        if (!enabled) {
+          dropDumpContext(data)
+        } else {
+          try {
+            setDumpEnabledCore(true)
+          } catch {}
+          try {
+            if (pendingDump.dispatch === 'http-relay') {
+              dumpHandle = await dumpRelayRequest({
+                affinity: pendingDump.affinity,
+                transport: 'http',
+                protocol: 1,
+                mode: 'full_sync',
+                status: response.status,
+                bodyText: pendingDump.bodyText,
+                payload: pendingDump.envelope ?? {},
+                relayBytes: pendingDump.relayBytes ?? 0,
+                ...(pendingDump.tag ? { tag: pendingDump.tag } : {}),
+              })
+            } else {
+              dumpHandle = await dumpDirectRequest({
+                affinity: pendingDump.affinity,
+                route: pendingDump.route,
+                status: response.status,
+                bodyText: pendingDump.bodyText,
+                url: pendingDump.url,
+                method: pendingDump.method,
+                headers: pendingDump.headers,
+                ...(pendingDump.tag ? { tag: pendingDump.tag } : {}),
+              })
+            }
+          } catch {
+            dumpHandle = null
+          }
+          dropDumpContext(data)
+          if (dumpHandle) {
+            dumpHandles.set(data, dumpHandle)
+            try {
+              await dumpResponseArtifact(dumpHandle, {
+                status: response.status,
+                message: null,
+                complete: false,
+              })
+            } catch {}
+            dumpWrites.set(data, Promise.resolve())
+          }
+        }
+      }
       // Remove this send's secrets from provider errors before any other
       // reader; successful bytes pass through unchanged.
       const safe = scrubResponse(data, response)
       // Only the OAuth route prefixes tool names, so only its responses are
       // mapped back. An API response reaches the host byte for byte.
-      if (data?.route !== 'oauth' || !safe.body)
+      if (data?.route !== 'oauth' || !safe.body) {
         return rewrittenFailure(data, safe)
+      }
       const context = { ...contextOf(attempt, data), status: response.status }
       const options = source.responseOptions?.(context) ?? {}
       const json = (response.headers.get('content-type') ?? '').includes(
         'application/json',
       )
+      const baseStreamOptions = {
+        ...options,
+        toolNameMap: data ? responseToolNameMaps.get(data) : undefined,
+        // Unsafe response names depend on this request's tool declarations,
+        // not the Anthropic account. Changing accounts must not bypass refusal.
+        onToolNameRefusal: () => {
+          if (!data) return
+          localRefusals.set(data, 'response_tool_names')
+          release(data)
+        },
+        laneStartOAuthServed: true,
+        ...(json ? { responseMode: 'json' as const } : {}),
+      }
+      if (!data || !dumpHandle) {
+        return rewrittenFailure(
+          data,
+          createStrippedStream(safe, baseStreamOptions),
+        )
+      }
+      // Observe the stripped stream the same way OpenCode 1 does, so the
+      // response artifact carries the provider message id, model, usage and
+      // stop reason instead of only the status.
+      const handleForStream = dumpHandle
+      const statusForStream = response.status
+      const appendDumpWrite = (write: () => Promise<unknown>) => {
+        const previous = dumpWrites.get(data) ?? Promise.resolve()
+        const next: Promise<void> = previous
+          .then(() => write().then(() => undefined))
+          .catch(() => undefined)
+        dumpWrites.set(data, next)
+      }
+      const originalStart = options.onMessageStart
+      const originalDelta = options.onMessageDelta as
+        | ((delta: {
+            usage?: Record<string, unknown>
+            stopReason?: string
+          }) => void)
+        | undefined
+      const originalResponse = (
+        options as {
+          onMessageResponse?: (message: Record<string, unknown>) => void
+        }
+      ).onMessageResponse
+      const originalEnd = options.onStreamEnd
       return rewrittenFailure(
         data,
         createStrippedStream(safe, {
-          ...options,
-          toolNameMap: responseToolNameMaps.get(data),
-          // Unsafe response names depend on this request's tool declarations,
-          // not the Anthropic account. Changing accounts must not bypass refusal.
-          onToolNameRefusal: () => {
-            localRefusals.set(data, 'response_tool_names')
-            release(data)
+          ...baseStreamOptions,
+          onMessageStart: (message: Record<string, unknown>) => {
+            try {
+              originalStart?.(message)
+            } catch {}
+            try {
+              dumpMessageStarts.set(data, { ...message })
+              appendDumpWrite(() =>
+                dumpResponseArtifact(handleForStream, {
+                  status: statusForStream,
+                  message,
+                  complete: false,
+                }),
+              )
+            } catch {}
           },
-          laneStartOAuthServed: true,
-          ...(json ? { responseMode: 'json' as const } : {}),
+          onMessageDelta: (delta: {
+            usage?: Record<string, unknown>
+            stopReason?: string
+          }) => {
+            try {
+              originalDelta?.(delta)
+            } catch {}
+            try {
+              const start = dumpMessageStarts.get(data) ?? {}
+              const startUsage =
+                start.usage &&
+                typeof start.usage === 'object' &&
+                !Array.isArray(start.usage)
+                  ? (start.usage as Record<string, unknown>)
+                  : {}
+              const merged = {
+                ...start,
+                ...(delta.usage
+                  ? { usage: { ...startUsage, ...delta.usage } }
+                  : {}),
+                ...(delta.stopReason ? { stop_reason: delta.stopReason } : {}),
+              }
+              appendDumpWrite(() =>
+                dumpResponseArtifact(handleForStream, {
+                  status: statusForStream,
+                  message: merged,
+                  complete: true,
+                }),
+              )
+            } catch {}
+          },
+          onMessageResponse: (message: Record<string, unknown>) => {
+            try {
+              originalResponse?.(message)
+            } catch {}
+            try {
+              appendDumpWrite(() =>
+                dumpResponseArtifact(handleForStream, {
+                  status: statusForStream,
+                  message,
+                  complete: true,
+                }),
+              )
+            } catch {}
+          },
+          onStreamEnd: async () => {
+            try {
+              await originalEnd?.()
+            } catch {}
+            try {
+              await (dumpWrites.get(data) ?? Promise.resolve())
+            } catch {}
+          },
         }),
       )
     },
@@ -1390,6 +1665,57 @@ export function createNativeAnthropicAdapter<Q, P>(
       const data = attempt.data
       if (!data) return
       pending.delete(data)
+      // A send that never reached `rewriteResponse` (the host's fetch threw,
+      // say) still writes its request dump with a fixed error label, as
+      // OpenCode 1 does. Sends that already dumped in `rewriteResponse` have
+      // no pending entry here, so each physical attempt writes at most once.
+      const pendingDump = dumpContexts.get(data)
+      if (pendingDump) {
+        dropDumpContext(data)
+        try {
+          const enabled = await dumpEnabledForSend()
+          if (enabled) {
+            try {
+              setDumpEnabledCore(true)
+            } catch {}
+            try {
+              if (pendingDump.dispatch === 'http-relay') {
+                // A relay send that never produced a response writes no relay
+                // dump, as on OpenCode 1: the host retries direct, and that
+                // direct attempt writes its own dump.
+                if (outcome.status !== undefined) {
+                  await dumpRelayRequest({
+                    affinity: pendingDump.affinity,
+                    transport: 'http',
+                    protocol: 1,
+                    mode: 'full_sync',
+                    status: outcome.status,
+                    bodyText: pendingDump.bodyText,
+                    payload: pendingDump.envelope ?? {},
+                    relayBytes: pendingDump.relayBytes ?? 0,
+                    ...(pendingDump.tag ? { tag: pendingDump.tag } : {}),
+                  })
+                }
+              } else {
+                await dumpDirectRequest({
+                  affinity: pendingDump.affinity,
+                  route: pendingDump.route,
+                  status: outcome.status,
+                  error:
+                    outcome.status === undefined
+                      ? DUMP_PHYSICAL_SEND_FAILED
+                      : undefined,
+                  bodyText: pendingDump.bodyText,
+                  url: pendingDump.url,
+                  method: pendingDump.method,
+                  headers: pendingDump.headers,
+                  ...(pendingDump.tag ? { tag: pendingDump.tag } : {}),
+                })
+              }
+            } catch {}
+          }
+        } catch {}
+      }
       // A send that completed, was cancelled or can no longer be observed
       // has no error left to read. An error status or a failed stream keeps
       // its redactor: the host still reads that error after this call, and
@@ -1430,6 +1756,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       inProgress.clear()
       pending.clear()
+      dumpContexts.clear()
       for (const data of [...owned.keys()]) release(data)
     },
     forgetSession(sessionID) {
@@ -1442,6 +1769,9 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       for (const [data, entry] of [...owned]) {
         if (entry.sessionID === sessionID) release(data)
+      }
+      for (const [data, dump] of [...dumpContexts]) {
+        if (dump.affinity === sessionID) dumpContexts.delete(data)
       }
       source.forgetSession?.(sessionID)
     },

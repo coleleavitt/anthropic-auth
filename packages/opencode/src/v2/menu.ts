@@ -20,6 +20,7 @@ import {
   type NativeMenuDispatch,
   nativeAccountCanServe,
   resetClaustrumEnrollmentState,
+  setDumpEnabled,
 } from '@cortexkit/anthropic-auth-core'
 import { LANE_START_TEXT } from '../lane-start'
 import { normalizeSidebarState } from '../sidebar-state'
@@ -278,9 +279,18 @@ export function createNativeMenuCapabilities(options: {
         await write('cacheKeep', { subagents: request.values.enabled === 'on' })
         return done()
       case 'dump-on':
-      case 'dump-off':
-        await write('dump', { enabled: request.action === 'dump-on' })
+      case 'dump-off': {
+        const enabled = request.action === 'dump-on'
+        await write('dump', { enabled })
+        // Mirror the persisted switch into this process's Core dump flag, as
+        // OpenCode 1 does after its own dump command. The adapter still reads
+        // the persisted switch per send; this keeps background Core dumps
+        // (CacheKeep prewarms) in sync without waiting for the next request.
+        try {
+          setDumpEnabled(enabled)
+        } catch {}
         return done()
+      }
       case 'logging-level':
         await write('logging', { level: request.values.level })
         return done()

@@ -7,6 +7,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - `npx @cortexkit/opencode-anthropic-auth setup --help` lists every setup option, and `--host pi` works as well as `--host=pi`.
 - `@cortexkit/common-auth` moves to 0.28.0.
 - Each OpenCode, Pi and setup process now records which account files it uses, ahead of moving the plugin's state files out of OpenCode's config folder in a later release. Nothing moves yet.
+- OpenCode 2: request dumps from `/claude` now write files, as on OpenCode 1. If dumps were already turned on, OpenCode 2 starts writing them after this update. Addresses #503.
 
 ## 2.3.0
 

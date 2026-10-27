@@ -5,6 +5,7 @@ import {
   getClaudeCodeIdentityForVerifiedAccount,
   getQuotaCheckIntervalMs,
   getRoutingMode,
+  isDumpPersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   logger,
   mergeHeaderQuotaForPersistence,
@@ -29,6 +30,7 @@ import {
   readNativeAccountsForRequest,
   remapModelId,
   StickySessionRouter,
+  setDumpEnabled,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
@@ -224,6 +226,26 @@ export function createNativeAnthropicSource(
     }
   }
 
+  // Mirror the current custody mode's persisted dump switch into this
+  // process's Core dump flag, so Core's manager (CacheKeep prewarms) and the
+  // adapter's settings-gated dumps agree. The switch lives in the snapshot's
+  // policy storage for the current mode, local or vault, exactly where the
+  // OpenCode 2 menu writes it (`write('dump', { enabled })`).
+  const syncDumpEnabled = (snapshot: NativeAccountSnapshot) => {
+    try {
+      setDumpEnabled(isDumpPersistentlyEnabled(snapshot.policyStorage))
+    } catch {}
+  }
+  const readDumpEnabled = async (): Promise<boolean> => {
+    try {
+      const snapshot = await runtime.read()
+      syncDumpEnabled(snapshot)
+      return isDumpPersistentlyEnabled(snapshot.policyStorage)
+    } catch {
+      return false
+    }
+  }
+
   const key = (scope: RequestScope, accountId: string) =>
     JSON.stringify([scope.sessionID, scope.kind, scope.modelID, accountId])
   const controller = (scope: RequestScope) => {
@@ -255,6 +277,7 @@ export function createNativeAnthropicSource(
     active: AbortController,
   ) => {
     const current = await runtime.read()
+    syncDumpEnabled(current)
     active.signal.throwIfAborted()
     assertTransport(current)
     const account = current.accounts.find((row) => row.id === accountId)
@@ -365,6 +388,7 @@ export function createNativeAnthropicSource(
       const active = controller(input)
       options.onOwnedRequest?.()
       let snapshot = await runtime.read()
+      syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
       // Account selection rejects a WebSocket relay before any OAuth token
       // refresh or retrieval starts.
@@ -548,6 +572,7 @@ export function createNativeAnthropicSource(
     async authorizeAccount(scope, accountId) {
       const active = controller(scope)
       const snapshot = await runtime.read()
+      syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
       assertTransport(snapshot)
       const modelID = remapModelId(
@@ -680,6 +705,7 @@ export function createNativeAnthropicSource(
     async requestOptions(input) {
       const active = controller(input)
       const snapshot = await runtime.read()
+      syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
       const account = snapshot.accounts.find(
         (row) => row.id === input.accountId,
@@ -715,6 +741,7 @@ export function createNativeAnthropicSource(
         scope: { ...state.scope, modelID: input.modelID },
       })
     },
+    isDumpEnabled: () => readDumpEnabled(),
     onRequestPrepared: (input) => options.onRequestPrepared?.(input),
     responseOptions(input) {
       return options.responseOptions?.({
