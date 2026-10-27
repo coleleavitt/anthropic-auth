@@ -28,7 +28,11 @@ type HostRuntimeFixture = {
   additionalKeymapRuntimeModules: boolean
 }
 
-const hostRuntimeFixtures: [HostRuntimeFixture, HostRuntimeFixture] = [
+const hostRuntimeFixtures: [
+  HostRuntimeFixture,
+  HostRuntimeFixture,
+  HostRuntimeFixture,
+] = [
   {
     id: 'opencode-1-19-3',
     label: 'OpenCode 1.19.3 OpenTUI/Solid library pair',
@@ -44,6 +48,16 @@ const hostRuntimeFixtures: [HostRuntimeFixture, HostRuntimeFixture] = [
     core: '0.5.14',
     solid: '0.5.14',
     solidJs: '1.9.15',
+    additionalKeymapRuntimeModules: false,
+  },
+  {
+    // @opencode/plugin 2.2.0 peers on exactly @opentui/core and
+    // @opentui/solid 0.7.0, and @opentui/solid 0.7.0 peers on solid-js 1.9.12.
+    id: 'opencode-2-2-0',
+    label: 'OpenCode 2.2.0 OpenTUI/Solid library-only pair',
+    core: '0.7.0',
+    solid: '0.7.0',
+    solidJs: '1.9.12',
     additionalKeymapRuntimeModules: false,
   },
 ]

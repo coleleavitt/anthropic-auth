@@ -10,9 +10,15 @@ updates:
       # @opentui/solid pins an exact @opentui/core version. Bumping one
       # without the other installs a second, nested core whose types don't
       # match, so both move in one pull request.
-      opentui:
+      #
+      # The OpenCode 2 SDK (@opencode/plugin and the @opencode/* packages it
+      # pins exactly) is in the same group: since 2.2.0, @opencode/plugin
+      # peers on one exact OpenTUI version, so a plugin SDK bump that needs a
+      # newer OpenTUI must move OpenTUI in the same pull request.
+      opentui-opencode:
         patterns:
           - "@opentui/*"
+          - "@opencode/*"
       # @opencode-ai/plugin pins an exact @opencode-ai/sdk version. Bumping
       # one without the other installs a second, nested SDK whose client types
       # don't match, so the family moves in one pull request.

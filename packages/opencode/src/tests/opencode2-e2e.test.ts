@@ -24,7 +24,6 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { fingerprintOf } from '@cortexkit/common-auth/store'
-import { Host } from '@opencode/plugin/host'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import {
   createTestLifetimeSuite,
@@ -902,14 +901,38 @@ async function withScenario(
 
 describe('packed Anthropic plugin on pinned real hosts', () => {
   test('OC2 published loader discovers the actual packed server export and its setup function', async () => {
-    const entry = Host.resolve({ name: PACKAGE, directory: packedProject })
-    expect(entry.server).toContain('/dist/v2/server.js')
-    if (!entry.server) throw new Error('Packed ./server export missing')
-    const mod = (await Host.load(entry.server)) as {
-      default: { setup: unknown; server: unknown }
-    }
-    expect(typeof mod.default.setup).toBe('function')
-    expect(typeof mod.default.server).toBe('function')
+    // Run the published loader under Node, not in this Bun process. Since
+    // @opencode/plugin 2.2.0, Host.resolve also looks up an optional
+    // `./gui-experimental` export and only skips a missing one when the
+    // resolver throws an `Error`. Bun 1.3.14, which this repository pins,
+    // throws a ResolveMessage that is not an `Error`, so every plugin without
+    // a GUI part fails there. OpenCode 2.2.0 itself runs on Bun 1.4, where
+    // the lookup is skipped as intended, and under Node the loader uses its
+    // own resolver.
+    const probe = join(scratch, 'host-loader-probe.mjs')
+    await writeFile(
+      probe,
+      `const [hostUrl, directory] = process.argv.slice(2)
+const { Host } = await import(hostUrl)
+const entry = Host.resolve({ name: ${JSON.stringify(PACKAGE)}, directory })
+const mod = entry.server ? await Host.load(entry.server) : undefined
+console.log(JSON.stringify({ server: entry.server ?? null, setup: typeof mod?.default?.setup, serverPart: typeof mod?.default?.server }))
+`,
+    )
+    const result = await requireCommand(
+      [
+        'node',
+        probe,
+        import.meta.resolve('@opencode/plugin/host'),
+        packedProject,
+      ],
+      packedProject,
+      { PATH: process.env.PATH ?? '' },
+    )
+    const loaded = JSON.parse(result.stdout.trim().split('\n').at(-1) ?? '')
+    expect(loaded.server).toContain('/dist/v2/server.js')
+    expect(loaded.setup).toBe('function')
+    expect(loaded.serverPart).toBe('function')
   })
   test('real OC2 direct request uses native authority without legacy credential reads', async () => {
     await withScenario(['direct'], async (run) => {
