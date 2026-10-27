@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.4.1
 
 - Works with OpenCode 2.2.0, which requires OpenTUI 0.7: the plugin now depends on OpenTUI 0.7.0, the version OpenCode 2.2.0's plugin SDK asks for, so one copy of OpenTUI installs next to it. OpenCode 1 keeps working: the sidebar and dialogs still run on the OpenTUI that OpenCode itself ships. Addresses #511.
 - The sidebar no longer says 'out in now' for a quota window that is already used up; it says the window is used up until its reset.
