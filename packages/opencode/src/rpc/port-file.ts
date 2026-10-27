@@ -7,12 +7,18 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { join } from 'node:path'
+import { type WriterStamp, writerStamp } from '@cortexkit/anthropic-auth-core'
 
 export interface PortFileEntry {
   port: number
   token: string
   pid: number
   startedAt: number
+  /**
+   * Present in files written by 2.3.0 and later, so a later version can tell
+   * them from files of older versions. Older readers ignore it.
+   */
+  writer?: WriterStamp
 }
 
 function pidAlive(pid: number): boolean {
@@ -29,7 +35,11 @@ export async function writePortFile(
   entry: { port: number; token: string; pid: number },
 ): Promise<string> {
   await mkdir(dir, { recursive: true })
-  const full: PortFileEntry = { ...entry, startedAt: Date.now() }
+  const full: PortFileEntry = {
+    ...entry,
+    startedAt: Date.now(),
+    writer: writerStamp(),
+  }
   const target = join(dir, `port-${entry.pid}.json`)
   const tmp = `${target}.${process.pid}.tmp`
   await writeFile(tmp, JSON.stringify(full), { encoding: 'utf8', mode: 0o600 })

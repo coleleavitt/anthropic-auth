@@ -144,6 +144,7 @@ import {
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
   oauthProfileMatchesIdentity,
+  openCodeHolderKind,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   PrimeManager,
   type PrimeManagerOptions,
@@ -181,6 +182,7 @@ import {
   readNativeHostAuthKind,
   readNativeMigrationJournal,
   refreshBackoffActive,
+  registerNativePoolHolder,
   remapRequestBodyModel,
   resetClaustrumEnrollmentState,
   resolveClaudeModelCapabilities,
@@ -1279,6 +1281,15 @@ const anthropicAuthPlugin = async (
   }
 
   const nativePaths = await resolveNativePoolPaths(accountStoragePath)
+  // Record that this process uses these files before any pool I/O, so a
+  // later version never moves them while it runs. This happens once per
+  // plugin start, never on a request.
+  const holderRegistration = await registerNativePoolHolder({
+    paths: nativePaths,
+    role: 'opencode1',
+    kind: openCodeHolderKind(),
+    onLockEvent: runtimeOverrides.nativeLocal?.onLockEvent,
+  })
   const nativeAccounts = acquireNativeAccountRuntime({
     paths: nativePaths,
     host: 'opencode',
@@ -1857,6 +1868,7 @@ const anthropicAuthPlugin = async (
         path,
         vaultSeed: snapshot.routingSeed,
         onLockEvent: nativeAccounts.onLockEvent,
+        relocationGuard: nativeAccounts.relocationGuard,
         localRecoveryPath:
           snapshot.mode === 'local' ? snapshot.routingRecoveryPath : undefined,
       })
@@ -4098,6 +4110,7 @@ const anthropicAuthPlugin = async (
 
   let rpcServerAdoption: RpcServerAdoption | null = null
   const dispose: NonNullable<Hooks['dispose']> = async () => {
+    holderRegistration.close()
     profileHydrationShutdown.abort()
     while (profilePublications.size) await Promise.all([...profilePublications])
     try {

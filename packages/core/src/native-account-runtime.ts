@@ -110,6 +110,10 @@ import {
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
 import type { QuotaRequestDispatch } from './quota-manager.ts'
 import { effectiveRelayTransport, type RelayConfig } from './relay.ts'
+import {
+  nativeRelocationGuard,
+  type RelocationGuard,
+} from './relocation-guard.ts'
 import { StickySessionRouter } from './sticky-routing.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -166,6 +170,12 @@ export type NativeRelayUpdate = Partial<Omit<RelayConfig, 'token'>> & {
 
 export interface NativeAccountRuntime {
   readonly onLockEvent?: (event: NativeLockEvent) => void
+  /**
+   * Refuses once a newer version has moved this runtime's files. Hosts pass
+   * it to the routing stores they create, so their writes check it under
+   * the routing file's lock.
+   */
+  readonly relocationGuard?: RelocationGuard
   readonly vault: NativeVaultRuntime
   readonly quotaObservations: NativeQuotaObservations
   /** Waits for pending quota observations, quota submissions, and runtime metadata writes. An accepted pool quota update may not yet be on disk; close() drains the pool's pending quota writes. */
@@ -306,10 +316,12 @@ export function acquireNativeAccountRuntime(
   const vault = leaseNativeVaultRuntime(() => use().vault, close)
   const quotaObservations = use().quotaObservations
   const onLockEvent = use().onLockEvent
+  const relocationGuard = use().relocationGuard
   const drainRoutingPublications = use().drainRoutingPublications
   const drainQuotaPublications = use().drainQuotaPublications
   return {
     onLockEvent,
+    relocationGuard,
     vault,
     quotaObservations,
     drainQuotaPublications,
@@ -388,6 +400,7 @@ export function createNativeAccountRuntime(
   const now = options.local?.now ?? options.vault?.now ?? Date.now
   const env = { ...(options.vault?.env ?? process.env) }
   const vaultPaths = nativeVaultPaths(paths)
+  const relocation = nativeRelocationGuard(paths)
   const routingSeed: NativeVaultRoutingSeed = {
     legacyConfig: paths.legacyConfig,
     roster: vaultPaths.roster,
@@ -397,6 +410,7 @@ export function createNativeAccountRuntime(
     vaultSeed: routingSeed,
     onLockEvent,
     now,
+    relocationGuard: relocation,
   })
   let settingsBootstrap: Promise<unknown> | undefined
   const vaultStore = createNativePoolStore({
@@ -405,8 +419,12 @@ export function createNativeAccountRuntime(
     now,
     onLockEvent: options.local?.onLockEvent,
     onStep: async (point) => {
-      if (point === 'before-config-write' || point === 'before-state-write')
+      if (point === 'before-config-write' || point === 'before-state-write') {
+        // Common-auth calls this under the store locks, which a mover holds
+        // while it replaces the runtime files with tombstones.
+        await relocation.assertNotRelocated()
         await requireMode('claustrum')
+      }
     },
   })
   const shutdown = new AbortController()
@@ -884,6 +902,7 @@ export function createNativeAccountRuntime(
   }
   const runtime: NativeAccountRuntime = {
     onLockEvent,
+    relocationGuard: relocation,
     vault,
     quotaObservations: vault.quotaObservations,
     drainQuotaPublications: async () => {

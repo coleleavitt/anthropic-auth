@@ -163,3 +163,27 @@ test('publishing also sweeps expired records from other instances', async () => 
 
   expect(await readdir(directory)).toEqual(['publisher.json'])
 })
+
+// The reader in this file is the one 2.2.x releases ship: normalizeRecord
+// copies only the fields it knows. A stamped record must stay readable by it.
+test('published records carry a writer stamp beside version 1 and stay readable', async () => {
+  const directory = await makeDirectory()
+  const writer = new CacheKeepSessionRegistry({
+    directory,
+    instanceId: 'writer',
+  })
+  const tracked = session('ses_stamped')
+  await writer.publish([tracked])
+  const stored = JSON.parse(
+    await readFile(join(directory, 'writer.json'), 'utf8'),
+  )
+  expect(stored.version).toBe(1)
+  expect(stored.writer).toMatchObject({ protocol: 1 })
+  expect(typeof stored.writer.release).toBe('string')
+
+  const reader = new CacheKeepSessionRegistry({
+    directory,
+    instanceId: 'reader',
+  })
+  expect(await reader.list()).toEqual([tracked])
+})

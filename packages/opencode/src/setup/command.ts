@@ -1,9 +1,12 @@
 import {
   createProcessFence,
+  type NativeHolderRegistration,
   NativePiAuthSlotError,
+  openCodeHolderKind,
   openNativePiAuthSlot,
   publishNativeEmptyInit,
   readNativeEnrollmentMode,
+  registerNativePoolHolder,
   releaseNativeMigrationPreflight,
   requireNoSupervisedAuthContentSnapshot,
   runSetup,
@@ -158,6 +161,7 @@ export async function runSetupCommand(
     Awaited<ReturnType<typeof resolveNativeSetupPaths>>
   >()
   const consent = new Map<HarnessKind, boolean>()
+  const holderRegistrations: NativeHolderRegistration[] = []
   let classified = false
   let phase: Parameters<typeof reportThrownFailure>[0] = 'setup-process-check'
   const localOptions = (host: HarnessKind) => ({
@@ -254,6 +258,16 @@ export async function runSetupCommand(
         for (const selected of context.hosts)
           paths.set(selected, await resolveNativeSetupPaths(selected, env))
         await requireDisjointNativeSetupPaths([...paths.values()])
+        // Record that setup uses each host's files before it reads or writes
+        // them, so a later version never moves them while setup runs.
+        for (const selected of context.hosts)
+          holderRegistrations.push(
+            await registerNativePoolHolder({
+              paths: hostPlan(paths, selected).paths,
+              role: 'setup',
+              kind: selected === 'pi' ? 'pi' : openCodeHolderKind(env),
+            }),
+          )
         if (context.mode === 'claustrum') {
           const files = context.hosts.map((selected) =>
             nativeVaultConnectionFile(selected, env),
@@ -402,6 +416,7 @@ export async function runSetupCommand(
     }
     return 1
   } finally {
+    for (const registration of holderRegistrations) registration.close()
     for (const plan of local.values())
       if (plan.preflight) releaseNativeMigrationPreflight(plan.preflight)
   }

@@ -566,6 +566,12 @@ export class StickySessionRouter {
       vaultSeed?: NativeVaultRoutingSeed
       localRecoveryPath?: string
       onLockEvent?: (event: NativeLockEvent) => void
+      /**
+       * Refuses once a newer version has moved the dataset this routing
+       * file belongs to. Every write runs it under the routing file's lock,
+       * before any temporary file is created.
+       */
+      relocationGuard?: { assertNotRelocated(): Promise<void> }
     },
   ) {
     this.state = emptyState(this.now())
@@ -736,6 +742,7 @@ export class StickySessionRouter {
     beforeRename: () => Promise<void>,
     prune = true,
   ) {
+    await this.options.relocationGuard?.assertNotRelocated()
     if (prune) this.prune(state)
     state.updatedAt = this.now()
     const tempPath = `${this.options.path}.${randomUUID()}.tmp`

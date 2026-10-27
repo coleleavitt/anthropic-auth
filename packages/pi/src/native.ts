@@ -13,6 +13,7 @@ import {
   type NativeCustodyClient,
   type NativeCustodyReceipt,
   type NativeCustodyReporterSource,
+  type NativeHolderRegistration,
   type NativeLocalExternalPolicy,
   type NativePoolPaths,
   type NativeRefreshResult,
@@ -25,6 +26,7 @@ import {
   quotaSnapshotPassesPolicy,
   readNativeAccountsForRequest,
   readNativeMigrationJournal,
+  registerNativePoolHolder,
   resolveClaustrumConnectionPath,
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
@@ -159,6 +161,7 @@ export interface PiVaultPollOptions {
 
 export class PiNativeRuntime {
   private readonly paths: Promise<NativePoolPaths>
+  private readonly holderRegistration: Promise<NativeHolderRegistration>
   private readonly initialization: Promise<NativeAccountRuntime>
   private readonly env: NodeJS.ProcessEnv
   private vaultWatch: NativeVaultWatch | undefined
@@ -194,7 +197,21 @@ export class PiNativeRuntime {
     const poll = options.vaultPoll ?? { intervalMs: PI_VAULT_POLL_INTERVAL_MS }
     const identity = getPiClaustrumConnectionOptions(storagePath).identity
     this.paths = resolveNativePoolPaths(storagePath)
-    this.initialization = this.paths.then((paths) => {
+    // Record that this process uses these files before any pool I/O, so a
+    // later version never moves them while it runs. A refusal (the files
+    // were moved, or an override points into a managed folder) fails
+    // initialization, which every request then reports.
+    this.holderRegistration = this.paths.then((paths) =>
+      registerNativePoolHolder({
+        paths,
+        role: 'pi',
+        kind: 'pi',
+        onLockEvent: options.local?.onLockEvent,
+      }),
+    )
+    void this.holderRegistration.catch(() => {})
+    this.initialization = this.holderRegistration.then(async () => {
+      const paths = await this.paths
       const runtime = acquireNativeAccountRuntime({
         paths,
         host: 'pi',
@@ -434,6 +451,10 @@ export class PiNativeRuntime {
   close(): Promise<void> {
     this.closed = true
     this.vaultWatch?.close()
+    void this.holderRegistration.then(
+      (registration) => registration.close(),
+      () => {},
+    )
     this.closing ??= (async () => {
       await this.usagePublications.drain()
       await this.drainRoutingPublications()

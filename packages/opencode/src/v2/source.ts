@@ -199,6 +199,7 @@ export function createNativeAnthropicSource(
         path,
         vaultSeed: snapshot.routingSeed,
         onLockEvent: runtime.onLockEvent,
+        relocationGuard: runtime.relocationGuard,
         localRecoveryPath:
           snapshot.mode === 'local' ? snapshot.routingRecoveryPath : undefined,
       })

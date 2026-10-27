@@ -101,6 +101,7 @@ import {
   QuotaRefreshDeferred,
   type QuotaRequestDispatch,
 } from './quota-manager.ts'
+import { nativeRelocationGuard } from './relocation-guard.ts'
 
 export interface NativeVaultRuntimeOptions {
   paths: NativePoolPaths
@@ -435,6 +436,10 @@ export function createNativeVaultRuntime(
     onLockEvent: options.onLockEvent,
   })
   const observeLock = nativeLockObserver(options.onLockEvent)
+  // Refuses once a newer version has moved this dataset. Each use below runs
+  // where a mover can't install its tombstones in between: under the lock
+  // that guards the file written, or just before a receipt is returned.
+  const relocation = nativeRelocationGuard(options.paths)
   // The vault watch for the current custody, opened while a host watches the
   // roster. While it reports `watching`, the list timer below runs only as a
   // slow safety net; in any other mode it keeps the host's own pace.
@@ -756,6 +761,7 @@ export function createNativeVaultRuntime(
       onLockEvent: options.onLockEvent,
       onStep: async (point) => {
         if (point === 'before-config-write' || point === 'before-state-write') {
+          await relocation.assertNotRelocated()
           await assertPrimary()
         }
       },
@@ -866,7 +872,10 @@ export function createNativeVaultRuntime(
         path: paths.roster,
         custody: options.discover ? { discover: options.discover } : custody,
         signal: shutdown.signal,
-        isActive: active,
+        // Common-auth asks again under the roster write lock before it stages
+        // a new roster; false there publishes nothing.
+        isActive: async () =>
+          (await active()) && !(await relocation.isRelocated()),
         projection: () => ({ reservedRouteIds }),
       })
         .then(async (roster) => {
@@ -917,6 +926,10 @@ export function createNativeVaultRuntime(
       // pending. The selected row must still be active before its receipt exits.
       if (!nativeAccountCanServe(current))
         throw new NativeCustodyError('not-active')
+      // No receipt leaves once the dataset has moved. A credential issued
+      // just before the move is harmless: the vault keeps the token and
+      // reissues it per send, and nothing is written here.
+      await relocation.assertNotRelocated()
       check(combined)
       issued.set(receipt, { routeId: row.routeId, logicalId })
       const key = JSON.stringify([
@@ -1215,7 +1228,10 @@ export function createNativeVaultRuntime(
       // disable calls report no change. Enabling removes this credential/account
       // pair from declined entries; disabling adds it so discovery cannot enable
       // it again.
-      const changed = await mutateVaultRoster(paths.roster, (current) => {
+      const changed = await mutateVaultRoster(paths.roster, async (current) => {
+        // Runs under the roster write lock, which a mover holds while it
+        // replaces the runtime files with tombstones.
+        await relocation.assertNotRelocated()
         const held = current?.rows.find(
           (entry) => entry.routeId === row.routeId,
         )

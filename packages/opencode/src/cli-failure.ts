@@ -25,6 +25,7 @@ import {
   createWindowsOwnerOnly,
   ensureWindowsOwnerOnlyDirectory,
   formatLogLine,
+  HOLDER_REGISTRATION_ERROR_MESSAGES,
   isOwnerOnly,
   isSecretKey,
   type NativeCustodyErrorCode,
@@ -33,6 +34,7 @@ import {
   type OwnerOnlyOptions,
   PRIVATE_FILES_UNAVAILABLE_MESSAGE,
   type ProviderErrorRedactor,
+  RELOCATED_MESSAGE,
   // From Core, not common-auth: Core bundles its own copy of runSetup, and
   // only that copy's setupEnrollment can see the outcomes runSetup recorded.
   setupEnrollment,
@@ -179,6 +181,8 @@ const ERROR_FIELD_VALUES = {
     'LockContentionError',
     'ClaustrumConsumerError',
     'ClaustrumCredentialError',
+    'RelocatedError',
+    'HolderRegistrationError',
   ]),
   code: new Set<string>([
     ...ACTIVATION_CODES,
@@ -233,6 +237,10 @@ const ERROR_FIELD_VALUES = {
     'source-changed',
     'source-too-large',
     'write-io',
+    'relocated',
+    'lock-timeout',
+    'managed-folder',
+    'malformed',
   ]),
   stage: new Set([
     'safe-parent',
@@ -293,6 +301,10 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
   // An enrollment that could not be read because the private-files native
   // backend did not load names that cause and its remedy instead.
   PRIVATE_FILES_UNAVAILABLE_MESSAGE,
+  // A newer version moved this host's account state; or a registration that
+  // must succeed failed. Both carry fixed text that names no path.
+  RELOCATED_MESSAGE,
+  ...HOLDER_REGISTRATION_ERROR_MESSAGES,
   // Local sign-in is forbidden while vault custody remains connected.
   'Disconnect from the vault first.',
   // CLI input validation uses fixed messages rather than error codes.

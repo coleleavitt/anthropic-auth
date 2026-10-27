@@ -9,7 +9,9 @@ import {
   type NativeAccountRuntimeOptions,
   type NativePoolPaths,
   type NativeUiOptions,
+  openCodeHolderKind,
   readNativeEnrollmentMode,
+  registerNativePoolHolder,
   resolveNativePoolPaths,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -209,6 +211,15 @@ export async function setupAnthropicAuth(
   options: AnthropicAuthV2Options = {},
 ): Promise<Plugin.Cleanup> {
   const paths = options.paths ?? (await resolveNativePoolPaths())
+  // Record that this process uses these files before any pool I/O, so a
+  // later version never moves them while it runs. This happens once per
+  // plugin setup, never on a request.
+  const holderRegistration = await registerNativePoolHolder({
+    paths,
+    role: 'opencode2',
+    kind: openCodeHolderKind(),
+    onLockEvent: options.local?.onLockEvent,
+  })
   const runtime = acquireNativeAccountRuntime({
     paths,
     host: 'opencode',
@@ -290,6 +301,7 @@ export async function setupAnthropicAuth(
     },
     { credential: preparedAnthropicCredential },
   ).catch(async (error: unknown) => {
+    holderRegistration.close()
     capabilities.close()
     await cacheKeep?.dispose()
     await source.close()
@@ -301,6 +313,7 @@ export async function setupAnthropicAuth(
   const dispose = () => {
     if (cleanup) return cleanup
     active = false
+    holderRegistration.close()
     capabilities.close()
     source.close()
     cleanup = (async () => {

@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   CACHE_KEEP_PREWARM_LEAD_MS,
@@ -196,6 +196,7 @@ async function fixture(child = false, brokenRegistry = false) {
   }
   return {
     live,
+    paths,
     store,
     registry,
     timers,
@@ -220,6 +221,22 @@ test('OpenCode 2 hybrid requests publish a CacheKeep lease and dispose removes i
   await f.dispose()
   expect(f.timers.callbacks.size).toBe(0)
   expect(await f.registry.list()).toEqual([])
+})
+
+test('OpenCode 2 records its use of the pool at setup and serves a request as before', async () => {
+  const f = await fixture()
+  const holders = JSON.parse(
+    await readFile(
+      join(dirname(f.paths.runtime), 'anthropic-auth-holders.json'),
+      'utf8',
+    ),
+  ) as { entries: Array<{ pid: number; role: string; files: string[] }> }
+  expect(holders.entries).toEqual([
+    expect.objectContaining({ pid: process.pid, role: 'opencode2' }),
+  ])
+  expect(holders.entries[0]?.files).toContain(f.paths.runtime)
+  const request = await f.live()
+  expect(request.headers.get('authorization')).toBe('Bearer sk-ant-oat01-first')
 })
 
 test('OpenCode 2 registry publication failure never rejects the live request', async () => {

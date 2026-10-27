@@ -242,6 +242,7 @@ async function getPiStickyRouter(storagePath: string) {
       path,
       vaultSeed,
       onLockEvent: runtime.onLockEvent,
+      relocationGuard: runtime.relocationGuard,
     })
     setBoundedService(stickyRouters, path, router)
   }

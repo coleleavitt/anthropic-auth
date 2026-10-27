@@ -1,10 +1,11 @@
 import { expect } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   getClaudeCodeIdentityForVerifiedAccount,
   type NativeCustodyClient,
+  resolveNativePoolPaths,
 } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
 import {
@@ -196,6 +197,20 @@ for (const scenario of [
             },
           })
           const runtime = await native.service()
+          // Pi recorded its use of the pool before any pool I/O; the request
+          // below must still take no foreground lock for it.
+          const holders = JSON.parse(
+            await readFile(
+              join(
+                dirname((await resolveNativePoolPaths(storagePath)).runtime),
+                'anthropic-auth-holders.json',
+              ),
+              'utf8',
+            ),
+          ) as { entries: Array<{ pid: number; role: string }> }
+          expect(holders.entries).toContainEqual(
+            expect.objectContaining({ pid: process.pid, role: 'pi' }),
+          )
           if (scenario === 'vault-healthy') {
             await runtime.vault.refresh()
             await runtime.updateSettings((settings) => {

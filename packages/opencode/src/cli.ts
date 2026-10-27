@@ -11,7 +11,9 @@ import {
   getAccountStoragePath,
   isValidApiBaseURL,
   type NativeAccountRuntime,
+  openCodeHolderKind,
   readNativeEnrollmentMode,
+  registerNativePoolHolder,
   resolveNativePoolPaths,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
@@ -25,11 +27,19 @@ async function withNativeAccounts<T>(
       'Native account changes require offline setup without OPENCODE_AUTH_CONTENT',
     )
   const paths = await resolveNativePoolPaths()
+  // Record that this process uses these files before any pool I/O, so a
+  // later version never moves them while the command runs.
+  const holderRegistration = await registerNativePoolHolder({
+    paths,
+    role: 'cli',
+    kind: openCodeHolderKind(),
+  })
   const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
   try {
     await runtime.read()
     return await run(runtime)
   } finally {
+    holderRegistration.close()
     await runtime.close()
   }
 }

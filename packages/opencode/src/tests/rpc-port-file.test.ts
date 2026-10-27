@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { discoverPortFile, writePortFile } from '../rpc/port-file'
@@ -34,6 +34,26 @@ describe('port-file', () => {
     await new Promise((r) => setTimeout(r, 5))
     await writePortFile(dir, { port: 2, token: 'b', pid: process.pid })
     expect((await discoverPortFile(dir))?.port).toBe(2)
+  })
+})
+
+describe('writer stamp', () => {
+  // discoverPortFile reads only port, pid and startedAt, as in 2.2.x, so the
+  // stamp a 2.3.0 writer adds is invisible to it.
+  test('a written port file carries a writer stamp and is still discovered', async () => {
+    const path = await writePortFile(dir, {
+      port: 5124,
+      token: 'tok',
+      pid: process.pid,
+    })
+    const stored = JSON.parse(await readFile(path, 'utf8'))
+    expect(stored.writer).toMatchObject({ protocol: 1 })
+    expect(typeof stored.writer.release).toBe('string')
+    expect(await discoverPortFile(dir)).toMatchObject({
+      port: 5124,
+      token: 'tok',
+      pid: process.pid,
+    })
   })
 })
 

@@ -1327,6 +1327,17 @@ for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
         ? { claustrumScopedConnect: async () => fixture.scopedClient }
         : {}),
     })
+    // Plugin start recorded this process beside the pool files; the request
+    // below must still take no foreground lock for it.
+    const holders = JSON.parse(
+      await readFile(
+        join(dirname(fixture.paths.runtime), 'anthropic-auth-holders.json'),
+        'utf8',
+      ),
+    ) as { entries: Array<{ pid: number; role: string }> }
+    expect(holders.entries).toContainEqual(
+      expect.objectContaining({ pid: process.pid, role: 'opencode1' }),
+    )
     probe.begin()
     const response = await sendNative(plugin)
     expect(response.status).toBe(200)

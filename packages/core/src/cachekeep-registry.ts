@@ -11,6 +11,8 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { type WriterStamp, writerStamp } from './holder-registry.ts'
+
 export const CACHE_KEEP_REGISTRY_LEASE_MS = 3 * 60_000
 
 export type CacheKeepTrackedSession = {
@@ -23,6 +25,12 @@ type CacheKeepRegistryRecord = {
   version: 1
   updatedAt: number
   sessions: CacheKeepTrackedSession[]
+  /**
+   * Written by 2.3.0 and later beside `version`, which must stay 1 because
+   * older readers require it. Readers here and in older versions ignore it;
+   * a later version uses it to tell these records from older ones.
+   */
+  writer?: WriterStamp
 }
 
 function normalizeSession(value: unknown): CacheKeepTrackedSession | undefined {
@@ -111,6 +119,7 @@ export class CacheKeepSessionRegistry {
             version: 1,
             updatedAt: now,
             sessions: snapshot,
+            writer: writerStamp(),
           }
           await writeFile(tempPath, `${JSON.stringify(record)}\n`, {
             mode: 0o600,

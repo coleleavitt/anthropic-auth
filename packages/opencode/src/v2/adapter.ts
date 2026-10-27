@@ -18,13 +18,16 @@ import {
   getAccountStoragePath,
   getRequestGzipLatch,
   getRequestGzipLatchPath,
+  type HolderRegistrationError,
   mergeAnthropicBetas,
   type ProviderErrorRedactor,
   type ProviderErrorResponseScope,
   type ProviderResponseMode,
+  type RelocatedError,
   type RequestGzipLatch,
   remapModelId,
   remapRequestBodyModel,
+  stateRefusalCause,
   stripEmptyTrailingAssistantMessages,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
@@ -495,6 +498,28 @@ export class NativeAnthropicLocalRefusal extends Error {
 }
 
 /**
+ * The request was refused because a newer anthropic-auth version moved the
+ * account state files this process uses, or because this process could not
+ * record its use of a folder it may only use once recorded. Nothing was
+ * sent. The message is Core's fixed text and names no path; the plugin log
+ * names the folders.
+ */
+export class NativeAnthropicStateRefusal extends Error {
+  readonly kind = 'state-relocated'
+  readonly providerID = ANTHROPIC_PROVIDER_ID
+
+  constructor(cause: RelocatedError | HolderRegistrationError) {
+    super(cause.message, { cause })
+    this.name = 'NativeAnthropicStateRefusal'
+  }
+}
+
+function stateRefusalFrom(error: unknown) {
+  const cause = stateRefusalCause(error)
+  return cause ? new NativeAnthropicStateRefusal(cause) : undefined
+}
+
+/**
  * What the adapter keeps for one authorized send until its request is
  * rewritten: the OAuth access token and identity, or the API base URL.
  */
@@ -871,7 +896,20 @@ export function createNativeAnthropicAdapter<Q, P>(
   ): Promise<AccountHeadersResult<Data>> =>
     tracked(request, async (ensureLive) => {
       const { accountId, ...scope } = request
-      const auth = await source.authorizeAccount(scope, accountId)
+      let auth: NativeAnthropicAuthorization<P> | undefined
+      try {
+        auth = await source.authorizeAccount(scope, accountId)
+      } catch (error) {
+        const refusal = stateRefusalFrom(error)
+        if (refusal) {
+          log?.warn(
+            'refused an Anthropic request: its account state was moved or could not be recorded',
+            { error: refusal.cause instanceof Error ? refusal.cause.name : '' },
+          )
+          throw refusal
+        }
+        throw error
+      }
       ensureLive()
       return headersFor(scope, auth)
     })

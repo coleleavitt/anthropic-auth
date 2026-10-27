@@ -12,9 +12,11 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   createProviderErrorRedactor,
+  HolderRegistrationError,
   NativeMigrationError,
   NativePiAuthSlotError,
   PRIVATE_FILES_UNAVAILABLE_MESSAGE,
+  RelocatedError,
   runSetup,
   type SetupIO,
   type SetupPlugin,
@@ -215,9 +217,25 @@ test('fixed remedies and validated closed codes are admitted word for word', () 
     new Error(
       'Anthropic account storage paths overlap; migration requires separate files',
     ),
+    // A newer version moved the account state; or a registration that must
+    // succeed failed. Their messages are fixed and name no path.
+    new RelocatedError('/config/opencode/anthropic-auth-native-state.json', {
+      relocatedTo: '/state/cortexkit/anthropic-auth/opencode',
+      stateRoot: '/state/cortexkit/anthropic-auth',
+      identity: '/config/opencode',
+      attempt: 'attempt-1',
+      by: '2.4.0',
+    }),
+    ...(
+      ['lock-timeout', 'managed-folder', 'malformed', 'unavailable'] as const
+    ).map((code) => new HolderRegistrationError(code, '/config/opencode')),
   ]
   for (const error of closed)
     expect(knownFailureMessage(error)).toBe(error.message)
+  for (const error of closed.slice(-5)) {
+    expect(error.message).not.toContain('/config')
+    expect(error.message).not.toContain('/state')
+  }
 })
 
 test('empty-vault remedies admit only a canonical command for a validated approved principal', () => {

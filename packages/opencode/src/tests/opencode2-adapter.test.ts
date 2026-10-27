@@ -9,6 +9,8 @@ import {
   extractBillingHeaderCCH,
   FAST_MODE_BETA,
   type ProviderAccountUuid,
+  RELOCATED_MESSAGE,
+  RelocatedError,
   RequestGzipLatch,
   signRequestBody,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
@@ -51,6 +53,7 @@ import {
   type NativeAnthropicResponseContext,
   NativeAnthropicRevokedError,
   type NativeAnthropicSource,
+  NativeAnthropicStateRefusal,
   NO_ACCOUNT_REFUSAL,
 } from '../v2/adapter'
 import { createNativeWirePolicy } from '../v2/wire'
@@ -1004,6 +1007,55 @@ describe('OpenCode 2 native Anthropic adapter: refusals', () => {
     expect(failure).toBe(unsupported)
     expect(host.sent).toHaveLength(0)
     expect(native.pendingSendCount).toBe(0)
+  })
+
+  test('moved account state refuses with a fixed message and zero sends', async () => {
+    const relocated = new RelocatedError(
+      '/config/opencode/anthropic-auth-native-state.json',
+      {
+        relocatedTo: '/state/cortexkit/anthropic-auth/opencode',
+        stateRoot: '/state/cortexkit/anthropic-auth',
+        identity: '/config/opencode',
+        attempt: 'attempt-1',
+        by: '2.4.0',
+      },
+    )
+    const { source } = makeSource({
+      authorizeAccount: () => {
+        throw relocated
+      },
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    const host = new Host(native.adapter)
+
+    const failure = await host
+      .run(scopeOf(), hostRequest(sonnetPayload()))
+      .catch((error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(NativeAnthropicStateRefusal)
+    if (!(failure instanceof Error)) throw new Error('Expected a refusal')
+    expect(failure.message).toBe(RELOCATED_MESSAGE)
+    // The fixed text names no folder.
+    expect(failure.message).not.toContain('/config')
+    expect(failure.message).not.toContain('/state')
+    expect(host.sent).toHaveLength(0)
+    expect(native.pendingSendCount).toBe(0)
+
+    // A pool operation wraps its hook's refusal and keeps it as the cause.
+    const wrapped = makeSource({
+      authorizeAccount: () => {
+        throw new Error(relocated.message, { cause: relocated })
+      },
+    })
+    const wrappedHost = new Host(
+      createNativeAnthropicAdapter({ source: wrapped.source }).adapter,
+    )
+    expect(
+      await wrappedHost
+        .run(scopeOf(), hostRequest(sonnetPayload()))
+        .catch((error: unknown) => error),
+    ).toBeInstanceOf(NativeAnthropicStateRefusal)
+    expect(wrappedHost.sent).toHaveLength(0)
   })
 })
 
