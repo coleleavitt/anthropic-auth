@@ -1,22 +1,16 @@
-import { afterEach, expect, test } from 'bun:test'
+import { expect } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import {
   expectOneLineQuotaRows,
   fiveAccountSidebarState,
 } from './fixtures/sidebar-five-accounts'
 
-let child: Bun.Subprocess<'ignore', 'pipe', 'pipe'> | undefined
-let fixture: string | undefined
-afterEach(async () => {
-  child?.kill()
-  await child?.exited
-  child = undefined
-  if (fixture) await rm(fixture, { recursive: true, force: true })
-  fixture = undefined
-})
+const lifetimes = createTestLifetimeSuite()
+const test = lifetimes.test
 
 /**
  * After the first frame, the probe writes `state` to the sidebar state file,
@@ -33,7 +27,10 @@ async function renderSidebar(
   options: { rewrite?: Rewrite; width?: number; height?: number } = {},
 ) {
   const { rewrite, width = 42, height = 32 } = options
-  fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-'))
+  const fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-'))
+  // Remove the fixture only after the owned probe below has exited and both
+  // pipes have ended; teardown drains those joins before running cleanups.
+  lifetimes.deferCleanup(() => rm(fixture, { recursive: true, force: true }))
   const stateFile = join(fixture, 'sidebar.json')
   await writeFile(stateFile, JSON.stringify(state))
   await writeFile(
@@ -49,6 +46,14 @@ async function renderSidebar(
   )
   // Render the compiled sidebar with installed OpenTUI libraries, without a package install.
   const probe = `
+let __probeRenderer;
+process.once('SIGTERM', () => {
+  // CliRenderer traps SIGTERM to destroy without exiting, leaving a probe
+  // blocked awaiting its next frame alive until the hook times out. Exit
+  // promptly so the harness never waits out its hook.
+  try { __probeRenderer?.destroy(); } catch {}
+  process.exit(143);
+});
 import { createTestRenderer } from '@opentui/core/testing';
 import { render } from '@opentui/solid';
 import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure';
@@ -71,7 +76,8 @@ const sidebar = registered.find((value) => value.slots?.sidebar_content)?.slots.
 if (!sidebar) throw new Error('sidebar slot was not registered');
 let destroyed;
 const teardown = new Promise((resolve) => { destroyed = resolve; });
-const setup = await createTestRenderer({ width: ${width}, height: ${height}, onDestroy() { destroyed(); } });
+const setup = await createTestRenderer({ width: ${width}, height: ${height}, exitSignals: [], onDestroy() { destroyed(); } });
+__probeRenderer = setup.renderer;
 let pending;
 const observe = () => {
   if (!pending) return;
@@ -126,7 +132,7 @@ try {
 }
 process.exit(0);
 `
-  child = Bun.spawn(
+  const child = Bun.spawn(
     [process.execPath, '--preload', '@opentui/solid/preload', '-e', probe],
     {
       cwd: fileURLToPath(new URL('../../', import.meta.url)),
@@ -141,11 +147,38 @@ process.exit(0);
       stderr: 'pipe',
     },
   )
-  const [stdout, stderr, exitCode] = await Promise.all([
+  // Own the probe through the test lifetime: the gate kills it as soon as
+  // teardown starts, before the lifetime waits for this body, so a body
+  // awaiting a frame it never receives can still finish. A SIGTERM-ignored
+  // probe would otherwise use up the hook; SIGKILL after a short grace is
+  // the backstop because a signal handler alone cannot be relied on once the
+  // renderer has trapped SIGTERM.
+  const cancel = lifetimes.gate()
+  const cancellation = cancel.wait.then(async () => {
+    if (child.exitCode !== null) return
+    child.kill('SIGTERM')
+    await Bun.sleep(500)
+    if (child.exitCode === null) child.kill('SIGKILL')
+  })
+  lifetimes.trackDetached(cancellation)
+  const joined = Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
     child.exited,
   ])
+  // Join the process and each stdio stream individually before the deferred
+  // fixture removal runs, even if this body times out before awaiting them.
+  lifetimes.trackDetached(
+    joined.then(
+      () => {},
+      (error) => {
+        throw error
+      },
+    ),
+  )
+  const [stdout, stderr, exitCode] = await joined
+  cancel.open()
+  await cancellation
   expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
   return stdout
 }
@@ -655,4 +688,100 @@ test('scoped rows whose models share a short name extend it as the collapsed lin
     width: 36,
   })
   expect(collapsed).toContain('5h 90% · 7d 80% · Fabr 10% left')
+})
+
+test('a probe killed mid-render exits well within one second', async () => {
+  const fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-kill-'))
+  lifetimes.deferCleanup(() => rm(fixture, { recursive: true, force: true }))
+  // A probe that never reaches its wanted text: without the SIGTERM handler
+  // the renderer's trapped SIGTERM leaves it alive for seconds, using up the
+  // hook. The handler plus exitSignals below must end it promptly.
+  const probe = `
+let __probeRenderer;
+process.once('SIGTERM', () => {
+  try { __probeRenderer?.destroy(); } catch {}
+  process.exit(143);
+});
+import { createTestRenderer } from '@opentui/core/testing';
+import { render } from '@opentui/solid';
+import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure';
+ensureRuntimePluginSupport();
+const { default: plugin } = await import(${JSON.stringify(new URL('../tui-compiled/tui.tsx', import.meta.url).href)});
+const registered = [];
+await plugin.tui({
+  event: { on() { return () => {}; } },
+  theme: { current: {
+    accent: '#3366ff', background: '#000000', borderActive: '#ffffff',
+    error: '#ff0000', success: '#00ff00', text: '#ffffff',
+    textMuted: '#888888', warning: '#ffff00',
+  } },
+  slots: { register(value) { registered.push(value); } },
+  state: { path: { directory: process.cwd() } },
+  route: { current: () => ({ type: 'home' }) },
+});
+const sidebar = registered.find((value) => value.slots?.sidebar_content)?.slots.sidebar_content;
+if (!sidebar) throw new Error('sidebar slot was not registered');
+let destroyed;
+const teardown = new Promise((resolve) => { destroyed = resolve; });
+const setup = await createTestRenderer({ width: 42, height: 32, exitSignals: [], onDestroy() { destroyed(); } });
+__probeRenderer = setup.renderer;
+setup.renderer.on('frame', () => {});
+try {
+  await render(() => sidebar({}, { session_id: 'quota-render-kill-test' }), setup.renderer);
+  setup.renderer.requestRender();
+  await new Promise(() => {});
+} finally {
+  setup.renderer.destroy();
+  await teardown;
+}
+`
+  const child = Bun.spawn(
+    [process.execPath, '--preload', '@opentui/solid/preload', '-e', probe],
+    {
+      cwd: fileURLToPath(new URL('../../', import.meta.url)),
+      env: {
+        ...process.env,
+        OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE: join(
+          fixture,
+          'sidebar.json',
+        ),
+        OPENCODE_TUI_PREFERENCES_FILE: join(fixture, 'preferences.jsonc'),
+        OPENCODE_ANTHROPIC_AUTH_RPC_DIR: join(fixture, 'rpc'),
+      },
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  const cancel = lifetimes.gate()
+  const cancellation = cancel.wait.then(async () => {
+    if (child.exitCode !== null) return
+    child.kill('SIGTERM')
+    await Bun.sleep(500)
+    if (child.exitCode === null) child.kill('SIGKILL')
+  })
+  lifetimes.trackDetached(cancellation)
+  const joined = Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ])
+  lifetimes.trackDetached(
+    joined.then(
+      () => {},
+      (error) => {
+        throw error
+      },
+    ),
+  )
+  // Let the probe reach its blocked render before killing it mid-render.
+  await Bun.sleep(2000)
+  const started = Date.now()
+  child.kill('SIGTERM')
+  const [, , exitCode] = await joined
+  const elapsed = Date.now() - started
+  cancel.open()
+  await cancellation
+  expect(exitCode).toBe(143)
+  expect(elapsed).toBeLessThan(1000)
 })

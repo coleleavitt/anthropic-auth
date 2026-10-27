@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, mock } from 'bun:test'
+import { describe, expect, mock } from 'bun:test'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { readFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -81,6 +82,86 @@ const nativeEnvKeys = [
   'XDG_DATA_HOME',
 ] as const
 
+/**
+ * Everything one tombstone body replaces or starts: the process-global fetch,
+ * clock and fixture environment, and the plugins it creates.
+ *
+ * Bun does not cancel a body that outlives its timeout, and once one
+ * afterEach hook times out it skips every later afterEach hook for that test,
+ * including the lifetime hook and setup.ts's leak check. A hook therefore
+ * cannot be the only thing that puts these globals back. The body closes its
+ * own scope before it returns, and teardown's cancellation gate closes it the
+ * moment teardown starts, before teardown waits for a body that is still
+ * running. Closing restores the globals synchronously, before any await, and
+ * only then disposes the plugins, so a slow or stuck disposal can fail only
+ * its own test. Once closed, a body that is still running cannot install
+ * globals or keep a new plugin alive.
+ */
+class CustodyScope {
+  private readonly plugins = new Set<PluginHooks>()
+  private readonly savedFetch = globalThis.fetch
+  private readonly savedNow = Date.now
+  private readonly savedEnv = new Map(
+    nativeEnvKeys.map((key) => [key, process.env[key]]),
+  )
+  private closing: Promise<void> | undefined
+  /** Set when the body starts waiting for close, so teardown need not report a close failure the body already reports. */
+  joinedByBody = false
+
+  /** Call before replacing fetch, Date.now or a fixture env key. */
+  assertOpen(): void {
+    if (this.closing)
+      throw new Error(
+        'Custody body was cancelled by teardown and may not continue',
+      )
+  }
+
+  /** Track a plugin for disposal; a plugin created after cancellation is disposed at once. */
+  own(plugin: PluginHooks): void {
+    if (this.closing) {
+      lifetimes.trackDetached(
+        disposeAll([plugin], 'Late custody tombstone plugin cleanup failed'),
+      )
+      this.assertOpen()
+    }
+    this.plugins.add(plugin)
+  }
+
+  /** Forget a plugin the body disposes itself mid-test, so close does not dispose it again. */
+  unown(plugin: PluginHooks): void {
+    this.plugins.delete(plugin)
+  }
+
+  close(): Promise<void> {
+    if (!this.closing) {
+      this.restoreGlobals()
+      this.closing = this.disposeOwned()
+    }
+    return this.closing
+  }
+
+  private restoreGlobals(): void {
+    globalThis.fetch = this.savedFetch
+    Date.now = this.savedNow
+    for (const key of nativeEnvKeys) {
+      const value = this.savedEnv.get(key)
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+
+  private async disposeOwned(): Promise<void> {
+    const plugins = [...this.plugins]
+    this.plugins.clear()
+    try {
+      await disposeAll(plugins, 'Custody tombstone plugin cleanup failed')
+    } finally {
+      await drainSidebarWrites()
+      resetClaudeCodeIdentityCachesForTest()
+    }
+  }
+}
+
 async function disposeAll(plugins: PluginHooks[], message: string) {
   const results = await Promise.allSettled(
     plugins.map((plugin) => Promise.resolve().then(() => plugin.dispose?.())),
@@ -93,43 +174,17 @@ async function disposeAll(plugins: PluginHooks[], message: string) {
     )
 }
 
-/**
- * Claim a fresh owner-only directory for this body. Teardown first disposes
- * the body's plugins and waits for sidebar writes, then restores fetch, the
- * clock, the environment and identity caches, and only then removes the
- * directory.
- */
+/** Claim a fresh owner-only directory for this body, removed after its plugins are disposed. */
 async function startNativeBody() {
-  const savedFetch = globalThis.fetch
-  const savedNow = Date.now
-  const savedEnv = new Map(nativeEnvKeys.map((key) => [key, process.env[key]]))
-  const plugins = new Set<PluginHooks>()
-  livePlugins.add(plugins)
-  lifetimes.deferCleanup(async () => {
-    const remaining = [...plugins]
-    plugins.clear()
-    livePlugins.delete(plugins)
-    try {
-      await disposeAll(remaining, 'Custody tombstone plugin cleanup failed')
-    } finally {
-      await drainSidebarWrites()
-      globalThis.fetch = savedFetch
-      Date.now = savedNow
-      for (const key of nativeEnvKeys) {
-        const value = savedEnv.get(key)
-        if (value === undefined) delete process.env[key]
-        else process.env[key] = value
-      }
-      resetClaudeCodeIdentityCachesForTest()
-    }
-  })
+  const scope = currentScope()
+  scope.assertOpen()
   delete process.env.OPENCODE_AUTH_CONTENT
   resetClaudeCodeIdentityCachesForTest()
   const root = await mkdtemp(join(tmpdir(), 'anthropic-custody-native-'))
   // migrateNativeOpencodeFixture also removes the root once it accepts it;
   // this covers a body that fails before handing the root to it.
   lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
-  return { root, plugins }
+  return { root, scope }
 }
 
 /**
@@ -140,6 +195,7 @@ async function startNativeBody() {
 function recordNetwork(
   options: { token?: () => Record<string, unknown> } = {},
 ): OutboundRecord[] {
+  currentScope().assertOpen()
   const records: OutboundRecord[] = []
   globalThis.fetch = Object.assign(
     async (
@@ -172,6 +228,7 @@ function recordNetwork(
 }
 
 function applyFixtureEnv(fixture: NativeFixture) {
+  currentScope().assertOpen()
   for (const [key, value] of Object.entries(fixture.env))
     process.env[key] = value
   process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
@@ -284,10 +341,11 @@ async function readNativeAccounts(fixture: NativeFixture) {
 }
 
 async function createNativePlugin(
-  plugins: Set<PluginHooks>,
+  scope: CustodyScope,
   root: string,
   options: PluginOptions = {},
 ) {
+  scope.assertOpen()
   const creation = AnthropicAuthPlugin(
     {
       client: createOpencodeClient({
@@ -313,12 +371,12 @@ async function createNativePlugin(
   )
   lifetimes.trackDetached(creation)
   const plugin = await creation
-  plugins.add(plugin)
+  scope.own(plugin)
   return plugin
 }
 
-async function disposePlugin(plugins: Set<PluginHooks>, plugin: PluginHooks) {
-  plugins.delete(plugin)
+async function disposePlugin(scope: CustodyScope, plugin: PluginHooks) {
+  scope.unown(plugin)
   await plugin.dispose?.()
 }
 
@@ -362,29 +420,45 @@ function proMaxMethod(plugin: PluginHooks) {
   return method
 }
 
-const livePlugins = new Set<Set<PluginHooks>>()
-// Registered before the lifetime suite's own afterEach: dispose every native
-// plugin (its timers and vault client) before that hook waits for a possibly
-// still-running body and removes the body's files.
-afterEach(async () => {
-  const plugins = [...livePlugins].flatMap((owned) => {
-    const current = [...owned]
-    owned.clear()
-    return current
-  })
-  await disposeAll(plugins, 'Custody tombstone plugin cancellation failed')
-})
 const lifetimes = createTestLifetimeSuite()
-// Registered after the lifetime suite's afterEach, so it runs only once a
-// timed-out native body has settled and its own cleanup has restored fetch.
-// Restoring earlier would let that body resume against the original fetch
-// instead of the synthetic provider it installed.
-afterEach(() => {
-  globalThis.fetch = originalFetch
-})
+const custodyScope = new AsyncLocalStorage<CustodyScope>()
+
+function currentScope(): CustodyScope {
+  const scope = custodyScope.getStore()
+  if (!scope)
+    throw new Error('Custody fixture used outside a custody test body')
+  return scope
+}
+
+// The lifetime suite registers ordinary Bun tests, which run one at a time
+// within this file unless Bun is started with --concurrent. Each body runs in
+// its own custody scope: the body closes its scope before it returns, and
+// teardown's cancellation gate closes it the moment teardown starts, before
+// teardown waits for a still-running body.
+function custodyTest(name: string, body: () => unknown): void {
+  lifetimes.test(name, async () => {
+    const scope = new CustodyScope()
+    // Teardown opens every gate as soon as its hook starts, before it waits
+    // for this body; closing then restores the globals even if the body is
+    // still running past its timeout. A disposal failure is reported by the
+    // body or by the cleanup below, not here.
+    void lifetimes.gate().wait.then(() => scope.close().catch(() => {}))
+    // Teardown joins a disposal the body did not wait for before it removes
+    // the body's files.
+    lifetimes.deferCleanup(() =>
+      scope.joinedByBody ? undefined : scope.close(),
+    )
+    try {
+      return await custodyScope.run(scope, body)
+    } finally {
+      scope.joinedByBody = true
+      await scope.close()
+    }
+  })
+}
 
 describe('Claustrum custody tombstones', () => {
-  lifetimes.test('recognizes only provider-bound OAuth tombstones', () => {
+  custodyTest('recognizes only provider-bound OAuth tombstones', () => {
     const provider = oauthFixture.provider
     const key = custodyTombstoneKey(provider)
     const productionTombstone = custodyTombstoneOAuth(provider)
@@ -443,7 +517,7 @@ describe('Claustrum custody tombstones', () => {
     }
   })
 
-  lifetimes.test(
+  custodyTest(
     'throws a non-provider-refresh error before the token endpoint',
     () => {
       let thrown: unknown
@@ -467,7 +541,7 @@ describe('Claustrum custody tombstones', () => {
     },
   )
 
-  lifetimes.test(
+  custodyTest(
     'keeps loader recognition contained by both irreversible boundaries',
     async () => {
       const provider = oauthFixture.provider
@@ -516,8 +590,8 @@ describe('Claustrum custody tombstones', () => {
     },
   )
 
-  lifetimes.test('refuses sentinel access during direct requests', async () => {
-    const { root, plugins } = await startNativeBody()
+  custodyTest('refuses sentinel access during direct requests', async () => {
+    const { root, scope } = await startNativeBody()
     const outbound = recordNetwork()
     const fixture = await prepareVaultPool(root, [vaultMainRow(MAIN_IDENTITY)])
     expect(
@@ -550,7 +624,7 @@ describe('Claustrum custody tombstones', () => {
       async reportAuthFailureScoped() {},
       close() {},
     }
-    const plugin = await createNativePlugin(plugins, root, {
+    const plugin = await createNativePlugin(scope, root, {
       claustrumScopedConnect: async () => sentinelVault,
     })
 
@@ -561,24 +635,21 @@ describe('Claustrum custody tombstones', () => {
     expect(outbound).toEqual([])
   })
 
-  lifetimes.test(
-    'refuses a tombstone before the quota poll fetch',
-    async () => {
-      const fetchImpl = mock(() =>
-        Promise.resolve(new Response('{}', { status: 200 })),
-      ) as unknown as typeof fetch
+  custodyTest('refuses a tombstone before the quota poll fetch', async () => {
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
 
-      await expect(
-        fetchOAuthQuotaSnapshot({
-          accessToken: custodyTombstoneKey('openai'),
-          fetchImpl,
-        }),
-      ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
-      expect(fetchImpl).not.toHaveBeenCalled()
-    },
-  )
+    await expect(
+      fetchOAuthQuotaSnapshot({
+        accessToken: custodyTombstoneKey('openai'),
+        fetchImpl,
+      }),
+    ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
 
-  lifetimes.test('refuses a tombstone before the profile fetch', async () => {
+  custodyTest('refuses a tombstone before the profile fetch', async () => {
     const fetchImpl = mock(() =>
       Promise.resolve(new Response('{}', { status: 200 })),
     ) as unknown as typeof fetch
@@ -592,7 +663,7 @@ describe('Claustrum custody tombstones', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 
-  lifetimes.test('refuses a tombstone before CacheKeep prewarm headers', () => {
+  custodyTest('refuses a tombstone before CacheKeep prewarm headers', () => {
     expect(() =>
       setOAuthHeaders(new Headers(), custodyTombstoneKey('openai'), {
         body: { model: 'claude-sonnet-4-5' },
@@ -600,7 +671,7 @@ describe('Claustrum custody tombstones', () => {
     ).toThrow(CustodyTombstoneRefreshError)
   })
 
-  lifetimes.test('refuses a tombstone before Prime fire headers', () => {
+  custodyTest('refuses a tombstone before Prime fire headers', () => {
     expect(() =>
       setOAuthHeaders(new Headers(), custodyTombstoneKey('openai'), {
         body: { model: 'claude-haiku-4-5' },
@@ -608,17 +679,17 @@ describe('Claustrum custody tombstones', () => {
     ).toThrow(CustodyTombstoneRefreshError)
   })
 
-  lifetimes.test(
+  custodyTest(
     'holds a local main tombstone dark without network or refresh state',
     async () => {
-      const { root, plugins } = await startNativeBody()
+      const { root, scope } = await startNativeBody()
       const outbound = recordNetwork()
       // Host auth.json contains only the inert Anthropic activation marker.
       // Migration must leave the local pool empty instead of importing it.
       const fixture = await migrateLocalPool(root, {
         anthropic: custodyTombstoneOAuth(oauthFixture.provider),
       })
-      const plugin = await createNativePlugin(plugins, root)
+      const plugin = await createNativePlugin(scope, root)
 
       // The marker enables plugin request handling, not bearer authorization.
       // With no local account, the request must fail without network traffic.
@@ -636,10 +707,10 @@ describe('Claustrum custody tombstones', () => {
     },
   )
 
-  lifetimes.test(
+  custodyTest(
     'never sends a foreign-provider main tombstone to the token endpoint after expiry',
     async () => {
-      const { root, plugins } = await startNativeBody()
+      const { root, scope } = await startNativeBody()
       const outbound = recordNetwork({
         // The rotation hands back another provider's tombstone as the refresh
         // token successor, so the pool now stores it for the main account.
@@ -657,7 +728,7 @@ describe('Claustrum custody tombstones', () => {
           expires: Date.now() + 8 * HOUR_MS,
         },
       })
-      const plugin = await createNativePlugin(plugins, root)
+      const plugin = await createNativePlugin(scope, root)
 
       // The first send validates the migrated credential through one real
       // rotation and serves with its successor.
@@ -674,6 +745,7 @@ describe('Claustrum custody tombstones', () => {
 
       // Expire the credential returned by the first token exchange. The next
       // request would need to refresh with its stored foreign-provider marker.
+      currentScope().assertOpen()
       const realNow = Date.now
       Date.now = () => realNow() + 9 * HOUR_MS
       const refused = await sendMessage(plugin).catch((error: unknown) => error)
@@ -700,10 +772,10 @@ describe('Claustrum custody tombstones', () => {
     },
   )
 
-  lifetimes.test(
+  custodyTest(
     'reconciles a real main without a resolved binding before serving OAuth',
     async () => {
-      const { root, plugins } = await startNativeBody()
+      const { root, scope } = await startNativeBody()
       const outbound = recordNetwork()
       let vaultIdentity = MAIN_IDENTITY
       const vaultReads: string[] = []
@@ -747,7 +819,7 @@ describe('Claustrum custody tombstones', () => {
       vaultIdentity = REPLACEMENT_IDENTITY
       // Startup discovery would replace the saved account UUID. Hold it so the
       // request compares the old UUID against the vault's replacement account.
-      const stale = await createNativePlugin(plugins, root, {
+      const stale = await createNativePlugin(scope, root, {
         claustrumScopedConnect: async () => vaultClient('waits'),
       })
       await expect(sendMessage(stale)).rejects.toMatchObject({
@@ -763,7 +835,7 @@ describe('Claustrum custody tombstones', () => {
       if (!(startup instanceof Promise))
         throw new Error('Plugin did not expose its startup fallback refresh')
       await startup
-      await disposePlugin(plugins, stale)
+      await disposePlugin(scope, stale)
 
       // The vault inventory refresh rebinds main to the account the vault serves.
       const discovery = createNativeAccountRuntime({
@@ -782,7 +854,7 @@ describe('Claustrum custody tombstones', () => {
         discovery.close()
       }
 
-      const reconciled = await createNativePlugin(plugins, root, {
+      const reconciled = await createNativePlugin(scope, root, {
         claustrumScopedConnect: async () => vaultClient('answers'),
       })
       expect((await sendMessage(reconciled)).status).toBe(200)
@@ -795,10 +867,10 @@ describe('Claustrum custody tombstones', () => {
     },
   )
 
-  lifetimes.test(
+  custodyTest(
     'refuses Claude Pro/Max login before authorization while claustrum is committed',
     async () => {
-      const { root, plugins } = await startNativeBody()
+      const { root, scope } = await startNativeBody()
       const outbound = recordNetwork()
       const authorizeImpl = mock(async () => ({
         url: 'https://example.test/authorize',
@@ -811,14 +883,14 @@ describe('Claustrum custody tombstones', () => {
       })
 
       // Without vault enrollment, Claude Pro/Max starts the local OAuth flow.
-      const local = await createNativePlugin(plugins, root, {
+      const local = await createNativePlugin(scope, root, {
         authorize: authorizeImpl,
       })
       await expect(proMaxMethod(local).authorize()).resolves.toMatchObject({
         url: 'https://example.test/authorize',
       })
       expect(authorizeImpl).toHaveBeenCalledTimes(1)
-      await disposePlugin(plugins, local)
+      await disposePlugin(scope, local)
 
       // Adding this host's enrollment token must block local OAuth sign-in.
       // The local pool and its settings remain unchanged.
@@ -827,7 +899,7 @@ describe('Claustrum custody tombstones', () => {
         JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
         { mode: 0o600, flag: 'wx' },
       )
-      const enrolled = await createNativePlugin(plugins, root, {
+      const enrolled = await createNativePlugin(scope, root, {
         authorize: authorizeImpl,
       })
       await expect(proMaxMethod(enrolled).authorize()).rejects.toThrow(

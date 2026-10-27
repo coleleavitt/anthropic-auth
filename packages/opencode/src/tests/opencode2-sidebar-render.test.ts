@@ -1,22 +1,16 @@
-import { afterEach, expect, test } from 'bun:test'
+import { expect } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import {
   expectOneLineQuotaRows,
   fiveAccountSidebarState,
 } from './fixtures/sidebar-five-accounts'
 
-let child: Bun.Subprocess<'ignore', 'pipe', 'pipe'> | undefined
-let fixture: string | undefined
-afterEach(async () => {
-  child?.kill()
-  await child?.exited
-  child = undefined
-  if (fixture) await rm(fixture, { recursive: true, force: true })
-  fixture = undefined
-})
+const lifetimes = createTestLifetimeSuite()
+const test = lifetimes.test
 
 interface Step {
   /** Text the frame must contain before the step completes. */
@@ -41,7 +35,8 @@ async function renderOpenCode2Sidebar(
   released: number
   colors: Record<string, string>
 }> {
-  fixture = await mkdtemp(join(tmpdir(), 'anthropic-oc2-sidebar-'))
+  const fixture = await mkdtemp(join(tmpdir(), 'anthropic-oc2-sidebar-'))
+  lifetimes.deferCleanup(() => rm(fixture, { recursive: true, force: true }))
   await writeFile(
     join(fixture, 'preferences.jsonc'),
     JSON.stringify({
@@ -49,6 +44,14 @@ async function renderOpenCode2Sidebar(
     }),
   )
   const probe = `
+let __probeRenderer;
+process.once('SIGTERM', () => {
+  // CliRenderer traps SIGTERM to destroy without exiting, leaving a probe
+  // blocked awaiting its next frame alive until the hook times out. Exit
+  // promptly so the harness never waits out its hook.
+  try { __probeRenderer?.destroy(); } catch {}
+  process.exit(143);
+});
 import { createTestRenderer } from '@opentui/core/testing';
 import { render } from '@opentui/solid';
 import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure';
@@ -95,7 +98,8 @@ const cleanup = await setup({
 if (claims.length !== 1 || claims[0].append !== 'sidebar.content') throw new Error('sidebar slot was not claimed');
 let destroyed;
 const teardown = new Promise((resolve) => { destroyed = resolve; });
-const setupRenderer = await createTestRenderer({ width: ${size.width}, height: ${size.height}, onDestroy() { destroyed(); } });
+const setupRenderer = await createTestRenderer({ width: ${size.width}, height: ${size.height}, exitSignals: [], onDestroy() { destroyed(); } });
+__probeRenderer = setupRenderer.renderer;
 const frames = [];
 try {
   await render(() => claims[0].render({ sessionID: 'ses_oc2' }), setupRenderer.renderer);
@@ -123,7 +127,7 @@ try {
 }
 process.exit(0);
 `
-  child = Bun.spawn(
+  const child = Bun.spawn(
     [process.execPath, '--preload', '@opentui/solid/preload', '-e', probe],
     {
       cwd: fileURLToPath(new URL('../../', import.meta.url)),
@@ -136,11 +140,35 @@ process.exit(0);
       stderr: 'pipe',
     },
   )
-  const [stdout, stderr, exitCode] = await Promise.all([
+  // Own the probe through the test lifetime: the gate kills it as soon as
+  // teardown starts, before the lifetime waits for this body, so a body
+  // awaiting a frame it never receives can still finish. SIGKILL after a
+  // short grace is the backstop because a signal handler alone cannot be
+  // relied on once the renderer has trapped SIGTERM.
+  const cancel = lifetimes.gate()
+  const cancellation = cancel.wait.then(async () => {
+    if (child.exitCode !== null) return
+    child.kill('SIGTERM')
+    await Bun.sleep(500)
+    if (child.exitCode === null) child.kill('SIGKILL')
+  })
+  lifetimes.trackDetached(cancellation)
+  const joined = Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
     child.exited,
   ])
+  lifetimes.trackDetached(
+    joined.then(
+      () => {},
+      (error) => {
+        throw error
+      },
+    ),
+  )
+  const [stdout, stderr, exitCode] = await joined
+  cancel.open()
+  await cancellation
   expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
   return JSON.parse(stdout.trim().split('\n').at(-1) ?? '{}')
 }
@@ -219,7 +247,8 @@ test(
 test(
   'OpenCode 2 setup survives a refused sidebar slot and stops watching preferences',
   async () => {
-    fixture = await mkdtemp(join(tmpdir(), 'anthropic-oc2-sidebar-slot-'))
+    const fixture = await mkdtemp(join(tmpdir(), 'anthropic-oc2-sidebar-slot-'))
+    lifetimes.deferCleanup(() => rm(fixture, { recursive: true, force: true }))
     await writeFile(
       join(fixture, 'preferences.jsonc'),
       JSON.stringify({ 'anthropic-auth': { rememberCollapsed: false } }),
@@ -230,6 +259,11 @@ test(
     // left open after the refused slot keeps it running, and the deadline
     // below catches that.
     const probe = `
+process.once('SIGTERM', () => {
+  // The refused slot leaves no renderer to trap SIGTERM, but exit promptly
+  // here too so a leaked watcher cannot use up the hook either.
+  process.exit(143);
+});
 const { setup } = await import(${JSON.stringify(new URL('../tui/entry.mjs', import.meta.url).href)});
 let slotCalls = 0;
 let result;
@@ -264,7 +298,7 @@ try {
 }
 console.log(JSON.stringify({ slotCalls, setupReturned: typeof result }));
 `
-    child = Bun.spawn(
+    const running = Bun.spawn(
       [process.execPath, '--preload', '@opentui/solid/preload', '-e', probe],
       {
         cwd: fileURLToPath(new URL('../../', import.meta.url)),
@@ -277,16 +311,46 @@ console.log(JSON.stringify({ slotCalls, setupReturned: typeof result }));
         stderr: 'pipe',
       },
     )
-    const running = child
+    // Own the probe through the test lifetime: the gate ends it as soon as
+    // teardown starts, before the lifetime waits for this body. SIGKILL after
+    // a short grace is the backstop for a watcher that outlives SIGTERM.
+    const cancel = lifetimes.gate()
+    const cancellation = cancel.wait.then(async () => {
+      if (running.exitCode !== null) return
+      running.kill('SIGTERM')
+      await Bun.sleep(500)
+      if (running.exitCode === null) running.kill('SIGKILL')
+    })
+    lifetimes.trackDetached(cancellation)
+    const stdoutPromise = new Response(running.stdout).text()
+    const stderrPromise = new Response(running.stderr).text()
+    const joined = Promise.all([stdoutPromise, stderrPromise, running.exited])
+    lifetimes.trackDetached(
+      joined.then(
+        () => {},
+        (error) => {
+          throw error
+        },
+      ),
+    )
     const exited = await Promise.race([
       running.exited.then(() => true),
       Bun.sleep(8_000).then(() => false),
     ])
-    if (!exited) running.kill()
-    const [stdout, stderr] = await Promise.all([
-      new Response(running.stdout).text(),
-      new Response(running.stderr).text(),
-    ])
+    if (!exited) {
+      running.kill('SIGTERM')
+      const killed = await Promise.race([
+        running.exited.then(() => true),
+        Bun.sleep(500).then(() => false),
+      ])
+      if (!killed) running.kill('SIGKILL')
+    }
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
+    // The child has exited and both pipes have ended; the gate is no longer
+    // needed for cancellation.
+    cancel.open()
+    await cancellation
+    await joined
     expect({ exited, exitCode: running.exitCode, stderr }).toEqual({
       exited: true,
       exitCode: 0,
