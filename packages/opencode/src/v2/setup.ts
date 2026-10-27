@@ -277,6 +277,7 @@ export async function setupAnthropicAuth(
     ...options.cacheKeep,
     runtime,
     source,
+    storageId: paths.storageId,
     fetch: options.fetch,
     isSubagent: async (sessionID) =>
       Boolean(

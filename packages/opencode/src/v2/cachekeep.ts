@@ -38,18 +38,72 @@ function accountKey(account: NativeAccountView) {
   ])
 }
 
-/** Keep admitted hybrid-cache prefixes warm using fresh native authorization for each send. */
-export function createNativeCacheKeep(
-  options: NativeCacheKeepOptions & {
-    runtime: NativeAccountRuntime
-    source: NativeSource
-    fetch?: typeof fetch
-    isSubagent?: (sessionID: string) => Promise<boolean>
-  },
-) {
-  const { runtime, source } = options
-  const abort = new AbortController()
-  let stopped = false
+type CacheKeepPolicyStorage = Awaited<
+  ReturnType<NativeAccountRuntime['read']>
+>['policyStorage']
+
+/**
+ * One plugin instance's lease on a shared CacheKeep. Prewarms run through the
+ * newest live lease, so each send reads policy and authorization from a plugin
+ * instance that OpenCode has not disposed.
+ */
+interface CacheKeepLease {
+  readonly generation: number
+  stopped: boolean
+  readonly loadStorage: () => Promise<CacheKeepPolicyStorage>
+  readonly send: (
+    target: CacheKeepTarget,
+    warm: Request,
+    deadline?: AbortSignal,
+  ) => Promise<Response>
+  /** Sends this lease started; its disposal waits for them to settle. */
+  readonly inflight: Set<Promise<unknown>>
+}
+
+/**
+ * Tracked sessions for one account storage, shared by every plugin instance in
+ * the host process that uses that storage. OpenCode 2 creates one plugin
+ * instance per directory and disposes it when it evicts the directory or a
+ * plugin file changes, so the tracked sessions must outlive any one instance.
+ */
+interface SharedCacheKeep {
+  readonly manager: CacheKeepManager
+  readonly registry: CacheKeepSessionRegistry
+  readonly prepared: Map<
+    number,
+    {
+      target: CacheKeepTarget
+      attempt: CacheKeepPrewarmAttempt
+      lease: CacheKeepLease
+    }
+  >
+  /** Live leases by generation, in the order they were taken. */
+  readonly leases: Map<number, CacheKeepLease>
+  nextGeneration: number
+  /** Set once the last lease is released; the entry is then never reused. */
+  released: boolean
+}
+
+// Kept on globalThis rather than in a module variable, so a plugin reload that
+// imports this module again still finds the sessions the previous copy
+// tracked. The version suffix keeps a future, differently shaped entry apart.
+const SHARED_CACHE_KEEPS = Symbol.for(
+  'cortexkit.anthropic-auth.opencode2.cachekeep.v1',
+)
+
+function sharedCacheKeeps(): Map<string, SharedCacheKeep> {
+  const scope = globalThis as typeof globalThis & {
+    [SHARED_CACHE_KEEPS]?: Map<string, SharedCacheKeep>
+  }
+  scope[SHARED_CACHE_KEEPS] ??= new Map()
+  return scope[SHARED_CACHE_KEEPS]
+}
+
+function createSharedCacheKeep(
+  options: NativeCacheKeepOptions,
+): SharedCacheKeep {
+  const prepared: SharedCacheKeep['prepared'] = new Map()
+  const leases: SharedCacheKeep['leases'] = new Map()
   const registry = new CacheKeepSessionRegistry({
     directory:
       options.registryDirectory ||
@@ -57,10 +111,96 @@ export function createNativeCacheKeep(
       getDefaultCacheKeepRegistryDirectory('opencode'),
     now: options.now,
   })
-  const prepared = new Map<
-    number,
-    { target: CacheKeepTarget; attempt: CacheKeepPrewarmAttempt }
-  >()
+  const newestLease = () => {
+    let newest: CacheKeepLease | undefined
+    for (const lease of leases.values()) newest = lease
+    return newest
+  }
+  const schedule = options.setIntervalImpl ?? globalThis.setInterval
+  const manager: CacheKeepManager = new CacheKeepManager({
+    loadStorage: async () => {
+      const lease = newestLease()
+      return lease ? lease.loadStorage() : null
+    },
+    now: options.now,
+    // Return the scheduler pass to timer drivers, so they can join the same
+    // work as disposal rather than observe a detached callback.
+    setIntervalImpl: ((_callback: unknown, ms: number | undefined) =>
+      schedule(
+        () =>
+          manager.tick().catch(() => {
+            logger.warn('cachekeep', 'tick failed')
+          }),
+        ms,
+      )) as typeof globalThis.setInterval,
+    clearIntervalImpl: options.clearIntervalImpl,
+    onTrackedSessionsChanged: (sessions) =>
+      registry.publish(shared.released ? [] : sessions),
+    prepareHeaders(_headers, target, attempt) {
+      // Bind each prewarm to the newest live instance when it is prepared, so
+      // it never authorizes through an instance OpenCode already disposed.
+      const lease = newestLease()
+      if (!lease) return undefined
+      prepared.set(attempt.id, { target, attempt, lease })
+      return new Headers({ 'x-native-cachekeep-attempt': String(attempt.id) })
+    },
+    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+      const request = new Request(input as Request, init)
+      const id = Number(request.headers.get('x-native-cachekeep-attempt'))
+      const entry = prepared.get(id)
+      prepared.delete(id)
+      if (!entry || entry.lease.stopped)
+        throw new Error('CacheKeep attempt is unavailable')
+      const sending = entry.lease.send(
+        entry.target,
+        request as Request,
+        entry.attempt.signal,
+      )
+      const settled = sending.then(
+        () => {},
+        () => {},
+      )
+      entry.lease.inflight.add(settled)
+      void settled.then(() => entry.lease.inflight.delete(settled))
+      return sending
+    }) as typeof fetch,
+    onComplete: ({ attempt }) => {
+      prepared.delete(attempt.id)
+    },
+  })
+  const shared: SharedCacheKeep = {
+    manager,
+    registry,
+    prepared,
+    leases,
+    nextGeneration: 0,
+    released: false,
+  }
+  return shared
+}
+
+/**
+ * Keep admitted hybrid-cache prefixes warm using fresh native authorization for
+ * each send. Instances for the same account storage share one set of tracked
+ * sessions: a later instance takes over sending for sessions an earlier one
+ * tracked, and the timer stops only when the last instance is disposed.
+ */
+export function createNativeCacheKeep(
+  options: NativeCacheKeepOptions & {
+    runtime: NativeAccountRuntime
+    source: NativeSource
+    /** Identity of the account storage; instances that share it share sessions. */
+    storageId: string
+    fetch?: typeof fetch
+    isSubagent?: (sessionID: string) => Promise<boolean>
+  },
+) {
+  const { runtime, source } = options
+  const abort = new AbortController()
+  const shareds = sharedCacheKeeps()
+  const owner = shareds.get(options.storageId) ?? createSharedCacheKeep(options)
+  shareds.set(options.storageId, owner)
+  const { manager, registry } = owner
   const send = async (
     target: CacheKeepTarget,
     warm: Request,
@@ -238,48 +378,21 @@ export function createNativeCacheKeep(
       }
     }
   }
-  const schedule = options.setIntervalImpl ?? globalThis.setInterval
-  const manager = new CacheKeepManager({
-    loadStorage: async () =>
-      stopped ? null : (await runtime.read()).policyStorage,
-    now: options.now,
-    // Return the scheduler pass to timer drivers, so they can join the same
-    // work as disposal rather than observe a detached callback.
-    setIntervalImpl: ((_callback: unknown, ms: number | undefined) =>
-      schedule(
-        () =>
-          manager.tick().catch(() => {
-            logger.warn('cachekeep', 'tick failed')
-          }),
-        ms,
-      )) as typeof globalThis.setInterval,
-    clearIntervalImpl: options.clearIntervalImpl,
-    onTrackedSessionsChanged: (sessions) =>
-      registry.publish(stopped ? [] : sessions),
-    prepareHeaders(_headers, target, attempt) {
-      if (stopped) return undefined
-      prepared.set(attempt.id, { target, attempt })
-      return new Headers({ 'x-native-cachekeep-attempt': String(attempt.id) })
-    },
-    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
-      const request = new Request(input as Request, init)
-      const id = Number(request.headers.get('x-native-cachekeep-attempt'))
-      const entry = prepared.get(id)
-      prepared.delete(id)
-      if (!entry) throw new Error('CacheKeep attempt is unavailable')
-      return send(entry.target, request as Request, entry.attempt.signal)
-    }) as typeof fetch,
-    onComplete: ({ attempt }) => {
-      prepared.delete(attempt.id)
-    },
-  })
+  const lease: CacheKeepLease = {
+    generation: owner.nextGeneration++,
+    stopped: false,
+    loadStorage: async () => (await runtime.read()).policyStorage,
+    send,
+    inflight: new Set(),
+  }
+  owner.leases.set(lease.generation, lease)
   let cleanup: Promise<void> | undefined
   return {
     async track(
       input: Parameters<NonNullable<NativeSource['onRequestPrepared']>>[0],
     ) {
       if (
-        stopped ||
+        lease.stopped ||
         input.route !== 'oauth' ||
         input.agent === 'cachekeep' ||
         input.agent === 'prime' ||
@@ -287,7 +400,8 @@ export function createNativeCacheKeep(
       )
         return
       const snapshot = await runtime.read()
-      if (stopped || !isCacheKeepHybridActive(snapshot.policyStorage)) return
+      if (lease.stopped || !isCacheKeepHybridActive(snapshot.policyStorage))
+        return
       let isSubagent = false
       try {
         isSubagent = (await options.isSubagent?.(input.sessionID)) ?? false
@@ -296,7 +410,7 @@ export function createNativeCacheKeep(
         return
       }
       if (
-        stopped ||
+        lease.stopped ||
         (isSubagent && !isCacheKeepSubagentsEnabled(snapshot.policyStorage))
       )
         return
@@ -331,17 +445,34 @@ export function createNativeCacheKeep(
     registry,
     dispose() {
       if (cleanup) return cleanup
-      stopped = true
-      manager.stop()
+      lease.stopped = true
       abort.abort()
+      for (const [id, entry] of owner.prepared)
+        if (entry.lease === lease) owner.prepared.delete(id)
+      // Only this instance's own lease is released. A predecessor disposed
+      // after its successor started leaves the successor's sessions and timer
+      // alone; the shared entry ends only when no instance holds a lease.
+      const last =
+        owner.leases.delete(lease.generation) && owner.leases.size === 0
+      if (last) {
+        owner.released = true
+        manager.stop()
+        if (shareds.get(options.storageId) === owner)
+          shareds.delete(options.storageId)
+      }
       cleanup = (async () => {
-        // tick() joins an active scheduler pass; stopped storage prevents a new
-        // pass from sending if disposal happens between timer callbacks.
         try {
-          await manager.tick()
+          // tick() joins an active scheduler pass; with no lease left, the
+          // manager reads no storage and cannot start another send.
+          if (last) await manager.tick()
+          // Sends this instance started use its runtime, which the caller
+          // closes after disposal; wait for them to observe the abort.
+          await Promise.all(lease.inflight)
         } finally {
-          prepared.clear()
-          await registry.dispose()
+          if (last) {
+            owner.prepared.clear()
+            await registry.dispose()
+          }
         }
       })()
       return cleanup

@@ -96,121 +96,127 @@ async function fixture(child = false, brokenRegistry = false) {
     directory: registryDirectory,
     now: () => now,
   })
-  const hooks = new Map<string, Array<(draft: any) => unknown>>()
-  const registration = { dispose: async () => {} }
-  const ctx = {
-    session: {
-      get: async () => ({ parentID: child ? 'ses_parent' : undefined }),
-      hook: async (name: string, callback: (draft: any) => unknown) => {
-        hooks.set(name, [...(hooks.get(name) ?? []), callback])
-        return registration
-      },
-    },
-    model: { transform: async () => registration },
-    integration: { transform: async () => registration },
-    rpc: {
-      register: async () => ({
-        ...registration,
-        events: { emit: async () => {} },
-      }),
-    },
-    command: { transform: async () => registration },
-    event: { subscribe: async function* () {} },
-  } as unknown as Plugin.Context
-  const sent: Request[] = []
-  let send: (request: Request) => Promise<Response> = async () =>
-    Response.json({ usage: { cache_read_input_tokens: 1 } })
-  const dispose = await setupAnthropicAuth(ctx, {
-    paths,
-    vault: {
-      env: {
-        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
-          directory,
-          'enrollment.json',
-        ),
-      },
-    },
-    local: {
-      resolveIdentity: async (access) =>
-        ({
-          accountUuid: access.endsWith('first')
-            ? identity
-            : '99999999-2222-4333-8444-555555555555',
-        }) as never,
-    },
-    fetch: (async (input: string | URL | Request, init?: RequestInit) => {
-      const request = new Request(input as Request, init)
-      if (new URL(request.url).pathname !== '/v1/messages')
-        return Response.json({})
-      sent.push(request.clone() as Request)
-      return send(request as Request)
-    }) as typeof fetch,
-    cacheKeep: {
-      now: () => now,
-      setIntervalImpl: timers.setInterval,
-      clearIntervalImpl: timers.clearInterval,
-      registryDirectory,
-    },
-  })
-  cleanups.push(dispose)
-  const live = async (url = 'https://api.anthropic.com/v1/messages') => {
-    const draft = {
-      sessionID: 'ses_oc2_keep' as SessionHooks['http.request']['sessionID'],
-      agent: 'build',
-      model: { providerID: 'anthropic', id: 'claude-sonnet-4-6' },
-      kind: 'primary',
-      request: new Request(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${placeholderSecret('anthropic')}`,
+  const start = async () => {
+    const hooks = new Map<string, Array<(draft: any) => unknown>>()
+    const registration = { dispose: async () => {} }
+    const ctx = {
+      session: {
+        get: async () => ({ parentID: child ? 'ses_parent' : undefined }),
+        hook: async (name: string, callback: (draft: any) => unknown) => {
+          hooks.set(name, [...(hooks.get(name) ?? []), callback])
+          return registration
         },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 8,
-          system: 'Cache me',
-          messages: [{ role: 'user', content: 'Hello' }],
-          metadata: { user_id: 'untrusted' },
+      },
+      model: { transform: async () => registration },
+      integration: { transform: async () => registration },
+      rpc: {
+        register: async () => ({
+          ...registration,
+          events: { emit: async () => {} },
         }),
-      }),
-    }
-    for (const callback of hooks.get('context') ?? [])
-      await callback({
-        ...draft,
-        messages: [
-          {
-            id: 'msg_oc2_keep',
-            role: 'user',
-            content: [{ type: 'text', text: 'Hello' }],
+      },
+      command: { transform: async () => registration },
+      event: { subscribe: async function* () {} },
+    } as unknown as Plugin.Context
+    const sent: Request[] = []
+    let send: (request: Request) => Promise<Response> = async () =>
+      Response.json({ usage: { cache_read_input_tokens: 1 } })
+    const dispose = await setupAnthropicAuth(ctx, {
+      paths,
+      vault: {
+        env: {
+          OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+            directory,
+            'enrollment.json',
+          ),
+        },
+      },
+      local: {
+        resolveIdentity: async (access) =>
+          ({
+            accountUuid: access.endsWith('first')
+              ? identity
+              : '99999999-2222-4333-8444-555555555555',
+          }) as never,
+      },
+      fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+        const request = new Request(input as Request, init)
+        if (new URL(request.url).pathname !== '/v1/messages')
+          return Response.json({})
+        sent.push(request.clone() as Request)
+        return send(request as Request)
+      }) as typeof fetch,
+      cacheKeep: {
+        now: () => now,
+        setIntervalImpl: timers.setInterval,
+        clearIntervalImpl: timers.clearInterval,
+        registryDirectory,
+      },
+    })
+    cleanups.push(dispose)
+    const live = async (url = 'https://api.anthropic.com/v1/messages') => {
+      const draft = {
+        sessionID: 'ses_oc2_keep' as SessionHooks['http.request']['sessionID'],
+        agent: 'build',
+        model: { providerID: 'anthropic', id: 'claude-sonnet-4-6' },
+        kind: 'primary',
+        request: new Request(url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${placeholderSecret('anthropic')}`,
           },
-        ],
-      })
-    const modelDraft = { ...draft, headers: {} as Record<string, string> }
-    for (const callback of hooks.get('model.request') ?? [])
-      await callback(modelDraft)
-    for (const [name, value] of Object.entries(modelDraft.headers))
-      draft.request.headers.set(name, value)
-    for (const callback of hooks.get('http.request') ?? [])
-      await callback(draft)
-    return draft.request
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 8,
+            system: 'Cache me',
+            messages: [{ role: 'user', content: 'Hello' }],
+            metadata: { user_id: 'untrusted' },
+          }),
+        }),
+      }
+      for (const callback of hooks.get('context') ?? [])
+        await callback({
+          ...draft,
+          messages: [
+            {
+              id: 'msg_oc2_keep',
+              role: 'user',
+              content: [{ type: 'text', text: 'Hello' }],
+            },
+          ],
+        })
+      const modelDraft = { ...draft, headers: {} as Record<string, string> }
+      for (const callback of hooks.get('model.request') ?? [])
+        await callback(modelDraft)
+      for (const [name, value] of Object.entries(modelDraft.headers))
+        draft.request.headers.set(name, value)
+      for (const callback of hooks.get('http.request') ?? [])
+        await callback(draft)
+      return draft.request
+    }
+    return {
+      live,
+      sent,
+      dispose,
+      setSend: (callback: typeof send) => {
+        send = callback
+      },
+    }
   }
   return {
-    live,
+    ...(await start()),
+    /** Another plugin instance for the same account storage and clock. */
+    start,
     paths,
     store,
     registry,
     timers,
-    sent,
-    dispose,
     due: () => {
       now += CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS
     },
-    setSend: (callback: typeof send) => {
-      send = callback
-    },
   }
 }
-
 test('OpenCode 2 hybrid requests publish a CacheKeep lease and dispose removes its timer', async () => {
   const f = await fixture()
   await f.live()
@@ -359,6 +365,110 @@ test('OpenCode 2 dispose aborts and joins an in-flight prewarm', async () => {
   await closing
   await tick
   expect(f.timers.callbacks.size).toBe(0)
+})
+
+test('a later OpenCode 2 instance for the same storage keeps warming a session the disposed one tracked', async () => {
+  const f = await fixture()
+  await f.live()
+  const next = await f.start()
+  await f.dispose()
+  expect(f.timers.callbacks.size).toBe(1)
+  expect((await f.registry.list()).map((session) => session.id)).toEqual([
+    'ses_oc2_keep',
+  ])
+  // A token refreshed after the reload must be the one the prewarm carries.
+  await f.store.rotate('first', {
+    type: 'oauth',
+    access: 'sk-ant-oat01-reloaded-first',
+    refresh: 'refresh-first',
+    expires: Date.now() + 12 * 3600_000,
+  })
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  expect(next.sent).toHaveLength(1)
+  expect(next.sent[0]!.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-reloaded-first',
+  )
+})
+
+test('a late OpenCode 2 dispose of the predecessor leaves its successor warming', async () => {
+  const f = await fixture()
+  await f.live()
+  const next = await f.start()
+  let entered!: () => void
+  const started = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const aborted: boolean[] = []
+  next.setSend(async (request) => {
+    entered()
+    await gate
+    aborted.push(request.signal.aborted)
+    return Response.json({ usage: { cache_read_input_tokens: 1 } })
+  })
+  f.due()
+  const tick = f.timers.fire()
+  await started
+  // The predecessor is disposed while its successor's prewarm is in flight.
+  await f.dispose()
+  release()
+  await tick
+  expect(aborted).toEqual([false])
+  expect(f.timers.callbacks.size).toBe(1)
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  expect(next.sent).toHaveLength(2)
+  expect(aborted).toEqual([false, false])
+})
+
+test('an OpenCode 2 prewarm never goes through a disposed instance, even the newest', async () => {
+  const f = await fixture()
+  const newer = await f.start()
+  await newer.live()
+  await newer.dispose()
+  f.due()
+  await f.timers.fire()
+  expect(newer.sent).toHaveLength(0)
+  expect(f.sent).toHaveLength(1)
+  expect(f.sent[0]!.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-first',
+  )
+})
+
+test('OpenCode 2 instances for different account storage never share tracked sessions', async () => {
+  const f = await fixture()
+  const other = await fixture()
+  await f.live()
+  expect(other.timers.callbacks.size).toBe(0)
+  // The other storage's live instance must not keep these sessions alive.
+  await f.dispose()
+  expect(f.timers.callbacks.size).toBe(0)
+  other.due()
+  await other.timers.fire()
+  expect(other.sent).toHaveLength(0)
+  expect(await other.registry.list()).toEqual([])
+})
+
+test('releasing the last OpenCode 2 instance for a storage stops the timer and drops its sessions', async () => {
+  const f = await fixture()
+  await f.live()
+  const next = await f.start()
+  await next.dispose()
+  expect(f.timers.callbacks.size).toBe(1)
+  await f.dispose()
+  expect(f.timers.callbacks.size).toBe(0)
+  expect(await f.registry.list()).toEqual([])
+  const later = await f.start()
+  f.due()
+  await f.timers.fire()
+  expect(later.sent).toHaveLength(0)
+  expect(await f.registry.list()).toEqual([])
 })
 
 /** Sets the test-only loopback OAuth origin until the test's cleanup. */
