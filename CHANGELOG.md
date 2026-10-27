@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Works with OpenCode 2.2.0, which requires OpenTUI 0.7: the plugin now depends on OpenTUI 0.7.0, the version OpenCode 2.2.0's plugin SDK asks for, so one copy of OpenTUI installs next to it. OpenCode 1 keeps working: the sidebar and dialogs still run on the OpenTUI that OpenCode itself ships. Addresses #511.
 - The sidebar no longer says 'out in now' for a quota window that is already used up; it says the window is used up until its reset.
 - OpenCode: a turn is no longer refused with 'Mismatched … effort anchor token' when another plugin puts back an earlier effort marker that gives exactly the same efforts. Effort-marker errors no longer name Fable 5.1 on Opus 5.5 and Sonnet 5.5 requests.
 
