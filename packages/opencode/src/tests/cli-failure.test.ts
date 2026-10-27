@@ -346,7 +346,7 @@ test('shared runner plain errors retain their exact display messages', async () 
     {
       argv: ['--yes', '--claustrum'],
       message:
-        'Claustrum is not available. Start ck or use --no-claustrum for local sign-in.',
+        'Claustrum is not available. Start ck, or omit vault-only flags and use --no-claustrum for local sign-in.',
     },
   ]
   for (const { argv, message, ...options } of cases) {

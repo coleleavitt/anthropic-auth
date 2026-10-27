@@ -4322,7 +4322,7 @@ describe('setup CLI boundary', () => {
     [
       'unavailable Claustrum',
       ['--yes', '--claustrum'],
-      'Claustrum is not available. Start ck or use --no-claustrum for local sign-in.',
+      'Claustrum is not available. Start ck, or omit vault-only flags and use --no-claustrum for local sign-in.',
     ],
   ] as const) {
     lifetimes.test(

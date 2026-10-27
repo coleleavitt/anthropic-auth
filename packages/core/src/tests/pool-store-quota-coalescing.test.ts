@@ -6,7 +6,7 @@
 // coalescer apart from a mismatch between the coalescer and Core's codec.
 // Native snapshots keep legacy whole-snapshot precedence. A late older poll
 // may therefore lose poll-only fields; the library codec is a per-field control.
-import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import {
   mkdir,
   mkdtemp,
@@ -34,6 +34,7 @@ import {
   type NativeStore,
   openNativeStore,
   pollSnapshot,
+  type QuotaCommitTimer,
 } from './pool-store-coalescing-fixture.ts'
 import { holdPoolStoreLocks } from './pool-store-lock-fixture.ts'
 
@@ -74,11 +75,12 @@ function coalesced(
   lane: Lane,
   options: Partial<Parameters<typeof openNativeStore>[0]> = {},
   drainTimeoutMs = 5_000,
+  quotaCommitTimer?: QuotaCommitTimer,
 ) {
   const before = coalescingOpens()
   const store = openNativeStore(
     { paths, quota: lane.codec, ...options },
-    { drainTimeoutMs },
+    { drainTimeoutMs, quotaCommitTimer },
   )
   // Confirms Core opted into coalescing rather than opening an immediate writer.
   expect(coalescingOpens()).toBe(before + 1)
@@ -498,25 +500,41 @@ for (const lane of lanes) {
         const waitingForRoom = new Promise<void>((resolve) => {
           preflight129 = resolve
         })
-        const store = coalesced(paths, lane, {
-          quota: {
-            validate: (value) => lane.codec.validate(value),
-            merge(stored, observation) {
-              const merged = lane.codec.merge(stored, observation)
-              if (
-                isQuotaMap(merged) &&
-                merged.limits.some(
-                  (entry) => entry.label === 'seven_day:marker-128',
+        let scheduledCommits = 0
+        // Leave ordinary scheduled commits pending so only the queue cap can
+        // start the flush while the holder keeps the pool locks contended.
+        const quotaCommitTimer: QuotaCommitTimer = {
+          now: () => 0,
+          schedule: () => {
+            scheduledCommits++
+            return { cancel() {} }
+          },
+        }
+        const store = coalesced(
+          paths,
+          lane,
+          {
+            quota: {
+              validate: (value) => lane.codec.validate(value),
+              merge(stored, observation) {
+                const merged = lane.codec.merge(stored, observation)
+                if (
+                  isQuotaMap(merged) &&
+                  merged.limits.some(
+                    (entry) => entry.label === 'seven_day:marker-128',
+                  )
                 )
-              )
-                preflight129()
-              return merged
+                  preflight129()
+                return merged
+              },
+            },
+            onLockEvent: (event) => {
+              if (event.type === 'contended') contended()
             },
           },
-          onLockEvent: (event) => {
-            if (event.type === 'contended') contended()
-          },
-        })
+          5_000,
+          quotaCommitTimer,
+        )
         const observation = (index: number) => {
           const checkedAt = 1_000 + index
           const scoped = pollSnapshot('acct-a', checkedAt, {
@@ -532,26 +550,11 @@ for (const lane of lanes) {
             scoped: [{ ...scoped, id: `marker-${index}` }],
           })
         }
-        const realSetTimeout = globalThis.setTimeout
-        let deferredDebounce = false
-        // Hold back the first coalescing timer, so a lock attempt at 128 can
-        // only come from the cap, not from a slow run reaching the debounce.
-        const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((
-          callback: (...args: unknown[]) => void,
-          delay: number | undefined,
-          ...args: unknown[]
-        ) => {
-          if (!deferredDebounce && delay === 100) {
-            deferredDebounce = true
-            return realSetTimeout(callback, 60_000, ...args)
-          }
-          return realSetTimeout(callback, delay, ...args)
-        }) as typeof setTimeout)
         let publishing: Promise<void> | undefined
         try {
           for (let index = 0; index < 128; index++)
             await store.recordQuota('a', epoch1('acct-a'), observation(index))
-          expect(deferredDebounce).toBe(true)
+          expect(scheduledCommits).toBeGreaterThan(0)
           // No 129th recordQuota call has started, so its capacity check cannot
           // have triggered the flush.
           expect(
@@ -560,7 +563,6 @@ for (const lane of lanes) {
               sleep(5_000).then(() => false),
             ]),
           ).toBe(true)
-          timer.mockRestore()
           let accepted = 128
           // Start all remaining calls while the lock is still held. The full
           // queue must make them wait for room rather than discard readings.
@@ -605,7 +607,6 @@ for (const lane of lanes) {
             isQuotaMap(written) ? [...written.limits].sort(byLabel) : undefined,
           ).toEqual(expected.sort(byLabel))
         } finally {
-          timer.mockRestore()
           await holder.release()
           await publishing
         }

@@ -7,7 +7,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 2: Prime now fires; it failed on every check because of an account-fingerprint format mismatch, and its failure log now says which step failed. Addresses #480.
 - The plugin logs which vault enrollment file, names and mode it uses, once per process. Addresses #476.
 - OpenCode 2: `/claude` opens with section names only and shows status in a wide view instead of raw Markdown. Addresses #478.
-- `@cortexkit/common-auth` moves to 0.26.0; local-mode quota saves use its shared write combining.
+- OpenCode 2: in sticky-balanced mode a session now waits on its account when whichever quota window blocks it resets within 15 minutes, instead of moving and rebuilding its cache, matching OpenCode 1 and Pi.
+- `@cortexkit/common-auth` moves to 0.27.1: vault connects are capped at 10 s, settings and enrollment files are read far less often, and local quota saves are batched.
 
 ## 2.2.8
 
@@ -18,7 +19,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 2: finishing an OAuth sign-in from `/claude` → Accounts no longer fails with "Action failed"; the Accounts menu explains how to connect OpenCode when no main account exists. Thanks to @colinmollenhour. Addresses #464.
 - When a relay request fell back to a direct send and that direct send failed after going out, the plugin could send the same request a second time. The direct fallback now runs at most once per request, and its failure goes to OpenCode or Pi, which retry as usual.
 - Vault setup now grants read access to the name the vault approved for this installation, not always the default name, and the printed `ck auth grant` command uses that name too. Addresses #471.
-- In sticky-balanced mode on OpenCode 1 and Pi, a session now waits on its account when whichever quota window blocks it resets within 15 minutes, including 7-day and model limits, instead of moving and rebuilding its cache. OpenCode 2 does not hold yet.
+- In sticky-balanced mode on OpenCode 1 and Pi, a session waits on its account when whichever quota window blocks it resets within 15 minutes, including 7-day and model limits, instead of moving and rebuilding its cache.
 
 ## 2.2.6
 

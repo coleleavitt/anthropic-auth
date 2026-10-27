@@ -35,6 +35,10 @@ const { createNativePoolStore } = await import('../pool-store.ts')
 
 export type NativeStore = ReturnType<typeof createNativePoolStore>
 
+export type QuotaCommitTimer = NonNullable<
+  storeModule.OpenPoolStoreOptions['quotaCommitTimer']
+>
+
 /** How many stores were opened with the coalescer switched on. */
 export function coalescingOpens(): number {
   return wrappedOpens
@@ -46,12 +50,18 @@ export function coalescingOpens(): number {
  */
 export function openNativeStore(
   options: NativePoolStoreOptions,
-  coalesce?: { drainTimeoutMs?: number },
+  coalesce?: {
+    drainTimeoutMs?: number
+    quotaCommitTimer?: QuotaCommitTimer
+  },
 ): NativeStore {
   injected = coalesce
     ? {
         ...(coalesce.drainTimeoutMs !== undefined
           ? { quotaDrainTimeoutMs: coalesce.drainTimeoutMs }
+          : {}),
+        ...(coalesce.quotaCommitTimer !== undefined
+          ? { quotaCommitTimer: coalesce.quotaCommitTimer }
           : {}),
       }
     : { coalesceQuota: false }

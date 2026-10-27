@@ -307,7 +307,7 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
   '--claustrum and --no-claustrum cannot be used together.',
   'Setup requires a TTY or --yes.',
   'Multiple OpenCode generations found. Choose --opencode=1|2|both before running noninteractive setup.',
-  'Claustrum is not available. Start ck or use --no-claustrum for local sign-in.',
+  'Claustrum is not available. Start ck, or omit vault-only flags and use --no-claustrum for local sign-in.',
   // Offline local setup refuses an unverified account identity.
   'Claude sign-in did not establish an account UUID',
   // Each selected host needs separate storage.

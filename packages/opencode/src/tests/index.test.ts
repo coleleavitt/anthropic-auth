@@ -4884,13 +4884,9 @@ describe('quota header feed integration', () => {
         getPluginTestHandles(plugin).quotaManager.getMain(uuidB)?.quota
           .five_hour?.usedPercent,
       ).toBe(60)
+      await plugin.__scopedRuntime.close()
       expect(
-        (
-          await waitForNativePoolQuota(
-            'main',
-            (quota) => quota?.accountIdentity === uuidB,
-          )
-        )?.accountIdentity,
+        (await readAccountStorage())?.quota?.mainQuota?.accountIdentity,
       ).toBe(uuidB)
       expect(
         (await readAccountStorage())?.quota?.mainQuota?.five_hour?.usedPercent,

@@ -325,7 +325,7 @@ async function oc2(f: HostFixture) {
       const account = await source.chooseAccount(scope)
       if (typeof account !== 'string') throw new Error('No account chosen')
       const auth = await source.authorizeAccount(scope, account)
-      if (!auth || auth.route !== 'oauth')
+      if (auth?.route !== 'oauth')
         throw new Error('Offline OAuth authorization refused')
       return auth.accessToken
     })()
