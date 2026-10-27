@@ -17,7 +17,11 @@ import {
   nativeMigrationAuthorityPhase,
   readNativeMigrationJournal,
 } from './pool-authority.ts'
-import { type NativePoolPaths, resolveNativePoolPaths } from './pool-paths.ts'
+import {
+  canonicalPath,
+  type NativePoolPaths,
+  resolveNativePoolPaths,
+} from './pool-paths.ts'
 import { drainNativePoolStores } from './pool-store.ts'
 import { forgetRelocationObservations } from './relocation-guard.ts'
 import {
@@ -65,8 +69,14 @@ export const LAYOUT_LOCK_TIMEOUT_MS = 120_000
 /** One file slot of a dataset in both layouts. */
 export interface RelocationSlot {
   readonly role: RelocationRole
-  /** The legacy-layout path, in the config folder. */
+  /** The canonical legacy-layout path, in the config folder. */
   readonly from: string
+  /**
+   * The legacy-layout path as configured: the config folder as given joined
+   * with the role's fixed file name. `from` follows a symlink at the leaf, so
+   * only this path shows whether the configured file is a link.
+   */
+  readonly configured: string
   /** The state-home path, in `<sub>`. */
   readonly to: string
 }
@@ -127,7 +137,9 @@ export async function resolveRelocationDataset(input: {
     identity: input.identity,
     stateRoot: input.stateRoot,
     sub: input.sub,
-    oldDir: dirname(oldPaths.state),
+    // The folder itself, not the folder of a resolved file: a file that is a
+    // link elsewhere must not move the folder the move works in.
+    oldDir: await canonicalPath(input.configDir),
     oldPaths,
     oldVault,
     newPaths,
@@ -136,6 +148,7 @@ export async function resolveRelocationDataset(input: {
       role,
       from: pairs[role][0],
       to: pairs[role][1],
+      configured: join(input.configDir, STATE_HOME_FILE_NAMES[role]),
     })),
     storageIds: { local: oldPaths.storageId, vault: oldVault.storageId },
   }
@@ -524,12 +537,10 @@ export async function movePreconditionFailure(
     return `${dataset.sub} and ${dataset.oldDir} contain one another`
   let anyOld = false
   for (const slot of dataset.slots) {
-    if (dirname(slot.from) !== dataset.oldDir)
-      return `${slot.from} is outside the config folder`
     // The configured path is checked as given: the canonical path follows a
-    // leaf symlink, and a moved symlink would move someone else's file.
-    const configured = join(dataset.configDir, basename(slot.from))
-    for (const path of new Set([configured, slot.from])) {
+    // leaf symlink, and a moved symlink would move someone else's file. Its
+    // name is the role's own, never the name of whatever a link points at.
+    for (const path of new Set([slot.configured, slot.from])) {
       let info: Awaited<ReturnType<typeof lstat>>
       try {
         info = await lstat(path)
@@ -545,6 +556,11 @@ export async function movePreconditionFailure(
       )
         return `${path} belongs to another user`
     }
+    if (
+      dirname(slot.from) !== dataset.oldDir ||
+      basename(slot.from) !== basename(slot.configured)
+    )
+      return `${slot.configured} resolves to ${slot.from}, not to a file of its own in the config folder`
     const fromExists = await exists(slot.from)
     anyOld ||= fromExists
     if (await exists(slot.to)) {
@@ -965,7 +981,12 @@ export async function moveDataset(
   // Step 1: snapshot every old file of the closed list.
   const files: RelocationFileRecord[] = []
   for (const slot of dataset.slots)
-    files.push({ ...slot, sha256: await fileSha256(slot.from) })
+    files.push({
+      role: slot.role,
+      from: slot.from,
+      to: slot.to,
+      sha256: await fileSha256(slot.from),
+    })
   const sha = (role: RelocationRole) =>
     files.find((file) => file.role === role)?.sha256 ?? null
   await ctx.stack.assertAll()

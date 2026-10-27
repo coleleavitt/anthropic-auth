@@ -8,8 +8,11 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  readlink,
   realpath,
+  rename,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -541,6 +544,27 @@ test('a legacy holder registered under another XDG_STATE_HOME still blocks the m
     env: { XDG_STATE_HOME: join(m.root, 'other-root') },
   })
   expect(decision.kind).toBe('legacy')
+})
+
+test('a configured file that is a symlink, even to a file in the same folder, keeps the dataset in place untouched', async () => {
+  const m = await machine()
+  const tokens = join(m.configDir, 'tokens.json')
+  await rename(m.oldPaths.state, tokens)
+  await symlink('tokens.json', m.oldPaths.state)
+  const snapshot = async () => ({
+    tree: await oldTree(m),
+    link: await readlink(m.oldPaths.state),
+    tokens: await readFile(tokens, 'utf8'),
+  })
+  const before = await snapshot()
+  const decision = await decide(m)
+  expect(decision.kind).toBe('legacy')
+  if (decision.kind === 'legacy')
+    expect(decision.reasons.join(' ')).toContain(m.oldPaths.state)
+  expect(await exists(join(m.sub, 'layout.json'))).toBe(false)
+  expect(await subDataFiles(m)).toEqual([])
+  expect(await snapshot()).toEqual(before)
+  expect((await lstat(m.oldPaths.state)).isSymbolicLink()).toBe(true)
 })
 
 test('an older version found after the copies rolls the move back to legacy', async () => {
