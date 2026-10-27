@@ -1900,3 +1900,70 @@ test('an override into the moved state folder refuses at start', async () => {
   })
   expect(process.env.OPENCODE_ANTHROPIC_AUTH_FILE).toBe(saved)
 })
+
+/** A home folder whose OpenCode config folder does not exist yet. */
+async function missingConfigFolder(): Promise<Machine> {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'state-move-')))
+  roots.push(root)
+  const home = join(root, 'home')
+  await mkdir(home)
+  const configDir = join(home, '.config', 'opencode')
+  const state = join(root, 'state')
+  const oldPaths = await resolveNativePoolPaths(
+    join(configDir, 'anthropic-auth.json'),
+    join(configDir, 'anthropic-auth-state.json'),
+    LEGACY_STATE_LAYOUT,
+  )
+  const sub = join(state, 'cortexkit', 'anthropic-auth', 'opencode')
+  return {
+    root,
+    home,
+    configDir,
+    env: { XDG_STATE_HOME: state },
+    sub,
+    oldPaths,
+    newPaths: await resolveNativePoolPaths(
+      oldPaths.legacyConfig,
+      oldPaths.legacyState,
+      { kind: 'state-home', dir: sub },
+    ),
+    artifacts: {
+      rpcRoots: [join(root, 'rpc')],
+      rpcDirs: [],
+      cacheKeepDirs: [join(root, 'cachekeep')],
+    },
+    original: {},
+  }
+}
+
+test('a start that found no config folder creates it owner-only, stays legacy, and a second start while it runs moves nothing', async () => {
+  const m = await missingConfigFolder()
+  const first = await decide(m)
+  expect(first).toMatchObject({
+    kind: 'legacy',
+    reasons: ['the config folder did not exist when this process started'],
+  })
+  expect((await lstat(m.configDir)).mode & 0o777).toBe(0o700)
+  expect(await readdir(m.configDir)).toEqual([HOLDER_FILE_NAME])
+  // The first start still runs: its entry keeps the folder where it is.
+  const second = await decide(m, { liveness: liveness() })
+  expect(second.kind).toBe('legacy')
+  expect(await exists(join(m.sub, 'layout.json'))).toBe(false)
+  expect(await readdir(m.configDir)).toEqual([HOLDER_FILE_NAME])
+  expect(await readRelocationPointer(m.oldPaths.runtime)).toBeUndefined()
+})
+
+test('a start that found no config folder and waited for its holder lock while another start moved the new folder serves the move instead of overruling it', async () => {
+  const m = await missingConfigFolder()
+  let other: StateLayoutDecision | undefined
+  const decision = await decide(m, {
+    onStep: async (step) => {
+      // The folder now exists; another start takes the holder lock first
+      // and moves it before this start registers.
+      if (step === 'old-holders-locking' && !other) other = await decide(m)
+    },
+  })
+  expect(other?.kind).toBe('state-home')
+  expect(decision.kind).toBe('state-home')
+  expect(decision.layout).toEqual({ kind: 'state-home', dir: m.sub })
+})

@@ -7,6 +7,7 @@ import { getOpenCodeConfigDir } from './accounts.ts'
 import {
   anthropicAuthRelease,
   buildHolderEntry,
+  ensureHolderDirectory,
   HOLDER_FILE_NAME,
   type HolderLiveness,
   HolderRegistrationError,
@@ -63,6 +64,7 @@ import {
   StateLayoutRollbackRefused,
   type StateLayoutStep,
   type StateLayoutTransitionContext,
+  stateLayoutStep,
   syncCommitted,
 } from './state-layout-move.ts'
 import {
@@ -426,29 +428,23 @@ export async function decideOpenCodeStateLayout(
     return { kind: 'explicit', layout: LEGACY_STATE_LAYOUT, registration }
   }
 
-  // 2. A config folder that doesn't exist has no identity and never moves.
-  const target = resolveStateHomeTarget({ env, home })
+  // 2. A config folder that doesn't exist has no identity, and this start
+  // never moves it. Registering needs the folder, so it is created (readable
+  // by its owner only), which gives it an identity. From there this start
+  // goes through the same checks as every other legacy admission, under the
+  // folder's holder lock: a move another start committed meanwhile is found
+  // and served, never overruled.
+  let target = resolveStateHomeTarget({ env, home })
+  const neverMove: string[] = []
   if (!target) {
-    const paths = await resolveNativePoolPaths(
-      join(configDir, ACCOUNT_FILE),
-      join(configDir, ACCOUNT_STATE_FILE),
-      LEGACY_STATE_LAYOUT,
-    )
-    const registration = await registerNativePoolHolder({
-      paths,
-      role: options.role,
-      kind: 'legacy',
-      policy: 'mandatory',
-      onLockEvent: options.onLockEvent,
-      liveness: options.liveness,
-      lockTimeoutMs: options.timeouts?.holderMs,
-    })
-    return {
-      kind: 'legacy',
-      layout: LEGACY_STATE_LAYOUT,
-      reasons: ['the config folder does not exist'],
-      registration,
+    try {
+      await ensureHolderDirectory(configDir)
+    } catch (error) {
+      throw new HolderRegistrationError('unavailable', configDir, error)
     }
+    target = resolveStateHomeTarget({ env, home })
+    if (!target) throw new HolderRegistrationError('unavailable', configDir)
+    neverMove.push('the config folder did not exist when this process started')
   }
 
   const sub = await canonicalPath(target.dir)
@@ -503,16 +499,24 @@ export async function decideOpenCodeStateLayout(
       if (admitted !== 'changed') return admitted
       continue
     }
-    if (overrides.length && noMoveRecord(record)) {
-      // A process with an override never moves and never writes the marker.
+    if ((overrides.length || neverMove.length) && noMoveRecord(record)) {
+      // A process with an override never moves and never writes the marker,
+      // and a start that found no config folder never moves: there is
+      // nothing to decide under the layout lock. The old holder lock is
+      // enough to stay legacy, because a mover holds it from before its fence
+      // read to its end, and the checks under it see a move that committed.
       const ctx = newContext()
       try {
+        await stateLayoutStep(ctx, 'old-holders-locking')
         await ctx.stack.acquire({
           name: 'holders',
           path: join(dataset.oldDir, HOLDER_FILE_NAME),
           timeoutMs: ctx.holderLockTimeoutMs,
         })
-        const blockers = overrides.map((variable) => `${variable} is set`)
+        const blockers = [
+          ...overrides.map((variable) => `${variable} is set`),
+          ...neverMove,
+        ]
         const decided = await legacyHeld(dataset, options, ctx, blockers)
         if (decided !== 'changed') return decided
       } catch (error) {
@@ -551,7 +555,13 @@ export async function decideOpenCodeStateLayout(
         }
         busy(dataset.configDir, error)
       }
-      const decided = await underLayoutLock(dataset, options, ctx, overrides)
+      const decided = await underLayoutLock(
+        dataset,
+        options,
+        ctx,
+        overrides,
+        neverMove,
+      )
       if (decided !== 'again') return decided
     } catch (error) {
       if (error instanceof LockContentionError) busy(dataset.configDir, error)
@@ -596,6 +606,8 @@ async function underLayoutLock(
   options: DecideStateLayoutOptions,
   ctx: StateLayoutTransitionContext,
   overrides: readonly string[],
+  /** Why this start may not move, besides overrides. */
+  neverMove: readonly string[],
 ): Promise<StateLayoutDecision | 'again'> {
   const record = await readRecord(dataset.sub)
   if (record) requireRecordMatches(record, dataset)
@@ -668,9 +680,12 @@ async function underLayoutLock(
     const decided = await legacyHeld(dataset, options, ctx, reasons)
     return decided === 'changed' ? 'again' : decided
   }
-  if (overrides.length) {
+  if (overrides.length || neverMove.length) {
     await acquireHolderLocks(dataset, ctx)
-    return stay(overrides.map((variable) => `${variable} is set`))
+    return stay([
+      ...overrides.map((variable) => `${variable} is set`),
+      ...neverMove,
+    ])
   }
   await acquireHolderLocks(dataset, ctx)
   const holdersMark = ctx.stack.size
