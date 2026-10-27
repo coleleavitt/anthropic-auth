@@ -1,20 +1,14 @@
-import { afterEach, expect, test } from 'bun:test'
+import { expect } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildClaudeQuotaSummary } from '@cortexkit/anthropic-auth-core'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { fiveAccountSidebarState } from './fixtures/sidebar-five-accounts'
 
-let child: Bun.Subprocess<'ignore', 'pipe', 'pipe'> | undefined
-let fixture: string | undefined
-afterEach(async () => {
-  child?.kill()
-  await child?.exited
-  child = undefined
-  if (fixture) await rm(fixture, { recursive: true, force: true })
-  fixture = undefined
-})
+const lifetimes = createTestLifetimeSuite()
+const test = lifetimes.test
 
 // Each test starts Bun with OpenTUI, whose startup on a busy machine can take
 // longer than the default 5 s test timeout.
@@ -118,7 +112,8 @@ async function runStatus(options: {
   sidebar?: unknown
   theme?: typeof DARK_THEME
 }): Promise<Run> {
-  fixture = await mkdtemp(join(tmpdir(), 'anthropic-oc2-menu-status-'))
+  const fixture = await mkdtemp(join(tmpdir(), 'anthropic-oc2-menu-status-'))
+  lifetimes.deferCleanup(() => rm(fixture, { recursive: true, force: true }))
   await writeFile(
     join(fixture, 'preferences.jsonc'),
     JSON.stringify({ 'anthropic-auth': { rememberCollapsed: false } }),
@@ -161,6 +156,14 @@ async function runStatus(options: {
     ],
   }
   const probe = `
+let __probeRenderer;
+process.once('SIGTERM', () => {
+  // CliRenderer traps SIGTERM to destroy without exiting, leaving a probe
+  // blocked awaiting its next frame alive until the hook times out. Exit
+  // promptly so the harness never waits out its hook.
+  try { __probeRenderer?.destroy(); } catch {}
+  process.exit(143);
+});
 import { createTestRenderer } from '@opentui/core/testing';
 import { render } from '@opentui/solid';
 import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure';
@@ -229,7 +232,8 @@ if (!dialog) {
 }
 let destroyed;
 const teardown = new Promise((resolve) => { destroyed = resolve; });
-const setupRenderer = await createTestRenderer({ width: ${options.width}, height: 60, onDestroy() { destroyed(); } });
+const setupRenderer = await createTestRenderer({ width: ${options.width}, height: 60, exitSignals: [], onDestroy() { destroyed(); } });
+__probeRenderer = setupRenderer.renderer;
 let frame = '';
 const colors = {};
 try {
@@ -255,7 +259,7 @@ cleanup();
 console.log(JSON.stringify({ selects, frame, colors, shown, sizes, alerts, sidebarCalls }));
 process.exit(0);
 `
-  child = Bun.spawn(
+  const child = Bun.spawn(
     [process.execPath, '--preload', '@opentui/solid/preload', '-e', probe],
     {
       cwd: fileURLToPath(new URL('../../', import.meta.url)),
@@ -268,11 +272,35 @@ process.exit(0);
       stderr: 'pipe',
     },
   )
-  const [stdout, stderr, exitCode] = await Promise.all([
+  // Own the probe through the test lifetime: the gate kills it as soon as
+  // teardown starts, before the lifetime waits for this body, so a body
+  // awaiting a frame it never receives can still finish. SIGKILL after a
+  // short grace is the backstop because a signal handler alone cannot be
+  // relied on once the renderer has trapped SIGTERM.
+  const cancel = lifetimes.gate()
+  const cancellation = cancel.wait.then(async () => {
+    if (child.exitCode !== null) return
+    child.kill('SIGTERM')
+    await Bun.sleep(500)
+    if (child.exitCode === null) child.kill('SIGKILL')
+  })
+  lifetimes.trackDetached(cancellation)
+  const joined = Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
     child.exited,
   ])
+  lifetimes.trackDetached(
+    joined.then(
+      () => {},
+      (error) => {
+        throw error
+      },
+    ),
+  )
+  const [stdout, stderr, exitCode] = await joined
+  cancel.open()
+  await cancellation
   expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
   return JSON.parse(stdout.trim().split('\n').at(-1) ?? '{}')
 }
