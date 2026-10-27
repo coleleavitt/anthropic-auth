@@ -924,15 +924,59 @@ describe('OpenCode scoped custody serving', () => {
     expect(gets.some((g) => g.credentialId === 'oauth:anthropic')).toBe(true)
     await firstResponse.text()
     await drainSidebarWrites()
+    // Settle detached quota-observation saves before listing, so their
+    // runtime staging files are already renamed away when the scan runs.
+    await getPluginTestHandles(plugin).scopedRuntime.drainQuotaPublications()
     // Neither the served access token nor the enrollment token may reach any
     // file the plugin or the migration wrote: pool config, state, runtime,
     // roster, journal, host auth, sidebar or request dumps. Only the
     // enrollment file itself holds the enrollment token.
     const dumps = await readdir(dumpDir)
     expect(dumps.length).toBeGreaterThan(0)
-    const written = (await filesUnder(fixture.root)).filter(
-      (path) => path !== fixture.enrollmentPath,
-    )
+    // The per-send lastUsed save runs detached (the host gets its response
+    // first) in the plugin's usage publisher, which no test handle drains.
+    // Its runtime staging file (`<leaf>.native-runtime.<uuid>.partial`) can
+    // therefore be listed just before it is renamed away, making the read
+    // throw ENOENT. Re-list and re-read until one listing reads completely
+    // instead of racing that rename. A released lock file still reads as
+    // empty (it held no persistent data); any other vanished file retries
+    // the whole listing, and a directory that never settles fails the test.
+    // Staging files are never skipped: skipping them would let a first-time
+    // write's content escape the leak check.
+    async function scanWrittenFiles() {
+      const maxScanPasses = 10
+      let passes = 0
+      for (;;) {
+        passes++
+        const written = (await filesUnder(fixture.root)).filter(
+          (path) => path !== fixture.enrollmentPath,
+        )
+        try {
+          const serialized = (
+            await Promise.all(
+              written.map((path) =>
+                readFile(path, 'utf8').catch((error: unknown) => {
+                  if (
+                    path.endsWith('.lock') &&
+                    (error as NodeJS.ErrnoException).code === 'ENOENT'
+                  )
+                    return ''
+                  throw error
+                }),
+              ),
+            )
+          ).join('\n')
+          return { written, serialized, passes }
+        } catch (error) {
+          if (
+            passes >= maxScanPasses ||
+            (error as NodeJS.ErrnoException)?.code !== 'ENOENT'
+          )
+            throw error
+        }
+      }
+    }
+    const clean = await scanWrittenFiles()
     for (const path of [
       fixture.paths.config,
       fixture.paths.runtime,
@@ -942,26 +986,25 @@ describe('OpenCode scoped custody serving', () => {
       getSidebarStateFile(),
       ...dumps.map((name) => join(dumpDir, name)),
     ])
-      expect(written).toContain(path)
-    // Background bookkeeping can still be holding a lock when the scan runs;
-    // a lock file that is released between listing and reading held no
-    // persistent data. Any other file that disappears still fails the test.
-    const serialized = (
-      await Promise.all(
-        written.map((path) =>
-          readFile(path, 'utf8').catch((error: unknown) => {
-            if (
-              path.endsWith('.lock') &&
-              (error as NodeJS.ErrnoException).code === 'ENOENT'
-            )
-              return ''
-            throw error
-          }),
-        ),
+      expect(clean.written).toContain(path)
+    expect(clean.serialized).not.toContain('scoped-access-oauth:anthropic')
+    expect(clean.serialized).not.toContain('aa'.repeat(32))
+    // The scan above must actually read file contents: planting the served
+    // access token in an already-written dump has to show up in a rescan.
+    // The planted bytes are removed again so later steps see clean dumps.
+    const plantedPath = join(dumpDir, dumps[0]!)
+    const plantedOriginal = await readFile(plantedPath, 'utf8')
+    await writeFile(
+      plantedPath,
+      `${plantedOriginal}scoped-access-oauth:anthropic`,
+    )
+    try {
+      expect((await scanWrittenFiles()).serialized).toContain(
+        'scoped-access-oauth:anthropic',
       )
-    ).join('\n')
-    expect(serialized).not.toContain('scoped-access-oauth:anthropic')
-    expect(serialized).not.toContain('aa'.repeat(32))
+    } finally {
+      await writeFile(plantedPath, plantedOriginal)
+    }
 
     // 2. Simulate user adding a 3rd account via `ck auth login`
     const personalRow: ScopedInventoryRow = {
