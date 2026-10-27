@@ -342,16 +342,30 @@ test('setup --restore-legacy puts a moved fixture tree back in the config folder
   for (const name of Object.keys(fixture)) expect(left).not.toContain(name)
 })
 
-for (const variant of ['state-home layout', 'managed folder'] as const)
+for (const variant of [
+  'state-home layout',
+  'destination-shaped folder',
+  'managed folder',
+] as const)
   test(`OpenCode 2 refuses injected paths that reach into the state folder (${variant}), with the fixed text and no registration there`, async () => {
     const m = await machine(false)
-    const sub = join(
-      m.stateRoot,
+    // Each fixture trips exactly one of the checks of injected paths.
+    // State-home layout: the runtime files sit apart from the account files,
+    // in a folder that is neither destination-shaped nor managed.
+    const plain = join(m.root, 'plain-state')
+    await mkdir(plain)
+    // Destination-shaped: legacy-layout files in a folder named like a
+    // state-home subfolder, with no marker in it.
+    const shaped = join(
+      m.root,
+      'elsewhere',
       'cortexkit',
       'anthropic-auth',
       'opencode-0123456789abcdef',
     )
-    // A folder holding the marker of a moved dataset.
+    await mkdir(shaped, { recursive: true })
+    // Managed: legacy-layout files in an ordinarily named folder holding the
+    // marker of a moved dataset.
     const managed = join(m.root, 'managed')
     await mkdir(managed)
     await Bun.write(join(managed, 'config-dir.json'), '{}\n')
@@ -360,11 +374,17 @@ for (const variant of ['state-home layout', 'managed folder'] as const)
         ? await resolveNativePoolPaths(
             join(m.configDir, 'anthropic-auth.json'),
             join(m.configDir, 'anthropic-auth-state.json'),
-            { kind: 'state-home', dir: sub },
+            { kind: 'state-home', dir: plain },
           )
         : await resolveNativePoolPaths(
-            join(managed, 'anthropic-auth.json'),
-            join(managed, 'anthropic-auth-state.json'),
+            join(
+              variant === 'managed folder' ? managed : shaped,
+              'anthropic-auth.json',
+            ),
+            join(
+              variant === 'managed folder' ? managed : shaped,
+              'anthropic-auth-state.json',
+            ),
             LEGACY_STATE_LAYOUT,
           )
     const failure = await setupAnthropicAuth(openCode2Context(), {
@@ -381,7 +401,7 @@ for (const variant of ['state-home layout', 'managed folder'] as const)
     const message = (failure as Error).message
     expect(HOLDER_REGISTRATION_ERROR_MESSAGES).toContain(message)
     expect(message).not.toContain(m.root)
-    for (const dir of [sub, managed])
+    for (const dir of [m.configDir, plain, shaped, managed])
       expect(await Bun.file(join(dir, HOLDER_FILE_NAME)).exists()).toBe(false)
   })
 

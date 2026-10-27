@@ -164,7 +164,13 @@ export interface DecideStateLayoutOptions {
   onStep?: (step: StateLayoutStep) => void | Promise<void>
   now?: () => number
   /** Tests shorten the waits; production uses the defaults. */
-  timeouts?: { layoutMs?: number; holderMs?: number; dataMs?: number }
+  timeouts?: {
+    layoutMs?: number
+    holderMs?: number
+    dataMs?: number
+    /** Between background retries of a failed registration. */
+    retryMs?: number
+  }
   /** Overrides `RELOCATION_MOVE_ENABLED`; tests only. */
   moveEnabled?: boolean
 }
@@ -351,6 +357,7 @@ function deferLegacyRegistration(
       onLockEvent: options.onLockEvent,
       liveness: options.liveness,
       lockTimeoutMs: options.timeouts?.holderMs,
+      retryIntervalMs: options.timeouts?.retryMs,
       now: options.now,
     },
     { directory: dir, error },
@@ -774,6 +781,7 @@ export async function decideOpenCodeStateLayout(
       onLockEvent: options.onLockEvent,
       liveness: options.liveness,
       lockTimeoutMs: options.timeouts?.holderMs,
+      retryIntervalMs: options.timeouts?.retryMs,
     })
     return { kind: 'explicit', layout: LEGACY_STATE_LAYOUT, registration }
   }
@@ -1307,6 +1315,8 @@ export async function decidePiStateLayout(options: {
   onLockEvent?: (event: NativeLockEvent) => void
   liveness?: HolderLiveness
   lockTimeoutMs?: number
+  /** Between background retries of a failed registration; tests only. */
+  retryIntervalMs?: number
   /** Overrides `RELOCATION_MOVE_ENABLED`; tests only. */
   moveEnabled?: boolean
 }): Promise<{
@@ -1322,6 +1332,7 @@ export async function decidePiStateLayout(options: {
     onLockEvent: options.onLockEvent,
     liveness: options.liveness,
     lockTimeoutMs: options.lockTimeoutMs,
+    retryIntervalMs: options.retryIntervalMs,
   })
   return { kind: 'pi', layout: LEGACY_STATE_LAYOUT, registration }
 }

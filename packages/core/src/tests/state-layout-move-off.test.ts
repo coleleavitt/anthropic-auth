@@ -12,7 +12,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { withLock } from '@cortexkit/common-auth/fs'
+import { lockPathFor, withLock } from '@cortexkit/common-auth/fs'
 import {
   HOLDER_FILE_NAME,
   HOLDER_REGISTRATION_ERROR_MESSAGES,
@@ -58,7 +58,11 @@ beforeEach(() => {
   resetStateHomeServingGuardForTests()
 })
 
+/** Undo a test's induced failures before its folders are removed. */
+const repairs: Array<() => Promise<unknown>> = []
+
 afterEach(async () => {
+  for (const repair of repairs.splice(0)) await repair()
   __setLogTestSink(null)
   for (const registration of closers.splice(0)) registration.close()
   resetProcessStateLayoutsForTests()
@@ -128,11 +132,26 @@ function decide(m: Machine, options: Partial<DecideStateLayoutOptions> = {}) {
 type Kind = 'legacy' | 'explicit' | 'pi'
 type Failure = 'malformed' | 'write' | 'lock'
 
+/** Between background retries of a failed registration, in these tests. */
+const RETRY_MS = 25
+
+/** Poll `condition` until it holds, failing after a few seconds. */
+async function until(condition: () => boolean | Promise<boolean>) {
+  // Inside bun's 5-second test timeout, so a miss fails with this message.
+  const deadline = Date.now() + 2_000
+  while (!(await condition())) {
+    if (Date.now() > deadline) throw new Error('the condition never held')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
 /**
  * Start a process of `kind` whose registration fails by `failure`, and
- * return what the start resolved to (or the refusal it threw). Legacy with
- * moving on stays legacy through a routing override, the case where moving
- * on still keeps OpenCode's own dataset in its config folder.
+ * return what the start resolved to (or the refusal it threw). The failure
+ * lasts until `repair` is called, so background retries keep failing until
+ * then. Legacy with moving on stays legacy through a routing override, the
+ * case where moving on still keeps OpenCode's own dataset in its config
+ * folder.
  */
 async function startWithFailedRegistration(
   kind: Kind,
@@ -173,10 +192,14 @@ async function startWithFailedRegistration(
     await writeFile(piPaths.runtime, '{"version":1}\n', { mode: 0o600 })
   }
   const holderFile = join(dir, HOLDER_FILE_NAME)
+  const events: NativeLockEvent[] = []
+  let failing = true
   // A failed holder write: the folder turns read-only once the holder lock
   // is held, so the lock is taken but the holder file can't be written.
   const onLockEvent = (event: NativeLockEvent) => {
+    events.push(event)
     if (
+      failing &&
       failure === 'write' &&
       event.type === 'acquired' &&
       event.name === 'holders' &&
@@ -185,6 +208,42 @@ async function startWithFailedRegistration(
       chmodSync(dir, 0o500)
   }
   if (failure === 'malformed') await writeFile(holderFile, '{not json')
+  // Another process holds the holder lock until the repair.
+  let releaseLock = () => {}
+  let holding: Promise<unknown> = Promise.resolve()
+  if (failure === 'lock') {
+    const held = new Promise<void>((resolve) => {
+      releaseLock = resolve
+    })
+    let taken = () => {}
+    const isTaken = new Promise<void>((resolve) => {
+      taken = resolve
+    })
+    holding = withLock(
+      holderFile,
+      { name: 'holders', ttlMs: 10_000, timeoutMs: 1_000, renew: true },
+      async () => {
+        taken()
+        await held
+      },
+    )
+    await isTaken
+  }
+  const repair = async () => {
+    failing = false
+    releaseLock()
+    await holding
+    await chmod(dir, 0o700)
+    if (failure === 'malformed') await rm(holderFile, { force: true })
+    // A holder lock taken while the folder was read-only could not be
+    // removed on release; it would block every retry until it expires.
+    if (failure === 'write')
+      await rm(lockPathFor(holderFile, 'holders'), {
+        recursive: true,
+        force: true,
+      })
+  }
+  repairs.push(repair)
   const start = async (): Promise<NativeHolderRegistration | undefined> => {
     if (kind === 'pi' && piPaths)
       return (
@@ -194,62 +253,126 @@ async function startWithFailedRegistration(
           onLockEvent,
           liveness: liveness([process.pid]),
           lockTimeoutMs: 300,
+          retryIntervalMs: RETRY_MS,
           moveEnabled,
         })
       ).registration
-    const decision = await decide(m, { env, onLockEvent, moveEnabled })
+    const decision = await decide(m, {
+      env,
+      onLockEvent,
+      moveEnabled,
+      timeouts: {
+        layoutMs: 300,
+        holderMs: 300,
+        dataMs: 300,
+        retryMs: RETRY_MS,
+      },
+    })
     expect(decision.kind).toBe(kind as 'legacy' | 'explicit')
     if (decision.kind === 'state-home') throw new Error('not expected')
     return decision.registration
   }
   const logs: LogTestRecord[] = []
   __setLogTestSink((record) => logs.push(record))
-  const result =
-    failure === 'lock'
-      ? withLock(
-          holderFile,
-          { name: 'holders', ttlMs: 10_000, timeoutMs: 1_000, renew: true },
-          start,
-        )
-      : start()
-  const outcome = await result.then(
+  const outcome = await start().then(
     (registration) => ({ registration }),
     (error: unknown) => ({ error }),
   )
+  // The start's own write failure leaves the folder read-only; the retries
+  // turn it read-only again each time they take the lock, until the repair.
   await chmod(dir, 0o700)
   if ('registration' in outcome && outcome.registration)
     closers.push(outcome.registration)
   return {
     m,
     dir,
+    holderFile,
     outcome,
-    warnings: logs.filter(
-      (record) =>
-        record.level === 'warn' &&
-        record.message.includes('could not record that it is using'),
-    ),
+    events,
+    repair,
+    warnings: () =>
+      logs.filter(
+        (record) =>
+          record.level === 'warn' &&
+          record.message.includes('could not record that it is using'),
+      ),
+  }
+}
+
+/** The lock events of background retries on `holderFile` of `type`. */
+function retryEvents(
+  events: readonly NativeLockEvent[],
+  holderFile: string,
+  type: NativeLockEvent['type'],
+) {
+  return events.filter(
+    (event) =>
+      event.detached === true &&
+      event.name === 'holders' &&
+      event.path === holderFile &&
+      event.type === type,
+  )
+}
+
+async function holderEntries(holderFile: string) {
+  const text = await readFile(holderFile, 'utf8').catch(() => undefined)
+  try {
+    return (
+      JSON.parse(text ?? '') as { entries: { pid: number; kind: string }[] }
+    ).entries
+  } catch {
+    // Absent or invalid: nobody is registered there.
+    return []
   }
 }
 
 for (const kind of ['legacy', 'explicit', 'pi'] as const)
   for (const failure of ['malformed', 'write', 'lock'] as const) {
-    test(`moving off: a ${kind} start whose registration fails (${failure}) still serves, warns once and retries in the background`, async () => {
-      const { outcome, warnings } = await startWithFailedRegistration(
-        kind,
-        failure,
-        false,
-      )
+    test(`moving off: a ${kind} start whose registration fails (${failure}) still serves, warns once, and its background retry registers it once repaired`, async () => {
+      const { outcome, events, holderFile, repair, warnings } =
+        await startWithFailedRegistration(kind, failure, false)
       if ('error' in outcome) throw outcome.error
-      expect(outcome.registration?.status).toBe('pending')
-      expect(warnings).toHaveLength(1)
+      const registration = outcome.registration
+      if (!registration) throw new Error('the start registered at once')
+      expect(registration.status).toBe('pending')
+      expect(warnings()).toHaveLength(1)
+      // Retries run, in the background, and keep failing while the failure
+      // lasts.
+      await until(
+        () => retryEvents(events, holderFile, 'acquiring').length >= 2,
+      )
+      expect(await holderEntries(holderFile)).not.toContainEqual(
+        expect.objectContaining({ pid: process.pid }),
+      )
+      await repair()
+      let timer: ReturnType<typeof setTimeout> | undefined
+      await Promise.race([
+        registration.settled,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('the retry never registered')),
+            2_000,
+          )
+        }),
+      ]).finally(() => clearTimeout(timer))
+      expect(await holderEntries(holderFile)).toContainEqual(
+        expect.objectContaining({ pid: process.pid, kind }),
+      )
+      // The registration that landed was a background retry's.
+      expect(
+        retryEvents(events, holderFile, 'acquired').length,
+      ).toBeGreaterThan(0)
+      // The failed retries did not warn again.
+      expect(warnings()).toHaveLength(1)
     })
 
     test(`moving on: a ${kind} start whose registration fails (${failure}) refuses`, async () => {
-      const { outcome, dir } = await startWithFailedRegistration(
+      const { outcome, dir, repair } = await startWithFailedRegistration(
         kind,
         failure,
         true,
       )
+      await repair()
       if (!('error' in outcome)) throw new Error('the start was admitted')
       if (kind === 'legacy' && failure === 'lock') {
         // OpenCode's own dataset waits for the holder lock as part of the
@@ -703,4 +826,82 @@ test('moving off: a journal a move set aside keeps the strict checks when the co
   )
   await repair()
   expectFixedRefusal(error, m)
+})
+
+test('a config folder that does not exist and can not be created: moving off serves legacy with the registration retried, moving on refuses with the fixed text', async () => {
+  for (const moveEnabled of [false, true]) {
+    const m = await machine()
+    // OPENCODE_CONFIG_DIR names a folder inside one that takes no new files.
+    const parent = join(m.root, 'read-only')
+    await mkdir(parent)
+    const configDir = join(parent, 'opencode')
+    await chmod(parent, 0o500)
+    repairs.push(() => chmod(parent, 0o700))
+    const logs: LogTestRecord[] = []
+    __setLogTestSink((record) => logs.push(record))
+    const result = await decide(m, {
+      env: { ...m.env, OPENCODE_CONFIG_DIR: configDir },
+      moveEnabled,
+    }).then(
+      (decision) => ({ decision }),
+      (error: unknown) => ({ error }),
+    )
+    if (!moveEnabled) {
+      if ('error' in result) throw result.error
+      expect(result.decision.kind).toBe('legacy')
+      expect(result.decision.layout).toEqual(LEGACY_STATE_LAYOUT)
+      if (result.decision.kind !== 'legacy') throw new Error('not expected')
+      const registration = result.decision.registration
+      if (registration) closers.push(registration)
+      expect(registration?.status).toBe('pending')
+      expect(
+        logs.filter(
+          (record) =>
+            record.level === 'warn' &&
+            record.message.includes('could not record that it is using'),
+        ),
+      ).toHaveLength(1)
+      continue
+    }
+    if (!('error' in result)) throw new Error('the start was admitted')
+    expectFixedRegistrationRefusal(result.error, m)
+  }
+})
+
+test('moving off: a move that commits while a start waits for the holder lock is found once the lock is taken', async () => {
+  const m = await machine()
+  const holderFile = join(m.configDir, HOLDER_FILE_NAME)
+  let contended = () => {}
+  const waiting = new Promise<void>((resolve) => {
+    contended = resolve
+  })
+  let start: Promise<unknown> | undefined
+  // Another process (a mover) holds the config folder's holder lock while
+  // this start waits for it, and leaves a tombstone before letting go. The
+  // record of the move can't be read, so a start that sees the move refuses.
+  await withLock(
+    holderFile,
+    { name: 'holders', ttlMs: 10_000, timeoutMs: 1_000, renew: true },
+    async () => {
+      start = decide(m, {
+        moveEnabled: false,
+        timeouts: { layoutMs: 300, holderMs: 5_000, dataMs: 300 },
+        onLockEvent: (event) => {
+          if (event.type === 'contended' && event.path === holderFile)
+            contended()
+        },
+      }).then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      await waiting
+      await tombstone(m)
+      await corruptRecord(m)
+    },
+  )
+  expectFixedRefusal(await start, m)
+  // Nothing was registered in the config folder as a legacy start.
+  expect(await holderEntries(holderFile)).not.toContainEqual(
+    expect.objectContaining({ pid: process.pid }),
+  )
 })
