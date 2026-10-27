@@ -10,7 +10,7 @@ on:
         type: string
         required: false
   push:
-    branches: [main, 'windows-verify/**']
+    branches: [main, "windows-verify/**"]
   pull_request:
     branches: [main]
 
@@ -27,10 +27,10 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
       - uses: actions/setup-node@v6
         with:
-          node-version: '24'
+          node-version: "24"
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: '1.3.14'
+          bun-version: "1.3.14"
       - name: Install locked build dependencies
         run: bun install --frozen-lockfile
       - name: Sync requested release version
@@ -80,7 +80,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
       - uses: actions/setup-node@v6
         with:
-          node-version: '24'
+          node-version: "24"
       - name: Download package tarballs
         uses: actions/download-artifact@v8
         with:
