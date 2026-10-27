@@ -1195,6 +1195,26 @@ test('an old pool state or journal reappearing after the move is a fatal conflic
   )
 })
 
+test('an already serving state-home process warns once, and keeps serving, when an old vault file is back', async () => {
+  const m = await machine()
+  expect((await decide(m)).kind).toBe('state-home')
+  const guard = nativeRelocationGuard(m.newPaths)
+  await expect(guard.assertNotRelocated()).resolves.toBeUndefined()
+  const logs: LogTestRecord[] = []
+  __setLogTestSink((record) => logs.push(record))
+  const roster = nativeVaultPaths(m.oldPaths, LEGACY_STATE_LAYOUT).roster
+  await writeFile(roster, '{"roster":"stale"}\n')
+  await expect(guard.assertNotRelocated()).resolves.toBeUndefined()
+  // A later change to the same file is checked again but not warned again.
+  await appendFile(roster, ' ')
+  await expect(guard.assertNotRelocated()).resolves.toBeUndefined()
+  expect(
+    logs.filter(
+      (record) => record.level === 'warn' && record.message.includes(roster),
+    ),
+  ).toHaveLength(1)
+})
+
 test('a changed XDG_STATE_HOME after a move refuses and names where the state went', async () => {
   const m = await machine()
   expect((await decide(m)).kind).toBe('state-home')

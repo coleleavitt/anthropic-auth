@@ -35,6 +35,7 @@ import {
 import {
   checkStateHomeServing,
   stateHomeServingFiles,
+  warnReappearedMetadata,
 } from './state-home-serving-guard.ts'
 import {
   StateLayoutRefusalError,
@@ -55,7 +56,6 @@ import {
   moveDataset,
   movePreconditionFailure,
   type RelocationDataset,
-  reappearedMetadataFiles,
   recordFilesProblem,
   resolveRelocationDataset,
   rollbackPreparing,
@@ -239,9 +239,6 @@ async function registerHeld(
   }
 }
 
-/** Warn once per process about old metadata files back in the config folder. */
-const warnedReappeared = new Set<string>()
-
 /**
  * Admit this process to the state-home layout while
  * `ctx.stack` holds `<sub>`'s holder lock: the record must still be
@@ -272,15 +269,7 @@ async function admitHeld(
     })
     throw conflict
   }
-  for (const path of await reappearedMetadataFiles(record)) {
-    if (warnedReappeared.has(path)) continue
-    warnedReappeared.add(path)
-    logger.warn(
-      'state-layout',
-      `anthropic-auth found ${path} in the config folder after moving its state to ${dataset.sub}. It holds no credentials and is not used; delete it when convenient.`,
-      { path },
-    )
-  }
+  await warnReappearedMetadata(record)
   await registerHeld(
     join(dataset.sub, HOLDER_FILE_NAME),
     dataset.newPaths,

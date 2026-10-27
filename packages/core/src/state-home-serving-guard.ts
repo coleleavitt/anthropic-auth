@@ -24,6 +24,12 @@ export interface StateHomeServingFiles {
   readonly newPoolState: string
   readonly oldJournal: string
   readonly newJournal: string
+  /**
+   * The old custody roster and vault store state, roster and routing files.
+   * They hold no credential, so one back in the old folder is only warned
+   * about.
+   */
+  readonly oldMetadata: readonly string[]
 }
 
 /**
@@ -41,6 +47,56 @@ export function stateHomeServingFiles(
     newPoolState: paths.state,
     oldJournal: join(oldDir, STATE_HOME_FILE_NAMES.journal),
     newJournal: paths.journal,
+    oldMetadata: METADATA_ROLES.map((role) =>
+      join(oldDir, STATE_HOME_FILE_NAMES[role]),
+    ),
+  }
+}
+
+const METADATA_ROLES = [
+  'localRoster',
+  'vaultStoreState',
+  'vaultRoster',
+  'vaultRouting',
+] as const
+
+async function exists(path: string): Promise<boolean> {
+  return (await identityOf(path)) !== 'absent'
+}
+
+/** Old files that hold no credential and are back in the old folder after a move. */
+export async function reappearedMetadataFiles(
+  record: StateLayoutRecord,
+): Promise<string[]> {
+  const found: string[] = []
+  for (const file of record.files) {
+    if (!(METADATA_ROLES as readonly string[]).includes(file.role)) continue
+    // Until cleanup is done the verified old copy may still be there.
+    if (record.cleanup === 'pending' && file.sha256 !== null) continue
+    if (record.kept?.includes(file.from)) continue
+    if (await exists(file.from)) found.push(file.from)
+  }
+  return found
+}
+
+/** Old metadata files already warned about, so each is warned about once. */
+const warnedReappeared = new Set<string>()
+
+/**
+ * Warn, once per file and process, about old metadata files back in the old
+ * folder. Serving goes on: they hold no credential and nothing reads them.
+ */
+export async function warnReappearedMetadata(
+  record: StateLayoutRecord,
+): Promise<void> {
+  for (const path of await reappearedMetadataFiles(record)) {
+    if (warnedReappeared.has(path)) continue
+    warnedReappeared.add(path)
+    logger.warn(
+      'state-layout',
+      `anthropic-auth found ${path} in the config folder after moving its state to ${record.sub}. It holds no credentials and is not used; delete it when convenient.`,
+      { path },
+    )
   }
 }
 
@@ -239,9 +295,11 @@ export function probeStateHomeServingForTests(
  * A guard that stops an already serving state-home process once its dataset
  * is in conflict. It has the relocation guard's shape so every locked write
  * callback that checks for a move (vault store, roster, routing, authorize)
- * checks for a conflict instead. It takes no lock, and reads files again
- * only when the `lstat` identity of the marker, an old file or the set-aside
- * journal changed, so a check costs four `lstat`s while nothing changes.
+ * checks for a conflict instead. It also warns once about an old metadata
+ * file back in the old folder. It takes no lock, and reads files again only
+ * when the `lstat` identity of the marker, an old file or the set-aside
+ * journal changed, so a check costs a few parallel `lstat`s while nothing
+ * changes.
  */
 export function createStateHomeServingGuard(
   files: StateHomeServingFiles,
@@ -252,7 +310,12 @@ export function createStateHomeServingGuard(
     const last = observations.get(dataset)
     // Every identity is taken before the file it describes is read, so a
     // change after this point always shows up as a new key next time.
-    const watched = [marker, files.oldJournal, files.oldPoolState]
+    const watched = [
+      marker,
+      files.oldJournal,
+      files.oldPoolState,
+      ...files.oldMetadata,
+    ]
     const moving = last?.moving
     const paths = moving ? [...watched, moving] : watched
     probe?.({ type: 'lstat', paths: paths.length })
@@ -275,6 +338,7 @@ export function createStateHomeServingGuard(
       moving: result.moving,
       refusal: result.refusal,
     })
+    if (result.record) await warnReappearedMetadata(result.record)
     const refusal = result.refusal
     if (refusal && !reported.has(refusal.message)) {
       reported.add(refusal.message)
@@ -301,4 +365,5 @@ export function createStateHomeServingGuard(
 export function resetStateHomeServingGuardForTests() {
   reported.clear()
   observations.clear()
+  warnedReappeared.clear()
 }

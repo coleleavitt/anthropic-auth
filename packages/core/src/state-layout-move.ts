@@ -1219,22 +1219,3 @@ async function rollbackAfterFailure(
   }
   return rollbackPreparing(preparing, dataset, ctx)
 }
-
-/** Old files that hold no credential and reappeared after a move. */
-export async function reappearedMetadataFiles(
-  record: StateLayoutRecord,
-): Promise<string[]> {
-  const found: string[] = []
-  for (const file of record.files) {
-    if (
-      CREDENTIAL_AUTHORITY_ROLES.includes(file.role) ||
-      file.role === 'localRuntime' ||
-      file.role === 'vaultRuntime'
-    )
-      continue
-    if (record.cleanup === 'pending' && file.sha256 !== null) continue
-    if (record.kept?.includes(file.from)) continue
-    if (await exists(file.from)) found.push(file.from)
-  }
-  return found
-}
