@@ -642,6 +642,32 @@ test('locks are taken in the order of the refresh drain', async () => {
   )
 })
 
+test('row locks are taken in the raw-key order common-auth publication uses, which encoding would change', async () => {
+  const m = await machine()
+  const store = createNativePoolStore({
+    paths: m.oldPaths,
+    quota: nativeQuotaCodec,
+  })
+  // Legal ids whose order flips once encoded: '-' < ':' but '%3A' < '-'.
+  for (const id of ['a:b', 'a-b'])
+    await store.add({ id, credential: credential(id) })
+  await store.close()
+  const rows: string[] = []
+  await decide(m, {
+    onLockEvent: (event) => {
+      if (
+        event.type === 'acquired' &&
+        event.path === m.oldPaths.state &&
+        event.name.startsWith('row-')
+      )
+        rows.push(event.name)
+    },
+  })
+  expect(rows).toEqual(
+    ['a', 'a-b', 'a:b'].map((key) => `row-${encodeURIComponent(key)}`),
+  )
+})
+
 /**
  * Core's refresh coordinator over the old pool, with every policy hook
  * allowing the refresh. `exchange` stands in for the provider's token

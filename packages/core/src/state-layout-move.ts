@@ -304,15 +304,17 @@ async function acquirePoolLocks(
 ): Promise<void> {
   const timeoutMs = ctx.dataLockTimeoutMs
   const snapshot = await poolRows(pool)
-  const rowNames = [
+  // Sorted by the raw key, then encoded, exactly as common-auth's roster
+  // publication orders the row locks it takes: encoding can reorder legal
+  // ids (`a-b` sorts before `a:b`, but `a%3Ab` before `a-b`).
+  const rowKeys = [
     ...new Set(
       snapshot.flatMap((row) =>
-        row.identity
-          ? [rowLockName(row.id), rowLockName(row.identity)]
-          : [rowLockName(row.id)],
+        row.identity ? [row.id, row.identity] : [row.id],
       ),
     ),
   ].sort()
+  const rowNames = rowKeys.map(rowLockName)
   for (const name of rowNames)
     await ctx.stack.acquire({ name, path: pool.state, timeoutMs })
   await ctx.stack.acquire({
