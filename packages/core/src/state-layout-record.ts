@@ -90,6 +90,16 @@ function hash(value: unknown): value is string | null {
     (typeof value === 'string' && /^[0-9a-f]{64}$/.test(value))
   )
 }
+/**
+ * A move's attempt id is a random UUID. It becomes part of file names
+ * (`<journal>.moving-<attempt>`, staging names), so nothing else is accepted.
+ */
+function attemptId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)
+  )
+}
 
 function parseRecord(value: unknown): StateLayoutRecord | undefined {
   if (!isRecord(value) || value.version !== 1) return undefined
@@ -108,7 +118,7 @@ function parseRecord(value: unknown): StateLayoutRecord | undefined {
   } = value
   if (
     !(STATE_LAYOUT_PHASES as readonly unknown[]).includes(phase) ||
-    !text(attempt) ||
+    !attemptId(attempt) ||
     !text(identity) ||
     !text(stateRoot) ||
     !text(sub) ||
@@ -141,14 +151,24 @@ function parseRecord(value: unknown): StateLayoutRecord | undefined {
   }
   if (new Set(parsedFiles.map((file) => file.role)).size !== parsedFiles.length)
     return undefined
+  // A record always lists every role, once.
+  if (parsedFiles.length !== RELOCATION_ROLES.length) return undefined
+  const sha = (role: RelocationRole) =>
+    parsedFiles.find((file) => file.role === role)?.sha256 ?? null
   const runtimeBarrier = (raw: unknown) =>
     isRecord(raw) && hash(raw.original) ? { original: raw.original } : undefined
   const localRuntime = runtimeBarrier(barriers.localRuntime)
   const vaultRuntime = runtimeBarrier(barriers.vaultRuntime)
+  // The barriers describe the same snapshot as the file list: the journal was
+  // set aside exactly when it existed, and each runtime's original bytes are
+  // the ones the list recorded.
+  const journal = sha('journal') === null ? 'absent' : 'present'
   if (
-    (barriers.journal !== 'present' && barriers.journal !== 'absent') ||
+    barriers.journal !== journal ||
     !localRuntime ||
-    !vaultRuntime
+    !vaultRuntime ||
+    localRuntime.original !== sha('localRuntime') ||
+    vaultRuntime.original !== sha('vaultRuntime')
   )
     return undefined
   const cleanup = value.cleanup
@@ -200,7 +220,7 @@ function parseRecord(value: unknown): StateLayoutRecord | undefined {
     startedAt,
     files: parsedFiles,
     barriers: {
-      journal: barriers.journal,
+      journal,
       localRuntime,
       vaultRuntime,
     },

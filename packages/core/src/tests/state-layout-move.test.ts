@@ -1289,6 +1289,77 @@ test('marker problems refuse: another config folder, an unreadable record, a del
   expect(await readdir(deleted.sub)).toEqual(before)
 })
 
+/** The state folder's files other than lock files, by name. */
+async function subTree(m: Machine) {
+  const tree: Record<string, string> = {}
+  for (const name of (await readdir(m.sub)).sort())
+    if (!name.endsWith('.lock'))
+      tree[name] = await readFile(join(m.sub, name), 'utf8')
+  return tree
+}
+
+test('recovery refuses a record that does not list exactly this dataset, and deletes nothing', async () => {
+  type RawRecord = {
+    attempt: string
+    files: { role: string; to: string }[]
+    barriers: { localRuntime: { original: string | null } }
+  }
+  const cases: [string, (record: RawRecord, victim: string) => void][] = [
+    [
+      'a missing role',
+      (record) => {
+        record.files = record.files.filter(
+          (file) => file.role !== 'vaultRouting',
+        )
+      },
+    ],
+    [
+      'a substituted path',
+      (record, victim) => {
+        const roster = record.files.find((file) => file.role === 'localRoster')
+        if (roster) roster.to = victim
+      },
+    ],
+    [
+      'an inconsistent barrier',
+      (record) => {
+        record.barriers.localRuntime.original = null
+      },
+    ],
+    [
+      'a malformed attempt id',
+      (record) => {
+        record.attempt = '../../elsewhere'
+      },
+    ],
+  ]
+  for (const [name, edit] of cases) {
+    const m = await machine()
+    await expect(
+      decide(m, { onStep: crashAt('copies-flushed') }),
+    ).rejects.toBeInstanceOf(StateLayoutCrash)
+    // An unrelated file with the same bytes as a copy the rollback would
+    // remove.
+    const victim = join(m.root, 'victim.json')
+    await writeFile(victim, await readFile(m.newPaths.roster))
+    const layout = join(m.sub, 'layout.json')
+    const record = JSON.parse(await readFile(layout, 'utf8')) as RawRecord
+    edit(record, victim)
+    await writeFile(layout, JSON.stringify(record))
+    const snapshot = async () => ({
+      name,
+      old: await oldTree(m),
+      sub: await subTree(m),
+      victim: await readFile(victim, 'utf8').catch(() => undefined),
+    })
+    const before = await snapshot()
+    await expect(decide(m)).rejects.toMatchObject({
+      code: 'marker-unreadable',
+    })
+    expect(await snapshot()).toEqual(before)
+  }
+})
+
 test('rollback never removes config-dir.json, holder files, lock files, unknown files or a copy whose source vanished', async () => {
   const m = await machine()
   await expect(

@@ -481,6 +481,27 @@ async function removeOwnStaging(path: string): Promise<void> {
   }
 }
 
+/**
+ * Why `record` doesn't list exactly the files of `dataset`, each role with the
+ * paths this start resolved, or undefined when it does. Recovery deletes and
+ * renames only files a record names, so a record naming any other file is
+ * never acted on.
+ */
+export function recordFilesProblem(
+  record: Pick<StateLayoutRecord, 'files'>,
+  dataset: Pick<RelocationDataset, 'slots'>,
+): string | undefined {
+  if (record.files.length !== dataset.slots.length)
+    return `it lists ${record.files.length} files, not ${dataset.slots.length}`
+  for (const slot of dataset.slots) {
+    const file = record.files.find((candidate) => candidate.role === slot.role)
+    if (!file) return `it has no ${slot.role} entry`
+    if (file.from !== slot.from || file.to !== slot.to)
+      return `its ${slot.role} entry names ${file.from} and ${file.to}, not ${slot.from} and ${slot.to}`
+  }
+  return undefined
+}
+
 /** Why a move may not start, or undefined when it may. */
 export async function movePreconditionFailure(
   dataset: RelocationDataset,

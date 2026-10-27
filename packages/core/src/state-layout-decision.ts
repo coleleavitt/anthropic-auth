@@ -56,6 +56,7 @@ import {
   movePreconditionFailure,
   type RelocationDataset,
   reappearedMetadataFiles,
+  recordFilesProblem,
   resolveRelocationDataset,
   rollbackPreparing,
   StateLayoutCrash,
@@ -193,6 +194,10 @@ function requireRecordMatches(
       `${layoutRecordPath(dataset.sub)} belongs to another config folder (${record.oldDir}), not ${dataset.oldDir}. Check OPENCODE_CONFIG_DIR and any symlink to the config folder.`,
       [layoutRecordPath(dataset.sub), record.oldDir, dataset.oldDir],
     )
+  // Recovery acts only on the files a record names: it must name exactly
+  // this dataset's files.
+  const problem = recordFilesProblem(record, dataset)
+  if (problem) markerUnreadable(dataset.sub, new Error(problem))
 }
 
 async function readRecord(sub: string) {
