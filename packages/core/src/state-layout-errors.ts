@@ -53,11 +53,13 @@ export class StateLayoutRefusalError extends Error {
 export function stateLayoutConflict(
   oldPath: string,
   newPath: string,
+  cause?: unknown,
 ): StateLayoutRefusalError {
   return new StateLayoutRefusalError(
     'conflict',
     `anthropic-auth found two copies of the same account state: ${oldPath} (old folder) and ${newPath} (state folder). It stopped using both so a refresh token is never used twice. Keep the copy you trust, move the other one out of both folders, then restart OpenCode.`,
     [oldPath, newPath],
+    cause,
   )
 }
 

@@ -1053,6 +1053,92 @@ test('the conflict stops a process that is already serving', async () => {
   await expect(guard.assertNotRelocated()).resolves.toBeUndefined()
 })
 
+test('a changed set-aside journal found by cleanup survives a later failed unlink: recorded as a conflict and refused', async () => {
+  for (const recordWrite of ['succeeds', 'fails'] as const) {
+    const m = await machine()
+    await expect(
+      decide(m, { onStep: crashAt('committed') }),
+    ).rejects.toBeInstanceOf(StateLayoutCrash)
+    const record = await readStateLayoutRecord(m.sub)
+    const moving = `${m.oldPaths.journal}.moving-${record?.attempt}`
+    // A writer that ignored every lock changed the journal the move set aside.
+    await appendFile(moving, ' ')
+    const changed = await readFile(moving, 'utf8')
+    const base = defaultStateLayoutFs()
+    const layout = join(m.sub, 'layout.json')
+    const fs: StateLayoutFs = {
+      ...base,
+      // The custody roster is removed after the journal is examined.
+      unlink: async (path) => {
+        if (path === m.oldPaths.roster)
+          throw Object.assign(new Error('injected'), { code: 'EIO' })
+        await base.unlink(path)
+      },
+      rename: async (from, to) => {
+        if (recordWrite === 'fails' && to === layout)
+          throw Object.assign(new Error('injected'), { code: 'EIO' })
+        await base.rename(from, to)
+      },
+    }
+    const attempt = decide(m, { fs })
+    await expect(attempt).rejects.toBeInstanceOf(StateLayoutRefusalError)
+    await expect(attempt).rejects.toMatchObject({
+      code: 'conflict',
+      paths: [moving, m.newPaths.journal],
+    })
+    expect({
+      recordWrite,
+      cleanup: (await readStateLayoutRecord(m.sub))?.cleanup,
+    }).toEqual({
+      recordWrite,
+      cleanup: recordWrite === 'succeeds' ? 'conflict' : 'pending',
+    })
+    if (recordWrite === 'succeeds')
+      expect((await readStateLayoutRecord(m.sub))?.conflict).toEqual([
+        { old: moving, new: m.newPaths.journal },
+      ])
+    // Both copies are kept.
+    expect(await readFile(moving, 'utf8')).toBe(changed)
+    expect(await readFile(m.newPaths.journal, 'utf8')).toBe(
+      m.original.journal as string,
+    )
+    expect(processStateLayout(m.oldPaths.legacyConfig)).toBe(
+      LEGACY_STATE_LAYOUT,
+    )
+    // The next start, with nothing failing, still refuses.
+    await expect(decide(m)).rejects.toMatchObject({ code: 'conflict' })
+  }
+})
+
+test('a process serving with cleanup pending notices a changed set-aside journal', async () => {
+  const m = await machine()
+  const base = defaultStateLayoutFs()
+  const fs: StateLayoutFs = {
+    ...base,
+    // The first old copy can't be removed, so cleanup stays pending.
+    unlink: async (path) => {
+      if (path === m.oldPaths.state)
+        throw Object.assign(new Error('injected'), { code: 'EIO' })
+      await base.unlink(path)
+    },
+  }
+  expect((await decide(m, { fs })).kind).toBe('state-home')
+  const record = await readStateLayoutRecord(m.sub)
+  expect(record?.cleanup).toBe('pending')
+  const moving = `${m.oldPaths.journal}.moving-${record?.attempt}`
+  expect(await readFile(moving, 'utf8')).toBe(m.original.journal as string)
+  const guard = nativeRelocationGuard(m.newPaths)
+  await expect(guard.assertNotRelocated()).resolves.toBeUndefined()
+  await appendFile(moving, ' ')
+  await expect(guard.assertNotRelocated()).rejects.toMatchObject({
+    code: 'conflict',
+    paths: [moving, m.newPaths.journal],
+  })
+  // The verified bytes back again: serving resumes.
+  await writeFile(moving, m.original.journal as string)
+  await expect(guard.assertNotRelocated()).resolves.toBeUndefined()
+})
+
 test('an old pool state or journal reappearing after the move is a fatal conflict at start; a vault file is only a warning', async () => {
   for (const [role, path] of [
     ['pool state', (m: Machine) => m.oldPaths.state],

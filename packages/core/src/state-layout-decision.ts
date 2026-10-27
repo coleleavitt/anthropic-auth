@@ -608,6 +608,9 @@ async function underLayoutLock(
         await cleanupOldCopies(record, dataset, ctx)
       } catch (error) {
         if (error instanceof StateLayoutCrash) throw error
+        // A conflict the cleanup found refuses; only an ordinary failure
+        // leaves cleanup for a later start, behind the barriers.
+        if (error instanceof StateLayoutRefusalError) throw error
         // The barriers keep the old copies unusable; cleanup is retried later.
         logger.warn(
           'state-layout',
@@ -698,7 +701,8 @@ async function underLayoutLock(
   } catch (error) {
     if (
       error instanceof StateLayoutCrash ||
-      error instanceof StateLayoutRollbackRefused
+      error instanceof StateLayoutRollbackRefused ||
+      error instanceof StateLayoutRefusalError
     )
       throw error
     await ctx.stack.releaseTo(holdersMark)

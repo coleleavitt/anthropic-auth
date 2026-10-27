@@ -227,6 +227,11 @@ export function layoutRecordPath(sub: string): string {
   return join(sub, STATE_HOME_FILE_NAMES.layoutMarker)
 }
 
+/** The name the journal is set aside under during a move. */
+export function movingJournalPath(journal: string, attempt: string): string {
+  return `${journal}.moving-${attempt}`
+}
+
 /**
  * Read `<sub>/layout.json` in full. Undefined only when it is absent; any other
  * read error, and any content that isn't a complete record, throws

@@ -21,6 +21,10 @@ import { type NativePoolPaths, resolveNativePoolPaths } from './pool-paths.ts'
 import { drainNativePoolStores } from './pool-store.ts'
 import { forgetRelocationObservations } from './relocation-guard.ts'
 import {
+  StateLayoutRefusalError,
+  stateLayoutConflict,
+} from './state-layout-errors.ts'
+import {
   createOwnerOnlyFile,
   digestFile,
   type FileDigest,
@@ -39,6 +43,7 @@ import {
   CREDENTIAL_AUTHORITY_ROLES,
   isLayoutRecordStage,
   layoutRecordPath,
+  movingJournalPath,
   publishStateLayoutRecord,
   RELOCATION_ROLES,
   type RelocationFileRecord,
@@ -49,6 +54,8 @@ import {
 
 const ACCOUNT_FILE = 'anthropic-auth.json'
 const ACCOUNT_STATE_FILE = 'anthropic-auth-state.json'
+
+export { movingJournalPath } from './state-layout-record.ts'
 
 /** Lock name of the layout lock on `<sub>/layout.json`. */
 export const LAYOUT_LOCK_NAME = 'runtime-layout'
@@ -443,11 +450,6 @@ async function tombstoneAttempt(path: string): Promise<string | undefined> {
   }
 }
 
-/** The name the journal is set aside under during a move. */
-export function movingJournalPath(journal: string, attempt: string): string {
-  return `${journal}.moving-${attempt}`
-}
-
 function relocatingPath(path: string, attempt: string): string {
   return `${path}.relocating-${attempt}`
 }
@@ -783,6 +785,11 @@ export async function rollbackPreparing(
  * stops every state-home process. Any other changed file is kept and listed.
  * Running it again after a conflict was resolved by hand finishes the
  * cleanup.
+ *
+ * Once a credential conflict is found it outlives any later failure: if a
+ * later step or the final record write fails, the conflict is still recorded
+ * when possible, and the call throws a `conflict` refusal rather than the
+ * failure, so no caller can mistake it for an ordinary pending cleanup.
  */
 export async function cleanupOldCopies(
   record: StateLayoutRecord,
@@ -791,67 +798,106 @@ export async function cleanupOldCopies(
 ): Promise<StateLayoutRecord> {
   const kept: string[] = []
   const conflict: { old: string; new: string }[] = []
-  // A journal at its legacy name after the commit is back from somewhere:
-  // the move set it aside before the commit.
-  const journalSlot = record.files.find((file) => file.role === 'journal')
-  if (journalSlot && (await exists(journalSlot.from)))
-    conflict.push({ old: journalSlot.from, new: journalSlot.to })
-  for (const role of RELOCATION_ROLES) {
-    if (role === 'localRuntime' || role === 'vaultRuntime') continue
-    const file = record.files.find((candidate) => candidate.role === role)
-    if (!file) continue
-    const path =
-      role === 'journal'
-        ? movingJournalPath(file.from, record.attempt)
-        : file.from
-    await ctx.stack.assertAll()
-    const digest: FileDigest = await digestFile(path)
-    const credential = CREDENTIAL_AUTHORITY_ROLES.includes(role)
-    if (digest.status === 'absent') {
-      // Already removed.
-    } else if (file.sha256 !== null && digest.sha256 === file.sha256) {
-      await owned(
-        ctx,
-        { kind: 'unlink', path },
-        expectDigest(path, file.sha256),
-      )
-    } else if (credential) {
-      conflict.push({ old: path, new: file.to })
-      logger.error(
-        'state-layout',
-        'an old copy of anthropic-auth credentials changed after the move; both copies were kept and anthropic-auth stopped using them',
-        { old: path, new: file.to },
-      )
-    } else if (file.sha256 !== null) {
-      kept.push(path)
-      logger.error(
-        'state-layout',
-        'an old anthropic-auth file changed after the move and was kept',
-        { path },
-      )
+  const publish = (next: StateLayoutRecord) =>
+    publishStateLayoutRecord(
+      next,
+      {
+        assertLeases: () => ctx.stack.assertAll(),
+        expect: expectRecord(dataset.sub, {
+          phase: 'committed',
+          attempt: record.attempt,
+        }),
+      },
+      ctx.fs,
+    )
+  const outcome = (): StateLayoutRecord => {
+    const next: StateLayoutRecord = {
+      ...record,
+      cleanup: conflict.length ? 'conflict' : kept.length ? 'kept' : 'done',
+      ...(kept.length ? { kept: [...kept] } : {}),
+      ...(conflict.length ? { conflict: [...conflict] } : {}),
     }
-    await stateLayoutStep(ctx, `cleanup:${role}`)
+    if (!conflict.length) delete (next as { conflict?: unknown }).conflict
+    if (!kept.length) delete (next as { kept?: unknown }).kept
+    return next
   }
-  await ctx.fs.syncDirectory(dataset.oldDir)
-  const next: StateLayoutRecord = {
-    ...record,
-    cleanup: conflict.length ? 'conflict' : kept.length ? 'kept' : 'done',
-    ...(kept.length ? { kept } : {}),
-    ...(conflict.length ? { conflict } : {}),
+  const refusal = (cause: unknown) => {
+    const [first] = conflict
+    return stateLayoutConflict(
+      first?.old ?? dataset.oldPaths.state,
+      first?.new ?? dataset.newPaths.state,
+      cause,
+    )
   }
-  if (!conflict.length) delete (next as { conflict?: unknown }).conflict
-  if (!kept.length) delete (next as { kept?: unknown }).kept
-  await publishStateLayoutRecord(
-    next,
-    {
-      assertLeases: () => ctx.stack.assertAll(),
-      expect: expectRecord(dataset.sub, {
-        phase: 'committed',
-        attempt: record.attempt,
-      }),
-    },
-    ctx.fs,
-  )
+  try {
+    // A journal at its legacy name after the commit is back from somewhere:
+    // the move set it aside before the commit.
+    const journalSlot = record.files.find((file) => file.role === 'journal')
+    if (journalSlot && (await exists(journalSlot.from)))
+      conflict.push({ old: journalSlot.from, new: journalSlot.to })
+    for (const role of RELOCATION_ROLES) {
+      if (role === 'localRuntime' || role === 'vaultRuntime') continue
+      const file = record.files.find((candidate) => candidate.role === role)
+      if (!file) continue
+      const path =
+        role === 'journal'
+          ? movingJournalPath(file.from, record.attempt)
+          : file.from
+      await ctx.stack.assertAll()
+      const credential = CREDENTIAL_AUTHORITY_ROLES.includes(role)
+      let digest: FileDigest | undefined
+      try {
+        digest = await digestFile(path)
+      } catch (error) {
+        // A credential file that is no longer a plain file can't be proven
+        // to be the verified copy, so it is a second copy.
+        if (!credential) throw error
+      }
+      if (digest?.status === 'absent') {
+        // Already removed.
+      } else if (
+        digest !== undefined &&
+        file.sha256 !== null &&
+        digest.sha256 === file.sha256
+      ) {
+        await owned(
+          ctx,
+          { kind: 'unlink', path },
+          expectDigest(path, file.sha256),
+        )
+      } else if (credential) {
+        conflict.push({ old: path, new: file.to })
+        logger.error(
+          'state-layout',
+          'an old copy of anthropic-auth credentials changed after the move; both copies were kept and anthropic-auth stopped using them',
+          { old: path, new: file.to },
+        )
+      } else if (file.sha256 !== null) {
+        kept.push(path)
+        logger.error(
+          'state-layout',
+          'an old anthropic-auth file changed after the move and was kept',
+          { path },
+        )
+      }
+      await stateLayoutStep(ctx, `cleanup:${role}`)
+    }
+    await ctx.fs.syncDirectory(dataset.oldDir)
+  } catch (error) {
+    if (error instanceof StateLayoutCrash || !conflict.length) throw error
+    // Record what was found before the failure; if even that fails, the
+    // refusal below still stops this start, and the next start finds the
+    // same conflict again.
+    await publish(outcome()).catch(() => {})
+    throw refusal(error)
+  }
+  const next = outcome()
+  try {
+    await publish(next)
+  } catch (error) {
+    if (error instanceof StateLayoutCrash || !conflict.length) throw error
+    throw refusal(error)
+  }
   await stateLayoutStep(ctx, 'cleanup-recorded')
   return next
 }
@@ -1089,6 +1135,9 @@ export async function moveDataset(
     }
   } catch (error) {
     if (error instanceof StateLayoutCrash) throw error
+    // A conflict found by the cleanup stops this process like any other
+    // start; only an ordinary cleanup failure leaves cleanup pending.
+    if (error instanceof StateLayoutRefusalError) throw error
     logger.warn(
       'state-layout',
       'anthropic-auth moved its state but could not remove every old copy yet; it retries at the next start',
