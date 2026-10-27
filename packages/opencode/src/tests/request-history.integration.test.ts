@@ -467,7 +467,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     )
     expect(missingRequestPlan.status).toBe(400)
     expect((await missingRequestPlan.json()).error.message).toBe(
-      'Missing or invalid internal Fable 5.1 effort request plan',
+      'Missing or invalid internal per-message effort request plan',
     )
 
     const refusalLogs: LogTestRecord[] = []
@@ -475,7 +475,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     const missingAllMarkers = await send('ses_effort_missing_all', [])
     expect(missingAllMarkers.status).toBe(400)
     expect((await missingAllMarkers.json()).error.message).toBe(
-      'Fable 5.1 effort marker correlation failed: expected 1, found 0',
+      'Per-message effort marker correlation failed: expected 1, found 0',
     )
     const missingAllLog = refusalLogs.find(
       (record) => record.payload?.check === 'missing_all_markers',
@@ -483,7 +483,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     expect(missingAllLog).toMatchObject({
       level: 'warn',
       channel: 'effort-history',
-      message: 'refused uncorrelated Fable 5.1 request',
+      message: 'refused uncorrelated per-message effort request',
       payload: {
         markerCount: 1,
         resolvedPlan: true,
@@ -502,7 +502,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     ])
     expect(duplicateTransition.status).toBe(400)
     expect((await duplicateTransition.json()).error.message).toBe(
-      'Fable 5.1 effort marker correlation failed: expected 1, found 2',
+      'Per-message effort marker correlation failed: expected 1, found 2',
     )
 
     const misplacedAnchor = await auth.fetch(MESSAGES_URL, {
@@ -531,12 +531,12 @@ describe('Fable 5.1 request-scoped effort history', () => {
     })
     expect(misplacedAnchor.status).toBe(400)
     expect((await misplacedAnchor.json()).error.message).toBe(
-      'Missing or invalid internal Fable 5.1 effort anchor placement',
+      'Missing or invalid internal per-message effort anchor placement',
     )
     expect(refusalLogs).toContainEqual({
       level: 'warn',
       channel: 'effort-history',
-      message: 'refused uncorrelated Fable 5.1 request',
+      message: 'refused uncorrelated per-message effort request',
       payload: expect.objectContaining({
         check: 'anchor_placement',
         anchorBoundaryId: 'msg_marked_high',

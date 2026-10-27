@@ -1522,6 +1522,8 @@ export async function rewriteRequestBody(
     midConversationEffortEnabled?: boolean
     midConversationEffortPlan?: string
     midConversationEffortResolvedPlan?: OpenCodeEffortMarkerPlan
+    // Every recorded plan version for the resolved plan's user message.
+    midConversationEffortPlanVersions?: readonly OpenCodeEffortMarkerPlan[]
     turnEndNoteEnabled?: boolean
     turnEndNote?: { tools: string[] }
     perf?: RewritePerfCallback
@@ -1604,6 +1606,7 @@ export async function rewriteRequestBody(
       options.midConversationEffortEnabled === true,
       options.midConversationEffortPlan,
       options.midConversationEffortResolvedPlan,
+      options.midConversationEffortPlanVersions,
     )
     applyThinkingBindingControls(
       parsed,

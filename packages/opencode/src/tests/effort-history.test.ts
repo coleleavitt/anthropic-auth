@@ -1,8 +1,11 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+import { logger } from '@cortexkit/anthropic-auth-core'
 import {
   applyOpenCodeEffortMarkers,
   EFFORT_ANCHOR_PREFIX,
   EFFORT_MARKER_PREFIX,
+  EFFORT_PLAN_REQUEST_HEADER,
   encodeOpenCodeEffortPlan,
   markOpenCodeEffortTransitions,
   OpenCodeEffortPlanTracker,
@@ -289,7 +292,9 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 0')
+    ).toThrow(
+      'Per-message effort marker correlation failed: expected 2, found 0',
+    )
 
     const body = {
       model: 'claude-fable-5-1',
@@ -403,7 +408,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Missing or invalid internal Fable 5.1 effort anchor placement')
+    ).toThrow('Missing or invalid internal per-message effort anchor placement')
   })
 
   test('rejects a plain user turn after an assistant reply', () => {
@@ -437,7 +442,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Missing or invalid internal Fable 5.1 effort anchor placement')
+    ).toThrow('Missing or invalid internal per-message effort anchor placement')
   })
 
   test('rejects a tool result that does not match the preceding tool use', () => {
@@ -485,7 +490,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Missing or invalid internal Fable 5.1 effort anchor placement')
+    ).toThrow('Missing or invalid internal per-message effort anchor placement')
   })
 
   test('rejects a tool-result user message mixed with text', () => {
@@ -530,7 +535,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Missing or invalid internal Fable 5.1 effort anchor placement')
+    ).toThrow('Missing or invalid internal per-message effort anchor placement')
   })
 
   test('distinguishes a mismatched anchor token from invalid placement', () => {
@@ -569,7 +574,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         ),
         expectedPlan as NonNullable<typeof expectedPlan>,
       ),
-    ).toThrow('Mismatched internal Fable 5.1 effort anchor token')
+    ).toThrow('Mismatched internal per-message effort anchor token')
   })
 
   test('rejects non-prefix transition loss even with the resolved plan', () => {
@@ -611,7 +616,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Fable 5.1 effort marker non-prefix loss')
+    ).toThrow('Per-message effort marker non-prefix loss')
   })
 
   test('rejects a lowered marker sequence that differs from the post-transform request plan', () => {
@@ -639,7 +644,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
 
     expect(() =>
       applyOpenCodeEffortMarkers(body, true, mismatchedHeader),
-    ).toThrow('Fable 5.1 effort marker request plan mismatch')
+    ).toThrow('Per-message effort marker request plan mismatch')
   })
 
   test('defers a change past user records that OpenCode will not lower', () => {
@@ -924,7 +929,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Fable 5.1 effort marker non-prefix loss')
+    ).toThrow('Per-message effort marker non-prefix loss')
   })
 
   test('rejects a merged boundary whose transitions are duplicated', () => {
@@ -963,7 +968,9 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 3')
+    ).toThrow(
+      'Per-message effort marker correlation failed: expected 2, found 3',
+    )
   })
 
   test('rejects a foreign-scope marker at index 1 of a merged boundary', () => {
@@ -1010,7 +1017,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Fable 5.1 effort marker scope mismatch')
+    ).toThrow('Per-message effort marker scope mismatch')
   })
 })
 
@@ -1119,7 +1126,7 @@ test('refuses complete marker loss when an earlier message survives the supposed
       encodeOpenCodeEffortPlan(plan),
       plan,
     ),
-  ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 0')
+  ).toThrow('Per-message effort marker correlation failed: expected 2, found 0')
 })
 
 test('rebinds an identical zero-marker header across ordinary same-effort turns without revoking the newer turn', () => {
@@ -1165,7 +1172,7 @@ test('rejects a cross-session plan collision even when its encoded zero-marker h
   const forged = { ...first, sessionId: 'ses_other', messageId: 'msg_other' }
   expect(encodeOpenCodeEffortPlan(forged)).toBe(encodeOpenCodeEffortPlan(first))
   expect(() => tracker.record(forged)).toThrow(
-    'Fable 5.1 effort plan header collision',
+    'Per-message effort plan header collision',
   )
   expect(tracker.resolveHeader(encodeOpenCodeEffortPlan(first))).toEqual(first)
   expect(
@@ -1449,5 +1456,243 @@ describe('OpenCode per-message effort beyond Fable 5.1', () => {
       baseline: 'max',
       markerCount: 0,
     })
+  })
+})
+
+// OpenCode re-plans the current user message on every tool-loop step. When a
+// compaction marker moves between steps, the same boundary gets a new plan,
+// and a message transform running after ours can put the earlier step's
+// anchor text back into the body.
+describe('OpenCode effort anchor restored from an earlier plan version', () => {
+  const session = 'ses_restored_anchor'
+  const model = 'claude-opus-5-5'
+  const ids = {
+    early: 'msg_01_early',
+    t1: 'msg_02_t1',
+    compaction: 'msg_03_compaction',
+    maxRun: 'msg_04_max',
+    t2: 'msg_05_t2',
+    boundary: 'msg_06_boundary',
+  }
+
+  /** The window before the compaction marker moved: T1 is still visible. */
+  function oldWindow(
+    efforts: { t1?: string; maxRun?: string; boundary?: string } = {},
+  ): HostMessage[] {
+    return [
+      user(ids.early, session, model, 'xhigh'),
+      assistant('msg_01_step', session),
+      user(ids.t1, session, model, efforts.t1 ?? 'max'),
+      assistant('msg_02_step', session),
+      user(ids.maxRun, session, model, efforts.maxRun ?? 'max'),
+      assistant('msg_04_step', session),
+      user(ids.t2, session, model, 'xhigh'),
+      assistant('msg_05_step', session),
+      user(ids.boundary, session, model, efforts.boundary ?? 'xhigh'),
+    ]
+  }
+
+  /** The window after the compaction marker moved past T1. */
+  function newWindow(): HostMessage[] {
+    const compaction = user(ids.compaction, session, model, 'max')
+    ;(compaction.parts as Array<Record<string, unknown>>).push({
+      type: 'compaction',
+    })
+    return [
+      compaction,
+      assistant('msg_03_summary', session),
+      user(ids.maxRun, session, model, 'max'),
+      assistant('msg_04_step', session),
+      user(ids.t2, session, model, 'xhigh'),
+      assistant('msg_05_step', session),
+      user(ids.boundary, session, model, 'xhigh'),
+    ]
+  }
+
+  function plan(messages: HostMessage[]) {
+    const marked = markOpenCodeEffortTransitions(messages)
+    if (!marked?.anchorToken) throw new Error('Missing anchored effort plan')
+    return marked
+  }
+
+  function requestBody(messages: HostMessage[]): Record<string, unknown> {
+    return {
+      model,
+      thinking: { ...ADAPTIVE },
+      output_config: { effort: 'xhigh' },
+      messages: lower(messages),
+    }
+  }
+
+  /** Replace the anchor on the last user message, as the restore did. */
+  function restoreAnchor(body: Record<string, unknown>, anchorToken: string) {
+    const messages = body.messages as Array<{
+      role: string
+      content: Array<{ type: string; text: string }>
+    }>
+    const last = messages.findLast((message) => message.role === 'user')
+    const block = last?.content.find((item) =>
+      item.text.startsWith(EFFORT_ANCHOR_PREFIX),
+    )
+    if (!block) throw new Error('Missing anchor block')
+    block.text = anchorToken
+  }
+
+  const sha256 = (value: string) =>
+    createHash('sha256').update(value).digest('hex')
+
+  test('accepts an earlier anchor whose plan gives the same efforts and sends the header plan', () => {
+    const tracker = new OpenCodeEffortPlanTracker()
+    const oldPlan = plan(oldWindow())
+    tracker.record(oldPlan)
+    const newMessages = newWindow()
+    const newPlan = plan(newMessages)
+    tracker.record(newPlan)
+    expect(oldPlan).toMatchObject({ baseline: 'xhigh', markerCount: 2 })
+    expect(newPlan).toMatchObject({ baseline: 'max', markerCount: 1 })
+    expect(oldPlan.anchorToken).not.toBe(newPlan.anchorToken)
+
+    const headers: Record<string, string> = {}
+    expect(
+      tracker.markHeaders({
+        sessionId: session,
+        messageId: ids.boundary,
+        headers,
+      }),
+    ).toBe(true)
+    const header = headers[EFFORT_PLAN_REQUEST_HEADER]
+    const resolved = tracker.resolveHeader(header)
+    expect(resolved?.digest).toBe(newPlan.digest)
+    const versions = tracker.versionsFor(session, ids.boundary)
+    expect(versions.map((version) => version.digest)).toEqual([
+      oldPlan.digest,
+      newPlan.digest,
+    ])
+
+    const control = requestBody(newMessages)
+    expect(
+      applyOpenCodeEffortMarkers(control, true, header, resolved, versions),
+    ).toEqual({ found: 1, inserted: 1 })
+
+    const restored = requestBody(newMessages)
+    restoreAnchor(restored, oldPlan.anchorToken as string)
+    const warn = spyOn(logger, 'warn').mockImplementation(() => {})
+    try {
+      expect(
+        applyOpenCodeEffortMarkers(restored, true, header, resolved, versions),
+      ).toEqual({ found: 1, inserted: 1 })
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith(
+        'effort-history',
+        expect.any(String),
+        expect.objectContaining({
+          check: 'anchor_token_equivalent_plan',
+          expectedAnchorHash: sha256(newPlan.anchorToken as string),
+          foundAnchorHash: sha256(oldPlan.anchorToken as string),
+        }),
+      )
+    } finally {
+      warn.mockRestore()
+    }
+
+    // The request goes out exactly as the header plan dictates.
+    expect(restored).toEqual(control)
+    expect(restored.output_config).toEqual({ effort: 'max' })
+    const wire = restored.messages as Array<Record<string, unknown>>
+    expect(wire.filter((message) => message.role === 'system')).toEqual([
+      { role: 'system', content: [], output_config: { effort: 'xhigh' } },
+    ])
+    const systemIndex = wire.findIndex((message) => message.role === 'system')
+    expect(wire[systemIndex + 1]).toEqual({
+      role: 'user',
+      content: [{ type: 'text', text: ids.t2 }],
+    })
+    expect(JSON.stringify(restored)).not.toContain('cortexkit-internal-effort')
+  })
+
+  function expectRefused(
+    restoredAnchor: string,
+    versionsFor: (
+      tracker: OpenCodeEffortPlanTracker,
+    ) => ReturnType<OpenCodeEffortPlanTracker['versionsFor']>,
+    recordBeforeNewPlan: Array<ReturnType<typeof plan>> = [],
+  ) {
+    const tracker = new OpenCodeEffortPlanTracker()
+    for (const recorded of recordBeforeNewPlan) tracker.record(recorded)
+    const newMessages = newWindow()
+    const newPlan = plan(newMessages)
+    tracker.record(newPlan)
+    const body = requestBody(newMessages)
+    restoreAnchor(body, restoredAnchor)
+    const warn = spyOn(logger, 'warn').mockImplementation(() => {})
+    try {
+      expect(() =>
+        applyOpenCodeEffortMarkers(
+          body,
+          true,
+          encodeOpenCodeEffortPlan(newPlan),
+          newPlan,
+          versionsFor(tracker),
+        ),
+      ).toThrow('Mismatched internal per-message effort anchor token')
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  }
+
+  test('refuses an earlier anchor whose plan folds to a different baseline', () => {
+    // The turns before T2 were `high`, so dropping T1 leaves a `high`
+    // baseline, not the header plan's `max`.
+    const oldPlan = plan(oldWindow({ t1: 'high', maxRun: 'high' }))
+    expect(oldPlan).toMatchObject({ baseline: 'xhigh', markerCount: 2 })
+    expectRefused(
+      oldPlan.anchorToken as string,
+      (tracker) => tracker.versionsFor(session, ids.boundary),
+      [oldPlan],
+    )
+  })
+
+  test('refuses an earlier anchor that is not recorded for the message', () => {
+    const oldPlan = plan(oldWindow())
+    expectRefused(oldPlan.anchorToken as string, (tracker) =>
+      tracker.versionsFor(session, ids.boundary),
+    )
+  })
+
+  test('refuses an earlier anchor on a different boundary', () => {
+    // The plan for the T2 turn, whose anchor names T2 instead of the current
+    // boundary. Offer it as a version anyway so only the boundary differs.
+    const otherBoundary = oldWindow().slice(0, 7)
+    const otherPlan = plan(otherBoundary)
+    expect(otherPlan.messageId).toBe(ids.t2)
+    expectRefused(
+      otherPlan.anchorToken as string,
+      (tracker) => [...tracker.versionsFor(session, ids.boundary), otherPlan],
+      [otherPlan],
+    )
+  })
+
+  test('refuses an earlier anchor that carries a different effort', () => {
+    const oldPlan = plan(oldWindow({ boundary: 'max' }))
+    expect(oldPlan.anchorToken).toContain('effort="z"')
+    expectRefused(
+      oldPlan.anchorToken as string,
+      (tracker) => tracker.versionsFor(session, ids.boundary),
+      [oldPlan],
+    )
+  })
+
+  test('refuses an earlier anchor whose plan is not a prefix trim of the header plan', () => {
+    // The change to xhigh sits on msg_04 instead of T2, so the header plan's
+    // transitions are not a suffix of this plan's.
+    const oldPlan = plan(oldWindow({ maxRun: 'xhigh' }))
+    expect(oldPlan.transitionTokens).toHaveLength(2)
+    expect(oldPlan.transitionTokens.at(-1)).toContain(ids.maxRun)
+    expectRefused(
+      oldPlan.anchorToken as string,
+      (tracker) => tracker.versionsFor(session, ids.boundary),
+      [oldPlan],
+    )
   })
 })

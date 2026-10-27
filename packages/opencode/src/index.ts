@@ -378,10 +378,14 @@ function shouldFallbackResponse(
 function effortMarkerFailureResponse(
   error: EffortMarkerCorrelationError,
 ): Response {
-  logger.warn('effort-history', 'refused uncorrelated Fable 5.1 request', {
-    check: error.check,
-    ...error.details,
-  })
+  logger.warn(
+    'effort-history',
+    'refused uncorrelated per-message effort request',
+    {
+      check: error.check,
+      ...error.details,
+    },
+  )
   return localInvalidRequestResponse(error.message)
 }
 
@@ -6945,6 +6949,12 @@ const anthropicAuthPlugin = async (
               requestHeaders.get(EFFORT_PLAN_REQUEST_HEADER) ?? undefined
             const resolvedEffortPlan =
               effortPlanTracker.resolveHeader(effortPlanHeader)
+            const effortPlanVersions = resolvedEffortPlan
+              ? effortPlanTracker.versionsFor(
+                  resolvedEffortPlan.sessionId,
+                  resolvedEffortPlan.messageId,
+                )
+              : undefined
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
@@ -6983,6 +6993,7 @@ const anthropicAuthPlugin = async (
                   midConversationEffortEnabled: false,
                   midConversationEffortPlan: effortPlanHeader,
                   midConversationEffortResolvedPlan: resolvedEffortPlan,
+                  midConversationEffortPlanVersions: effortPlanVersions,
                   modelRemapEnabled: true,
                   perf: (stage, data) =>
                     trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
@@ -7158,6 +7169,12 @@ const anthropicAuthPlugin = async (
               requestHeaders.get(EFFORT_PLAN_REQUEST_HEADER) ?? undefined
             const resolvedEffortPlan =
               effortPlanTracker.resolveHeader(effortPlanHeader)
+            const effortPlanVersions = resolvedEffortPlan
+              ? effortPlanTracker.versionsFor(
+                  resolvedEffortPlan.sessionId,
+                  resolvedEffortPlan.messageId,
+                )
+              : undefined
             const billingLineageHeader =
               requestHeaders.get(BILLING_LINEAGE_REQUEST_HEADER) ?? undefined
             const resolvedBillingLineage =
@@ -7270,6 +7287,7 @@ const anthropicAuthPlugin = async (
                   turnEndNote: (await getRequestStorage())?.turnEndNote,
                   midConversationEffortPlan: effortPlanHeader,
                   midConversationEffortResolvedPlan: resolvedEffortPlan,
+                  midConversationEffortPlanVersions: effortPlanVersions,
                   hybridStandbyAnchor: standbyCacheAnchor,
                   serverSideFallbackEnabled: fallbackMode === 'server',
                   laneStart: laneStartRequest,

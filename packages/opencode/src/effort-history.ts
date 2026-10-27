@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import {
   type AdaptiveEffort,
   defaultAdaptiveEffort,
+  logger,
   normalizeAdaptiveEffort,
   pinsEffortOnEveryRequest,
   resolveClaudeModelCapabilities,
@@ -112,8 +113,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * Group a model id into the per-message-effort family whose user turns share
- * one effort timeline. Turns sent to a different family in the same session
- * are left out, so a Fable 5.1 timeline never counts Opus 5.5 turns.
+ * one effort timeline. Every model that takes effort markers (Fable 5.1,
+ * Opus 5.5 and Sonnet 5.5) is its own family, and turns sent to a different
+ * family in the same session are left out: an Opus 5.5 timeline never counts
+ * Sonnet 5.5 or Fable 5.1 turns, and the reverse.
  */
 function perMessageEffortFamily(model: unknown): string | undefined {
   // Models whose capability row allows effort markers; the family is the
@@ -367,7 +370,7 @@ export function markOpenCodeEffortTransitions(
   const messageId = currentUser.info?.id
   if (typeof sessionId !== 'string' || typeof messageId !== 'string') {
     throw new EffortMarkerCorrelationError(
-      'Cannot correlate Fable 5.1 effort markers without session and message IDs',
+      'Cannot correlate per-message effort markers without session and message IDs',
     )
   }
   const scope = markerScope(sessionId)
@@ -410,12 +413,12 @@ export function markOpenCodeEffortTransitions(
     if (effort === activeEffort) continue
     if (transitionTokens.length >= MAX_EFFORT_MARKERS) {
       throw new EffortMarkerCorrelationError(
-        'Too many Fable 5.1 effort changes in the active context',
+        'Too many per-message effort changes in the active context',
       )
     }
     if (!Array.isArray(item.parts) || typeof info.id !== 'string') {
       throw new EffortMarkerCorrelationError(
-        'Cannot mark a Fable 5.1 effort change without message identity',
+        'Cannot mark a per-message effort change without message identity',
       )
     }
     const token = transitionMarker(scope, info.id, effort)
@@ -579,7 +582,7 @@ function resolveExpectedPlan(
     resolvedPlan.transitionTokens.length !== requestPlan.markerCount
   ) {
     throw new EffortMarkerCorrelationError(
-      'Fable 5.1 effort marker request plan mismatch',
+      'Per-message effort marker request plan mismatch',
     )
   }
   const transitions = resolvedPlan.transitionTokens.map((token) =>
@@ -609,7 +612,7 @@ function resolveExpectedPlan(
       )
   ) {
     throw new EffortMarkerCorrelationError(
-      'Fable 5.1 effort marker request plan mismatch',
+      'Per-message effort marker request plan mismatch',
     )
   }
   return {
@@ -618,18 +621,207 @@ function resolveExpectedPlan(
   }
 }
 
-/** Consume request-correlated markers and insert Anthropic effort system messages. */
+type BodyPlanResolution = {
+  effectiveBaseline: AdaptiveEffort
+  // One entry per wire message that receives an effort system message, as
+  // "<message index>:<effort>", with the effort read from the plan.
+  systemMarkers: string[]
+}
+
+/**
+ * Match the body's surviving transition markers against the end of a plan's
+ * transition list. A later message transform may trim old history, so leading
+ * transitions can be missing; the last missing one sets the effective
+ * baseline. Throws when the body is not such a suffix of the plan.
+ */
+function resolveBodyAgainstPlan(
+  planTransitions: readonly ParsedTransitionMarker[],
+  planBaseline: AdaptiveEffort,
+  messages: readonly ParsedUserMessage[],
+  anchor: ParsedEffortAnchor | undefined,
+): BodyPlanResolution {
+  const transitions = messages.flatMap((message) => message.transitions)
+  const found = transitions.length
+  const trimmedPrefix = planTransitions.length - found
+  if (trimmedPrefix < 0) {
+    throw new EffortMarkerCorrelationError(
+      `Per-message effort marker correlation failed: expected ${planTransitions.length}, found ${found}`,
+    )
+  }
+  const expectedSuffix = planTransitions.slice(trimmedPrefix)
+  if (
+    transitions.some(
+      (transition, index) => transition.token !== expectedSuffix[index]?.token,
+    )
+  ) {
+    throw new EffortMarkerCorrelationError(
+      'Per-message effort marker non-prefix loss',
+    )
+  }
+  const removedTransitions = planTransitions.slice(0, trimmedPrefix)
+  if (
+    anchor &&
+    removedTransitions.some(
+      (transition) => transition.boundary === anchor.boundary,
+    )
+  ) {
+    throw new EffortMarkerCorrelationError(
+      'Per-message effort marker non-prefix loss',
+    )
+  }
+  const systemMarkers: string[] = []
+  let seen = 0
+  messages.forEach((message, index) => {
+    if (message.transitions.length === 0) return
+    seen += message.transitions.length
+    systemMarkers.push(`${index}:${expectedSuffix[seen - 1]?.effort}`)
+  })
+  return {
+    effectiveBaseline: removedTransitions.at(-1)?.effort ?? planBaseline,
+    systemMarkers,
+  }
+}
+
+/**
+ * Two plans for the same user message are prefix-trim consistent when the
+ * shorter one is the longer one with its oldest transitions folded into the
+ * baseline: its transitions are the longer plan's last ones, and its baseline
+ * is the effort of the last transition it drops (or the longer plan's
+ * baseline when it drops none).
+ */
+function isPrefixTrimConsistent(
+  first: {
+    baseline: AdaptiveEffort
+    transitions: readonly ParsedTransitionMarker[]
+  },
+  second: {
+    baseline: AdaptiveEffort
+    transitions: readonly ParsedTransitionMarker[]
+  },
+): boolean {
+  const [longer, shorter] =
+    first.transitions.length >= second.transitions.length
+      ? [first, second]
+      : [second, first]
+  const dropped = longer.transitions.length - shorter.transitions.length
+  if (
+    shorter.transitions.some(
+      (transition, index) =>
+        transition.token !== longer.transitions[dropped + index]?.token,
+    )
+  ) {
+    return false
+  }
+  const foldedBaseline =
+    dropped > 0 ? longer.transitions[dropped - 1]?.effort : longer.baseline
+  return shorter.baseline === foldedBaseline
+}
+
+/**
+ * Find the recorded plan behind a body anchor that differs from the header
+ * plan's anchor, and return it only when sending the body under the header
+ * plan is provably the same as sending it under that plan.
+ *
+ * OpenCode runs the messages transform on every tool-loop step, so the same
+ * user message can be planned again after its history window moved (for
+ * example when a compaction marker moved). A message transform that runs
+ * after ours can then put back the anchor text we appended on an earlier
+ * step. Returns null in every other case, and the caller refuses the request.
+ */
+function equivalentRecordedPlan(input: {
+  anchor: ParsedEffortAnchor
+  anchorCount: number
+  headerPlan: OpenCodeEffortMarkerPlan
+  headerTransitions: readonly ParsedTransitionMarker[]
+  headerAnchor: ParsedEffortAnchor
+  recordedVersions: readonly OpenCodeEffortMarkerPlan[]
+  messages: readonly ParsedUserMessage[]
+}): OpenCodeEffortMarkerPlan | null {
+  const { anchor, headerPlan, headerAnchor } = input
+  // The anchor's checksum was verified when it was parsed from the body.
+  if (
+    input.anchorCount !== 1 ||
+    anchor.scope !== headerAnchor.scope ||
+    anchor.boundary !== headerAnchor.boundary
+  ) {
+    return null
+  }
+  const bodyPlan = input.recordedVersions.find(
+    (version) =>
+      version.sessionId === headerPlan.sessionId &&
+      version.messageId === headerPlan.messageId &&
+      version.digest !== headerPlan.digest &&
+      version.anchorToken === anchor.token,
+  )
+  if (!bodyPlan) return null
+  try {
+    const bodyExpected = resolveExpectedPlan(
+      {
+        scope: bodyPlan.scope,
+        baseline: bodyPlan.baseline,
+        markerCount: bodyPlan.markerCount,
+        digest: bodyPlan.digest,
+      },
+      bodyPlan,
+    )
+    if (
+      !bodyExpected?.anchor ||
+      bodyExpected.anchor.token !== anchor.token ||
+      bodyExpected.anchor.effort !== headerAnchor.effort ||
+      !isPrefixTrimConsistent(
+        {
+          baseline: headerPlan.baseline,
+          transitions: input.headerTransitions,
+        },
+        { baseline: bodyPlan.baseline, transitions: bodyExpected.transitions },
+      )
+    ) {
+      return null
+    }
+    const underHeader = resolveBodyAgainstPlan(
+      input.headerTransitions,
+      headerPlan.baseline,
+      input.messages,
+      anchor,
+    )
+    const underBody = resolveBodyAgainstPlan(
+      bodyExpected.transitions,
+      bodyPlan.baseline,
+      input.messages,
+      anchor,
+    )
+    if (
+      underHeader.effectiveBaseline !== underBody.effectiveBaseline ||
+      underHeader.systemMarkers.join('\n') !==
+        underBody.systemMarkers.join('\n')
+    ) {
+      return null
+    }
+  } catch (error) {
+    if (error instanceof EffortMarkerCorrelationError) return null
+    throw error
+  }
+  return bodyPlan
+}
+
+/**
+ * Consume request-correlated markers and insert Anthropic effort system
+ * messages. `recordedVersions` lists every plan still recorded for the
+ * resolved plan's user message; it is consulted only when the body's anchor
+ * differs from the header plan's.
+ */
 export function applyOpenCodeEffortMarkers(
   body: Record<string, unknown>,
   enabled: boolean,
   requestPlanHeader?: string,
   resolvedPlan?: OpenCodeEffortMarkerPlan,
+  recordedVersions: readonly OpenCodeEffortMarkerPlan[] = [],
 ): { found: number; inserted: number } {
   if (!Array.isArray(body.messages)) return { found: 0, inserted: 0 }
   const requestPlan = parseRequestEffortPlan(requestPlanHeader)
   if (requestPlanHeader && !requestPlan) {
     throw new EffortMarkerCorrelationError(
-      'Missing or invalid internal Fable 5.1 effort request plan',
+      'Missing or invalid internal per-message effort request plan',
     )
   }
 
@@ -674,7 +866,7 @@ export function applyOpenCodeEffortMarkers(
           ? lastUserMessage.content
           : []
       throw new EffortMarkerCorrelationError(
-        `Fable 5.1 effort marker correlation failed: expected ${requestPlan.markerCount}, found 0`,
+        `Per-message effort marker correlation failed: expected ${requestPlan.markerCount}, found 0`,
         'missing_all_markers',
         {
           markerCount: requestPlan.markerCount,
@@ -703,7 +895,7 @@ export function applyOpenCodeEffortMarkers(
         planDigest(requestPlan.scope, requestPlan.baseline, 0, [])
     ) {
       throw new EffortMarkerCorrelationError(
-        'Fable 5.1 effort marker request plan mismatch',
+        'Per-message effort marker request plan mismatch',
       )
     }
     // Only models with `effortMarkers: "always"` (Fable 5.1) pin top-level
@@ -730,7 +922,7 @@ export function applyOpenCodeEffortMarkers(
     // Marker-shaped user text without a trusted internal plan remains untouched.
     if (found === 0) return { found: 0, inserted: 0 }
     throw new EffortMarkerCorrelationError(
-      'Missing or invalid internal Fable 5.1 effort request plan',
+      'Missing or invalid internal per-message effort request plan',
     )
   }
 
@@ -742,13 +934,13 @@ export function applyOpenCodeEffortMarkers(
     for (const transition of message.transitions) {
       if (transition.scope !== requestPlan.scope) {
         throw new EffortMarkerCorrelationError(
-          'Fable 5.1 effort marker scope mismatch',
+          'Per-message effort marker scope mismatch',
         )
       }
     }
     if (message.anchors.length > 1) {
       throw new EffortMarkerCorrelationError(
-        'Multiple internal Fable 5.1 effort anchors on one user boundary',
+        'Multiple internal per-message effort anchors on one user boundary',
       )
     }
   }
@@ -773,7 +965,7 @@ export function applyOpenCodeEffortMarkers(
       anchor.scope !== requestPlan.scope)
   ) {
     throw new EffortMarkerCorrelationError(
-      'Missing or invalid internal Fable 5.1 effort anchor placement',
+      'Missing or invalid internal per-message effort anchor placement',
       'anchor_placement',
       {
         anchorBoundaryId: anchor?.boundary ?? null,
@@ -798,65 +990,71 @@ export function applyOpenCodeEffortMarkers(
   }
   if (requestPlan.markerCount === 0 && anchors.length !== 0) {
     throw new EffortMarkerCorrelationError(
-      'Unexpected internal Fable 5.1 effort anchor',
+      'Unexpected internal per-message effort anchor',
     )
   }
   if (expectedPlan?.anchor && anchor?.token !== expectedPlan.anchor.token) {
-    throw new EffortMarkerCorrelationError(
-      'Mismatched internal Fable 5.1 effort anchor token',
-      'anchor_token',
+    const equivalentPlan =
+      anchor && resolvedPlan && expectedTransitions
+        ? equivalentRecordedPlan({
+            anchor,
+            anchorCount: anchors.length,
+            headerPlan: resolvedPlan,
+            headerTransitions: expectedTransitions,
+            headerAnchor: expectedPlan.anchor,
+            recordedVersions,
+            messages: consumed.messages,
+          })
+        : null
+    if (!equivalentPlan) {
+      throw new EffortMarkerCorrelationError(
+        'Mismatched internal per-message effort anchor token',
+        'anchor_token',
+        {
+          anchorBoundaryId: anchor?.boundary ?? null,
+          plannedBoundaryId: expectedPlan.anchor.boundary,
+          lastUserMessageId: providerMessageId(lastUserMessage),
+          anchorMessageIndex,
+          lastUserMessageIndex,
+          anchorsFound: anchors.length,
+          markerCount: requestPlan.markerCount,
+          scope: requestPlan.scope,
+          foundScope: anchor?.scope ?? null,
+          expectedAnchorHash: digest(expectedPlan.anchor.token),
+          foundAnchorHash: anchor ? digest(anchor.token) : null,
+          anchorMatchesExpected: false,
+        },
+      )
+    }
+    // The request still goes out exactly as the header plan dictates. Log the
+    // substitution so a later message transform restoring stale anchors stays
+    // visible; hashes and ids only, never prompt text.
+    logger.warn(
+      'effort-history',
+      'accepted an earlier effort anchor whose plan gives the same efforts',
       {
-        anchorBoundaryId: anchor?.boundary ?? null,
+        check: 'anchor_token_equivalent_plan',
         plannedBoundaryId: expectedPlan.anchor.boundary,
-        lastUserMessageId: providerMessageId(lastUserMessage),
-        anchorMessageIndex,
-        lastUserMessageIndex,
-        anchorsFound: anchors.length,
         markerCount: requestPlan.markerCount,
-        scope: requestPlan.scope,
-        foundScope: anchor?.scope ?? null,
+        foundPlanMarkerCount: equivalentPlan.markerCount,
+        markersFound: found,
         expectedAnchorHash: digest(expectedPlan.anchor.token),
         foundAnchorHash: anchor ? digest(anchor.token) : null,
-        anchorMatchesExpected: false,
       },
     )
   }
   let effectiveBaseline = requestPlan.baseline
   if (expectedTransitions) {
-    const trimmedPrefix = expectedTransitions.length - found
-    if (trimmedPrefix < 0) {
-      throw new EffortMarkerCorrelationError(
-        `Fable 5.1 effort marker correlation failed: expected ${requestPlan.markerCount}, found ${found}`,
-      )
-    }
-    const expectedSuffix = expectedTransitions.slice(trimmedPrefix)
-    if (
-      transitions.some(
-        (transition, index) =>
-          transition.token !== expectedSuffix[index]?.token,
-      )
-    ) {
-      throw new EffortMarkerCorrelationError(
-        'Fable 5.1 effort marker non-prefix loss',
-      )
-    }
-    const removedTransitions = expectedTransitions.slice(0, trimmedPrefix)
-    if (
-      anchor &&
-      removedTransitions.some(
-        (transition) => transition.boundary === anchor.boundary,
-      )
-    ) {
-      throw new EffortMarkerCorrelationError(
-        'Fable 5.1 effort marker non-prefix loss',
-      )
-    }
-    effectiveBaseline =
-      removedTransitions.at(-1)?.effort ?? requestPlan.baseline
+    effectiveBaseline = resolveBodyAgainstPlan(
+      expectedTransitions,
+      requestPlan.baseline,
+      consumed.messages,
+      anchor,
+    ).effectiveBaseline
   } else {
     if (found !== requestPlan.markerCount) {
       throw new EffortMarkerCorrelationError(
-        `Fable 5.1 effort marker correlation failed: expected ${requestPlan.markerCount}, found ${found}`,
+        `Per-message effort marker correlation failed: expected ${requestPlan.markerCount}, found ${found}`,
       )
     }
     const actualDigest = planDigest(
@@ -868,7 +1066,7 @@ export function applyOpenCodeEffortMarkers(
     )
     if (requestPlan.digest !== actualDigest) {
       throw new EffortMarkerCorrelationError(
-        'Fable 5.1 effort marker request plan mismatch',
+        'Per-message effort marker request plan mismatch',
       )
     }
     const expectedEffort = transitions.at(-1)?.effort ?? requestPlan.baseline
@@ -877,7 +1075,7 @@ export function applyOpenCodeEffortMarkers(
       (anchor.effort !== expectedEffort || anchor.digest !== requestPlan.digest)
     ) {
       throw new EffortMarkerCorrelationError(
-        'Missing or invalid internal Fable 5.1 effort anchor',
+        'Missing or invalid internal per-message effort anchor',
       )
     }
   }
@@ -962,6 +1160,23 @@ export class OpenCodeEffortPlanTracker {
     return value ? this.history.get(value) : undefined
   }
 
+  /**
+   * Every plan version still recorded for one user message, in the order
+   * they were first recorded.
+   * The fetch hands these to `applyOpenCodeEffortMarkers` so it can recognise
+   * an anchor from an earlier version that gives the same efforts.
+   */
+  versionsFor(
+    sessionId: string,
+    messageId: string,
+  ): OpenCodeEffortMarkerPlan[] {
+    const headers = this.historyByMessage.get(this.key(sessionId, messageId))
+    return [...(headers ?? [])].flatMap((header) => {
+      const plan = this.history.get(header)
+      return plan ? [plan] : []
+    })
+  }
+
   private remember(key: string, plan: OpenCodeEffortMarkerPlan): string {
     const header = encodeOpenCodeEffortPlan(plan)
     const previous = this.history.get(header)
@@ -977,7 +1192,7 @@ export class OpenCodeEffortPlanTracker {
         previous.sessionId !== plan.sessionId
       ) {
         throw new EffortMarkerCorrelationError(
-          'Fable 5.1 effort plan header collision',
+          'Per-message effort plan header collision',
         )
       }
       const priorKey = this.key(previous.sessionId, previous.messageId)
