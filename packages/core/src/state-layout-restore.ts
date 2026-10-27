@@ -81,6 +81,7 @@ import {
   anthropicAuthRelease,
   HOLDER_FILE_NAME,
   type HolderLiveness,
+  HolderRegistrationError,
   holderEntryIsLive,
   holderEntryLiveness,
   readHolderFile,
@@ -99,6 +100,7 @@ import { forgetRelocationObservations } from './relocation-guard.ts'
 import {
   RESTORE_LEGACY_COMMAND,
   StateLayoutRefusalError,
+  stateLayoutIoFailure,
 } from './state-layout-errors.ts'
 import {
   createOwnerOnlyFile,
@@ -921,7 +923,24 @@ export async function restoreLegacyLayout(
           [dataset.oldDir],
           error,
         )
-      throw error
+      if (
+        error instanceof StateLayoutCrash ||
+        error instanceof StateLayoutRefusalError ||
+        error instanceof HolderRegistrationError
+      )
+        throw error
+      // Any other failure to take a lock (a lock file that can't be
+      // created) is reported with fixed public text, not its raw path.
+      const failure = stateLayoutIoFailure(
+        `take the locks of ${dataset.oldDir} and ${sub}`,
+        [dataset.oldDir, sub],
+        error,
+      )
+      logger.error('state-layout', failure.message, {
+        code: failure.code,
+        paths: failure.paths,
+      })
+      throw failure
     }
     await stateLayoutStep(ctx, 'restore:locks-held')
     for (let round = 0; round < 3; round++) {

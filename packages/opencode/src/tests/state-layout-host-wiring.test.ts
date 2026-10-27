@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -27,7 +28,7 @@ import {
 import type { Plugin } from '@opencode/plugin'
 import { relaySetup } from '../cli'
 import { runSetupCommand } from '../setup/command'
-import { setupAnthropicAuth } from '../v2/setup'
+import { setupAnthropicAuth, startFailure } from '../v2/setup'
 
 /**
  * Environment variables a host start reads to find OpenCode's config folder
@@ -383,3 +384,53 @@ for (const variant of ['state-home layout', 'managed folder'] as const)
     for (const dir of [sub, managed])
       expect(await Bun.file(join(dir, HOLDER_FILE_NAME)).exists()).toBe(false)
   })
+
+test('OpenCode 2 hands any error its start does not recognise on as fixed text, naming no path', async () => {
+  const root = join(tmpdir(), 'private-folder-name')
+  const raw = Object.assign(
+    new Error(`EACCES: permission denied, open '${root}/layout.json.lock'`),
+    { code: 'EACCES' },
+  )
+  const shown = startFailure(raw)
+  expect(shown.message).toBe(stateLayoutRefusalPublicMessage('io-failed'))
+  expect(shown.message).not.toContain(root)
+})
+
+test('OpenCode 2 with moving off refuses with fixed text when the config folder shows a move and the layout lock fails with an I/O error', async () => {
+  const m = await machine(true)
+  await Bun.write(
+    join(m.configDir, 'anthropic-auth-native-state.json'),
+    '{"version":1}\n',
+  )
+  expect((await decideOpenCodeStateLayout({ role: 'cli' })).kind).toBe(
+    'state-home',
+  )
+  const sub = await subfolder(m)
+  if (!sub) throw new Error('the dataset was not moved')
+  // A cleanup still pending keeps the start off the fast admission, so it
+  // takes the layout lock.
+  const record = JSON.parse(await readFile(join(sub, 'layout.json'), 'utf8'))
+  await writeFile(
+    join(sub, 'layout.json'),
+    JSON.stringify({ ...record, cleanup: 'pending' }),
+  )
+  setRelocationMoveEnabledForTests(false)
+  resetDecisions()
+  // The state folder can't take new files: the layout lock file can't be
+  // created (EACCES).
+  await chmod(sub, 0o500)
+  cleanups.push(() => chmod(sub, 0o700))
+  const failure = await setupAnthropicAuth(openCode2Context(), {
+    vault: { env: { ...process.env } },
+  }).then(
+    (dispose) => {
+      cleanups.push(() => dispose())
+      return undefined
+    },
+    (error: unknown) => error,
+  )
+  expect(failure).toBeInstanceOf(Error)
+  const message = (failure as Error).message
+  expect(message).toBe(stateLayoutRefusalPublicMessage('io-failed'))
+  expect(message).not.toContain(m.root)
+})

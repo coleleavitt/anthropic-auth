@@ -469,7 +469,25 @@ async function admitFast(
   try {
     return await admitHeld(dataset, options, ctx, false, false)
   } finally {
+    await releaseLocks(ctx)
+  }
+}
+
+/**
+ * Release every lock `ctx` holds. A lock file that can't be removed refuses
+ * with the fixed text of `io-failed` rather than escaping raw with its path;
+ * its lease then expires on its own.
+ */
+async function releaseLocks(ctx: StateLayoutTransitionContext): Promise<void> {
+  try {
     await ctx.stack.releaseAll()
+  } catch (error) {
+    refuse(
+      'io-failed',
+      `anthropic-auth could not release its locks: ${errorMessage(error)}`,
+      [],
+      error,
+    )
   }
 }
 
@@ -897,7 +915,7 @@ export async function decideOpenCodeStateLayout(
         if (error instanceof LockContentionError) busy(dataset.configDir, error)
         throw error
       } finally {
-        await ctx.stack.releaseAll()
+        await releaseLocks(ctx)
       }
       continue
     }
@@ -916,7 +934,13 @@ export async function decideOpenCodeStateLayout(
           timeoutMs: options.timeouts?.layoutMs ?? LAYOUT_LOCK_TIMEOUT_MS,
         })
       } catch (error) {
-        if (!(error instanceof LockContentionError)) throw error
+        if (!(error instanceof LockContentionError))
+          refuse(
+            'io-failed',
+            `anthropic-auth can't take the layout lock beside ${layoutRecordPath(sub)}: ${errorMessage(error)}`,
+            [layoutRecordPath(sub)],
+            error,
+          )
         // Another process holds the layout. Only a finished move may be used;
         // anything else could still change under that process.
         const record = await readRecord(sub)
@@ -954,19 +978,36 @@ export async function decideOpenCodeStateLayout(
   busy(dataset.configDir)
 }
 
+/**
+ * Create the state-home folder, owner-only, and make its entry durable. A
+ * folder that can't be created or flushed refuses with the fixed text of
+ * `io-failed`.
+ */
 async function ensureSubfolder(sub: string, fs: StateLayoutFs): Promise<void> {
-  if (process.platform === 'win32') {
-    await ensureWindowsOwnerOnlyDirectory(sub)
-    return
-  }
-  const created = await mkdir(sub, { recursive: true, mode: 0o700 })
-  if (created === undefined) return
-  // Each new folder's entry must be durable in its parent before anything
-  // inside it is: flush every parent from the new subfolder's up to the
-  // parent of the highest folder just created.
-  for (let dir = dirname(sub); ; dir = dirname(dir)) {
-    await fs.syncDirectory(dir)
-    if (dir === dirname(created) || dir === dirname(dir)) break
+  try {
+    if (process.platform === 'win32') {
+      await ensureWindowsOwnerOnlyDirectory(sub)
+      return
+    }
+    const created = await mkdir(sub, { recursive: true, mode: 0o700 })
+    if (created === undefined) return
+    // Each new folder's entry must be durable in its parent before anything
+    // inside it is: flush every parent from the new subfolder's up to the
+    // parent of the highest folder just created.
+    for (let dir = dirname(sub); ; dir = dirname(dir)) {
+      await fs.syncDirectory(dir)
+      if (dir === dirname(created) || dir === dirname(dir)) break
+    }
+  } catch (error) {
+    // Rethrow a test's simulated crash unchanged, so the test stops at the
+    // point where it injected the failure.
+    if (error instanceof StateLayoutCrash) throw error
+    refuse(
+      'io-failed',
+      `anthropic-auth can't create its state folder ${sub}: ${errorMessage(error)}`,
+      [sub],
+      error,
+    )
   }
 }
 

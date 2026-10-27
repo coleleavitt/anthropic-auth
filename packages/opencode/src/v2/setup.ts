@@ -18,6 +18,7 @@ import {
   registerNativePoolHolder,
   resolveNativePoolPaths,
   setDumpEnabled,
+  stateLayoutIoFailure,
   unmovedRegistrationPolicy,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -231,38 +232,63 @@ export function createAnthropicAuthPlugin(
  * record, so they may name only files outside the state folder: paths in
  * the state-home layout, or in a folder anthropic-auth manages or a
  * destination-shaped one, refuse. Other injected paths are only registered.
+ *
+ * Whatever fails here, OpenCode 2 is handed fixed text that names no path
+ * (see `startFailure`).
  */
 async function decideNativePaths(options: AnthropicAuthV2Options): Promise<{
   paths: NativePoolPaths
   holderRegistration: NativeHolderRegistration | undefined
 }> {
+  try {
+    return await decideNativePathsRaw(options)
+  } catch (error) {
+    throw startFailure(error)
+  }
+}
+
+/**
+ * What OpenCode 2 is handed when its start can't decide the pool files: the
+ * relocation or registration refusal behind `error` with its fixed text, or
+ * for any other error, such as a file system error whose message names a
+ * path, a refusal with the fixed text of `io-failed`. OpenCode 2 may show a
+ * plugin's setup error where its output is shared, so no raw message may
+ * reach it; the plugin log keeps the original error.
+ */
+export function startFailure(error: unknown): Error {
+  const refusal = stateRefusalFrom(error)
+  if (refusal) return refusal
+  const failure = stateLayoutIoFailure(
+    'decide where its account state is',
+    [],
+    error,
+  )
+  logger.error('state-layout', failure.message, { code: failure.code })
+  return stateRefusalFrom(failure) ?? failure
+}
+
+async function decideNativePathsRaw(options: AnthropicAuthV2Options): Promise<{
+  paths: NativePoolPaths
+  holderRegistration: NativeHolderRegistration | undefined
+}> {
   if (options.paths) {
     const paths = options.paths
-    try {
-      await assertUnmanagedInjectedPaths(paths)
-      return {
+    await assertUnmanagedInjectedPaths(paths)
+    return {
+      paths,
+      holderRegistration: await registerNativePoolHolder({
         paths,
-        holderRegistration: await registerNativePoolHolder({
-          paths,
-          role: 'opencode2',
-          kind: openCodeHolderKind(),
-          policy: unmovedRegistrationPolicy(),
-          onLockEvent: options.local?.onLockEvent,
-        }),
-      }
-    } catch (error) {
-      throw stateRefusalFrom(error) ?? error
+        role: 'opencode2',
+        kind: openCodeHolderKind(),
+        policy: unmovedRegistrationPolicy(),
+        onLockEvent: options.local?.onLockEvent,
+      }),
     }
   }
-  let decision: Awaited<ReturnType<typeof decideOpenCodeStateLayoutOnce>>
-  try {
-    decision = await decideOpenCodeStateLayoutOnce({
-      role: 'opencode2',
-      onLockEvent: options.local?.onLockEvent,
-    })
-  } catch (error) {
-    throw stateRefusalFrom(error) ?? error
-  }
+  const decision = await decideOpenCodeStateLayoutOnce({
+    role: 'opencode2',
+    onLockEvent: options.local?.onLockEvent,
+  })
   return {
     paths: await resolveNativePoolPaths(undefined, undefined, decision.layout),
     holderRegistration:

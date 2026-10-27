@@ -7,6 +7,7 @@ import type { RelocationGuard } from './relocation-guard.ts'
 import {
   StateLayoutRefusalError,
   stateLayoutConflict,
+  stateLayoutIoFailure,
 } from './state-layout-errors.ts'
 import { fileSha256 } from './state-layout-io.ts'
 import { STATE_HOME_FILE_NAMES } from './state-layout-paths.ts'
@@ -89,7 +90,13 @@ const warnedReappeared = new Set<string>()
 export async function warnReappearedMetadata(
   record: StateLayoutRecord,
 ): Promise<void> {
-  for (const path of await reappearedMetadataFiles(record)) {
+  let found: string[]
+  try {
+    found = await reappearedMetadataFiles(record)
+  } catch (error) {
+    throw guardIoFailure(record.sub, error)
+  }
+  for (const path of found) {
     if (warnedReappeared.has(path)) continue
     warnedReappeared.add(path)
     logger.warn(
@@ -245,7 +252,22 @@ async function evaluate(files: StateHomeServingFiles): Promise<Evaluation> {
 export async function checkStateHomeServing(
   files: StateHomeServingFiles,
 ): Promise<StateLayoutRefusalError | undefined> {
-  return (await evaluate(files)).refusal
+  try {
+    return (await evaluate(files)).refusal
+  } catch (error) {
+    return guardIoFailure(files.sub, error)
+  }
+}
+
+/**
+ * The refusal for a failure to look at a state-home dataset's files (an
+ * `lstat` or read that fails with EACCES, EIO and the like): the fixed text
+ * of `io-failed`, never the raw error with its path.
+ */
+function guardIoFailure(sub: string, error: unknown): StateLayoutRefusalError {
+  return error instanceof StateLayoutRefusalError
+    ? error
+    : stateLayoutIoFailure(`check the state of ${sub}`, [sub], error)
 }
 
 function markerRefusal(sub: string, cause?: unknown) {
@@ -306,7 +328,26 @@ export function createStateHomeServingGuard(
 ): RelocationGuard & { check(): Promise<StateLayoutRefusalError | undefined> } {
   const marker = join(files.sub, STATE_HOME_FILE_NAMES.layoutMarker)
   const dataset = JSON.stringify(files)
+  function report(refusal: StateLayoutRefusalError | undefined) {
+    if (refusal && !reported.has(refusal.message)) {
+      reported.add(refusal.message)
+      logger.error('state-layout', refusal.message, {
+        code: refusal.code,
+        paths: refusal.paths,
+      })
+    }
+    return refusal
+  }
   async function check() {
+    try {
+      return report(await observeDataset())
+    } catch (error) {
+      // Not remembered: once the files can be looked at again, the next
+      // check reads them afresh.
+      return report(guardIoFailure(files.sub, error))
+    }
+  }
+  async function observeDataset() {
     const last = observations.get(dataset)
     // Every identity is taken before the file it describes is read, so a
     // change after this point always shows up as a new key next time.
@@ -339,15 +380,7 @@ export function createStateHomeServingGuard(
       refusal: result.refusal,
     })
     if (result.record) await warnReappearedMetadata(result.record)
-    const refusal = result.refusal
-    if (refusal && !reported.has(refusal.message)) {
-      reported.add(refusal.message)
-      logger.error('state-layout', refusal.message, {
-        code: refusal.code,
-        paths: refusal.paths,
-      })
-    }
-    return refusal
+    return result.refusal
   }
   return {
     check,

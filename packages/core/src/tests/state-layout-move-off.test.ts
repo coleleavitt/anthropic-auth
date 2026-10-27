@@ -25,7 +25,12 @@ import {
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import type { NativeLockEvent } from '../native-lock-observer.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
-import { resetStateHomeServingGuardForTests } from '../state-home-serving-guard.ts'
+import {
+  checkStateHomeServing,
+  createStateHomeServingGuard,
+  resetStateHomeServingGuardForTests,
+  stateHomeServingFiles,
+} from '../state-home-serving-guard.ts'
 import {
   type DecideStateLayoutOptions,
   decideOpenCodeStateLayout,
@@ -35,11 +40,14 @@ import {
   StateLayoutRefusalError,
   stateLayoutRefusalPublicMessage,
 } from '../state-layout-errors.ts'
-import { relocationTombstone } from '../state-layout-move.ts'
+import { defaultStateLayoutFs, type StateLayoutFs } from '../state-layout-io.ts'
+import { relocationTombstone, StateLayoutCrash } from '../state-layout-move.ts'
 import {
   LEGACY_STATE_LAYOUT,
   resetProcessStateLayoutsForTests,
 } from '../state-layout-paths.ts'
+import { readStateLayoutRecord } from '../state-layout-record.ts'
+import { restoreLegacyLayout } from '../state-layout-restore.ts'
 
 const roots: string[] = []
 const closers: NativeHolderRegistration[] = []
@@ -504,3 +512,99 @@ for (const homeDefault of ['inaccessible', 'looping'] as const)
       }
     }
   })
+
+/** A refusal as a host shows it: the fixed text of `io-failed`, naming no file. */
+function expectIoRefusal(error: unknown, m: Machine) {
+  expect(error).toBeInstanceOf(StateLayoutRefusalError)
+  expect(error).toMatchObject({ code: 'io-failed' })
+  const shown = stateRefusalPublicMessage(error)
+  expect(shown).toBe(stateLayoutRefusalPublicMessage('io-failed'))
+  expect(shown).not.toContain(m.root)
+}
+
+/**
+ * A move that stopped after its local tombstone was installed: the config
+ * folder shows the move and the state folder holds a `preparing` record,
+ * which only the layout lock may roll back.
+ */
+async function interruptedMove(m: Machine) {
+  await decide(m, {
+    moveEnabled: true,
+    onStep: (step) => {
+      if (step === 'local-runtime-tombstoned') throw new StateLayoutCrash(step)
+    },
+  }).catch((error: unknown) => {
+    if (!(error instanceof StateLayoutCrash)) throw error
+  })
+  expect((await readStateLayoutRecord(stateSub(m)))?.phase).toBe('preparing')
+}
+
+test('a layout lock that fails with an I/O error, not contention, refuses with the fixed text, moving off or on', async () => {
+  for (const moveEnabled of [false, true]) {
+    const m = await machine()
+    await interruptedMove(m)
+    // The state folder can't take new files, so the layout lock file can't
+    // be created (EACCES).
+    await chmod(stateSub(m), 0o500)
+    const error = await decide(m, { moveEnabled }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    )
+    await chmod(stateSub(m), 0o700)
+    expectIoRefusal(error, m)
+    // Nothing was rolled back without the lock.
+    expect((await readStateLayoutRecord(stateSub(m)))?.phase).toBe('preparing')
+  }
+})
+
+test('a state folder that is created but can not be flushed refuses with the fixed text', async () => {
+  const m = await machine()
+  const base = defaultStateLayoutFs()
+  const fs: StateLayoutFs = {
+    ...base,
+    syncDirectory: async () => {
+      throw Object.assign(new Error(`EIO: i/o error, fsync '${m.stateRoot}'`), {
+        code: 'EIO',
+      })
+    },
+  }
+  const error = await decide(m, { moveEnabled: true, fs }).then(
+    () => undefined,
+    (caught: unknown) => caught,
+  )
+  expectIoRefusal(error, m)
+})
+
+test('a restore whose layout lock fails with an I/O error refuses with the fixed text', async () => {
+  const m = await machine()
+  expect((await decide(m, { moveEnabled: true })).kind).toBe('state-home')
+  await chmod(stateSub(m), 0o500)
+  const error = await restoreLegacyLayout({
+    env: m.env,
+    home: m.home,
+    liveness: liveness([process.pid]),
+    timeouts: { layoutMs: 300, holderMs: 300, dataMs: 300 },
+  }).then(
+    () => undefined,
+    (caught: unknown) => caught,
+  )
+  await chmod(stateSub(m), 0o700)
+  expectIoRefusal(error, m)
+})
+
+test("a serving guard that can't look at the old folder refuses with the fixed text, and looks again next time", async () => {
+  const m = await machine()
+  const decision = await decide(m, { moveEnabled: true })
+  if (decision.kind !== 'state-home') throw new Error('not moved')
+  const files = stateHomeServingFiles(decision.dataset.newPaths)
+  const guard = createStateHomeServingGuard(files)
+  expect(await guard.check()).toBeUndefined()
+  // The old copies can't be looked at (EACCES on lstat).
+  await chmod(m.configDir, 0o000)
+  const refusal = await guard.check()
+  const direct = await checkStateHomeServing(files)
+  await chmod(m.configDir, 0o700)
+  expectIoRefusal(refusal, m)
+  expectIoRefusal(direct, m)
+  expect(await guard.check()).toBeUndefined()
+})
