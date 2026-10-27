@@ -1076,15 +1076,28 @@ export type ReadSidebarState = (
   signal: AbortSignal,
 ) => Promise<SidebarState>
 
-/** What the sidebar reads and draws with, independent of the host chrome. */
-interface HostSidebarPropsState {
+/**
+ * What the sidebar reads and draws with, independent of the host chrome.
+ * The timer functions default to the global ones; a test passes its own so it
+ * can drive the refresh schedule without touching the shared globals.
+ */
+export interface HostSidebarPropsState {
   read: ReadSidebarState
   controller: SidebarController
   sessionId: string
+  setTimeoutImpl?: typeof globalThis.setTimeout
+  /** Clears a handle `setTimeoutImpl` returned, whatever type that was. */
+  clearTimeoutImpl?: (handle: unknown) => void
 }
 
 interface HostSidebarProps extends HostSidebarPropsState {
   host: ClaudeSidebarHost
+}
+
+/** The refresh loop's own timers, so a test can drive its schedule. */
+export interface SidebarScheduleTimers {
+  setTimeoutImpl?: typeof globalThis.setTimeout
+  clearTimeoutImpl?: (handle: unknown) => void
 }
 
 /**
@@ -1103,28 +1116,63 @@ export function sidebarRetryDelay(
   return Math.min(pollMs * 2 ** failures, retryMaxMs)
 }
 
-// Runs the sidebar's state: one read on mount, then a timer that backs off
-// after failures and resets after a success. Separate from the component so
-// the refresh schedule can be tested without a host renderer.
-export function useHostSidebarState(
-  props: HostSidebarPropsState,
-): () => SidebarState {
-  const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
+/** Starts and stops the refresh schedule the sidebar lives on. */
+export interface SidebarSchedule {
+  /**
+   * Reads once and then keeps the retry timer running. Safe to call more than
+   * once: a running schedule is left alone.
+   */
+  start: () => void
+  /**
+   * Stops the schedule for good: clears the waiting timer and aborts a read
+   * still in flight, so it cannot queue another one. The item that unmounts a
+   * sidebar calls this; without it, a failing refresh would keep polling the
+   * server from a sidebar nobody is looking at.
+   */
+  stop: () => void
+}
+
+// One read on start, then a timer that backs off after failures and resets
+// after a success. Lives outside Solid: the component drives it from an
+// effect, and tests drive it with their own timers.
+export function createSidebarSchedule(
+  options: {
+    read: ReadSidebarState
+    sessionId: string
+    pollRate: () => { pollMs: number; retryMaxMs: number }
+    /** Receives each answer that differs from the one before it. */
+    onState: (state: SidebarState) => void
+  } & SidebarScheduleTimers,
+): SidebarSchedule {
+  const {
+    read,
+    sessionId,
+    pollRate,
+    onState,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout as (handle: unknown) => void,
+  } = options
   const abort = new AbortController()
+  // The timer waiting to run. Every schedule replaces it, so stopping always
+  // clears the one that is actually queued.
+  let timer: unknown
+  let running = false
   let inFlight = false
   let shown = ''
   let failures = 0
-  const refresh = async () => {
-    if (inFlight || abort.signal.aborted) return false
+  // `undefined` means the previous read was still running, which is not a
+  // failure: counting it as one would back off before the server answered.
+  const refresh = async (): Promise<boolean | undefined> => {
+    if (inFlight || abort.signal.aborted) return undefined
     inFlight = true
     try {
-      const next = await props.read(props.sessionId, abort.signal)
-      // Every answer is stamped now; redraw only when its content changed.
-      // Countdowns and ages advance on the sidebar's own clock.
+      const next = await read(sessionId, abort.signal)
+      // Every answer is stamped by the server; redraw only when its content
+      // changed. Countdowns and ages advance on the sidebar's own clock.
       const content = JSON.stringify({ ...next, lastUpdated: 0 })
       if (!abort.signal.aborted && content !== shown) {
         shown = content
-        setState(next)
+        onState(next)
       }
       return true
     } catch {
@@ -1134,31 +1182,65 @@ export function useHostSidebarState(
       inFlight = false
     }
   }
-  createEffect(() => {
-    // Reading the prefs here re-runs this effect when they change.
-    const pollMs = props.controller.prefs().pollMs
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const schedule = () => {
-      if (abort.signal.aborted) return
-      const wait = sidebarRetryDelay(
-        pollMs,
-        failures,
-        props.controller.retryMaxMs,
-      )
-      timer = setTimeout(async () => {
-        if (await refresh()) failures = 0
-        else failures += 1
-        schedule()
-      }, wait)
-    }
-    void refresh().then((ok) => {
-      if (!ok) failures += 1
-    })
-    schedule()
-    onCleanup(() => {
-      clearTimeout(timer)
+  const schedule = () => {
+    if (!running) return
+    const { pollMs, retryMaxMs } = pollRate()
+    const wait = sidebarRetryDelay(pollMs, failures, retryMaxMs)
+    timer = setTimeoutImpl(async () => {
+      timer = undefined
+      if (!running) return
+      const ok = await refresh()
+      if (!running) return
+      if (ok === true) failures = 0
+      else if (ok === false) failures += 1
+      schedule()
+    }, wait)
+  }
+  return {
+    start() {
+      if (running || abort.signal.aborted) return
+      running = true
+      // The first read happens here rather than in the timer, so a caller that
+      // starts before any draw still has an answer waiting for it. The loop
+      // then continues on the retry timer below.
+      void refresh().then((ok) => {
+        if (running && ok === false) failures += 1
+      })
+      schedule()
+    },
+    stop() {
+      running = false
+      if (timer !== undefined) clearTimeoutImpl(timer)
+      timer = undefined
       abort.abort()
-    })
+    },
+  }
+}
+
+// The OpenCode 2 sidebar's state: its refresh schedule, redrawn through a
+// signal the component renders from.
+export function useHostSidebarState(
+  props: HostSidebarPropsState,
+): () => SidebarState {
+  const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
+  const schedule = createSidebarSchedule({
+    read: props.read,
+    sessionId: props.sessionId,
+    pollRate: () => ({
+      pollMs: props.controller.prefs().pollMs,
+      retryMaxMs: props.controller.retryMaxMs,
+    }),
+    onState: setState,
+    setTimeoutImpl: props.setTimeoutImpl,
+    clearTimeoutImpl: props.clearTimeoutImpl,
+  })
+  createEffect(() => {
+    // Reading the poll rate here re-runs this effect when it changes, which
+    // restarts the schedule at the new rate. The previous run stops first.
+    void props.controller.prefs().pollMs
+    schedule.stop()
+    schedule.start()
+    onCleanup(() => schedule.stop())
   })
   return state
 }
