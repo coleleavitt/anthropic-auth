@@ -2012,6 +2012,10 @@ test('vault sticky routing keeps session assignments only in the vault routing f
     claustrumScopedConnect: async () => fixture.scopedClient,
   })
   expect((await sendNative(plugin)).status).toBe(200)
+  // Sticky session pins publish detached under the routing lock after the
+  // request has been routed, so the file has no assignment until that save
+  // lands. Disposal drains those pin publications before reading the file.
+  await plugin.dispose?.()
   const assignments = Object.values(
     (
       JSON.parse(await readFile(vaultRouting, 'utf8')) as {
