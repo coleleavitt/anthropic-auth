@@ -182,6 +182,21 @@ export function resolveStateHomeTarget(
   const home = options.home ?? homedir()
   const identity = configFolderIdentity(getOpenCodeConfigDir(env, home))
   if (identity === undefined) return undefined
+  return stateHomeTargetFor(identity, { env, home })
+}
+
+/**
+ * `resolveStateHomeTarget` for a config folder whose identity is already
+ * known. Naming the subfolder resolves the home directory's default config
+ * folder, which may be a different folder from the one in use, so a start
+ * that never looks at the state folder never calls this.
+ */
+export function stateHomeTargetFor(
+  identity: string,
+  options: { env?: NodeJS.ProcessEnv; home?: string } = {},
+): StateHomeTarget {
+  const env = options.env ?? process.env
+  const home = options.home ?? homedir()
   const stateRoot = anthropicAuthStateRoot({
     xdgStateHome: env.XDG_STATE_HOME,
     home,

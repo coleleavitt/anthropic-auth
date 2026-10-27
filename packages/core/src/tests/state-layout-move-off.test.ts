@@ -7,6 +7,7 @@ import {
   readFile,
   realpath,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -416,5 +417,90 @@ for (const branch of ['override', 'layout-lock', 'state-home'] as const)
       }
       if (!('error' in result)) throw new Error('the start was admitted')
       expectFixedRegistrationRefusal(result.error, m)
+    }
+  })
+
+/**
+ * A machine whose OpenCode uses its own config folder (OPENCODE_CONFIG_DIR),
+ * while the home directory's default config folder can't be resolved: a
+ * folder on its way may not be searched, or it is a symlink loop. Returns
+ * the machine and a function that makes the default folder resolvable
+ * again, so the test can clean up.
+ */
+async function customConfigMachine(homeDefault: 'inaccessible' | 'looping') {
+  const m = await machine()
+  const configDir = join(m.root, 'custom-config')
+  await mkdir(configDir)
+  const legacy = await resolveNativePoolPaths(
+    join(configDir, 'anthropic-auth.json'),
+    join(configDir, 'anthropic-auth-state.json'),
+    LEGACY_STATE_LAYOUT,
+  )
+  await writeFile(legacy.runtime, '{"version":1}\n', { mode: 0o600 })
+  const dotConfig = join(m.home, '.config')
+  if (homeDefault === 'looping') {
+    await rm(m.configDir, { recursive: true })
+    await symlink(m.configDir, m.configDir)
+  } else await chmod(dotConfig, 0o000)
+  const custom: Machine = {
+    ...m,
+    configDir,
+    legacy,
+    env: { ...m.env, OPENCODE_CONFIG_DIR: configDir },
+  }
+  return { m: custom, repair: () => chmod(dotConfig, 0o700) }
+}
+
+for (const homeDefault of ['inaccessible', 'looping'] as const)
+  test(`moving off: a custom config folder is served when the home directory's default config folder is ${homeDefault}`, async () => {
+    const { m, repair } = await customConfigMachine(homeDefault)
+    try {
+      const decision = await decide(m, { moveEnabled: false })
+      expect(decision.kind).toBe('legacy')
+      expect(decision.layout).toEqual(LEGACY_STATE_LAYOUT)
+      if (decision.kind !== 'legacy') throw new Error('not expected')
+      // Registered beside the custom folder's files, not deferred.
+      expect(decision.registration).toBeUndefined()
+      const holders = JSON.parse(
+        await readFile(join(m.configDir, HOLDER_FILE_NAME), 'utf8'),
+      ) as { entries: { pid: number; kind: string }[] }
+      expect(holders.entries).toContainEqual(
+        expect.objectContaining({ pid: process.pid, kind: 'legacy' }),
+      )
+    } finally {
+      await repair()
+    }
+  })
+
+for (const homeDefault of ['inaccessible', 'looping'] as const)
+  test(`once the state folder matters, a home default config folder that is ${homeDefault} refuses with the fixed text`, async () => {
+    for (const moveEnabled of [false, true]) {
+      const { m, repair } = await customConfigMachine(homeDefault)
+      try {
+        // With moving off, a tombstone in the config folder sends the start
+        // to the full decision, which must name the state folder.
+        if (!moveEnabled)
+          await writeFile(
+            m.legacy.runtime,
+            relocationTombstone({
+              sub: join(m.root, 'elsewhere'),
+              stateRoot: join(m.stateRoot, 'cortexkit', 'anthropic-auth'),
+              identity: m.configDir,
+              attempt: '00000000-0000-4000-8000-000000000000',
+              by: 'test',
+            }),
+          )
+        const error = await decide(m, { moveEnabled }).then(
+          () => undefined,
+          (caught: unknown) => caught,
+        )
+        expect(error).toBeInstanceOf(StateLayoutRefusalError)
+        expect(error).toMatchObject({ code: 'io-failed' })
+        const shown = stateRefusalPublicMessage(error)
+        expect(shown).toBe(stateLayoutRefusalPublicMessage('io-failed'))
+        expect(shown).not.toContain(m.root)
+      } finally {
+        await repair()
+      }
     }
   })

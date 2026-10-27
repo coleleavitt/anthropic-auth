@@ -75,13 +75,16 @@ import {
   syncCommitted,
 } from './state-layout-move.ts'
 import {
+  configFolderIdentity,
+  homeDefaultConfigDir,
   LEGACY_STATE_LAYOUT,
   readConfigDirMarker,
   readRelocationPointer,
   recordProcessStateLayout,
-  resolveStateHomeTarget,
+  type StateHomeTarget,
   type StateLayout,
   StateLayoutFileError,
+  stateHomeTargetFor,
 } from './state-layout-paths.ts'
 import {
   layoutRecordPath,
@@ -230,6 +233,30 @@ function restoreUnfinished(configDir: string): never {
     `A restore of anthropic-auth's state for ${configDir} did not finish; run ${RESTORE_LEGACY_COMMAND} again.`,
     [configDir],
   )
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * The config folder's identity (see `configFolderIdentity`), undefined when
+ * it doesn't exist. Any other failure to resolve it (a folder on the way
+ * that may not be searched, a symlink loop) refuses with a fixed public
+ * message: the dataset's own files can't be resolved either, so 2.4.x
+ * could not serve it.
+ */
+function configIdentity(configDir: string): string | undefined {
+  try {
+    return configFolderIdentity(configDir)
+  } catch (error) {
+    refuse(
+      'io-failed',
+      `anthropic-auth can't resolve its config folder ${configDir}: ${errorMessage(error)}`,
+      [configDir],
+      error,
+    )
+  }
 }
 
 /** A `restored` record whose cleanup is done reads as "no move". */
@@ -567,7 +594,19 @@ async function legacyWhileMoveOff(
   ctx: StateLayoutTransitionContext,
   stayReasons: string[],
 ): Promise<StateLayoutDecision | undefined> {
-  const old = await resolveLegacyDatasetFiles(configDir)
+  let old: LegacyDatasetFiles
+  try {
+    old = await resolveLegacyDatasetFiles(configDir)
+  } catch (error) {
+    // The dataset's files can't be resolved, so 2.4.x could not serve them
+    // either; refuse without showing the path.
+    refuse(
+      'io-failed',
+      `anthropic-auth can't resolve its files in ${configDir}: ${errorMessage(error)}`,
+      [configDir],
+      error,
+    )
+  }
   if (await oldFolderTransition(old)) return undefined
   try {
     await stateLayoutStep(ctx, 'old-holders-locking')
@@ -681,9 +720,9 @@ export async function decideOpenCodeStateLayout(
   // goes through the same checks as every other legacy admission, under the
   // folder's holder lock: a move another start committed meanwhile is found
   // and served, never overruled.
-  let target = resolveStateHomeTarget({ env, home })
+  let identity = configIdentity(configDir)
   const neverMove: string[] = []
-  if (!target) {
+  if (identity === undefined) {
     const reason = 'the config folder did not exist when this process started'
     try {
       await ensureHolderDirectory(configDir)
@@ -705,8 +744,9 @@ export async function decideOpenCodeStateLayout(
         deferLegacyRegistration(paths, configDir, options, error),
       )
     }
-    target = resolveStateHomeTarget({ env, home })
-    if (!target) throw new HolderRegistrationError('unavailable', configDir)
+    identity = configIdentity(configDir)
+    if (identity === undefined)
+      throw new HolderRegistrationError('unavailable', configDir)
     neverMove.push(reason)
   }
   const overrides = statePathOverrides(env)
@@ -716,12 +756,14 @@ export async function decideOpenCodeStateLayout(
   ]
 
   // 3. While moving is off, a config folder with no sign of a move stays
-  // legacy without looking at the state folder.
+  // legacy without looking at the state folder, or even naming it: the
+  // name depends on the home directory's default config folder, which may
+  // be an unrelated folder this start must not depend on.
   const moveEnabled = relocationMoveEnabled(options)
   if (!moveEnabled) {
     const legacy = await legacyWhileMoveOff(
       configDir,
-      target.identity,
+      identity,
       options,
       newContext(),
       stayReasons,
@@ -729,8 +771,20 @@ export async function decideOpenCodeStateLayout(
     if (legacy) return legacy
   }
 
-  // From here the state folder may hold the dataset, so a failure to read it
-  // refuses, with a fixed message.
+  // From here the state folder may hold the dataset, so a failure to name
+  // or read it refuses, with a fixed message.
+  let target: StateHomeTarget
+  try {
+    target = stateHomeTargetFor(identity, { env, home })
+  } catch (error) {
+    const homeDefault = homeDefaultConfigDir(home)
+    refuse(
+      'io-failed',
+      `anthropic-auth can't resolve ${homeDefault}, which names its state folder, so it won't use either copy: ${errorMessage(error)}`,
+      [homeDefault],
+      error,
+    )
+  }
   let sub: string
   let dataset: RelocationDataset
   try {

@@ -22,6 +22,11 @@ export type StateLayoutRefusalCode =
   | 'unexpected-data'
   /** A restore to the legacy layout can't start; the message names what to fix. */
   | 'restore-refused'
+  /**
+   * A folder or file that decides where the state is (the config folder, the
+   * state folder, or a lock beside them) could not be read or written.
+   */
+  | 'io-failed'
 
 /** The command that restores the legacy layout, as users run it. */
 export const RESTORE_LEGACY_COMMAND =
@@ -47,6 +52,8 @@ const PUBLIC_MESSAGES: Record<StateLayoutRefusalCode, string> = {
   'unexpected-data':
     "anthropic-auth's state folder holds files it did not write, so it won't use them. The log names the files.",
   'restore-refused': `anthropic-auth can't restore the old layout yet. Run ${RESTORE_LEGACY_COMMAND} to see what to fix.`,
+  'io-failed':
+    "anthropic-auth could not read or write a folder that decides where its state is, so it won't use either copy. The log names the folder and the error; check its permissions, then restart.",
 }
 
 /** Every refusal code, for readers that check a code they were handed. */
@@ -114,6 +121,25 @@ export function stateLayoutConflict(
     'conflict',
     `anthropic-auth found two copies of the same account state: ${oldPath} (old folder) and ${newPath} (state folder). It stopped using both so a refresh token is never used twice. Keep the copy you trust, move the other one out of both folders, then restart OpenCode.`,
     [oldPath, newPath],
+    cause,
+  )
+}
+
+/**
+ * A file system failure while deciding or changing where the state is, such
+ * as a lock file that can't be created or a folder that can't be resolved.
+ * `what` says what was being done, for the log; the public text is fixed.
+ */
+export function stateLayoutIoFailure(
+  what: string,
+  paths: readonly string[],
+  cause: unknown,
+): StateLayoutRefusalError {
+  const reason = cause instanceof Error ? cause.message : String(cause)
+  return new StateLayoutRefusalError(
+    'io-failed',
+    `anthropic-auth could not ${what}: ${reason}`,
+    paths,
     cause,
   )
 }
