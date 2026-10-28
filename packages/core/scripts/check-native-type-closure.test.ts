@@ -102,32 +102,35 @@ test('recognizes runtime dynamic import edges and exact ranges without matching 
   ).toEqual([['./chunk.js', "'./chunk.js'"]])
 })
 
-test('rejects unsupported published producer versions before copying declarations', async () => {
-  const root = await fixture()
-  const dist = join(root, 'dist')
-  const producer = join(root, 'producer')
-  await put(
-    producer,
-    'package.json',
-    JSON.stringify({
-      version: '0.24.0',
-      exports: { './store': { types: './dist/store.d.ts' } },
-    }),
-  )
-  await put(producer, 'LICENSE', 'Synthetic test license')
-  await put(producer, 'dist/store.d.ts', 'export interface Store {}')
-  await put(dist, 'index.js', 'export const ready = true;')
-  await put(
-    dist,
-    'index.d.ts',
-    `export type { Store } from '@cortexkit/common-auth/store';`,
-  )
+test.each(['0.24.0', '0.28.0', '0.29.1'])(
+  'rejects unsupported published producer version %s before copying declarations',
+  async (version) => {
+    const root = await fixture()
+    const dist = join(root, 'dist')
+    const producer = join(root, 'producer')
+    await put(
+      producer,
+      'package.json',
+      JSON.stringify({
+        version,
+        exports: { './store': { types: './dist/store.d.ts' } },
+      }),
+    )
+    await put(producer, 'LICENSE', 'Synthetic test license')
+    await put(producer, 'dist/store.d.ts', 'export interface Store {}')
+    await put(dist, 'index.js', 'export const ready = true;')
+    await put(
+      dist,
+      'index.d.ts',
+      `export type { Store } from '@cortexkit/common-auth/store';`,
+    )
 
-  await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
-    'Expected published common-auth 0.28.0, got 0.24.0',
-  )
-  expect(await readdir(dist)).not.toContain('internal-types')
-})
+    await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
+      `Expected published common-auth 0.29.0, got ${version}`,
+    )
+    expect(await readdir(dist)).not.toContain('internal-types')
+  },
+)
 
 test('copies the complete published relative declaration graph including cycles and directives', async () => {
   const root = await fixture()
@@ -137,7 +140,7 @@ test('copies the complete published relative declaration graph including cycles 
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.28.0',
+      version: '0.29.0',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
@@ -273,11 +276,11 @@ test('packed Core types and Node runtime work in a fresh consumer without common
   const manifest = JSON.parse(
     await readFile(join(core, 'package.json'), 'utf8'),
   )
-  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.28.0')
+  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.29.0')
   expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.13.0')
   expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.22.10')
   expect(manifest.dependencies['jsonc-parser']).toBe('^3.3.1')
-  expect(manifest.dependencies['@cortexkit/private-files']).toBe('0.2.1')
+  expect(manifest.dependencies['@cortexkit/private-files']).toBe('0.2.2')
   expect(manifest.dependencies['@cortexkit/common-auth']).toBeUndefined()
   const consumer = join(root, 'prefix')
   await put(
@@ -324,7 +327,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
       'utf8',
     ),
   )
-  expect(privateFilesManifest.version).toBe('0.2.1')
+  expect(privateFilesManifest.version).toBe('0.2.2')
   const claustrumManifests = allInstalled.filter((path) =>
     /(?:^|\/)@cortexkit\/claustrum-client\/package\.json$/.test(path),
   )

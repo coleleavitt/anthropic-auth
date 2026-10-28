@@ -2,6 +2,10 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- `@cortexkit/common-auth` moves to 0.29.0, which fixes lock release and long paths on Windows.
+
 ## 2.4.2
 
 - OpenCode 2: `/claude` → Status now looks up vault accounts itself, so a freshly connected vault shows its accounts before the first request, and an empty vault says so instead of 'No native Claude accounts.' Addresses #528.
