@@ -13,7 +13,13 @@ const GUIDANCE_COMMAND =
 
 const statusFor = async (snapshot: NativeAccountSnapshot) => {
   const capabilities = createNativeMenuCapabilities({
-    runtime: { read: async () => snapshot } as NativeAccountRuntime,
+    runtime: {
+      read: async () => snapshot,
+      vault: {
+        refresh: async () => undefined,
+        read: async () => ({ view: 'synthetic-view' }),
+      },
+    } as unknown as NativeAccountRuntime,
     source: {} as NativeSource,
     start: async () => {},
   })

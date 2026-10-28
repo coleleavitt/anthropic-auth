@@ -7,6 +7,7 @@ import {
   buildPrimeStatusSummary,
   type CacheKeepSessionRegistry,
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+  effectiveRelayTransport,
   exchange,
   formatNativeAccountState,
   formatOAuthAccountTier,
@@ -28,6 +29,7 @@ import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
   CLAUDE_POOL_LOGIN_METHOD_LABEL,
 } from './activation'
+import { NativeAnthropicTransportRefusal } from './adapter'
 import type { NativeMenuCapabilities } from './menu-contract'
 import { buildNativeSidebarState } from './sidebar'
 import type { NativeSource } from './source'
@@ -40,6 +42,33 @@ const record = (value: unknown): Record<string, unknown> =>
     : {}
 
 const POOL_CONNECTION_GUIDANCE = `For first-time model access, connect Anthropic with "${CLAUDE_POOL_LOGIN_METHOD_LABEL}".\nRun: opencode auth login anthropic --method ${CLAUDE_POOL_LOGIN_METHOD_ID}`
+const VAULT_EMPTY =
+  'No Claude accounts in the vault for this host yet. Add one with `ck auth login --provider anthropic`, then grant it to this host.'
+const VAULT_REJECTED =
+  'The vault returned an account this plugin cannot use yet.'
+
+async function refreshVaultForStatus(runtime: NativeAccountRuntime) {
+  const deadline = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    // Refresh shares discovery with requests and the watcher. Only this menu's
+    // wait ends at the deadline; the shared lookup can still publish later.
+    return await Promise.race([
+      runtime.vault.refresh(deadline.signal).then(
+        () => 'complete' as const,
+        () => 'failed' as const,
+      ),
+      new Promise<'pending'>((resolve) => {
+        timer = setTimeout(() => {
+          resolve('pending')
+          deadline.abort()
+        }, 2000)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 /**
  * The pool login connects OpenCode and stores the pool's main account, and
@@ -312,11 +341,43 @@ export function createNativeMenuCapabilities(options: {
   return {
     dispatch,
     async readStatus(command) {
-      const snapshot = await runtime.read()
+      let snapshot = await runtime.read()
       if (command === 'account') {
-        const accounts =
-          snapshot.accounts.map(formatAccountStatus).join('\n') ||
-          'No native Claude accounts.'
+        let empty = 'No native Claude accounts.'
+        const notices: string[] = []
+        if (snapshot.mode === 'claustrum') {
+          const relay = snapshot.policyStorage.relay
+          if (
+            relay?.enabled === true &&
+            effectiveRelayTransport(relay.transport, relay.url) === 'websocket'
+          )
+            return new NativeAnthropicTransportRefusal().message
+          let lookup = await refreshVaultForStatus(runtime)
+          // The host may have disconnected from the vault during discovery.
+          snapshot = await runtime.read()
+          if (snapshot.mode === 'claustrum') {
+            const roster = await runtime.vault.read()
+            if (lookup === 'complete' && !roster?.view) lookup = 'failed'
+            empty =
+              lookup === 'complete'
+                ? VAULT_EMPTY
+                : 'No saved Claude accounts for this host yet.'
+            if (roster?.rejected?.length) {
+              empty = VAULT_REJECTED
+              if (snapshot.accounts.length) notices.push(VAULT_REJECTED)
+            }
+            if (lookup === 'pending')
+              notices.push('Vault account lookup is still running.')
+            else if (lookup === 'failed')
+              notices.push(
+                'Vault account lookup did not complete; reopen /claude to retry.',
+              )
+          }
+        }
+        const accounts = [
+          snapshot.accounts.map(formatAccountStatus).join('\n') || empty,
+          ...notices,
+        ].join('\n')
         return needsPoolConnection(snapshot)
           ? `${accounts}\n\n${POOL_CONNECTION_GUIDANCE}\nQuota refresh checks the pool; it does not check OpenCode's Anthropic connection.`
           : accounts
