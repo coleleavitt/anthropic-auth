@@ -235,7 +235,7 @@ for (const width of [37, 42]) {
         const result = await renderOpenCode2Sidebar(
           [sharedShapeSidebarState()],
           [{ wanted: collapsed ? ['5h 70% left', '…'] : ['Health', 'Prime'] }],
-          { width, height: 50, collapsed, showVersion: false },
+          { width, height: 50, collapsed },
         )
         const [frame] = result.frames
         expectSharedSidebarShape(frame!, result.lines, width, collapsed)

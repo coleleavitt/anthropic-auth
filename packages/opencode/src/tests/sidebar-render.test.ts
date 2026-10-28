@@ -204,7 +204,7 @@ for (const width of [36, 42]) {
           ? ['5h 40% · 7d 80% left', '5h 70% left', '…']
           : ['Health', 'Prime'],
         collapsed,
-        { width, height: 50, showVersion: false },
+        { width, height: 50 },
       )
       const [frame, styles] = stdout.split('STYLES:')
       expectSharedSidebarShape(

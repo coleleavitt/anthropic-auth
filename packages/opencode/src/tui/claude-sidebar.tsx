@@ -825,7 +825,9 @@ export function ClaudeSidebar(props: {
             <b>{headerLabel()}</b>
           </text>
         </box>
-        <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
+        <Show when={prefs().header.showVersion && PLUGIN_VERSION !== ''}>
+          <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
+        </Show>
       </box>
 
       {/* Collapsed accounts keep placement order; only a fresh active row is emphasized. */}
