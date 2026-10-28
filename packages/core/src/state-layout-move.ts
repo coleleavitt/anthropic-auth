@@ -556,6 +556,19 @@ export async function acquireDataLocks(
             ),
           }
         : undefined
+      if (ctx.fs.platform === 'win32' && refresh) {
+        // Common-auth leaves '*' unescaped in row lock names. Renaming only
+        // the mover's lock would stop it coordinating with refresh writers.
+        for (const [pool, locks] of [
+          ['local', refresh.local],
+          ['vault', refresh.vault],
+        ] as const) {
+          if (locks.rows.some((name) => name.includes('*')))
+            throw new Error(
+              `the ${pool} pool has a row id or identity whose refresh lock name contains '*', which Windows filenames do not allow`,
+            )
+        }
+      }
       for (const spec of stateLayoutDataLockOrder(dataset, {
         timeoutMs,
         refresh,

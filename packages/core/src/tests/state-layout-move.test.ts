@@ -673,6 +673,64 @@ test('row locks are taken in the raw-key order common-auth publication uses, whi
   )
 })
 
+for (const pool of ['local', 'vault'] as const) {
+  for (const key of ['id', 'identity'] as const) {
+    test(`Windows: an asterisk in a ${pool} row ${key} keeps the legacy layout before data locks`, async () => {
+      const m = await machine()
+      const paths =
+        pool === 'local'
+          ? m.oldPaths
+          : nativeVaultPaths(m.oldPaths, LEGACY_STATE_LAYOUT)
+      const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+      await store.initialize()
+      await store.add({
+        id: key === 'id' ? 'row*id' : 'row-id',
+        ...(key === 'identity' ? { identity: 'account*identity' } : {}),
+        credential: credential('asterisk'),
+      })
+      await store.close()
+      const before = await oldTree(m)
+      const events: NativeLockEvent[] = []
+      const win = windowsFs(m, async () => false)
+      const decision = await decide(m, {
+        fs: win.fs,
+        onLockEvent: (event) => events.push(event),
+      })
+      expect(decision.kind).toBe('legacy')
+      if (decision.kind === 'legacy')
+        expect(decision.reasons).toEqual([
+          `the ${pool} pool has a row id or identity whose refresh lock name contains '*', which Windows filenames do not allow`,
+        ])
+      expect(events.some((event) => event.name === 'native-migration')).toBe(
+        false,
+      )
+      expect(events.some((event) => event.name.startsWith('row-'))).toBe(false)
+      expect(await oldTree(m)).toEqual(before)
+      expect(await exists(join(m.sub, 'layout.json'))).toBe(false)
+      expect(await subDataFiles(m)).toEqual([])
+    })
+  }
+}
+
+test('POSIX keeps the common-auth row lock name for an asterisk id', async () => {
+  const m = await machine()
+  const store = createNativePoolStore({
+    paths: m.oldPaths,
+    quota: nativeQuotaCodec,
+  })
+  await store.add({ id: 'row*id', credential: credential('asterisk') })
+  await store.close()
+  const rows: string[] = []
+  const decision = await decide(m, {
+    onLockEvent: (event) => {
+      if (event.type === 'acquired' && event.name.startsWith('row-'))
+        rows.push(event.name)
+    },
+  })
+  expect(decision.kind).toBe('state-home')
+  expect(rows).toEqual(['row-a', 'row-row*id'])
+})
+
 /**
  * Core's refresh coordinator over the old pool, with every policy hook
  * allowing the refresh. `exchange` stands in for the provider's token
