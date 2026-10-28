@@ -73,9 +73,6 @@ const PLUGIN_VERSION: string = (() => {
   return ''
 })()
 
-// biome-ignore lint/suspicious/noExplicitAny: opentui border prop not typed in plugin tui surface
-const SINGLE_BORDER = { type: 'single' } as any
-
 export type SidebarColor = RGBA | string
 
 /** The flat theme tokens the sidebar draws with; OpenCode 1's `theme.current` has them all. */
@@ -255,7 +252,8 @@ function CollapsedAccountRow(props: {
   let row: BoxRenderable | undefined
   const summary = () => getCollapsedQuotaSummary(props.account.quota, props.now)
   const value = () => summary().text ?? '—'
-  const labelWidth = () => Math.max(0, width() - Bun.stringWidth(value()) - 1)
+  // Reserve two cells for the status glyph and one between label and quota.
+  const labelWidth = () => Math.max(0, width() - Bun.stringWidth(value()) - 3)
   const dim = () =>
     !props.account.active || props.account.quotaDated || summary().stale
   const attributes = () => (dim() ? TextAttributes.DIM : TextAttributes.BOLD)
@@ -272,6 +270,21 @@ function CollapsedAccountRow(props: {
       }}
       onSizeChange={() => setWidth(row?.width || 40)}
     >
+      <text
+        width={2}
+        flexShrink={0}
+        fg={toneColor(
+          props.theme,
+          props.account.blocked
+            ? 'warn'
+            : props.account.active
+              ? 'ok'
+              : 'muted',
+        )}
+        attributes={attributes()}
+      >
+        {props.account.blocked ? '⊘ ' : '● '}
+      </text>
       <Show when={labelWidth() > 0}>
         <text
           width={labelWidth()}
@@ -795,17 +808,8 @@ export function ClaudeSidebar(props: {
   }
 
   return (
-    <box
-      width='100%'
-      flexDirection='column'
-      border={SINGLE_BORDER}
-      borderColor={theme().borderActive}
-      paddingTop={1}
-      paddingBottom={1}
-      paddingLeft={1}
-      paddingRight={1}
-    >
-      {/* Header: ▼/▶ CLAUDE badge (click to collapse) + version, or LIMITED badge */}
+    <box width='100%' flexDirection='column'>
+      {/* The collapse control stays on the left; the version stays on the right. */}
       {/* biome-ignore lint/a11y/noStaticElementInteractions: opentui renders to a terminal, not the DOM — ARIA roles do not apply */}
       <box
         width='100%'
@@ -821,24 +825,7 @@ export function ClaudeSidebar(props: {
             <b>{headerLabel()}</b>
           </text>
         </box>
-        <Show
-          when={degraded()}
-          fallback={
-            <Show when={prefs().header.showVersion && PLUGIN_VERSION !== ''}>
-              <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
-            </Show>
-          }
-        >
-          <box
-            paddingLeft={1}
-            paddingRight={1}
-            backgroundColor={theme().warning}
-          >
-            <text fg={theme().background}>
-              <b>{'LIMITED'}</b>
-            </text>
-          </box>
-        </Show>
+        <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
       </box>
 
       {/* Collapsed accounts keep placement order; only a fresh active row is emphasized. */}

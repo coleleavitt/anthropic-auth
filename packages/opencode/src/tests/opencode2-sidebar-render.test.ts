@@ -8,6 +8,12 @@ import {
   expectOneLineQuotaRows,
   fiveAccountSidebarState,
 } from './fixtures/sidebar-five-accounts'
+import {
+  captureSharedSidebarFrame,
+  expectSharedSidebarShape,
+  type SidebarFrameLine,
+  sharedShapeSidebarState,
+} from './fixtures/sidebar-shared-shape'
 
 const lifetimes = createTestLifetimeSuite()
 const test = lifetimes.test
@@ -28,19 +34,30 @@ interface Step {
 async function renderOpenCode2Sidebar(
   answers: unknown[],
   steps: Step[],
-  size: { width: number; height: number } = { width: 42, height: 32 },
+  size: {
+    width: number
+    height: number
+    collapsed?: boolean
+    showVersion?: boolean
+  } = { width: 42, height: 32 },
 ): Promise<{
   frames: string[]
   asked: string[]
   released: number
   colors: Record<string, string>
+  lines: SidebarFrameLine[]
 }> {
   const fixture = await mkdtemp(join(tmpdir(), 'anthropic-oc2-sidebar-'))
   lifetimes.deferCleanup(() => rm(fixture, { recursive: true, force: true }))
   await writeFile(
     join(fixture, 'preferences.jsonc'),
     JSON.stringify({
-      'anthropic-auth': { rememberCollapsed: false, pollMs: 500 },
+      'anthropic-auth': {
+        rememberCollapsed: false,
+        pollMs: 500,
+        startCollapsed: size.collapsed ?? false,
+        header: { showVersion: size.showVersion ?? true },
+      },
     }),
   )
   const probe = `
@@ -116,11 +133,15 @@ try {
     clock += step.advanceMs ?? 0;
   }
   const colors = {};
+  const lines = setupRenderer.captureSpans().lines.map((line) => ({
+    text: line.spans.map((span) => span.text).join(''),
+    spans: line.spans.map((span) => ({ text: span.text, fg: String(span.fg) })),
+  }));
   for (const line of setupRenderer.captureSpans().lines)
     for (const span of line.spans)
       if (span.text.trim()) colors[span.text.trim()] ??= String(span.fg);
   cleanup();
-  console.log(JSON.stringify({ frames, asked, released, colors }));
+  console.log(JSON.stringify({ frames, asked, released, colors, lines }));
 } finally {
   setupRenderer.renderer.destroy();
   await teardown;
@@ -203,6 +224,25 @@ function quotaState() {
     relay: null,
     fastMode: false,
     lastUpdated: now,
+  }
+}
+
+for (const width of [37, 42]) {
+  for (const collapsed of [false, true]) {
+    test(
+      `OpenCode 2 shared sidebar shape at ${width} columns ${collapsed ? 'collapsed' : 'expanded'}`,
+      async () => {
+        const result = await renderOpenCode2Sidebar(
+          [sharedShapeSidebarState()],
+          [{ wanted: collapsed ? ['5h 70% left', '…'] : ['Health', 'Prime'] }],
+          { width, height: 50, collapsed, showVersion: false },
+        )
+        const [frame] = result.frames
+        expectSharedSidebarShape(frame!, result.lines, width, collapsed)
+        captureSharedSidebarFrame('OpenCode 2', width, collapsed, frame!)
+      },
+      SUBPROCESS_TIMEOUT_MS,
+    )
   }
 }
 

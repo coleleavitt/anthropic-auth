@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- The Claude sidebar matches the other CortexKit auth plugins: no frame border, a status dot on each collapsed account row, and the plugin version always on the right of the header.
 - `@cortexkit/common-auth` moves to 0.29.0, which fixes lock release and long paths on Windows.
 
 ## 2.4.2

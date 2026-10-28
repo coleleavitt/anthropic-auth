@@ -8,6 +8,11 @@ import {
   expectOneLineQuotaRows,
   fiveAccountSidebarState,
 } from './fixtures/sidebar-five-accounts'
+import {
+  captureSharedSidebarFrame,
+  expectSharedSidebarShape,
+  sharedShapeSidebarState,
+} from './fixtures/sidebar-shared-shape'
 
 const lifetimes = createTestLifetimeSuite()
 const test = lifetimes.test
@@ -24,7 +29,12 @@ async function renderSidebar(
   state: unknown,
   wanted: string[],
   collapsed = false,
-  options: { rewrite?: Rewrite; width?: number; height?: number } = {},
+  options: {
+    rewrite?: Rewrite
+    width?: number
+    height?: number
+    showVersion?: boolean
+  } = {},
 ) {
   const { rewrite, width = 42, height = 32 } = options
   const fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-'))
@@ -39,6 +49,7 @@ async function renderSidebar(
       'anthropic-auth': {
         startCollapsed: collapsed,
         rememberCollapsed: false,
+        header: { showVersion: options.showVersion ?? true },
         // The fastest poll the preferences allow keeps a rewrite test short.
         ...(rewrite ? { pollMs: 500 } : {}),
       },
@@ -121,6 +132,7 @@ try {
     console.log('STYLES:' + JSON.stringify(setup.captureSpans().lines.map((line) => {
       const spans = line.spans.filter((span) => span.text.trim());
       return { text: line.spans.map((span) => span.text).join(''),
+        spans: spans.map((span) => ({ text: span.text, fg: String(span.fg) })),
         dim: spans.length > 0 && spans.every((span) => (span.attributes & TextAttributes.DIM) !== 0),
         bold: spans.length > 0 && spans.every((span) => (span.attributes & TextAttributes.BOLD) !== 0) };
     })));
@@ -181,6 +193,29 @@ process.exit(0);
   await cancellation
   expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
   return stdout
+}
+
+for (const width of [36, 42]) {
+  for (const collapsed of [false, true]) {
+    test(`OpenCode 1 shared sidebar shape at ${width} columns ${collapsed ? 'collapsed' : 'expanded'}`, async () => {
+      const stdout = await renderSidebar(
+        sharedShapeSidebarState(),
+        collapsed
+          ? ['5h 40% · 7d 80% left', '5h 70% left', '…']
+          : ['Health', 'Prime'],
+        collapsed,
+        { width, height: 50, showVersion: false },
+      )
+      const [frame, styles] = stdout.split('STYLES:')
+      expectSharedSidebarShape(
+        frame!,
+        JSON.parse(styles ?? '[]'),
+        width,
+        collapsed,
+      )
+      captureSharedSidebarFrame('OpenCode 1', width, collapsed, frame!)
+    })
+  }
 }
 
 test('compiled sidebar renders the shared quota figure reset and stale reading age offline', async () => {
@@ -487,7 +522,7 @@ test('42-column sidebar renders short scoped names credits and stale fallback ro
     .filter((line) => /38% left|59% left|22% left|92% left|7% left/.test(line))
   expect(rows).toHaveLength(5)
   expect(new Set(rows.map((line) => line.search(/[█░▓▒]/)))).toEqual(
-    new Set([4]),
+    new Set([3]),
   )
 })
 
@@ -511,10 +546,13 @@ function largeCreditState() {
   }
 }
 
-test('42-column sidebar drops the cents from credit amounts that would not fit on one line', async () => {
-  const stdout = await renderSidebar(largeCreditState(), [
-    'credits 75% left · $125,000/$500,000',
-  ])
+test('36-column sidebar drops the cents from credit amounts that would not fit on one line', async () => {
+  const stdout = await renderSidebar(
+    largeCreditState(),
+    ['credits 75% left · $125,000/$500,000'],
+    false,
+    { width: 36 },
+  )
   const line = stdout.split('\n').find((row) => row.includes('credits'))
   expect(line?.trim()).toBe('credits 75% left · $125,000/$500,000')
   expect(stdout).not.toContain('.00')
@@ -552,7 +590,7 @@ for (const width of [36, 42]) {
     expect(stdout).not.toContain('Fable')
     // One label column: every bar starts in the same cell.
     expect(new Set(rows.map((row) => row.search(/[█░▓▒]/)))).toEqual(
-      new Set([4]),
+      new Set([3]),
     )
     // Every row here fits whole, so each keeps its reset after a space.
     for (const row of rows) expect(row).toMatch(/left( •)? +\d+[a-z]/)
@@ -562,20 +600,20 @@ for (const width of [36, 42]) {
   })
 }
 
-test('a 30-column sidebar drops resets that do not fit instead of wrapping rows or running text together', async () => {
+test('a 28-column sidebar drops resets that do not fit instead of wrapping rows or running text together', async () => {
   const stdout = await renderSidebar(
     fiveAccountSidebarState(),
     // The cents drop once the block has a measured width, so this waits for it.
     ['backup', 'checked 1d6h ago', 'Routing', '$12/$50'],
     false,
-    { width: 30, height: 70 },
+    { width: 28, height: 70 },
   )
   const rows = expectOneLineQuotaRows(stdout, FIVE_ACCOUNTS)
   expect(rows).toHaveLength(15)
-  for (const row of rows) expect(row).toMatch(/^ \S+ +[█░▓▒]{10} \d+% left/)
+  for (const row of rows) expect(row).toMatch(/^\S+ +[█░▓▒]{10} \d+% left/)
   // `100% left •` leaves no room for ` 4h39m`, so that row has no reset; a
   // row that fits exactly keeps its one-cell gap.
-  expect(rows).toContain(' 5h ▒░░░░░░░░░ 100% left •')
+  expect(rows).toContain('5h ▒░░░░░░░░░ 100% left •')
   expect(rows.some((row) => / 97% left \d+h\d+m$/.test(row))).toBe(true)
   expect(stdout).toMatch(/reserve \d+% · lasts to re…/)
 })
@@ -683,7 +721,7 @@ test('scoped rows whose models share a short name extend it as the collapsed lin
     '7d',
   ])
   // The column fits the longest label in the sidebar, across accounts.
-  expect(new Set(rows.map((row) => row.search(/[█░▓▒]/)))).toEqual(new Set([6]))
+  expect(new Set(rows.map((row) => row.search(/[█░▓▒]/)))).toEqual(new Set([5]))
   const collapsed = await renderSidebar(state, ['Fabr 10% left'], true, {
     width: 36,
   })

@@ -809,6 +809,48 @@ describe('getCollapsedQuotaSummary', () => {
 })
 
 describe('getCollapsedAccounts', () => {
+  test('marks unavailable credentials as blocked without confusing idle or stale accounts with blocked ones', () => {
+    const fallback = (id: string, overrides = {}) => ({
+      id,
+      enabled: true,
+      needsReauth: false,
+      quota: quota(20),
+      ...overrides,
+    })
+    const state = make({
+      main: { quota: quota(10), stateLine: 'refresh paused' },
+      fallbacks: [
+        fallback('idle'),
+        fallback('dated', { quotaDated: true }),
+        fallback('reauth', { needsReauth: true }),
+        fallback('vault-reauth', { vaultReauth: true }),
+        fallback('state-line', { stateLine: 'credential unavailable' }),
+        fallback('vault-disabled', { enabled: false, custodyState: 'on-cold' }),
+        fallback('vault-cold', { custodyState: 'on-cold' }),
+        fallback('vault-served', { custodyState: 'on-vault-served' }),
+        fallback('vault-off', { custodyState: 'off' }),
+      ],
+    })
+    expect(
+      getCollapsedAccounts(state).map(({ id, blocked }) => ({ id, blocked })),
+    ).toEqual([
+      { id: 'main', blocked: true },
+      { id: 'idle', blocked: false },
+      { id: 'dated', blocked: false },
+      { id: 'reauth', blocked: true },
+      { id: 'vault-reauth', blocked: true },
+      { id: 'state-line', blocked: true },
+      { id: 'vault-disabled', blocked: true },
+      { id: 'vault-cold', blocked: true },
+      { id: 'vault-served', blocked: false },
+      { id: 'vault-off', blocked: false },
+    ])
+    expect(
+      getCollapsedAccounts(make({ main: { quota: null, enabled: false } }))[0]
+        ?.blocked,
+    ).toBe(true)
+  })
+
   test('keeps placement order rather than moving the active fallback first', () => {
     const state = make({
       main: { quota: quota(10) },

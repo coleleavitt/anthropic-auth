@@ -1149,6 +1149,7 @@ export function getCollapsedAccounts(
       quota: state.main?.quota ?? null,
       quotaDated: state.main?.quotaDated,
       active: activeId === 'main',
+      blocked: state.main?.enabled === false || Boolean(state.main?.stateLine),
     },
     ...(showFallbacks
       ? (state.fallbacks ?? [])
@@ -1163,6 +1164,14 @@ export function getCollapsedAccounts(
             quota: account.quota,
             quotaDated: account.quotaDated,
             active: activeId === account.id,
+            blocked:
+              !account.enabled ||
+              Boolean(account.stateLine) ||
+              account.needsReauth ||
+              account.vaultReauth === true ||
+              (account.custodyState != null &&
+                account.custodyState !== 'off' &&
+                account.custodyState !== 'on-vault-served'),
           }))
       : []),
   ]
