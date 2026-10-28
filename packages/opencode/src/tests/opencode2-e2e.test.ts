@@ -31,6 +31,10 @@ import {
 } from '../../../core/src/tests/test-lifetime'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
 import { seedOpencodeConfigDependencies } from '../../../e2e-tests/src/opencode-runner'
+import {
+  disposableCommandError,
+  isolatedPackedHostEnv,
+} from './support/packed-host-install'
 
 const { test, gate, trackDetached, deferCleanup } = createTestLifetimeSuite()
 
@@ -77,29 +81,12 @@ const hostLogDirectory = (env: Record<string, string>) =>
   env.TMPDIR ? join(env.TMPDIR, 'host-logs') : undefined
 
 /** Also used for installation: the CLI's postinstall runs --version itself. */
-async function isolatedEnv(root: string): Promise<Record<string, string>> {
-  const directories = {
-    HOME: join(root, 'home'),
-    XDG_CONFIG_HOME: join(root, 'config'),
-    XDG_DATA_HOME: join(root, 'data'),
-    XDG_STATE_HOME: join(root, 'state'),
-    XDG_CACHE_HOME: join(root, 'cache'),
-    TMPDIR: join(root, 'tmp'),
-  }
-  await Promise.all(
-    Object.values(directories).map((directory) =>
-      mkdir(directory, { recursive: true }),
-    ),
-  )
-  return {
-    PATH: process.env.PATH ?? '',
-    ...directories,
-    OPENCODE_DB: join(root, 'disposable.sqlite'),
-    OPENCODE_SERVER_PASSWORD: PASSWORD,
-    OPENCODE_PASSWORD: PASSWORD,
-    OPENCODE_ANTHROPIC_AUTH_LOG_FILE: join(root, 'anthropic-auth.log'),
-  }
-}
+const isolatedEnv = (root: string) =>
+  isolatedPackedHostEnv(root, {
+    path: process.env.PATH ?? '',
+    password: PASSWORD,
+    npmCache: join(workspace, 'node_modules', '.cache', 'opencode-host-npm'),
+  })
 async function command(
   args: string[],
   cwd: string,
@@ -128,7 +115,9 @@ async function command(
       })
     : Promise.resolve()
   if (cancellation) trackDetached(stopWork)
+  let timedOut = false
   const timer = setTimeout(() => {
+    timedOut = true
     timing?.clock.mark(`${timing.name}.deadline`)
     child.kill('SIGKILL')
   }, limit)
@@ -151,7 +140,7 @@ async function command(
         redactFixtureSecrets(stderr),
       )
     }
-    return { stdout, stderr, exit }
+    return { stdout, stderr, exit, timedOut }
   } finally {
     clearTimeout(timer)
     if (child.exitCode === null) child.kill('SIGKILL')
@@ -169,11 +158,7 @@ async function requireCommand(
 ) {
   const result = await command(args, cwd, env, 60_000, undefined, timing)
   if (result.exit !== 0)
-    throw new Error(
-      redactFixtureSecrets(
-        `Disposable command failed: ${args[0]} ${args[1]}\n${result.stdout}\n${result.stderr}`,
-      ),
-    )
+    throw disposableCommandError(args, result, redactFixtureSecrets)
   return result
 }
 

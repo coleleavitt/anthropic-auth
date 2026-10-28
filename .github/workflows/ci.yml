@@ -101,6 +101,12 @@ jobs:
         with:
           minimum_release_age: 0s
       - run: bun install --frozen-lockfile
+      - name: Restore packed OpenCode host npm downloads
+        if: matrix.suite == 'opencode'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: node_modules/.cache/opencode-host-npm
+          key: packed-opencode-npm-v1-${{ runner.os }}-${{ runner.arch }}-oc1-1.18.31-oc2-2.0.22
       # A full rebuild takes 4-8s and avoids another job plus artifact transfer on every test's path.
       - run: bun run build
       - run: bun scripts/ci-unit-tests.ts --suite '${{ matrix.suite }}' --shard '${{ matrix.shard }}' --output-dir unit-counts
