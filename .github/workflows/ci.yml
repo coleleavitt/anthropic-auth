@@ -101,12 +101,35 @@ jobs:
         with:
           minimum_release_age: 0s
       - run: bun install --frozen-lockfile
+      # Bun owns file sharding; the runner has no stable file-to-shard map.
+      # Prepare hosts in every ordinary OpenCode shard, but not miniflare.
+      - name: Read packed OpenCode host versions
+        if: matrix.suite == 'opencode' && matrix.shard != 'miniflare'
+        id: packed-host-versions
+        run: |
+          key=$(bun packages/opencode/scripts/install-packed-hosts.ts --version-key)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
       - name: Restore packed OpenCode host npm downloads
-        if: matrix.suite == 'opencode'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: matrix.suite == 'opencode' && matrix.shard != 'miniflare'
+        id: packed-host-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: node_modules/.cache/opencode-host-npm
-          key: packed-opencode-npm-v1-${{ runner.os }}-${{ runner.arch }}-oc1-1.18.31-oc2-2.0.22
+          key: packed-opencode-npm-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.packed-host-versions.outputs.key }}
+      - name: Install packed OpenCode hosts
+        if: matrix.suite == 'opencode' && matrix.shard != 'miniflare'
+        id: packed-host-install
+        timeout-minutes: 5
+        run: |
+          bun packages/opencode/scripts/install-packed-hosts.ts "$RUNNER_TEMP/packed-opencode-hosts"
+          echo "ANTHROPIC_AUTH_PACKED_HOSTS=$RUNNER_TEMP/packed-opencode-hosts" >> "$GITHUB_ENV"
+      # Save before tests so a test failure cannot leave the download cache cold.
+      - name: Save packed OpenCode host npm downloads
+        if: steps.packed-host-install.outcome == 'success' && steps.packed-host-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: node_modules/.cache/opencode-host-npm
+          key: ${{ steps.packed-host-cache.outputs.cache-primary-key }}
       # A full rebuild takes 4-8s and avoids another job plus artifact transfer on every test's path.
       - run: bun run build
       - run: bun scripts/ci-unit-tests.ts --suite '${{ matrix.suite }}' --shard '${{ matrix.shard }}' --output-dir unit-counts

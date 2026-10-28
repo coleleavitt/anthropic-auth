@@ -34,6 +34,9 @@ import { seedOpencodeConfigDependencies } from '../../../e2e-tests/src/opencode-
 import {
   disposableCommandError,
   isolatedPackedHostEnv,
+  packedHostNpmCache,
+  packedHostsEnv,
+  installPackedHosts as preparePackedHosts,
 } from './support/packed-host-install'
 
 const { test, gate, trackDetached, deferCleanup } = createTestLifetimeSuite()
@@ -85,7 +88,7 @@ const isolatedEnv = (root: string) =>
   isolatedPackedHostEnv(root, {
     path: process.env.PATH ?? '',
     password: PASSWORD,
-    npmCache: join(workspace, 'node_modules', '.cache', 'opencode-host-npm'),
+    npmCache: packedHostNpmCache(workspace),
   })
 async function command(
   args: string[],
@@ -155,8 +158,9 @@ async function requireCommand(
   cwd: string,
   env: Record<string, string>,
   timing?: CommandClock,
+  limit = 60_000,
 ) {
-  const result = await command(args, cwd, env, 60_000, undefined, timing)
+  const result = await command(args, cwd, env, limit, undefined, timing)
   if (result.exit !== 0)
     throw disposableCommandError(args, result, redactFixtureSecrets)
   return result
@@ -166,81 +170,22 @@ async function installPackedHosts() {
   const cache = join(workspace, 'node_modules', '.cache', 'opencode2-e2e')
   await mkdir(cache, { recursive: true })
   scratch = await mkdtemp(join(cache, 'fixture-'))
-  const install = join(scratch, 'install')
-  await mkdir(install, { recursive: true })
-  const env = await isolatedEnv(install)
-  // Both real hosts are installed from the npm registry. If it is
-  // unreachable, fail here before an install stalls: an offline runner must
-  // report this test as failed, never skip it.
-  const registry = await command(
-    [
-      'npm',
-      'ping',
-      '--registry=https://registry.npmjs.org',
-      '--fetch-retries=0',
-      '--fetch-timeout=2000',
-    ],
-    install,
-    env,
-    10_000,
-    undefined,
-    { clock: installation, name: 'registry' },
+  const hosts = await preparePackedHosts(
+    scratch,
+    {
+      path: process.env.PATH ?? '',
+      password: PASSWORD,
+      npmCache: packedHostNpmCache(workspace),
+      run: (args, cwd, env, name, limit) =>
+        requireCommand(args, cwd, env, { clock: installation, name }, limit),
+    },
+    process.env[packedHostsEnv],
   )
-  if (registry.exit !== 0)
-    throw new Error(
-      `Packed OpenCode host verification requires npm registry access. Run this gate in network-enabled CI; no host checks ran.\n${registry.stdout}\n${registry.stderr}`,
-    )
-  await writeFile(
-    join(install, 'package.json'),
-    JSON.stringify({ private: true }),
-  )
-  await requireCommand(
-    ['npm', 'install', '--no-audit', '--no-fund', '@opencode/cli@2.0.22'],
-    install,
-    env,
-    { clock: installation, name: 'oc2.install' },
-  )
-  cli = join(install, 'node_modules', '.bin', 'opencode')
-  const version = await requireCommand([cli, '--version'], install, env)
-  expect(version.stdout).toContain('2.0.22')
-  const install1 = join(scratch, 'install1')
-  await mkdir(install1, { recursive: true })
-  await writeFile(
-    join(install1, 'package.json'),
-    JSON.stringify({ private: true }),
-  )
-  const env1 = await isolatedEnv(install1)
-  await requireCommand(
-    ['npm', 'install', '--no-audit', '--no-fund', 'opencode-ai@1.18.31'],
-    install1,
-    env1,
-    { clock: installation, name: 'oc1.install' },
-  )
-  oc1 = join(install1, 'node_modules', '.bin', 'opencode')
-  const oc1Version = JSON.parse(
-    await readFile(
-      join(install1, 'node_modules', 'opencode-ai', 'package.json'),
-      'utf8',
-    ),
-  ).version
-  expect(oc1Version).toBe('1.18.31')
-  // OC1 installs @opencode-ai/plugin at its own version into each config
-  // directory before it loads plugins. Install that tree once here, while
-  // the registry is reachable, the same way OC1 does (npm, no install
-  // scripts), so each OC1 scenario can be given a complete copy.
-  const sdk = join(scratch, 'oc1-config-deps')
-  await mkdir(sdk, { recursive: true })
-  await writeFile(
-    join(sdk, 'package.json'),
-    JSON.stringify({ dependencies: { '@opencode-ai/plugin': oc1Version } }),
-  )
-  await requireCommand(
-    ['npm', 'install', '--no-audit', '--no-fund', '--ignore-scripts'],
-    sdk,
-    env1,
-    { clock: installation, name: 'oc1.sdk.install' },
-  )
-  oc1ConfigDependencies = { fixture: sdk, version: oc1Version }
+  cli = hosts.cli
+  oc1 = hosts.oc1
+  oc1ConfigDependencies = hosts.oc1ConfigDependencies
+  // Keep packing and plugin installation in the test, against this checkout.
+  const env = await isolatedEnv(join(scratch, 'packed-env'))
   packedProject = join(scratch, 'packed')
   await mkdir(packedProject, { recursive: true })
   const pack = join(scratch, 'archives')

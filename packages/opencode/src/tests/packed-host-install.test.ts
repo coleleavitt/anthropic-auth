@@ -1,14 +1,65 @@
 import { describe, expect } from 'bun:test'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime'
 import {
   disposableCommandError,
+  installPackedHosts,
   isolatedPackedHostEnv,
+  packedHostNpmCache,
+  packedHostsEnv,
 } from './support/packed-host-install'
+import { packedHostVersions } from './support/packed-host-versions'
 
 const { test, deferCleanup } = createTestLifetimeSuite()
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), 'packed-host-install-'))
+  deferCleanup(() => rm(root, { recursive: true, force: true }))
+  return root
+}
+
+async function manifest(directory: string, pkg: string, version: string) {
+  const target = join(directory, 'node_modules', pkg)
+  await mkdir(target, { recursive: true })
+  await writeFile(join(target, 'package.json'), JSON.stringify({ version }))
+}
+
+async function preparedHosts(root: string) {
+  await manifest(join(root, 'install'), '@opencode/cli', packedHostVersions.oc2)
+  await manifest(join(root, 'install1'), 'opencode-ai', packedHostVersions.oc1)
+  await manifest(
+    join(root, 'oc1-config-deps'),
+    '@opencode-ai/plugin',
+    packedHostVersions.oc1,
+  )
+}
+
+function installer(root: string) {
+  const calls: { args: string[]; cwd: string }[] = []
+  const options = {
+    path: process.env.PATH ?? '',
+    password: 'fixture-password',
+    npmCache: packedHostNpmCache(root),
+    async run(args: string[], cwd: string) {
+      calls.push({ args, cwd })
+      if (args[1] === '--version')
+        return {
+          stdout: `${cwd.endsWith('install1') ? packedHostVersions.oc1 : `opencode v${packedHostVersions.oc2}`}\n`,
+        }
+      if (args[1] === 'install') {
+        if (args.includes(`@opencode/cli@${packedHostVersions.oc2}`))
+          await manifest(cwd, '@opencode/cli', packedHostVersions.oc2)
+        else if (args.includes(`opencode-ai@${packedHostVersions.oc1}`))
+          await manifest(cwd, 'opencode-ai', packedHostVersions.oc1)
+        else await manifest(cwd, '@opencode-ai/plugin', packedHostVersions.oc1)
+      }
+      return { stdout: '' }
+    },
+  }
+  return { calls, options }
+}
 
 describe('packed host installation', () => {
   test('shares npm downloads without sharing host state', async () => {
@@ -56,24 +107,178 @@ describe('packed host installation', () => {
     expect(output.trim()).toBe(npmCache)
   })
 
-  test('CI restores the cache used by the pinned host installs', async () => {
+  test('CI saves host downloads immediately after provisioning, before tests can fail', async () => {
     const workspace = resolve(import.meta.dir, '../../../..')
-    const workflow = await readFile(
-      join(workspace, '.github/workflows/ci.yml'),
-      'utf8',
+    type Step = {
+      id?: string
+      if?: string
+      uses?: string
+      run?: string
+      'timeout-minutes'?: number
+      with?: { path?: string; key?: string }
+    }
+    const workflow = Bun.YAML.parse(
+      await readFile(join(workspace, '.github/workflows/ci.yml'), 'utf8'),
+    ) as { jobs: { unit: { steps: Step[] } } }
+    const steps = workflow.jobs.unit.steps
+    const restore = steps.findIndex((step) => step.id === 'packed-host-cache')
+    const install = steps.findIndex((step) => step.id === 'packed-host-install')
+    const save = steps.findIndex((step) =>
+      step.uses?.startsWith('actions/cache/save@'),
+    )
+    const tests = steps.findIndex((step) =>
+      step.run?.includes('scripts/ci-unit-tests.ts'),
+    )
+    expect(restore).toBeGreaterThan(-1)
+    expect(install).toBeGreaterThan(restore)
+    expect(save).toBe(install + 1)
+    expect(tests).toBeGreaterThan(save)
+    expect(steps[restore]?.uses).toStartWith('actions/cache/restore@')
+    for (const step of [steps[restore], steps[install]])
+      expect(step?.if).toBe(
+        "matrix.suite == 'opencode' && matrix.shard != 'miniflare'",
+      )
+    expect(steps[install]?.['timeout-minutes']).toBe(5)
+    expect(steps[install]?.run).toContain(
+      'bun packages/opencode/scripts/install-packed-hosts.ts "$RUNNER_TEMP/packed-opencode-hosts"',
+    )
+    expect(steps[install]?.run).toContain(
+      `${packedHostsEnv}=$RUNNER_TEMP/packed-opencode-hosts`,
+    )
+    expect(steps[install]?.run).toContain('>> "$GITHUB_ENV"')
+    expect(steps[restore]?.with?.path).toBe(
+      'node_modules/.cache/opencode-host-npm',
+    )
+    expect(steps[save]?.with?.path).toBe(steps[restore]?.with?.path)
+    expect(steps[restore]?.with?.key).toBe(
+      `packed-opencode-npm-v2-\${{ runner.os }}-\${{ runner.arch }}-\${{ steps.packed-host-versions.outputs.key }}`,
+    )
+    expect(steps[save]?.with?.key).toBe(
+      `\${{ steps.packed-host-cache.outputs.cache-primary-key }}`,
+    )
+    expect(steps[save]?.if).toBe(
+      "steps.packed-host-install.outcome == 'success' && steps.packed-host-cache.outputs.cache-hit != 'true'",
+    )
+    const versions = steps.findIndex(
+      (step) => step.id === 'packed-host-versions',
+    )
+    expect(versions).toBeLessThan(restore)
+    expect(steps[versions]?.run).toContain(
+      'install-packed-hosts.ts --version-key',
+    )
+  })
+
+  test('CI cache key reads the same version pins as host verification', async () => {
+    const workspace = resolve(import.meta.dir, '../../../..')
+    const child = Bun.spawn(
+      [
+        'bun',
+        'packages/opencode/scripts/install-packed-hosts.ts',
+        '--version-key',
+      ],
+      { cwd: workspace, stdout: 'pipe', stderr: 'pipe' },
+    )
+    const [stdout, stderr, exit] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect(exit).toBe(0)
+    expect(stderr).toBe('')
+    expect(stdout.trim()).toBe(
+      `oc1-${packedHostVersions.oc1}-oc2-${packedHostVersions.oc2}`,
     )
     const gate = await readFile(
       join(import.meta.dir, 'opencode2-e2e.test.ts'),
       'utf8',
     )
-    expect(workflow).toContain('path: node_modules/.cache/opencode-host-npm')
-    expect(workflow).toContain('-oc1-1.18.31-oc2-2.0.22')
-    expect(gate).toContain(
-      "npmCache: join(workspace, 'node_modules', '.cache', 'opencode-host-npm')",
-    )
-    expect(gate).toContain("'opencode-ai@1.18.31'")
-    expect(gate).toContain("'@opencode/cli@2.0.22'")
+    expect(gate).toContain('process.env[packedHostsEnv]')
   })
+
+  test('reuses prepared hosts only after checking both package and executable versions', async () => {
+    const root = await fixture()
+    const prepared = join(root, 'prepared')
+    await preparedHosts(prepared)
+    const { calls, options } = installer(root)
+    const hosts = await installPackedHosts(
+      join(root, 'local'),
+      options,
+      prepared,
+    )
+    expect(hosts.cli).toBe(join(prepared, 'install/node_modules/.bin/opencode'))
+    expect(hosts.oc1).toBe(
+      join(prepared, 'install1/node_modules/.bin/opencode'),
+    )
+    expect(hosts.oc1ConfigDependencies.fixture).toBe(
+      join(prepared, 'oc1-config-deps'),
+    )
+    expect(calls.map(({ args }) => args)).toEqual([
+      [hosts.cli, '--version'],
+      [hosts.oc1, '--version'],
+    ])
+    expect(
+      await Bun.file(join(root, 'local/install/package.json')).exists(),
+    ).toBe(false)
+  })
+
+  for (const [directory, pkg] of [
+    ['install', '@opencode/cli'],
+    ['install1', 'opencode-ai'],
+    ['oc1-config-deps', '@opencode-ai/plugin'],
+  ] as const) {
+    test(`reinstalls locally when prepared ${directory} has a stale ${pkg} version`, async () => {
+      const root = await fixture()
+      const prepared = join(root, 'prepared')
+      await preparedHosts(prepared)
+      await manifest(join(prepared, directory), pkg, '0.0.0')
+      const { calls, options } = installer(root)
+      const hosts = await installPackedHosts(
+        join(root, 'local'),
+        options,
+        prepared,
+      )
+      expect(hosts.cli).toStartWith(join(root, 'local'))
+      expect(
+        calls
+          .filter(({ args }) => args[1] === 'install')
+          .map(({ args }) => args.at(-1)),
+      ).toEqual([
+        `@opencode/cli@${packedHostVersions.oc2}`,
+        `opencode-ai@${packedHostVersions.oc1}`,
+        '--ignore-scripts',
+      ])
+    })
+  }
+
+  for (const condition of [
+    'absent',
+    'missing',
+    'wrong executable',
+    'broken executable',
+  ]) {
+    test(`installs locally for ${condition} prepared hosts`, async () => {
+      const root = await fixture()
+      const prepared = join(root, 'prepared')
+      if (condition.includes('executable')) await preparedHosts(prepared)
+      const { calls, options } = installer(root)
+      const run = options.run
+      options.run = async (args, cwd) => {
+        if (cwd.startsWith(prepared)) {
+          if (condition === 'broken executable')
+            throw new Error('not executable')
+          return { stdout: '0.0.0\n' }
+        }
+        return run(args, cwd)
+      }
+      const hosts = await installPackedHosts(
+        join(root, 'local'),
+        options,
+        condition === 'absent' ? undefined : prepared,
+      )
+      expect(hosts.cli).toStartWith(join(root, 'local'))
+      expect(calls.filter(({ args }) => args[1] === 'install')).toHaveLength(3)
+    })
+  }
 
   test('failed installs include bounded redacted output tails without host logs', () => {
     const output = Array.from(
