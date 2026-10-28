@@ -197,7 +197,7 @@ process.exit(0);
 
 for (const width of [36, 42]) {
   for (const collapsed of [false, true]) {
-    test(`OpenCode 1 shared sidebar shape at ${width} columns ${collapsed ? 'collapsed' : 'expanded'}`, async () => {
+    test(`OpenCode 1 shared sidebar shape at ${width} columns ${collapsed ? 'collapsed with trailing status glyphs' : 'expanded'}`, async () => {
       const stdout = await renderSidebar(
         sharedShapeSidebarState(),
         collapsed
@@ -400,10 +400,10 @@ test('collapsed sidebar leaves out a window without a reading and keeps the mute
     bold: boolean
   }[]
   const main = styles.find((line) => line.text.includes('main'))
-  expect(main?.text.trimEnd().endsWith('5h 87% left')).toBe(true)
+  expect(main?.text.trimEnd().endsWith('5h 87% left ●')).toBe(true)
   expect(main).toMatchObject({ dim: false, bold: true })
   const work = styles.find((line) => line.text.includes('work'))
-  expect(work?.text.trimEnd().endsWith('—')).toBe(true)
+  expect(work?.text.trimEnd().endsWith('— ●')).toBe(true)
   expect(work).toMatchObject({ dim: true, bold: false })
 })
 

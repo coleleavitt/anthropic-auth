@@ -230,7 +230,7 @@ function quotaState() {
 for (const width of [37, 42]) {
   for (const collapsed of [false, true]) {
     test(
-      `OpenCode 2 shared sidebar shape at ${width} columns ${collapsed ? 'collapsed' : 'expanded'}`,
+      `OpenCode 2 shared sidebar shape at ${width} columns ${collapsed ? 'collapsed with trailing status glyphs' : 'expanded'}`,
       async () => {
         const result = await renderOpenCode2Sidebar(
           [sharedShapeSidebarState()],

@@ -59,16 +59,17 @@ export function expectSharedSidebarShape(
   expect(header).toEndWith(`v${version}`)
   expect(Bun.stringWidth(header)).toBe(width)
   if (collapsed) {
-    const rows = frame.split('\n').filter((line) => /^[●⊘] /.test(line))
+    const rows = frame.split('\n').filter((line) => line.includes(' left'))
     expect(rows).toHaveLength(3)
-    expect(rows[0]?.trimEnd()).toMatch(/^● main +5h 40% · 7d 80% left$/)
+    expect(rows[0]?.trimEnd()).toMatch(/^main +5h 40% · 7d 80% left ●$/)
     expect(rows[1]?.trimEnd()).toMatch(
-      /^● very-long-.*… +5h 90% · 7d 90% left$/,
+      /^very-long-.*… +5h 90% · 7d 90% left ●$/,
     )
-    expect(rows[2]?.trimEnd()).toMatch(/^⊘ locked +5h 70% left$/)
+    expect(rows[2]?.trimEnd()).toMatch(/^locked +5h 70% left ⊘$/)
+    for (const row of rows) expect(Bun.stringWidth(row.trimEnd())).toBe(width)
     const glyphColors = lines
-      .filter((line) => /^[●⊘] /.test(line.text))
-      .map((line) => line.spans.find((span) => /^[●⊘]/.test(span.text))?.fg)
+      .filter((line) => line.text.includes(' left'))
+      .map((line) => line.spans.find((span) => /[●⊘]\s*$/.test(span.text))?.fg)
     expect(glyphColors).toEqual([
       'rgba(0.00, 1.00, 0.00, 1.00)',
       'rgba(0.53, 0.53, 0.53, 1.00)',

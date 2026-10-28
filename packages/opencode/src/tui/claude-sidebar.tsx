@@ -252,8 +252,8 @@ function CollapsedAccountRow(props: {
   let row: BoxRenderable | undefined
   const summary = () => getCollapsedQuotaSummary(props.account.quota, props.now)
   const value = () => summary().text ?? '—'
-  // Reserve two cells for the status glyph and one between label and quota.
-  const labelWidth = () => Math.max(0, width() - Bun.stringWidth(value()) - 3)
+  // Keep the quota and its two-cell status suffix intact; only the label shrinks.
+  const labelWidth = () => Math.max(0, width() - 1 - Bun.stringWidth(value()) - 2)
   const dim = () =>
     !props.account.active || props.account.quotaDated || summary().stale
   const attributes = () => (dim() ? TextAttributes.DIM : TextAttributes.BOLD)
@@ -270,21 +270,6 @@ function CollapsedAccountRow(props: {
       }}
       onSizeChange={() => setWidth(row?.width || 40)}
     >
-      <text
-        width={2}
-        flexShrink={0}
-        fg={toneColor(
-          props.theme,
-          props.account.blocked
-            ? 'warn'
-            : props.account.active
-              ? 'ok'
-              : 'muted',
-        )}
-        attributes={attributes()}
-      >
-        {props.account.blocked ? '⊘ ' : '● '}
-      </text>
       <Show when={labelWidth() > 0}>
         <text
           width={labelWidth()}
@@ -307,6 +292,21 @@ function CollapsedAccountRow(props: {
         attributes={attributes()}
       >
         {value()}
+      </text>
+      <text
+        width={2}
+        flexShrink={0}
+        fg={toneColor(
+          props.theme,
+          props.account.blocked
+            ? 'warn'
+            : props.account.active
+              ? 'ok'
+              : 'muted',
+        )}
+        attributes={attributes()}
+      >
+        {props.account.blocked ? ' ⊘' : ' ●'}
       </text>
     </box>
   )
