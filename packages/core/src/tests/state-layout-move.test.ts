@@ -957,8 +957,10 @@ const MOVE_STEPS: StateLayoutStep[] = [
   'cleanup-recorded',
 ]
 
-test('a crash at every step of the move recovers to exactly one usable copy holding the original credentials', async () => {
-  for (const step of MOVE_STEPS) {
+// Each crash point has its own deadline so durable I/O across the whole matrix
+// cannot exhaust one test's timeout while individual recoveries remain healthy.
+for (const step of MOVE_STEPS) {
+  test(`a crash at move step ${step} recovers to exactly one usable copy holding the original credentials`, async () => {
     const m = await machine()
     await expect(decide(m, { onStep: crashAt(step) })).rejects.toBeInstanceOf(
       StateLayoutCrash,
@@ -979,8 +981,8 @@ test('a crash at every step of the move recovers to exactly one usable copy hold
       m.original.localRuntime as string,
     )
     expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('done')
-  }
-})
+  })
+}
 
 test('a crash after a rename landed but before its folder was flushed, at every flush of the move, recovers to exactly one usable copy', async () => {
   const base = defaultStateLayoutFs()
@@ -1120,8 +1122,8 @@ const ROLLBACK_STEPS: StateLayoutStep[] = [
   'rolled-back',
 ]
 
-test('a crash at every step of a rollback converges on the next start', async () => {
-  for (const step of ROLLBACK_STEPS) {
+for (const step of ROLLBACK_STEPS) {
+  test(`a crash at rollback step ${step} converges on the next start`, async () => {
     const m = await machine()
     const before = await oldTree(m)
     await expect(
@@ -1136,8 +1138,8 @@ test('a crash at every step of a rollback converges on the next start', async ()
     expect({ step, tree: await oldTree(m) }).toEqual({ step, tree: before })
     expect({ step, sub: await subDataFiles(m) }).toEqual({ step, sub: [] })
     expect(await usableCopies(m)).toEqual(['legacy'])
-  }
-})
+  })
+}
 
 test('rollback leaves a runtime written by a legacy process alone', async () => {
   const m = await machine()
