@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.4.3
 
 - OpenCode 2: CacheKeep prewarms now read the session's prompt cache. A prewarm sent the stored request through the request rewrite a second time, which renamed every tool again and added the system blocks again, so each idle hour cost two full cache writes. Addresses #547.
 - OpenCode 2 now applies the saved log level when it starts. Addresses #543.
