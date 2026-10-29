@@ -7711,9 +7711,10 @@ const anthropicAuthPlugin = async (
                     }
                     // A new user turn whose history no longer starts with
                     // the kept prefix (compaction, history edit) makes the
-                    // source cache unusable. The earliest anchored message is
-                    // compared the way standby anchors match: long histories
-                    // only append after it, so membership is the whole check.
+                    // source cache unusable. Each user message that carries a
+                    // cache breakpoint has a content fingerprint; histories
+                    // only append after the kept prefix's earliest one, so
+                    // checking that it is still present is the whole test.
                     if (
                       warm.firstAnchorFingerprint !== undefined &&
                       !currentAnchors.includes(warm.firstAnchorFingerprint)

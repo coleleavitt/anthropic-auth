@@ -990,7 +990,7 @@ describe('vault-served fallback outbound token census', () => {
   for (const fallbackMode of ['server', 'legacy'] as const)
     for (const cleanReset of [false, true])
       test.serial(
-        `recovery ${cleanReset ? 'clean-source reset' : 'backoff and model reset'} counts tool responses without source warms (${fallbackMode})`,
+        `recovery ${cleanReset ? 'clean-source reset' : 'backoff and model reset'} counts tool responses and warms the source only near expiry (${fallbackMode})`,
         async () => {
           const now = Date.now()
           const fixture = await createFixture('recovery', {
@@ -1032,10 +1032,18 @@ describe('vault-served fallback outbound token census', () => {
                 .at(-1)?.model,
             ).toBe(model)
             expect(immediateWarm).not.toHaveBeenCalled()
+            // Warms go to the live Opus 4.8 prefix, or to the source model's
+            // kept prefix near its expiry. A source warm never carries the
+            // server-side fallback opt-in.
             expect(
               messages()
                 .filter((body) => body.max_tokens === 0)
-                .every((body) => body.model === 'claude-opus-4-8'),
+                .every(
+                  (body) =>
+                    body.model === 'claude-opus-4-8' ||
+                    (body.model === 'claude-opus-5-5' &&
+                      body.fallbacks === undefined),
+                ),
             ).toBe(true)
           }
           for (const responses of [10]) {
@@ -1052,11 +1060,14 @@ describe('vault-served fallback outbound token census', () => {
                   }
                 ).clock(now + 55 * 60_000)
                 await manager.tick()
+                // Both caches are near expiry: the live Opus 4.8 prefix and
+                // the source model's prefix kept when the round started.
                 expect(
                   messages()
                     .filter((body) => body.max_tokens === 0)
-                    .map((body) => body.model),
-                ).toEqual(['claude-opus-4-8'])
+                    .map((body) => body.model)
+                    .sort(),
+                ).toEqual(['claude-opus-4-8', 'claude-opus-5-5'])
               }
             }
             await send('claude-opus-5-5')
