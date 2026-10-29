@@ -1065,11 +1065,13 @@ test('a crash after a rename landed but before its folder was flushed, at every 
   }
 })
 
-test('a crash before the commit followed by a blocked restart rolls back to the exact original tree', async () => {
-  for (const step of MOVE_STEPS.slice(0, MOVE_STEPS.indexOf('committed'))) {
-    for (const journal of [true, false]) {
-      // Without a journal there is no journal copy to stop at.
-      if (!journal && step === 'copied:journal') continue
+// One test per crash point: each case builds a full machine, so a single
+// test looping over every step ran close to Bun's 5 s per-test limit.
+for (const step of MOVE_STEPS.slice(0, MOVE_STEPS.indexOf('committed'))) {
+  for (const journal of [true, false]) {
+    // Without a journal there is no journal copy to stop at.
+    if (!journal && step === 'copied:journal') continue
+    test(`a crash at move step ${step} before the commit${journal ? '' : ' without a journal'}, followed by a blocked restart, rolls back to the exact original tree`, async () => {
       const m = await machine({ journal })
       const before = await oldTree(m)
       await expect(decide(m, { onStep: crashAt(step) })).rejects.toBeInstanceOf(
@@ -1077,28 +1079,16 @@ test('a crash before the commit followed by a blocked restart rolls back to the 
       )
       await olderVersionRunning(m)
       const decision = await decide(m)
-      expect({ step, journal, kind: decision.kind }).toEqual({
-        step,
-        journal,
-        kind: 'legacy',
-      })
-      expect({ step, journal, tree: await oldTree(m) }).toEqual({
-        step,
-        journal,
-        tree: before,
-      })
-      expect({ step, journal, sub: await subDataFiles(m) }).toEqual({
-        step,
-        journal,
-        sub: [],
-      })
+      expect(decision.kind).toBe('legacy')
+      expect(await oldTree(m)).toEqual(before)
+      expect(await subDataFiles(m)).toEqual([])
       expect(await usableCopies(m)).toEqual(journal ? ['legacy'] : [])
-    }
+    })
   }
-})
+}
 
-test('a crash after the commit never goes back to legacy', async () => {
-  for (const step of MOVE_STEPS.slice(MOVE_STEPS.indexOf('committed'))) {
+for (const step of MOVE_STEPS.slice(MOVE_STEPS.indexOf('committed'))) {
+  test(`a crash at move step ${step} after the commit never goes back to legacy`, async () => {
     const m = await machine()
     await expect(decide(m, { onStep: crashAt(step) })).rejects.toBeInstanceOf(
       StateLayoutCrash,
@@ -1109,8 +1099,8 @@ test('a crash after the commit never goes back to legacy', async () => {
     await olderVersionRunning(m)
     expect((await decide(m)).kind).toBe('state-home')
     expect(await usableCopies(m)).toEqual(['state-home'])
-  }
-})
+  })
+}
 
 const ROLLBACK_STEPS: StateLayoutStep[] = [
   'rollback:journal',
