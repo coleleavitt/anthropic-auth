@@ -253,7 +253,8 @@ function CollapsedAccountRow(props: {
   const summary = () => getCollapsedQuotaSummary(props.account.quota, props.now)
   const value = () => summary().text ?? '—'
   // Keep the quota and its two-cell status suffix intact; only the label shrinks.
-  const labelWidth = () => Math.max(0, width() - 1 - Bun.stringWidth(value()) - 2)
+  const labelWidth = () =>
+    Math.max(0, width() - 1 - Bun.stringWidth(value()) - 2)
   const dim = () =>
     !props.account.active || props.account.quotaDated || summary().stale
   const attributes = () => (dim() ? TextAttributes.DIM : TextAttributes.BOLD)
