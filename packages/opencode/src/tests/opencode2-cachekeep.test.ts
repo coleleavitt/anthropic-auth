@@ -418,6 +418,49 @@ test('a due OpenCode 2 prewarm sends once with the original account and no billi
   expect(f.sent).toHaveLength(1)
 })
 
+test('a killswitch-refused OpenCode 2 target warns once, stops, and tracks the next live account', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture()
+  await f.live()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    mainAccountId: 'second',
+    quota: { enabled: false, failClosedOnUnknownQuota: false },
+    killswitch: {
+      enabled: true,
+      main: { five_hour: 0, seven_day: 0 },
+      accounts: { first: { five_hour: 10 } },
+    },
+  }))
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  const warnings = () => lines.filter((line) => line.includes(' WARN '))
+  expect(warnings()).toHaveLength(1)
+  expect(warnings()[0]).toContain('stopped warming session')
+  expect(warnings()[0]).toContain('"session":"ses_oc2_keep"')
+  expect(warnings()[0]).toContain('"reason":"account-policy"')
+  expect(await f.registry.list()).toEqual([])
+  f.advance(2 * 60_000)
+  await f.timers.fire()
+  expect(warnings()).toHaveLength(1)
+  expect(f.sent).toHaveLength(0)
+
+  expect((await f.live()).headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-second',
+  )
+  expect((await f.registry.list()).map((session) => session.id)).toEqual([
+    'ses_oc2_keep',
+  ])
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(1)
+  expect(f.sent[0]!.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-second',
+  )
+  expect(warnings()).toHaveLength(1)
+})
+
 test('an OpenCode 2 API-key request and a prewarm send produce no WARN', async () => {
   const lines = captureStartupLogs()
   const warming = await fixture(false, false, 'debug')
@@ -546,6 +589,7 @@ test('OpenCode 2 only keeps child sessions warm when subagent tracking is enable
 })
 
 test('OpenCode 2 never prewarms a replacement login in the same account row', async () => {
+  const lines = captureStartupLogs()
   const f = await fixture()
   await f.live()
   expect(f.timers.callbacks.size).toBe(1)
@@ -566,6 +610,15 @@ test('OpenCode 2 never prewarms a replacement login in the same account row', as
   f.due()
   await f.timers.fire()
   expect(f.sent).toHaveLength(0)
+  expect(await f.registry.list()).toEqual([])
+  expect(lines.filter((line) => line.includes(' WARN '))).toHaveLength(1)
+  expect(lines.find((line) => line.includes(' WARN '))).toContain(
+    '"reason":"credential-changed"',
+  )
+  f.advance(2 * 60_000)
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  expect(lines.filter((line) => line.includes(' WARN '))).toHaveLength(1)
 })
 
 test('OpenCode 2 dispose aborts and joins an in-flight prewarm', async () => {

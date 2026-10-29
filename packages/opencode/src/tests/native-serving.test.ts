@@ -1781,6 +1781,43 @@ test('native CacheKeep background prewarm cannot reuse a stored legacy bearer', 
   )
 })
 
+test('native CacheKeep returns a terminal killswitch refusal without authorizing or sending', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  try {
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      killswitch: { enabled: true, main: { five_hour: 5, seven_day: 0 } },
+    }))
+  } finally {
+    runtime.close()
+  }
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
+  const cacheKeep = getPluginTestHandles(plugin).cacheKeepManager
+  if (!(cacheKeep instanceof CacheKeepManager))
+    throw new Error('No CacheKeep manager')
+  const reads = fixture.authorizedGets.length
+  expect(
+    await cacheKeep.prewarmNow({
+      sessionId: 'synthetic-policy-session',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      bodyText: cacheKeepPrewarmBody,
+      oauthAccountId: 'main',
+    }),
+  ).toEqual({ ok: false, reason: 'account-policy', refusal: 'account-policy' })
+  expect(fixture.authorizedGets).toHaveLength(reads)
+  expect(
+    fixture.records.filter((record) => record.url.includes('/v1/messages')),
+  ).toEqual([])
+})
+
 test('vault relay transport failure reauthorizes direct fallback without false credential rejection', async () => {
   const fixture = await migrateServingFixture('claustrum')
   const runtime = createNativeAccountRuntime({

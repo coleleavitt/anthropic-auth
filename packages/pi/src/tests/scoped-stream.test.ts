@@ -9,6 +9,7 @@ import {
   type NativeCustodyClient as ClaustrumScopedClient,
   getLogLevel,
   type LogTestRecord,
+  NativeCustodyError,
   PER_TURN_CONTROL_BETA,
   resolveNativePoolPaths,
   setLogLevel,
@@ -1048,6 +1049,57 @@ registerTest.each(hostCredentials)(
         { sessionManager: { getSessionId: () => undefined } },
       )
     }
+  }),
+)
+
+registerTest(
+  'Pi CacheKeep returns a terminal killswitch refusal without authorizing or sending',
+  wrapBody(async () => {
+    const f = await fixture()
+    const runtime = await getPiNativeRuntime(f.path).service()
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      killswitch: { enabled: true, main: { five_hour: 5, seven_day: 0 } },
+    }))
+    let gets = 0
+    f.client.getScoped = async () => {
+      gets++
+      throw new NativeCustodyError('unavailable')
+    }
+    let sends = 0
+    globalThis.fetch = Object.assign(
+      async () => {
+        sends++
+        return Response.json({})
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    expect(
+      await __prewarmPiCacheKeepForTest({
+        sessionId: 'pi-cachekeep-policy',
+        url: 'https://api.anthropic.com/v1/messages',
+        headers: new Headers(),
+        bodyText: JSON.stringify({
+          model: model.id,
+          system: [
+            {
+              type: 'text',
+              text: 'stable',
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        }),
+        oauthAccountId: 'main',
+        oauthAccountIdentity: fixtureAccountIdentity('main'),
+        accountStoragePath: f.path,
+      }),
+    ).toEqual({
+      ok: false,
+      reason: 'account-policy',
+      refusal: 'account-policy',
+    })
+    expect(gets).toBe(0)
+    expect(sends).toBe(0)
   }),
 )
 

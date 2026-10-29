@@ -8,8 +8,11 @@ import {
   isCacheKeepHybridActive,
   isCacheKeepSubagentsEnabled,
   logger,
+  NativeAccountRefusal,
+  type NativeAccountRefusalReason,
   type NativeAccountRuntime,
   type NativeAccountView,
+  nativeAccountRefusal,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
 import {
@@ -267,6 +270,9 @@ export function createNativeCacheKeep(
       agent: 'cachekeep',
       kind: 'generate',
     }
+    const refuse = (reason: NativeAccountRefusalReason) => {
+      throw new NativeAccountRefusal(reason)
+    }
     const native = createNativeAnthropicAdapter({
       source: {
         ...source,
@@ -275,7 +281,7 @@ export function createNativeCacheKeep(
         onRequestPrepared: undefined,
         responseOptions: undefined,
         async requestOptions(input) {
-          const policy = await source.requestOptions?.(input)
+          const policy = await source.requestOptions?.(input, refuse)
           return {
             ...policy,
             laneStart: false,
@@ -287,9 +293,11 @@ export function createNativeCacheKeep(
           const snapshot = await runtime.read()
           signal.throwIfAborted()
           const account = snapshot.accounts.find((row) => row.id === accountId)
+          if (account?.type !== 'oauth')
+            throw new NativeAccountRefusal('account-unavailable')
+          if (accountKey(account) !== target.oauthAccountIdentity)
+            throw new NativeAccountRefusal('credential-changed')
           if (
-            account?.type !== 'oauth' ||
-            accountKey(account) !== target.oauthAccountIdentity ||
             (target.isSubagent &&
               !isCacheKeepSubagentsEnabled(snapshot.policyStorage)) ||
             !isCacheKeepHybridActive(snapshot.policyStorage) ||
@@ -299,7 +307,11 @@ export function createNativeCacheKeep(
             )
           )
             return undefined
-          const authorized = await source.authorizeAccount(input, accountId)
+          const authorized = await source.authorizeAccount(
+            input,
+            accountId,
+            refuse,
+          )
           if (
             authorized?.provenance.kind === 'local' &&
             accountKey({
@@ -308,24 +320,25 @@ export function createNativeCacheKeep(
               accountIdentity: authorized.provenance.subject.binding.identity,
             }) !== target.oauthAccountIdentity
           )
-            return undefined
+            throw new NativeAccountRefusal('credential-changed')
           if (
             authorized?.provenance.kind === 'vault' &&
             authorized.provenance.credentialId !== account.credentialId
           )
-            return undefined
+            throw new NativeAccountRefusal('credential-changed')
           return authorized
         },
         async admitRequest(input) {
-          await source.admitRequest?.(input)
+          await source.admitRequest?.(input, refuse)
           const snapshot = await runtime.read()
           const account = snapshot.accounts.find(
             (row) => row.id === input.accountId,
           )
           signal.throwIfAborted()
+          if (!account) throw new NativeAccountRefusal('account-unavailable')
+          if (accountKey(account) !== target.oauthAccountIdentity)
+            throw new NativeAccountRefusal('credential-changed')
           if (
-            !account ||
-            accountKey(account) !== target.oauthAccountIdentity ||
             (target.isSubagent &&
               !isCacheKeepSubagentsEnabled(snapshot.policyStorage)) ||
             !isCacheKeepHybridActive(snapshot.policyStorage) ||
@@ -346,10 +359,18 @@ export function createNativeCacheKeep(
     const cancel = () => native.forgetSession(scope.sessionID)
     signal.addEventListener('abort', cancel, { once: true })
     try {
-      const accountId = (await runtime.read()).accounts.find(
+      const snapshot = await runtime.read()
+      const accountId = snapshot.accounts.find(
         (account) => accountKey(account) === target.oauthAccountIdentity,
       )?.id
-      if (!accountId) throw new Error('CacheKeep account is unavailable')
+      if (!accountId)
+        throw new NativeAccountRefusal(
+          snapshot.accounts.some(
+            (account) => account.id === target.oauthAccountId,
+          )
+            ? 'credential-changed'
+            : 'account-unavailable',
+        )
       const authorized = await native.adapter.accountHeaders({
         ...scope,
         accountId,
@@ -408,7 +429,9 @@ export function createNativeCacheKeep(
       const bytes = await response.arrayBuffer()
       complete = true
       return new Response(bytes, { status, headers: response.headers })
-    } catch {
+    } catch (error) {
+      const refusal = nativeAccountRefusal(error)
+      if (refusal) throw refusal
       // The manager's transport headers contain only a correlation ID, so its
       // generic error scrubber cannot know the native send's credentials.
       throw new Error('Native CacheKeep was not completed')

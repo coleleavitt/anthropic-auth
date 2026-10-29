@@ -37,6 +37,7 @@ import {
   logger,
   type MidConversationEffortTransition,
   mergeAnthropicBetas,
+  NativeAccountRefusal,
   type NativeAccountSnapshot,
   type NativeAccountView,
   type NativeApiSubject,
@@ -325,12 +326,13 @@ const cacheKeepManager = new CacheKeepManager({
       id,
       attempt.signal,
       typeof body.model === 'string' ? body.model : undefined,
+      'cachekeep',
     )
     if (
       !target.oauthAccountIdentity ||
       served.accountIdentity !== target.oauthAccountIdentity
     )
-      throw new Error('CacheKeep account identity changed')
+      throw new NativeAccountRefusal('credential-changed')
     const identity = getClaudeCodeIdentityForVerifiedAccount(
       id === STICKY_ROUTING_MAIN_ACCOUNT_ID
         ? (current.policyStorage.mainAccountId ?? id)

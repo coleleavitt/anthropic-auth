@@ -10,6 +10,7 @@ import {
   killswitchPassesPolicy,
   LEGACY_STATE_LAYOUT,
   logger,
+  NativeAccountRefusal,
   type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
   type NativeAccountSnapshot,
@@ -22,6 +23,8 @@ import {
   type NativeRefreshResult,
   type NativeVaultWatch,
   nativeAccountCanServe,
+  nativeAccountRefusal,
+  nativeLocalAccountRefusal,
   nativeMigrationAuthorityPhase,
   nativeRuntimeOptionIdentity,
   quotaSnapshotHasStandardWindows,
@@ -331,21 +334,34 @@ export class PiNativeRuntime {
     routeId: string,
     signal?: AbortSignal,
     modelId?: string,
+    intent: 'serve' | 'cachekeep' = 'serve',
   ): Promise<PiNativeAttempt> {
+    const background = intent === 'cachekeep'
     const runtime = await this.service()
     const snapshot = await runtime.read()
     const account = snapshot.accounts.find(
       (candidate) => candidate.id === routeId,
     )
     if (!nativeAccountCanServe(account) || account?.type !== 'oauth')
-      throw new Error('Pi native OAuth route is unavailable')
+      throw background
+        ? new NativeAccountRefusal('account-unavailable')
+        : new Error('Pi native OAuth route is unavailable')
     const policy = requestPolicy(routeId, modelId)
     if (policy(account, snapshot).status === 'blocked')
-      throw new Error('Pi native quota policy refused the OAuth route')
+      throw background
+        ? new NativeAccountRefusal('account-policy')
+        : new Error('Pi native quota policy refused the OAuth route')
     if (snapshot.mode === 'claustrum') {
-      const receipt = await runtime.authorizeVault(routeId, signal)
+      const receipt = await runtime
+        .authorizeVault(routeId, signal)
+        .catch((error) => {
+          const refusal = background && nativeAccountRefusal(error)
+          throw refusal || error
+        })
       if (!receipt.assertedAccountIdentity)
-        throw new Error('Pi native OAuth identity is unasserted')
+        throw background
+          ? new NativeAccountRefusal('account-unavailable')
+          : new Error('Pi native OAuth identity is unasserted')
       const current = await runtime.read()
       const admitted = current.accounts.find(
         (candidate) => candidate.id === routeId,
@@ -358,7 +374,15 @@ export class PiNativeRuntime {
         admitted.accountIdentity !== receipt.assertedAccountIdentity ||
         requestPolicy(routeId, modelId)(admitted, current).status === 'blocked'
       )
-        throw new Error('Pi native quota policy refused the OAuth route')
+        throw background
+          ? new NativeAccountRefusal(
+              !admitted || current.mode !== 'claustrum'
+                ? 'account-unavailable'
+                : admitted.accountIdentity !== receipt.assertedAccountIdentity
+                  ? 'credential-changed'
+                  : 'account-policy',
+            )
+          : new Error('Pi native quota policy refused the OAuth route')
       return {
         source: 'vault',
         accountIdentity: receipt.assertedAccountIdentity,
@@ -366,8 +390,15 @@ export class PiNativeRuntime {
       }
     }
     const admission = await runtime.authorizeLocal(routeId, { signal, policy })
-    if (admission.status !== 'usable' || !admission.binding.identity)
+    if (admission.status !== 'usable') {
+      const refusal = background && nativeLocalAccountRefusal(admission)
+      if (refusal) throw refusal
       throw new Error('Pi native OAuth admission refused')
+    }
+    if (!admission.binding.identity)
+      throw background
+        ? new NativeAccountRefusal('account-unavailable')
+        : new Error('Pi native OAuth admission refused')
     return {
       source: 'local',
       accountIdentity: admission.binding.identity,

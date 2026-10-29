@@ -64,6 +64,7 @@ export {
 } from './model-capabilities.ts'
 export * from './model-remap.ts'
 export * from './models.ts'
+export * from './native-account-refusal.ts'
 export type {
   NativeAccountRuntime,
   NativeAccountRuntimeOptions,

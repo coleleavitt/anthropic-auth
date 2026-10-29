@@ -3,6 +3,7 @@ import type { AccountStorage } from '../accounts.ts'
 import {
   CACHE_KEEP_MAX_BODY_BYTES,
   CACHE_KEEP_MAX_TARGETS,
+  CACHE_KEEP_PREWARM_LEAD_MS,
   CACHE_KEEP_TTL_MS,
   CacheKeepManager,
 } from '../cachekeep.ts'
@@ -12,6 +13,8 @@ import {
   type LogTestRecord,
   setLogLevel,
 } from '../logger.ts'
+import { NativeAccountRefusal } from '../native-account-refusal.ts'
+import { NativeCustodyError } from '../native-custody.ts'
 
 const storage: AccountStorage = {
   version: 1,
@@ -42,11 +45,14 @@ afterEach(() => {
   setLogLevel(level)
 })
 
-function fixture() {
+function fixture(
+  options: Partial<ConstructorParameters<typeof CacheKeepManager>[0]> = {},
+) {
   const manager = new CacheKeepManager({
     now: () => now,
     loadStorage: async () => storage,
     fetchImpl: (async () => Response.json({})) as unknown as typeof fetch,
+    ...options,
   })
   managers.push(manager)
   const track = (id: string, bodyText = body, settings = storage) =>
@@ -60,6 +66,79 @@ function fixture() {
     })
   return { manager, track }
 }
+
+test.each(['prepareHeaders', 'fetchImpl'] as const)(
+  'a typed account refusal from %s removes the target with one closed warning',
+  async (stage) => {
+    let calls = 0
+    const refuse = () => {
+      calls++
+      throw new NativeAccountRefusal('account-policy')
+    }
+    const f = fixture(
+      stage === 'prepareHeaders'
+        ? { prepareHeaders: refuse }
+        : {
+            fetchImpl: Object.assign(refuse, { preconnect: fetch.preconnect }),
+          },
+    )
+    f.track('ses_policy')
+    now += CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS
+    await f.manager.tick()
+    warning('ses_policy', 'account-policy', Buffer.byteLength(body))
+    expect(f.manager.trackedCount()).toBe(0)
+    now += 2 * 60_000
+    await f.manager.tick()
+    expect(calls).toBe(1)
+    expect(logs).toHaveLength(1)
+  },
+)
+
+test.each(['prepareHeaders', 'fetchImpl'] as const)(
+  'an unreachable vault in %s is retried without dropping the target',
+  async (stage) => {
+    let authorizations = 0
+    let sends = 0
+    const unreachable = () => {
+      authorizations++
+      throw new NativeCustodyError('unavailable')
+    }
+    const f = fixture({
+      ...(stage === 'prepareHeaders'
+        ? {
+            prepareHeaders: unreachable,
+            fetchImpl: Object.assign(
+              async () => {
+                sends++
+                return Response.json({})
+              },
+              { preconnect: fetch.preconnect },
+            ),
+          }
+        : {
+            fetchImpl: Object.assign(unreachable, {
+              preconnect: fetch.preconnect,
+            }),
+          }),
+    })
+    f.track('ses_outage')
+    now += CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS
+    await f.manager.tick()
+    expect(f.manager.trackedCount()).toBe(1)
+    expect(authorizations).toBe(1)
+    now = f.manager.trackedSessions()[0]!.nextPrewarmAt
+    await f.manager.tick()
+    expect(authorizations).toBe(2)
+    expect(sends).toBe(0)
+    expect(f.manager.trackedCount()).toBe(1)
+    expect(logs).toHaveLength(2)
+    for (const log of logs)
+      expect(log).toMatchObject({
+        message: 'prewarm failed',
+        payload: { provider_error: { reason: 'transport' } },
+      })
+  },
+)
 
 function warning(session: string, reason: string, bodyBytes: number) {
   expect(logs).toHaveLength(1)

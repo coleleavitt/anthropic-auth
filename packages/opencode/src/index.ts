@@ -124,6 +124,7 @@ import {
   logger,
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
+  NativeAccountRefusal,
   type NativeAccountRuntimeOptions,
   type NativeAccountSnapshot,
   type NativeAccountView,
@@ -137,6 +138,8 @@ import {
   type NativeUiOptions,
   NativeVaultNoAccountError,
   nativeAccountCanServe,
+  nativeAccountRefusal,
+  nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
   nativeMigrationAuthorityPhase,
   normalizeQuotaHeaders,
@@ -1667,7 +1670,7 @@ const anthropicAuthPlugin = async (
     signal?: AbortSignal,
     rejectedAccessToken?: string,
     modelId?: string,
-    intent: 'serve' | 'refresh' | 'last-main' = 'serve',
+    intent: 'serve' | 'refresh' | 'last-main' | 'cachekeep' = 'serve',
     accountSnapshot?: NativeAccountSnapshot,
   ): Promise<NativeOAuthAuthorization> {
     assertNativeEnvironment()
@@ -1676,6 +1679,11 @@ const anthropicAuthPlugin = async (
     const account = snapshot.accounts.find(
       (candidate) => candidate.id === routeId,
     )
+    if (
+      intent === 'cachekeep' &&
+      (account?.type !== 'oauth' || !nativeAccountCanServe(account))
+    )
+      throw new NativeAccountRefusal('account-unavailable')
     if (account?.state === 'unsupported-access')
       throw new NativeUnsupportedCredentialError()
     if (account?.source === 'vault' && !nativeAccountCanServe(account))
@@ -1707,7 +1715,9 @@ const anthropicAuthPlugin = async (
           )) ||
           (!lastMainAttempt && !quotaSnapshotPassesModelScope(quota, modelId)))
       )
-        throw new NativeModelPolicyError(view, getQuotaCheckIntervalMs(storage))
+        throw intent === 'cachekeep'
+          ? new NativeAccountRefusal('account-policy')
+          : new NativeModelPolicyError(view, getQuotaCheckIntervalMs(storage))
     }
     checkModelPolicy(account, snapshot.policyStorage)
     let result: NativeOAuthAuthorization
@@ -1716,6 +1726,10 @@ const anthropicAuthPlugin = async (
         .authorizeVault(routeId, signal)
         .catch((error) => {
           signal?.throwIfAborted()
+          if (intent === 'cachekeep') {
+            const refusal = nativeAccountRefusal(error)
+            if (refusal) throw refusal
+          }
           if (
             error instanceof NativeCustodyError &&
             ['not-active', 'route-declined', 'route-unavailable'].includes(
@@ -1737,11 +1751,15 @@ const anthropicAuthPlugin = async (
         rejectedAccessToken,
         intent: rejectedAccessToken
           ? 'refresh'
-          : intent === 'last-main'
+          : intent === 'last-main' || intent === 'cachekeep'
             ? 'serve'
             : intent,
       })
-      if (authorization.status !== 'usable')
+      if (authorization.status !== 'usable') {
+        if (intent === 'cachekeep') {
+          const refusal = nativeLocalAccountRefusal(authorization)
+          if (refusal) throw refusal
+        }
         throw new NativeCredentialUnavailableError(
           account,
           authorization.status,
@@ -1749,6 +1767,7 @@ const anthropicAuthPlugin = async (
             authorization.failure.kind === 'provider',
           authorization.status === 'failed' ? authorization.failure : undefined,
         )
+      }
       result = {
         accessToken: authorization.access,
         expires: authorization.expires,
@@ -1771,7 +1790,9 @@ const anthropicAuthPlugin = async (
       selected.source !== account.source ||
       selected.accountIdentity !== result.accountIdentity
     )
-      throw new Error('Native OAuth account changed before dispatch')
+      throw intent === 'cachekeep'
+        ? new NativeAccountRefusal('credential-changed')
+        : new Error('Native OAuth account changed before dispatch')
     if (
       result.localSubject &&
       (!selected.binding ||
@@ -1781,12 +1802,16 @@ const anthropicAuthPlugin = async (
           result.localSubject.binding.credentialEpoch ||
         selected.binding.identity !== result.localSubject.binding.identity)
     )
-      throw new Error('Native local account binding changed before dispatch')
+      throw intent === 'cachekeep'
+        ? new NativeAccountRefusal('credential-changed')
+        : new Error('Native local account binding changed before dispatch')
     if (
       result.scopedAttempt &&
       selected.credentialId !== result.scopedAttempt.credentialId
     )
-      throw new Error('Native vault credential binding changed before dispatch')
+      throw intent === 'cachekeep'
+        ? new NativeAccountRefusal('credential-changed')
+        : new Error('Native vault credential binding changed before dispatch')
     checkModelPolicy(selected, current.policyStorage, result.scopedAttempt)
     return result
   }
@@ -3652,6 +3677,7 @@ const anthropicAuthPlugin = async (
         attempt.signal,
         served.scopedAttempt ? undefined : served.accessToken,
         modelId,
+        'cachekeep',
       )
       if (
         current.accountIdentity !== served.accountIdentity ||
@@ -3689,7 +3715,13 @@ const anthropicAuthPlugin = async (
         attempt.signal,
         undefined,
         modelId,
+        'cachekeep',
       )
+      if (
+        target.oauthAccountIdentity &&
+        credential.accountIdentity !== target.oauthAccountIdentity
+      )
+        throw new NativeAccountRefusal('credential-changed')
       const accessToken = credential.accessToken
       cacheKeepScopedAttempts.set(attempt.id, credential)
       try {
@@ -3725,15 +3757,14 @@ const anthropicAuthPlugin = async (
         attempt.signal,
         undefined,
         modelId,
+        'cachekeep',
       )
       if (
         finalCredential.accountIdentity !== credential.accountIdentity ||
         Boolean(finalCredential.scopedAttempt) !==
           Boolean(credential.scopedAttempt)
       )
-        throw new Error(
-          'CacheKeep credential authority changed before dispatch',
-        )
+        throw new NativeAccountRefusal('credential-changed')
       headers.set('authorization', `Bearer ${finalCredential.accessToken}`)
       cacheKeepScopedAttempts.set(attempt.id, finalCredential)
       return headers
@@ -7435,6 +7466,7 @@ const anthropicAuthPlugin = async (
                   storage,
                   cacheMode: 'hybrid',
                   oauthAccountId,
+                  oauthAccountIdentity: nativeAuthorization?.accountIdentity,
                   isSubagent: subagentRequest,
                 })
                 trace?.mark('cachekeep_track', {

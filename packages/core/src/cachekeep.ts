@@ -5,6 +5,10 @@ import { orderClaudeCodeBody } from './claude-code.ts'
 import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
 import { logger } from './logger.ts'
 import {
+  NativeAccountRefusal,
+  type NativeAccountRefusalReason,
+} from './native-account-refusal.ts'
+import {
   createProviderErrorResponseScope,
   type ProviderErrorSummary,
   summarizePrewarmProviderError,
@@ -397,6 +401,7 @@ export type CacheKeepPrewarmResult =
   | {
       ok: false
       reason: string
+      refusal?: NativeAccountRefusalReason
       status?: number
       transient?: true
       provider_error?: ProviderErrorSummary['provider_error']
@@ -846,6 +851,10 @@ export class CacheKeepManager {
           })
           return scope.redactResponse(sent)
         } catch (error) {
+          if (error instanceof NativeAccountRefusal) {
+            scope.dispose()
+            throw error
+          }
           const redacted = scope.redactError(error)
           scope.dispose()
           throw redacted
@@ -866,7 +875,11 @@ export class CacheKeepManager {
               bodyText: prewarm.bodyText,
               attempt,
             })
-          } catch {
+          } catch (error) {
+            if (error instanceof NativeAccountRefusal) {
+              await response.body?.cancel().catch(() => {})
+              throw error
+            }
             // A failed credential lookup cannot justify replay. Observe and
             // report the original 401 against its actual send-time receipt.
           }
@@ -878,7 +891,8 @@ export class CacheKeepManager {
             response = await send(headers)
           }
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof NativeAccountRefusal) throw error
         const summary = summarizePrewarmProviderError({ failure: 'transport' })
         return {
           ok: false,
@@ -944,6 +958,10 @@ export class CacheKeepManager {
           }
         | undefined
       return { ok: true, ...(usage && { usage }) }
+    } catch (error) {
+      if (error instanceof NativeAccountRefusal)
+        return { ok: false, reason: error.reason, refusal: error.reason }
+      throw error
     } finally {
       try {
         await this.options.onComplete?.({ target, attempt })
@@ -954,7 +972,9 @@ export class CacheKeepManager {
   private async prewarm(target: CacheKeepTarget, now: number) {
     const result = await this.sendPrewarm(target)
     if (!result.ok) {
-      if (result.status == null && !result.transient) {
+      if (result.refusal) {
+        this.removeTarget(target, result.refusal, now)
+      } else if (result.status == null && !result.transient) {
         this.removeTarget(
           target,
           result.reason === 'body is not valid JSON'

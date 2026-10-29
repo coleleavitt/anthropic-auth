@@ -9,6 +9,7 @@ import {
   isQuotaBearingHeaderFrame,
   logger,
   mergeHeaderQuotaForPersistence,
+  type NativeAccountRefusalReason,
   type NativeAccountRuntime,
   type NativeAccountSnapshot,
   type NativeAccountView,
@@ -20,6 +21,7 @@ import {
   NativeVaultNoAccountError,
   nativeAccountCanServe,
   nativeAccountPolicy,
+  nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
   nativePollQuotaGenerallyExhausted,
   normalizeQuotaHeaders,
@@ -45,6 +47,7 @@ import type {
 } from '@cortexkit/common-auth/opencode2'
 import { extractAnthropicRequestId } from '../billing-lineage'
 import {
+  type NativeAnthropicAttemptContext,
   type NativeAnthropicAuthorization,
   type NativeAnthropicBodyOptions,
   type NativeAnthropicRequestContext,
@@ -69,6 +72,7 @@ export type NativeSourceProvenance =
   | { readonly kind: 'api'; readonly subject: NativeApiSubject }
 
 type Authorization = NativeAnthropicAuthorization<NativeSourceProvenance>
+type OnAccountRefusal = (reason: NativeAccountRefusalReason) => void
 type State = {
   readonly scope: RequestScope
   readonly active: AbortController
@@ -171,6 +175,20 @@ export interface NativeSourceOptions {
 
 export interface NativeSource
   extends NativeAnthropicSource<OAuthQuotaSnapshot, NativeSourceProvenance> {
+  /** Background sends can stop retrying terminal refusals without changing live routing. */
+  readonly authorizeAccount: (
+    scope: RequestScope,
+    accountId: string,
+    onRefusal?: OnAccountRefusal,
+  ) => Promise<Authorization | undefined>
+  readonly requestOptions?: (
+    input: NativeAnthropicRequestContext<NativeSourceProvenance>,
+    onRefusal?: OnAccountRefusal,
+  ) => Promise<NativeAnthropicBodyOptions> | NativeAnthropicBodyOptions
+  readonly admitRequest?: (
+    input: NativeAnthropicAttemptContext<NativeSourceProvenance>,
+    onRefusal?: OnAccountRefusal,
+  ) => Promise<void> | void
   readonly close: () => Promise<void>
   readonly drainRoutingPublications: () => Promise<void>
   readonly resetRouting: (sessionID: string) => Promise<void>
@@ -275,6 +293,7 @@ export function createNativeAnthropicSource(
     modelID: string,
     route: 'oauth' | 'api',
     active: AbortController,
+    onRefusal?: (reason: NativeAccountRefusalReason) => void,
   ) => {
     const current = await runtime.read()
     syncDumpEnabled(current)
@@ -285,8 +304,14 @@ export function createNativeAnthropicSource(
       !account ||
       account.type !== route ||
       !eligible(account, current, modelID)
-    )
+    ) {
+      onRefusal?.(
+        !account || !nativeAccountCanServe(account)
+          ? 'account-unavailable'
+          : 'account-policy',
+      )
       return false
+    }
     if (route === 'api') {
       const main = current.accounts.find(
         (row) => row.id === 'main' && row.type === 'oauth',
@@ -569,7 +594,7 @@ export function createNativeAnthropicSource(
       queue?.shift()
       if (queue?.length === 0) choices.delete(queueKey)
     },
-    async authorizeAccount(scope, accountId) {
+    async authorizeAccount(scope, accountId, onRefusal) {
       const active = controller(scope)
       const snapshot = await runtime.read()
       syncDumpEnabled(snapshot)
@@ -580,7 +605,14 @@ export function createNativeAnthropicSource(
       )
       active.signal.throwIfAborted()
       const account = snapshot.accounts.find((row) => row.id === accountId)
-      if (!account || !eligible(account, snapshot, modelID)) return undefined
+      if (!account || !eligible(account, snapshot, modelID)) {
+        onRefusal?.(
+          !account || !nativeAccountCanServe(account)
+            ? 'account-unavailable'
+            : 'account-policy',
+        )
+        return undefined
+      }
       const queueKey = key(scope, accountId)
       const queue = choices.get(queueKey)
       const choice = queue?.shift()
@@ -591,7 +623,15 @@ export function createNativeAnthropicSource(
       )
       active.signal.throwIfAborted()
       if (choice?.auth) {
-        if (!(await admitted(accountId, modelID, choice.auth.route, active)))
+        if (
+          !(await admitted(
+            accountId,
+            modelID,
+            choice.auth.route,
+            active,
+            onRefusal,
+          ))
+        )
           return undefined
         const served = states.get(choice.auth.provenance)
         if (
@@ -654,7 +694,7 @@ export function createNativeAnthropicSource(
       if (account.source === 'vault') {
         const receipt = await runtime.authorizeVault(accountId, active.signal)
         active.signal.throwIfAborted()
-        if (!(await admitted(accountId, modelID, 'oauth', active)))
+        if (!(await admitted(accountId, modelID, 'oauth', active, onRefusal)))
           return undefined
         const provenance: NativeSourceProvenance = {
           kind: 'vault',
@@ -663,7 +703,10 @@ export function createNativeAnthropicSource(
         }
         states.set(provenance, { ...common, receipt })
         const identity = receipt.assertedAccountIdentity
-        if (!identity) return undefined
+        if (!identity) {
+          onRefusal?.('account-unavailable')
+          return undefined
+        }
         servedBy.set(scope.sessionID, accountId)
         return {
           route: 'oauth',
@@ -681,8 +724,12 @@ export function createNativeAnthropicSource(
         policy: (row, view) => nativeAccountPolicy(row, view, modelID),
       })
       active.signal.throwIfAborted()
-      if (material.status !== 'usable') return undefined
-      if (!(await admitted(accountId, modelID, 'oauth', active)))
+      if (material.status !== 'usable') {
+        const refusal = nativeLocalAccountRefusal(material)
+        if (refusal) onRefusal?.(refusal.reason)
+        return undefined
+      }
+      if (!(await admitted(accountId, modelID, 'oauth', active, onRefusal)))
         return undefined
       const provenance: NativeSourceProvenance = {
         kind: 'local',
@@ -702,7 +749,7 @@ export function createNativeAnthropicSource(
         ),
       }
     },
-    async requestOptions(input) {
+    async requestOptions(input, onRefusal) {
       const active = controller(input)
       const snapshot = await runtime.read()
       syncDumpEnabled(snapshot)
@@ -710,10 +757,16 @@ export function createNativeAnthropicSource(
       const account = snapshot.accounts.find(
         (row) => row.id === input.accountId,
       )
-      if (!account || !eligible(account, snapshot, input.modelID))
+      if (!account || !eligible(account, snapshot, input.modelID)) {
+        onRefusal?.(
+          !account || !nativeAccountCanServe(account)
+            ? 'account-unavailable'
+            : 'account-policy',
+        )
         throw new Error(
           'request refused: native account is ineligible for this model',
         )
+      }
       const state = states.get(input.provenance)
       if (state)
         states.set(input.provenance, {
@@ -722,7 +775,7 @@ export function createNativeAnthropicSource(
         })
       return options.requestOptions(input, snapshot)
     },
-    async admitRequest(input) {
+    async admitRequest(input, onRefusal) {
       const state = states.get(input.provenance)
       if (
         !state ||
@@ -731,6 +784,7 @@ export function createNativeAnthropicSource(
           input.modelID,
           input.route,
           state.active,
+          onRefusal,
         ))
       )
         throw new Error(
