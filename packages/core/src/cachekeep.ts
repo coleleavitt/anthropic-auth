@@ -1,9 +1,12 @@
+import { createHash } from 'node:crypto'
 import type { AccountStorage } from './accounts.ts'
 import type { CacheKeepTrackedSession } from './cachekeep-registry.ts'
 import { signRequestBody, stripBillingLineageFromBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
 import { logger } from './logger.ts'
+import { getClaudeModelCatalogue } from './model-capabilities.ts'
+import { CLAUDE_OPUS_5_5_PRICING } from './models.ts'
 import {
   NativeAccountRefusal,
   type NativeAccountRefusalReason,
@@ -314,6 +317,11 @@ export async function buildCacheKeepPrewarmBody(
   stripBillingLineageFromBody(warm)
   warm.max_tokens = 0
   delete warm.stream
+  // A prewarm carrying the server-side fallback opt-in can be sticky-routed
+  // to a fallback model instead of the model whose cache it should extend.
+  // The warm re-derives its betas from its own body, so dropping the opt-in
+  // here also drops the server-fallback beta from its headers.
+  delete warm.fallbacks
 
   const thinking = warm.thinking as Record<string, unknown> | undefined
   if (thinking?.type === 'enabled') delete warm.thinking
@@ -346,6 +354,94 @@ export type CacheKeepTarget = {
   oauthAccountIdentity?: string
   accountStoragePath?: string
   isSubagent: boolean
+  /**
+   * A recovery-round warm for the original (source) model, tracked under a
+   * key that cannot collide with the session's live target. It follows the
+   * same send, auth, retry and logging path; the caller stops it through
+   * untrack() when the round ends or its prefix becomes unusable.
+   */
+  sourceWarm?: boolean
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+const BILLING_HEADER_BLOCK_PREFIX = 'x-anthropic-billing-header:'
+
+function isBillingHeaderBlock(block: unknown): boolean {
+  return (
+    isRecord(block) &&
+    block.type === 'text' &&
+    typeof block.text === 'string' &&
+    block.text.startsWith(BILLING_HEADER_BLOCK_PREFIX)
+  )
+}
+
+function normalizePrefixValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizePrefixValue)
+  if (!isRecord(value)) return value
+  const normalized: Record<string, unknown> = {}
+  for (const key of Object.keys(value).sort()) {
+    normalized[key] = normalizePrefixValue(value[key])
+  }
+  return normalized
+}
+
+/**
+ * Fingerprint of the cacheable prefix of a request body: tools, system
+ * blocks, and messages up to the last cache breakpoint. The billing header
+ * block is excluded because its signature is re-signed on every send, and
+ * everything past the last breakpoint (output limits, stream flags,
+ * thinking config) never affects the stored cache entry. Two bodies with
+ * the same fingerprint warm the same cache entry.
+ */
+export function cacheWarmCacheablePrefixFingerprint(
+  bodyText: string,
+): string | undefined {
+  let body: unknown
+  try {
+    body = JSON.parse(bodyText)
+  } catch {
+    return undefined
+  }
+  if (!isRecord(body)) return undefined
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  let lastBreakpoint = -1
+  messages.forEach((message, index) => {
+    if (hasExplicitCacheControl(message)) lastBreakpoint = index
+  })
+  const system = Array.isArray(body.system)
+    ? body.system.filter((block) => !isBillingHeaderBlock(block))
+    : (body.system ?? null)
+  const prefix = normalizePrefixValue({
+    tools: body.tools ?? null,
+    system,
+    messages: messages.slice(0, lastBreakpoint + 1),
+  })
+  return createHash('sha256').update(JSON.stringify(prefix)).digest('hex')
+}
+
+/**
+ * How many warms one idle recovery round may send before stopping: each
+ * warm pays the 1-hour cache write while a cache hit saves the difference
+ * between that write and a read, so the round stops after
+ * floor((write - read) / read) warms since the last user turn. Rates come
+ * from the source model's own catalogue pricing; models without catalogue
+ * facts (Opus 5) use the nearest sibling with 1-hour pricing.
+ */
+export function cacheKeepSourceWarmIdleCap(modelId: string): number {
+  let pricing: { cacheRead: number; cacheWrite1h: number }
+  try {
+    pricing = getClaudeModelCatalogue(modelId).pricing
+  } catch {
+    pricing = CLAUDE_OPUS_5_5_PRICING
+  }
+  if (!Number.isFinite(pricing.cacheRead) || pricing.cacheRead <= 0) return 1
+  return Math.max(
+    1,
+    Math.floor((pricing.cacheWrite1h - pricing.cacheRead) / pricing.cacheRead),
+  )
 }
 
 export type CacheKeepPrewarmAttempt = {
@@ -392,6 +488,7 @@ function cacheKeepSentCredentials(headers: Headers): string[] {
 export type CacheKeepPrewarmResult =
   | {
       ok: true
+      refused?: false
       usage?: {
         input_tokens?: number
         cache_creation_input_tokens?: number
@@ -400,12 +497,26 @@ export type CacheKeepPrewarmResult =
     }
   | {
       ok: false
+      refused?: false
       reason: string
       refusal?: NativeAccountRefusalReason
       status?: number
       transient?: true
       provider_error?: ProviderErrorSummary['provider_error']
     }
+  | {
+      /** The warm was refused before any send; the target is removed. */
+      ok: false
+      refused: true
+      reason: string
+      status?: undefined
+      transient?: undefined
+      provider_error?: undefined
+    }
+
+export type CacheKeepPrewarmValidation =
+  | { ok: true }
+  | { ok: false; reason: string }
 
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
@@ -442,6 +553,15 @@ export class CacheKeepManager {
         bodyText: string,
         target: CacheKeepTarget,
       ) => string | Promise<string>
+      /**
+       * Veto a prewarm after its body is built but before anything is
+       * sent. A refusal removes the target without sending. Throwing also
+       * refuses, so a failing check can never send a mismatched warm.
+       */
+      validatePrewarm?: (input: {
+        target: CacheKeepTarget
+        warmBodyText: string
+      }) => CacheKeepPrewarmValidation | Promise<CacheKeepPrewarmValidation>
       onResponse?: (input: {
         target: CacheKeepTarget
         bodyText: string
@@ -512,6 +632,18 @@ export class CacheKeepManager {
   ): { oauthAccountId?: string } | undefined {
     const target = this.targets.get(sessionId)
     return target ? { oauthAccountId: target.oauthAccountId } : undefined
+  }
+
+  /**
+   * Stop warming a session without logging: the caller owns the reason
+   * (a finished recovery round, a model change, a cleared session) and
+   * logs it where the decision is made. Returns whether a target existed.
+   */
+  untrack(id: string): boolean {
+    if (!this.targets.has(id)) return false
+    this.targets.delete(id)
+    this.publishTrackedSessions()
+    return true
   }
 
   trackedCount(): number {
@@ -622,6 +754,7 @@ export class CacheKeepManager {
     oauthAccountIdentity?: string
     accountStoragePath?: string
     isSubagent?: boolean
+    sourceWarm?: boolean
   }): { tracked: true } | { tracked: false; reason: string } {
     const now = this.options.now?.() ?? Date.now()
     // Measured only once the policy checks pass: track() runs on every live
@@ -690,6 +823,7 @@ export class CacheKeepManager {
       oauthAccountIdentity: input.oauthAccountIdentity,
       accountStoragePath: input.accountStoragePath,
       isSubagent: input.isSubagent ?? false,
+      ...(input.sourceWarm === true && { sourceWarm: true }),
     })
     this.pruneTargets(now, today)
     this.publishTrackedSessions()
@@ -758,6 +892,13 @@ export class CacheKeepManager {
     }
 
     if (!isCacheKeepHybridActive(storage)) {
+      // CacheKeep (or hybrid mode) was turned off mid-round. Live targets
+      // keep their entries until their cache expires; recovery-round source
+      // warms stop for good instead of resuming on re-enable.
+      for (const target of this.targets.values()) {
+        if (target.sourceWarm)
+          this.removeTarget(target, 'cachekeep-hybrid-inactive', now)
+      }
       this.publishTrackedSessions()
       return
     }
@@ -807,6 +948,31 @@ export class CacheKeepManager {
       const preparedTarget = { ...target, bodyText }
       const prewarm = await buildCacheKeepPrewarmBody(bodyText)
       if (!prewarm.ok) return prewarm
+
+      if (this.options.validatePrewarm) {
+        let verdict: CacheKeepPrewarmValidation | undefined
+        try {
+          verdict = await this.options.validatePrewarm({
+            target,
+            warmBodyText: prewarm.bodyText,
+          })
+        } catch {
+          verdict = undefined
+        }
+        if (!verdict?.ok) {
+          // Refused before any send: never dispatch a warm the keeper no
+          // longer trusts. The failure branch below removes the target and
+          // logs the single warning with the session id and reason code.
+          return {
+            ok: false,
+            refused: true as const,
+            reason:
+              verdict && !verdict.ok
+                ? verdict.reason
+                : 'prewarm-validation-failed',
+          }
+        }
+      }
 
       const fetchImpl = this.options.fetchImpl ?? fetch
       const prewarmTarget = { ...preparedTarget, bodyText: prewarm.bodyText }
@@ -972,6 +1138,12 @@ export class CacheKeepManager {
   private async prewarm(target: CacheKeepTarget, now: number) {
     const result = await this.sendPrewarm(target)
     if (!result.ok) {
+      if (result.refused === true) {
+        this.removeTarget(target, result.reason, now, {
+          detail: 'prewarm refused before send',
+        })
+        return
+      }
       if (result.refusal) {
         this.removeTarget(target, result.refusal, now)
       } else if (result.status == null && !result.transient) {

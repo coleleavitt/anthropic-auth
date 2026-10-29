@@ -7,11 +7,13 @@ import type {
   ProviderAccountUuid,
   QuotaManager,
 } from '@cortexkit/anthropic-auth-core'
+import type { FableFallbackManager } from './fable-fallback.ts'
 
 export interface PluginTestHandles {
   primeManager: PrimeManager
   quotaManager: QuotaManager
   cacheKeepManager: CacheKeepManager
+  fableFallbackManager: FableFallbackManager
   resolveMainQuotaIdentity: (
     accessToken: string,
     model?: string,

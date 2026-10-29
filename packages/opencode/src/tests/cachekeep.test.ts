@@ -517,7 +517,7 @@ describe('CacheKeepManager', () => {
     })
 
     expect(result.ok).toBe(false)
-    if (result.ok) throw new Error('expected prewarm to fail')
+    if (result.ok || result.refused) throw new Error('expected prewarm to fail')
     expect(result.transient).toBe(true)
     expect(result.reason).toBe('Provider prewarm transport failed')
     expect(result.provider_error?.reason).toBe('transport')

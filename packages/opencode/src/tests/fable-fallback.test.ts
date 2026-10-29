@@ -3,6 +3,9 @@ import {
   FABLE_FALLBACK_MODEL_ID,
   FABLE_FALLBACK_TURNS,
   FableFallbackManager,
+  type FableSourceWarmInit,
+  parseSourceWarmTargetId,
+  sourceWarmTargetId,
 } from '../fable-fallback'
 import { createStrippedStream } from '../transform'
 
@@ -644,4 +647,156 @@ test('only a changed primary selection clears recovery, not another family using
   expect(manager.plan('session-a', body('claude-fable-5'))?.downgraded).toBe(
     false,
   )
+})
+
+describe('FableFallbackManager source-warm keeps', () => {
+  function keep(
+    overrides: Partial<FableSourceWarmInit> = {},
+  ): FableSourceWarmInit {
+    return {
+      bodyText: body('claude-opus-5-5'),
+      oauthAccountId: 'main',
+      accountIdentity: 'account-uuid-1',
+      sentAt: 1_000,
+      model: 'claude-opus-5-5',
+      firstAnchorFingerprint: 'anchor-fp',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: { authorization: 'Bearer token' },
+      ...overrides,
+    }
+  }
+
+  function activateWithKeep(
+    manager: FableFallbackManager,
+    session = 'session-a',
+    model = 'claude-opus-5-5',
+  ) {
+    const plan = manager.plan(session, body(model))!
+    expect(manager.activate(plan, 'main', keep({ model }))).toBe(
+      FABLE_FALLBACK_TURNS,
+    )
+    return plan
+  }
+
+  test('source warm target ids round-trip and reject foreign ids', () => {
+    expect(sourceWarmTargetId('ses_a', 'opus-5-5')).toBe(
+      'source-warm:ses_a:opus-5-5',
+    )
+    expect(parseSourceWarmTargetId('source-warm:ses_a:opus-5-5')).toEqual({
+      sessionId: 'ses_a',
+      family: 'opus-5-5',
+    })
+    expect(parseSourceWarmTargetId('ses_a')).toBeNull()
+    expect(parseSourceWarmTargetId('source-warm:ses_a')).toBeNull()
+    expect(parseSourceWarmTargetId('source-warm:ses_a:nope')).toBeNull()
+  })
+
+  test('activate keeps the source with a zeroed idle count', () => {
+    const manager = new FableFallbackManager()
+    const plan = activateWithKeep(manager)
+    const warm = manager.sourceWarmFor(plan.recoveryKey)
+    expect(warm).toMatchObject({
+      oauthAccountId: 'main',
+      model: 'claude-opus-5-5',
+      warmsSinceUserTurn: 0,
+    })
+    expect(manager.sourceWarmForTarget('source-warm:session-a:opus-5-5')).toBe(
+      warm,
+    )
+    expect(manager.hasSourceWarmForSession('session-a')).toBe(true)
+    expect(manager.hasSourceWarmForSession('session-b')).toBe(false)
+  })
+
+  test('a new round replaces the previous keep', () => {
+    const manager = new FableFallbackManager()
+    const first = activateWithKeep(manager)
+    expect(manager.sourceWarmFor(first.recoveryKey)?.bodyText).toContain(
+      'claude-opus-5-5',
+    )
+    // Finish the round, then refuse again: the keep comes from the new send.
+    for (let index = 0; index < FABLE_FALLBACK_TURNS; index++)
+      manager.complete(manager.plan('session-a', body('claude-opus-5-5'))!)
+    const second = manager.plan('session-a', body('claude-opus-5-5'))!
+    manager.activate(second, 'main', keep({ bodyText: body('claude-opus-5') }))
+    expect(manager.sourceWarmFor(second.recoveryKey)?.bodyText).toContain(
+      '"claude-opus-5"',
+    )
+  })
+
+  test('a served source drops the keep but keeps the backoff', () => {
+    const manager = new FableFallbackManager()
+    activateWithKeep(manager)
+    for (let index = 0; index < FABLE_FALLBACK_TURNS; index++)
+      manager.complete(manager.plan('session-a', body('claude-opus-5-5'))!)
+    const probe = manager.plan('session-a', body('claude-opus-5-5'))!
+    expect(probe.downgraded).toBe(false)
+    expect(manager.completeSource(probe)).toBe(true)
+    expect(manager.sourceWarmFor(probe.recoveryKey)).toBeUndefined()
+    expect(manager.hasSourceWarmForSession('session-a')).toBe(false)
+    // The refusal history survives the dropped keep: refusing again
+    // escalates the round instead of resetting it.
+    expect(
+      manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
+    ).toBe(20)
+  })
+
+  test('account migration drops the keep', () => {
+    const manager = new FableFallbackManager()
+    activateWithKeep(manager)
+    const migrated = manager.plan('session-a', body('claude-opus-5-5'))!
+    expect(manager.bindRecoveryAccount(migrated, 'fallback-1')).toBe(true)
+    expect(manager.sourceWarmFor(migrated.recoveryKey)).toBeUndefined()
+    expect(manager.dropSourceWarmForTarget('bogus')).toBe(false)
+  })
+
+  test('model change and session clear drop the keep', () => {
+    const manager = new FableFallbackManager()
+    expect(manager.resetForModelChange('session-a', 'claude-opus-5-5')).toBe(
+      false,
+    )
+    activateWithKeep(manager)
+    expect(manager.resetForModelChange('session-a', 'claude-opus-5')).toBe(true)
+    expect(manager.hasSourceWarmForSession('session-a')).toBe(false)
+    activateWithKeep(manager)
+    manager.clearSession('session-a')
+    expect(manager.hasSourceWarmForSession('session-a')).toBe(false)
+  })
+
+  test('sent warms count up and a new user turn resets the count', () => {
+    const manager = new FableFallbackManager()
+    const plan = activateWithKeep(manager)
+    expect(manager.noteSourceWarmSent(plan.recoveryKey)).toBe(1)
+    expect(manager.noteSourceWarmSent(plan.recoveryKey)).toBe(2)
+    expect(manager.noteSourceWarmSent('missing')).toBeUndefined()
+    expect(
+      manager.noteSourceWarmSentForTarget('source-warm:session-a:opus-5-5'),
+    ).toBe(3)
+    // The first observed turn key is recorded, not counted as a reset.
+    expect(manager.noteSourceWarmUserTurn('session-a', 'prompt-1')).toBe(false)
+    expect(manager.sourceWarmFor(plan.recoveryKey)).toMatchObject({
+      warmsSinceUserTurn: 3,
+      lastUserTurnKey: 'prompt-1',
+    })
+    // Repeating the same turn changes nothing.
+    expect(manager.noteSourceWarmUserTurn('session-a', 'prompt-1')).toBe(false)
+    expect(manager.sourceWarmFor(plan.recoveryKey)?.warmsSinceUserTurn).toBe(3)
+    // A new turn resets the idle count back to zero.
+    expect(manager.noteSourceWarmUserTurn('session-a', 'prompt-2')).toBe(true)
+    expect(manager.sourceWarmFor(plan.recoveryKey)?.warmsSinceUserTurn).toBe(0)
+    // Other sessions are untouched.
+    expect(manager.noteSourceWarmUserTurn('session-b', 'prompt-9')).toBe(false)
+  })
+
+  test('dropSourceWarm keeps the recovery round itself', () => {
+    const manager = new FableFallbackManager()
+    const plan = activateWithKeep(manager)
+    expect(manager.dropSourceWarm(plan.recoveryKey)).toBe(true)
+    expect(manager.dropSourceWarm(plan.recoveryKey)).toBe(false)
+    expect(manager.plan('session-a', body('claude-opus-5-5'))?.downgraded).toBe(
+      true,
+    )
+    expect(
+      manager.dropSourceWarmForTarget('source-warm:session-a:opus-5-5'),
+    ).toBe(false)
+  })
 })

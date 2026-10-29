@@ -8,6 +8,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.4.3
 
+- During an Opus 4.8 recovery round on OpenCode 1, cache keep-warm also keeps the original model's prompt cache alive, so returning to it doesn't rebuild the whole prompt. A restart during a round drops this.
 - OpenCode 2: CacheKeep prewarms now read the session's prompt cache. A prewarm sent the stored request through the request rewrite a second time, which renamed every tool again and added the system blocks again, so each idle hour cost two full cache writes. Addresses #547.
 - OpenCode 2 now applies the saved log level when it starts. Addresses #543.
 - CacheKeep keeps up to 64 MiB of sessions (was 16 MiB) and logs a warning whenever it stops warming a session whose cache is still alive. Addresses #544.

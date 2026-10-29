@@ -40,6 +40,8 @@ import {
   CLAUDE_SONNET_5_5_RELEASE_DATE,
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
   type CustodyStatusState,
+  cacheKeepSourceWarmIdleCap,
+  cacheWarmCacheablePrefixFingerprint,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
   createEmptyStorage,
@@ -247,7 +249,9 @@ import {
   type FableFallbackPlan,
   type FableStandbyCacheAnchor,
   isRecoverableRefusalModel,
+  parseSourceWarmTargetId,
   recoverableRefusalFamily,
+  sourceWarmTargetId,
 } from './fable-fallback.ts'
 import {
   fireLaneStart,
@@ -311,6 +315,7 @@ import {
   cancelUnsafeToolNameResponse,
   createStrippedStream,
   extractLatestHybridMessageCacheAnchor,
+  hybridUserMessageCacheAnchorFingerprints,
   isInsecure,
   mergeHeaders,
   normalizeToolNameResponseError,
@@ -815,6 +820,7 @@ type FableRequestContext = {
   serverFallback?: boolean
   opusCacheAnchor?: FableStandbyCacheAnchor
   standbyBridgeLogged?: boolean
+  subagent?: boolean
 }
 
 type StickyOAuthRoute = {
@@ -1863,6 +1869,40 @@ const anthropicAuthPlugin = async (
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
   )
   const fableFallbackManager = new FableFallbackManager()
+  // Last actually-sent source-model request per recovery round, keyed by
+  // recovery key. A content-filter refusal consumes the entry into the
+  // round's kept source prefix; every later send for the round overwrites
+  // it, so a stale unsent entry can never become a warm.
+  const pendingSourceSends = new Map<
+    string,
+    {
+      bodyText: string
+      url: string
+      headers: Record<string, string>
+      oauthAccountId: string
+      accountIdentity?: string
+      sentAt: number
+      subagent: boolean
+    }
+  >()
+  // Stop every source warm in a session for good and drop the CacheKeep
+  // targets with it. The manager already forgot the kept prefixes (session
+  // clear, model change); this mirrors that into CacheKeep's machinery.
+  function dropSessionSourceWarms(sessionId: string) {
+    for (const { recoveryKey } of fableFallbackManager.sourceWarmsForSession(
+      sessionId,
+    )) {
+      fableFallbackManager.dropSourceWarm(recoveryKey)
+    }
+    for (const target of cacheKeepManager.trackedSessions()) {
+      const parsed = parseSourceWarmTargetId(target.id)
+      if (parsed && parsed.sessionId === sessionId)
+        cacheKeepManager.untrack(target.id)
+    }
+    for (const key of [...pendingSourceSends.keys()]) {
+      if (key.startsWith(`${sessionId}\0`)) pendingSourceSends.delete(key)
+    }
+  }
   const laneStartTracker = new LaneStartTracker()
   const effortPlanTracker = new OpenCodeEffortPlanTracker()
   const billingLineageTracker = new BillingLineageTracker()
@@ -3610,6 +3650,10 @@ const anthropicAuthPlugin = async (
       if (status === 401 && authorization?.scopedAttempt) {
         await reportVault401(authorization.scopedAttempt, 'direct')
       }
+      // A successful source warm counts toward the round's idle cap.
+      if (target.sourceWarm && status >= 200 && status < 300) {
+        fableFallbackManager.noteSourceWarmSentForTarget(target.id)
+      }
       const prepared = cacheKeepDiagnosticsRequests.get(target.id)
       if (!prepared?.betasHash || !prepared.betas) {
         cacheKeepDiagnosticsRequests.delete(target.id)
@@ -3767,9 +3811,106 @@ const anthropicAuthPlugin = async (
         throw new NativeAccountRefusal('credential-changed')
       headers.set('authorization', `Bearer ${finalCredential.accessToken}`)
       cacheKeepScopedAttempts.set(attempt.id, finalCredential)
+      if (target.sourceWarm) {
+        // The warm must still belong to the account the source request was
+        // sent on. The same-account re-authorization above already fenced
+        // this dispatch; this fences the round: a replaced account or a
+        // rotated credential stops the warm for good instead of warming
+        // another account's cache.
+        const kept = fableFallbackManager.sourceWarmForTarget(target.id)
+        if (
+          !kept ||
+          kept.oauthAccountId !== target.oauthAccountId ||
+          (kept.accountIdentity !== undefined &&
+            finalCredential.accountIdentity !== kept.accountIdentity)
+        ) {
+          fableFallbackManager.dropSourceWarmForTarget(target.id)
+          cacheKeepManager.untrack(target.id)
+          logger.warn(
+            'cachekeep',
+            'source warm refused: bound account changed',
+            {
+              session: target.id,
+              reason: 'source-warm-account-changed',
+            },
+          )
+          return undefined
+        }
+      }
       return headers
     },
+    validatePrewarm: ({ target, warmBodyText }) => {
+      if (!target.sourceWarm) return { ok: true as const }
+      const kept = fableFallbackManager.sourceWarmForTarget(target.id)
+      if (!kept) {
+        // The round ended (or never kept a source) while the target lived
+        // on: nothing is left to warm.
+        cacheKeepManager.untrack(target.id)
+        return { ok: false, reason: 'source-round-ended' }
+      }
+      if (kept.warmsSinceUserTurn >= cacheKeepSourceWarmIdleCap(kept.model)) {
+        // Idle for the whole economic life of the warm: stop for good. A
+        // new user turn before the cap resets the count instead.
+        fableFallbackManager.dropSourceWarmForTarget(target.id)
+        return { ok: false, reason: 'source-warm-idle-cap' }
+      }
+      const warmFingerprint = cacheWarmCacheablePrefixFingerprint(warmBodyText)
+      const keptFingerprint = cacheWarmCacheablePrefixFingerprint(kept.bodyText)
+      if (
+        !warmFingerprint ||
+        !keptFingerprint ||
+        warmFingerprint !== keptFingerprint
+      ) {
+        // The kept prefix no longer matches what the warm would refresh
+        // (compaction, history edit, or a corrupted keep): refuse it rather
+        // than writing a cache entry the return cannot read.
+        fableFallbackManager.dropSourceWarmForTarget(target.id)
+        return { ok: false, reason: 'source-prefix-mismatch' }
+      }
+      return { ok: true as const }
+    },
   })
+
+  // Track one recovery round's kept source prefix as a second CacheKeep
+  // target. It reuses the live prewarm path (same lead, same auth, same
+  // retry and logging), keyed so it cannot collide with the session's live
+  // target. A round that ends before expiry sends nothing: the target is
+  // removed on the round's end and the tick only fires at the lead.
+  async function syncSourceWarmTarget(plan: FableFallbackPlan) {
+    const family = recoverableRefusalFamily(plan.requestedModel)
+    if (!family) return
+    const targetId = sourceWarmTargetId(plan.sessionId, family)
+    const kept = fableFallbackManager.sourceWarmFor(plan.recoveryKey)
+    if (!kept) {
+      cacheKeepManager.untrack(targetId)
+      return
+    }
+    let storage: AccountStorage | null
+    try {
+      storage = await loadAccounts()
+    } catch {
+      return
+    }
+    const tracked = cacheKeepManager.track({
+      sessionId: targetId,
+      url: kept.url,
+      headers: new Headers(kept.headers),
+      bodyText: kept.bodyText,
+      storage,
+      cacheMode: 'hybrid',
+      oauthAccountId: kept.oauthAccountId,
+      ...(kept.accountIdentity !== undefined && {
+        oauthAccountIdentity: kept.accountIdentity,
+      }),
+      isSubagent: kept.subagent ?? false,
+      sourceWarm: true,
+    })
+    if (!tracked.tracked) {
+      // CacheKeep policy (disabled, non-hybrid, off-schedule, subagents)
+      // refused the warm: forget the prefix with the target.
+      fableFallbackManager.dropSourceWarm(plan.recoveryKey)
+    }
+  }
 
   // Prime sends a minimal Haiku request after the account's quota reset to
   // start its next five-hour usage window. One shared manager and an atomic
@@ -6181,6 +6322,7 @@ const anthropicAuthPlugin = async (
 
       if (value.type === 'session.deleted') {
         fableFallbackManager.clearSession(sessionId)
+        dropSessionSourceWarms(sessionId)
         nativeCommands.delete(sessionId)
         oauthPending.delete(sessionId)
         laneStartTracker.clearSession(sessionId)
@@ -7450,13 +7592,14 @@ const anthropicAuthPlugin = async (
             const cacheDiagnosticsBetas =
               await getCacheDiagnosticsBetas(requestHeaders)
             if (fableRequest) fableRequest.oauthAccountId = oauthAccountId
-            if (
-              typeof body === 'string' &&
-              isCache1hEnabled() &&
-              getCache1hMode() === 'hybrid'
-            ) {
+            if (fableRequest) fableRequest.subagent = subagentRequest
+            if (typeof body === 'string') {
               const storage = await getRequestStorage()
-              if (!subagentRequest || isCacheKeepSubagentsEnabled(storage)) {
+              if (
+                isCache1hEnabled() &&
+                getCache1hMode() === 'hybrid' &&
+                (!subagentRequest || isCacheKeepSubagentsEnabled(storage))
+              ) {
                 const cacheKeepStart = nowMs()
                 const tracked = cacheKeepManager.track({
                   sessionId: relayAffinity,
@@ -7476,6 +7619,134 @@ const anthropicAuthPlugin = async (
                   reason: tracked.tracked ? undefined : tracked.reason,
                   bodyBytes: body.length,
                 })
+                // Remember the exact signed bytes sent to a recoverable
+                // source model. A later refusal keeps them as the round's
+                // source prefix; anything else (a 4.8 request, a probe that
+                // never refuses) overwrites them so only sent source bodies
+                // can become a warm.
+                if (
+                  relayAffinity &&
+                  fableRequest &&
+                  !fableRequest.plan.downgraded &&
+                  tracked.tracked
+                ) {
+                  pendingSourceSends.set(fableRequest.plan.recoveryKey, {
+                    bodyText: body,
+                    url:
+                      rewritten.url?.toString() ?? rewritten.input.toString(),
+                    headers: Object.fromEntries(
+                      requestHeaders.entries(),
+                    ) as Record<string, string>,
+                    oauthAccountId,
+                    ...(nativeAuthorization.accountIdentity !== undefined && {
+                      accountIdentity: nativeAuthorization.accountIdentity,
+                    }),
+                    sentAt: Date.now(),
+                    subagent: subagentRequest,
+                  })
+                  while (pendingSourceSends.size > 128) {
+                    const oldest = pendingSourceSends.keys().next().value
+                    if (oldest === undefined) break
+                    pendingSourceSends.delete(oldest)
+                  }
+                }
+              }
+              // Source-warm maintenance runs for every sent request, even
+              // when hybrid caching is off: turning CacheKeep or hybrid mode
+              // off stops the warm for good.
+              if (
+                relayAffinity &&
+                !subagentRequest &&
+                fableFallbackManager.hasSourceWarmForSession(relayAffinity)
+              ) {
+                if (
+                  activeBillingLineage &&
+                  activeBillingLineage.sessionId === relayAffinity
+                ) {
+                  fableFallbackManager.noteSourceWarmUserTurn(
+                    relayAffinity,
+                    activeBillingLineage.promptId,
+                  )
+                }
+                if (
+                  !isCacheKeepPersistentlyEnabled(storage) ||
+                  !isCache1hEnabled() ||
+                  getCache1hMode() !== 'hybrid'
+                ) {
+                  dropSessionSourceWarms(relayAffinity)
+                } else {
+                  const currentAnchors =
+                    hybridUserMessageCacheAnchorFingerprints(body)
+                  const trackedIds = new Set(
+                    cacheKeepManager.trackedSessions().map((s) => s.id),
+                  )
+                  for (const {
+                    recoveryKey,
+                    warm,
+                  } of fableFallbackManager.sourceWarmsForSession(
+                    relayAffinity,
+                  )) {
+                    const family = recoverableRefusalFamily(warm.model)
+                    const targetId = family
+                      ? sourceWarmTargetId(relayAffinity, family)
+                      : undefined
+                    if (
+                      targetId !== undefined &&
+                      !trackedIds.has(targetId) &&
+                      // The CacheKeep track for a new keep lands just after the
+                      // refusal is observed; a keep younger than that track
+                      // flight may not be tracked yet.
+                      Date.now() - warm.sentAt > 30_000
+                    ) {
+                      // The target expired or was evicted without a warm ever
+                      // firing: the kept prefix outlived its cache entry.
+                      fableFallbackManager.dropSourceWarm(recoveryKey)
+                      continue
+                    }
+                    if (
+                      warm.oauthAccountId !== 'main' &&
+                      !storage?.accounts.some(
+                        (account) =>
+                          account.id === warm.oauthAccountId &&
+                          nativeAccountCanServe(account),
+                      )
+                    ) {
+                      fableFallbackManager.dropSourceWarm(recoveryKey)
+                      if (targetId !== undefined)
+                        cacheKeepManager.untrack(targetId)
+                      logger.info(
+                        'fable-fallback',
+                        'source warm stopped: bound account unavailable',
+                        {
+                          session: relayAffinity,
+                          reason: 'account-unavailable',
+                        },
+                      )
+                      continue
+                    }
+                    // A new user turn whose history no longer starts with
+                    // the kept prefix (compaction, history edit) makes the
+                    // source cache unusable. The earliest anchored message is
+                    // compared the way standby anchors match: long histories
+                    // only append after it, so membership is the whole check.
+                    if (
+                      warm.firstAnchorFingerprint !== undefined &&
+                      !currentAnchors.includes(warm.firstAnchorFingerprint)
+                    ) {
+                      fableFallbackManager.dropSourceWarm(recoveryKey)
+                      if (targetId !== undefined)
+                        cacheKeepManager.untrack(targetId)
+                      logger.warn(
+                        'fable-fallback',
+                        'source warm stopped: history no longer starts with the kept prefix',
+                        {
+                          session: relayAffinity,
+                          reason: 'source-prefix-changed',
+                        },
+                      )
+                    }
+                  }
+                }
               }
             }
 
@@ -8651,6 +8922,9 @@ const anthropicAuthPlugin = async (
                     pendingRecoveryDesktopNotices.delete(key)
                 }
                 pendingDesktopNotices.delete(sessionId)
+                // A new selected model cannot reuse the previous model's
+                // kept source prefix.
+                dropSessionSourceWarms(sessionId)
               }
               const fablePlan = fableFallbackManager.plan(sessionId, init?.body)
               const serverFallbackModel =
@@ -8715,10 +8989,48 @@ const anthropicAuthPlugin = async (
                             )
                             return false
                           }
+                          // Keep the exact signed bytes this refusal answered
+                          // (normally the refused request itself) as the
+                          // round's source prefix. Never build it from a 4.8
+                          // request: the fallback boundary markers would not
+                          // match the source cache.
+                          const pending = pendingSourceSends.get(
+                            fablePlan.recoveryKey,
+                          )
+                          pendingSourceSends.delete(fablePlan.recoveryKey)
                           const remaining = fableFallbackManager.activate(
                             fablePlan,
                             fableRequest.oauthAccountId,
+                            pending &&
+                              pending.oauthAccountId ===
+                                fableRequest.oauthAccountId
+                              ? {
+                                  bodyText: pending.bodyText,
+                                  oauthAccountId: pending.oauthAccountId,
+                                  ...(pending.accountIdentity !== undefined && {
+                                    accountIdentity: pending.accountIdentity,
+                                  }),
+                                  sentAt: pending.sentAt,
+                                  model: fablePlan.requestedModel,
+                                  firstAnchorFingerprint:
+                                    hybridUserMessageCacheAnchorFingerprints(
+                                      pending.bodyText,
+                                    )[0],
+                                  url: pending.url,
+                                  headers: pending.headers,
+                                  ...(pending.subagent && { subagent: true }),
+                                }
+                              : undefined,
                           )
+                          void syncSourceWarmTarget(fablePlan).catch(() => {
+                            logger.warn(
+                              'fable-fallback',
+                              'source warm sync failed',
+                              {
+                                session: fablePlan.sessionId,
+                              },
+                            )
+                          })
                           pendingRecoveryDesktopNotices.delete(
                             fablePlan.recoveryKey,
                           )
@@ -8766,10 +9078,24 @@ const anthropicAuthPlugin = async (
                     ? {
                         onComplete: (finishReason: string) => {
                           if (!fablePlan.downgraded) {
-                            fableFallbackManager.completeSource(
+                            const ended = fableFallbackManager.completeSource(
                               fablePlan,
                               !fableRequest.serverFallback,
                             )
+                            if (ended) {
+                              // The source serves again: the round (and its
+                              // warm) is over.
+                              const family = recoverableRefusalFamily(
+                                fablePlan.requestedModel,
+                              )
+                              if (family)
+                                cacheKeepManager.untrack(
+                                  sourceWarmTargetId(
+                                    fablePlan.sessionId,
+                                    family,
+                                  ),
+                                )
+                            }
                             return
                           }
                           const completed = fableFallbackManager.complete(
@@ -9221,6 +9547,15 @@ const anthropicAuthPlugin = async (
                         route.id,
                       )
                     ) {
+                      // The kept source body was bound to the previous
+                      // account; the round re-keeps it on its next refusal.
+                      const family = recoverableRefusalFamily(
+                        fablePlan.requestedModel,
+                      )
+                      if (family)
+                        cacheKeepManager.untrack(
+                          sourceWarmTargetId(fablePlan.sessionId, family),
+                        )
                       logger.info(
                         'fable-fallback',
                         'rebound recovery to migrated sticky account',
@@ -9459,11 +9794,20 @@ const anthropicAuthPlugin = async (
                         )
                         if (resolution && migratedRoute) {
                           route = migratedRoute
-                          if (fablePlan?.downgraded) {
+                          if (
+                            fablePlan?.downgraded &&
                             fableFallbackManager.bindRecoveryAccount(
                               fablePlan,
                               route.id,
                             )
+                          ) {
+                            const family = recoverableRefusalFamily(
+                              fablePlan.requestedModel,
+                            )
+                            if (family)
+                              cacheKeepManager.untrack(
+                                sourceWarmTargetId(fablePlan.sessionId, family),
+                              )
                           }
                           return completeRoute(route, await sendRoute(route))
                         }
@@ -10317,6 +10661,7 @@ const anthropicAuthPlugin = async (
     primeManager,
     quotaManager,
     cacheKeepManager,
+    fableFallbackManager,
     resolveMainQuotaIdentity: resolveMainQuotaAccountIdentity,
     resolveSidebarQuotaAccess,
     refreshSidebarQuota,

@@ -6,6 +6,71 @@ import {
 export const FABLE_FALLBACK_MODEL_ID = 'claude-opus-4-8'
 export const FABLE_FALLBACK_TURNS = 10
 
+/**
+ * CacheKeep target key for one recovery round's source-model warm. The
+ * `source-warm:` prefix keeps it out of the session's live target keyspace,
+ * and the family suffix keeps concurrent rounds for different source models
+ * in the same session on their own targets.
+ */
+export const SOURCE_WARM_TARGET_PREFIX = 'source-warm:'
+
+export function sourceWarmTargetId(
+  sessionId: string,
+  family: RecoverableRefusalFamily,
+): string {
+  return `${SOURCE_WARM_TARGET_PREFIX}${sessionId}:${family}`
+}
+
+export function parseSourceWarmTargetId(
+  id: string,
+): { sessionId: string; family: RecoverableRefusalFamily } | null {
+  if (!id.startsWith(SOURCE_WARM_TARGET_PREFIX)) return null
+  const rest = id.slice(SOURCE_WARM_TARGET_PREFIX.length)
+  const separator = rest.lastIndexOf(':')
+  if (separator <= 0) return null
+  const sessionId = rest.slice(0, separator)
+  const family = rest.slice(separator + 1)
+  if (
+    family !== 'fable-5' &&
+    family !== 'fable-5-1' &&
+    family !== 'opus-5' &&
+    family !== 'opus-5-5'
+  ) {
+    return null
+  }
+  return { sessionId, family }
+}
+
+export function sourceWarmRecoveryKey(
+  sessionId: string,
+  family: RecoverableRefusalFamily,
+): string {
+  return `${sessionId}\0${family}`
+}
+
+/**
+ * The source request a recovery round keeps alive: the exact signed bytes
+ * the plugin sent to the source model (normally the refused request), bound
+ * to the OAuth account that sent it. In memory only; a restart drops it
+ * along with the process-local round state.
+ */
+export type FableSourceWarmInit = {
+  bodyText: string
+  oauthAccountId: string
+  accountIdentity?: string
+  sentAt: number
+  model: string
+  firstAnchorFingerprint?: string
+  lastUserTurnKey?: string
+  url: string
+  headers: Record<string, string>
+  subagent?: boolean
+}
+
+export type FableSourceWarmKeep = FableSourceWarmInit & {
+  warmsSinceUserTurn: number
+}
+
 export type FableStandbyCacheAnchor = {
   fingerprint: string
   messageIndex: number
@@ -38,6 +103,7 @@ type FableFallbackState = {
   cycle: number
   cacheAccountId?: string
   standbyCacheAnchor?: FableStandbyCacheAnchor
+  sourceWarm?: FableSourceWarmKeep
   nextRequestSequence: number
   standbyAnchorSequence: number
   updatedAt: number
@@ -187,13 +253,21 @@ export class FableFallbackManager {
     state.cacheAccountId = oauthAccountId
     state.standbyCacheAnchor = undefined
     state.standbyAnchorSequence = 0
+    // The kept source body was authorized for the previous account; a warm
+    // must never go to another one, so the round re-keeps its source on its
+    // next refusal instead of warming a stale prefix elsewhere.
+    state.sourceWarm = undefined
     state.updatedAt = this.now()
     plan.cacheAccountId = oauthAccountId
     plan.standbyCacheAnchor = undefined
     return true
   }
 
-  activate(plan: FableFallbackPlan, cacheAccountId?: string): number {
+  activate(
+    plan: FableFallbackPlan,
+    cacheAccountId?: string,
+    sourceWarm?: FableSourceWarmInit,
+  ): number {
     if (plan.downgraded || !isRecoverableRefusalModel(plan.requestedModel)) {
       return this.remaining(plan)
     }
@@ -210,6 +284,9 @@ export class FableFallbackManager {
       cycle: this.nextCycle++,
       cacheAccountId,
       standbyCacheAnchor: plan.standbyCacheAnchor,
+      sourceWarm: sourceWarm
+        ? { ...sourceWarm, warmsSinceUserTurn: 0 }
+        : undefined,
       nextRequestSequence: 0,
       standbyAnchorSequence: 0,
       updatedAt: this.now(),
@@ -218,6 +295,101 @@ export class FableFallbackManager {
     this.recoveries.set(plan.recoveryKey, state)
     this.prune()
     return state.remaining
+  }
+
+  /** The source warm kept for one recovery round, if any. */
+  sourceWarmFor(recoveryKey: string): FableSourceWarmKeep | undefined {
+    return this.recoveries.get(recoveryKey)?.sourceWarm
+  }
+
+  sourceWarmForTarget(targetId: string): FableSourceWarmKeep | undefined {
+    const parsed = parseSourceWarmTargetId(targetId)
+    if (!parsed) return undefined
+    return this.sourceWarmFor(
+      sourceWarmRecoveryKey(parsed.sessionId, parsed.family),
+    )
+  }
+
+  hasSourceWarmForSession(sessionId: string): boolean {
+    for (const key of this.recoveries.keys()) {
+      if (
+        key.startsWith(`${sessionId}\0`) &&
+        this.recoveries.get(key)?.sourceWarm
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  sourceWarmsForSession(
+    sessionId: string,
+  ): Array<{ recoveryKey: string; warm: FableSourceWarmKeep }> {
+    const warms: Array<{ recoveryKey: string; warm: FableSourceWarmKeep }> = []
+    for (const [key, state] of this.recoveries) {
+      if (key.startsWith(`${sessionId}\0`) && state.sourceWarm) {
+        warms.push({ recoveryKey: key, warm: state.sourceWarm })
+      }
+    }
+    return warms
+  }
+
+  /** Drop one round's kept source request without touching its backoff. */
+  dropSourceWarm(recoveryKey: string): boolean {
+    const state = this.recoveries.get(recoveryKey)
+    if (!state?.sourceWarm) return false
+    state.sourceWarm = undefined
+    state.updatedAt = this.now()
+    return true
+  }
+
+  dropSourceWarmForTarget(targetId: string): boolean {
+    const parsed = parseSourceWarmTargetId(targetId)
+    if (!parsed) return false
+    return this.dropSourceWarm(
+      sourceWarmRecoveryKey(parsed.sessionId, parsed.family),
+    )
+  }
+
+  /** Count one dispatched source warm; returns the new idle total. */
+  noteSourceWarmSent(recoveryKey: string): number | undefined {
+    const warm = this.recoveries.get(recoveryKey)?.sourceWarm
+    if (!warm) return undefined
+    warm.warmsSinceUserTurn++
+    return warm.warmsSinceUserTurn
+  }
+
+  noteSourceWarmSentForTarget(targetId: string): number | undefined {
+    const parsed = parseSourceWarmTargetId(targetId)
+    if (!parsed) return undefined
+    return this.noteSourceWarmSent(
+      sourceWarmRecoveryKey(parsed.sessionId, parsed.family),
+    )
+  }
+
+  /**
+   * A new user turn resets the idle warm count for every warm in the
+   * session. A turn key seen for the first time is recorded without
+   * counting as a reset.
+   */
+  noteSourceWarmUserTurn(sessionId: string, turnKey: string): boolean {
+    let reset = false
+    for (const [key, state] of this.recoveries) {
+      const warm = key.startsWith(`${sessionId}\0`)
+        ? state.sourceWarm
+        : undefined
+      if (!warm) continue
+      if (warm.lastUserTurnKey === undefined) {
+        warm.lastUserTurnKey = turnKey
+        continue
+      }
+      if (warm.lastUserTurnKey !== turnKey) {
+        warm.lastUserTurnKey = turnKey
+        warm.warmsSinceUserTurn = 0
+        reset = true
+      }
+    }
+    return reset
   }
 
   completeSource(plan: FableFallbackPlan, servedBySource = true): boolean {
@@ -235,6 +407,8 @@ export class FableFallbackManager {
       FABLE_FALLBACK_TURNS,
     )
     state.updatedAt = this.now()
+    // The source serves again: the round is over and its kept prefix can go.
+    state.sourceWarm = undefined
     return true
   }
 
