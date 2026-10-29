@@ -154,7 +154,10 @@ async function fixture(child = false, brokenRegistry = false) {
       },
     })
     cleanups.push(dispose)
-    const live = async (url = 'https://api.anthropic.com/v1/messages') => {
+    const live = async (
+      url = 'https://api.anthropic.com/v1/messages',
+      extra: Record<string, unknown> = {},
+    ) => {
       const draft = {
         sessionID: 'ses_oc2_keep' as SessionHooks['http.request']['sessionID'],
         agent: 'build',
@@ -172,6 +175,7 @@ async function fixture(child = false, brokenRegistry = false) {
             system: 'Cache me',
             messages: [{ role: 'user', content: 'Hello' }],
             metadata: { user_id: 'untrusted' },
+            ...extra,
           }),
         }),
       }
@@ -283,6 +287,37 @@ test('a due OpenCode 2 prewarm sends once with the original account and no billi
   ).toBe(true)
   await f.timers.fire()
   expect(f.sent).toHaveLength(1)
+})
+
+test('an OpenCode 2 prewarm sends the live request prefix as it was sent, without rewriting it again', async () => {
+  const f = await fixture()
+  // The stored body is the one already sent: tool names prefixed, billing
+  // and identity blocks added. Rewriting it again changes that prefix, so the
+  // prewarm would write a new cache entry instead of reading the session's.
+  const sentLive = JSON.parse(
+    await (
+      await f.live(undefined, {
+        tools: [
+          {
+            name: 'read',
+            description: 'Read a file',
+            input_schema: { type: 'object', properties: {} },
+          },
+        ],
+      })
+    ).text(),
+  ) as Record<string, any>
+  expect(sentLive.tools[0].name).toBe('mcp_Read')
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(1)
+  const warm = (await f.sent[0]!.json()) as Record<string, any>
+  expect(warm.tools).toEqual(sentLive.tools)
+  // Only the first system block, the billing header, may differ: it carries
+  // the signature over the changed prewarm body.
+  expect(warm.system).toHaveLength(sentLive.system.length)
+  expect(warm.system.slice(1)).toEqual(sentLive.system.slice(1))
+  expect(warm.messages).toEqual(sentLive.messages)
 })
 
 test('turning OpenCode 2 cache keepalive off prevents due prewarms', async () => {

@@ -1122,12 +1122,17 @@ export function createNativeAnthropicAdapter<Q, P>(
           // Recheck session revocation after awaiting policy options. A
           // cleared session must not enter body rewriting or signing.
           ensureLive()
-          body = await rewriteRequestBody(body, {
-            ...options,
-            ...(identity ? { identity } : {}),
-            sessionId: input.sessionID,
-            onToolNameMap: (map) => responseToolNameMaps.set(data, map),
-          })
+          // A CacheKeep prewarm carries the body this session already sent,
+          // re-signed for the prewarm. Rewriting it again would prefix the
+          // tool names twice and add the system blocks again, so the prewarm
+          // would miss the session's cache instead of reading it.
+          if (attempt.agent !== 'cachekeep')
+            body = await rewriteRequestBody(body, {
+              ...options,
+              ...(identity ? { identity } : {}),
+              sessionId: input.sessionID,
+              onToolNameMap: (map) => responseToolNameMaps.set(data, map),
+            })
           const parsed = parseJson(body)
           finalBody = isRecord(parsed) ? parsed : null
         }

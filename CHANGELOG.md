@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- OpenCode 2: CacheKeep prewarms now read the session's prompt cache. A prewarm sent the stored request through the request rewrite a second time, which renamed every tool again and added the system blocks again, so each idle hour cost two full cache writes. Addresses #547.
 - The Claude sidebar matches the other CortexKit auth plugins: no frame border, a status dot ends each collapsed account row, and the plugin version is always on the right of the header.
 - `@cortexkit/common-auth` moves to 0.29.0, which fixes lock release and long paths on Windows.
 
