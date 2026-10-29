@@ -621,7 +621,10 @@ export class CacheKeepManager {
     const bodyBytes = Buffer.byteLength(input.bodyText, 'utf8')
     const now = this.options.now?.() ?? Date.now()
     const refuse = (reason: string, reasonCode: string) => {
-      logger.warn('cachekeep', 'tracking skipped', {
+      // Policy exclusions leave any existing target intact. Only a body that
+      // cannot fit in the budget warrants a warning rather than debug detail.
+      const level = reasonCode === 'body-budget' ? 'warn' : 'debug'
+      logger[level]('cachekeep', 'tracking skipped', {
         session: input.sessionId ?? null,
         reason: reasonCode,
         detail: reason,

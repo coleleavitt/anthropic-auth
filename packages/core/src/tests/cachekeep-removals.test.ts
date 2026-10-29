@@ -196,6 +196,7 @@ test.each([
   ['body-budget', 'body exceeds cachekeep memory budget'],
   ['outside-schedule', 'outside configured schedule'],
 ])('tracking refusal reports %s and the returned reason', (code, reason) => {
+  setLogLevel('debug')
   const { manager } = fixture()
   const text = code === 'body-budget' ? 'é'.repeat(34 * 1024 * 1024) : body
   const result = manager.track({
@@ -217,7 +218,7 @@ test.each([
   expect(result).toEqual({ tracked: false, reason })
   expect(logs).toHaveLength(1)
   expect(logs[0]).toMatchObject({
-    level: 'warn',
+    level: code === 'body-budget' ? 'warn' : 'debug',
     payload: {
       session: code === 'missing-session' ? null : 'refused',
       reason: code,

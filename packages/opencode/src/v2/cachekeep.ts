@@ -445,7 +445,7 @@ export function createNativeCacheKeep(
       input: Parameters<NonNullable<NativeSource['onRequestPrepared']>>[0],
     ) {
       const skipped = (reason: string) => {
-        logger.warn('cachekeep', 'tracking skipped', {
+        logger.debug('cachekeep', 'tracking skipped', {
           session: input.sessionID,
           reason,
           bodyBytes: Buffer.byteLength(input.bodyText, 'utf8'),

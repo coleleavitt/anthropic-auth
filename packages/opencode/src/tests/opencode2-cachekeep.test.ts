@@ -17,11 +17,18 @@ import {
   runNativeMigration,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
-import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
+import {
+  type Attempt,
+  placeholderSecret,
+} from '@cortexkit/common-auth/opencode2'
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import {
+  createNativeAnthropicAdapter,
+  type NativeAnthropicAttemptData,
+} from '../v2/adapter'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
 import type { NativeSource } from '../v2/source'
@@ -409,6 +416,75 @@ test('a due OpenCode 2 prewarm sends once with the original account and no billi
   ).toBe(true)
   await f.timers.fire()
   expect(f.sent).toHaveLength(1)
+})
+
+test('an OpenCode 2 API-key request and a prewarm send produce no WARN', async () => {
+  const lines = captureStartupLogs()
+  const warming = await fixture(false, false, 'debug')
+  await warming.live()
+  warming.due()
+  await warming.timers.fire()
+  expect(warming.sent).toHaveLength(1)
+  expect(warming.sent[0]!.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-first',
+  )
+
+  const api = createNativeAnthropicAdapter({
+    source: {
+      chooseAccount: () => 'paid',
+      authorizeAccount: () => ({
+        route: 'api',
+        headers: { 'x-api-key': 'synthetic-api-key' },
+        provenance: null,
+      }),
+    },
+  })
+  cleanups.push(() => api.dispose())
+  const scope = {
+    providerID: 'anthropic',
+    modelID: 'claude-sonnet-4-6',
+    sessionID: 'ses_api',
+    agent: 'build',
+    kind: 'primary' as const,
+  }
+  const accountId = await api.adapter.chooseAccount({
+    ...scope,
+    phase: 'request',
+  })
+  expect(accountId).toBe('paid')
+  const authorized = (await api.adapter.accountHeaders({
+    ...scope,
+    accountId: 'paid',
+  })) as {
+    attempt: NativeAnthropicAttemptData<null>
+  }
+  const attempt: Attempt<NativeAnthropicAttemptData<null>> = {
+    ...scope,
+    accountId: 'paid',
+    attemptId: 'api-attempt',
+    transport: 'http',
+    data: authorized.attempt,
+  }
+  const request = await api.adapter.rewriteRequest!({
+    ...attempt,
+    attempt,
+    request: new Request('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: scope.modelID,
+        max_tokens: 8,
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+    }),
+  })
+  expect(request).toBeInstanceOf(Request)
+  if (!request) throw new Error('API-key request was not prepared')
+  expect(request.headers.get('x-api-key')).toBe('synthetic-api-key')
+  expect((await warming.registry.list()).map((session) => session.id)).toEqual([
+    'ses_oc2_keep',
+  ])
+  expect(lines.filter((line) => line.includes(' WARN '))).toEqual([])
 })
 
 test('an OpenCode 2 prewarm sends the live request prefix as it was sent, without rewriting it again', async () => {
