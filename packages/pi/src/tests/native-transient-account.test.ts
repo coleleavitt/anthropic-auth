@@ -183,7 +183,11 @@ function watchJoin() {
   const waiting = gate()
   const outcomes: unknown[] = []
   const previousLevel = getLogLevel()
+  const previousEnv = process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
   setLogLevel('debug')
+  // Pi applies the saved log level when its runtime starts, after this
+  // helper runs; the environment override is what keeps debug on.
+  process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL = 'debug'
   __setLogTestSink((record) => {
     if (record.channel !== 'native-auth') return
     if (record.payload?.phase === 'waiting') waiting.open()
@@ -193,6 +197,9 @@ function watchJoin() {
   deferCleanup(() => {
     __setLogTestSink(null)
     setLogLevel(previousLevel)
+    if (previousEnv === undefined)
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
+    else process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL = previousEnv
   })
   return { waiting: waiting.wait, outcomes }
 }
