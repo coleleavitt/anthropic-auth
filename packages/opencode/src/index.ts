@@ -1869,21 +1869,15 @@ const anthropicAuthPlugin = async (
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
   )
   const fableFallbackManager = new FableFallbackManager()
-  // Last actually-sent source-model request per recovery round, keyed by
-  // recovery key. A content-filter refusal consumes the entry into the
-  // round's kept source prefix; every later send for the round overwrites
-  // it, so a stale unsent entry can never become a warm.
-  const pendingSourceSends = new Map<
+  // Send-time metadata per recovery round, keyed by recovery key. The kept
+  // source body itself is never copied here: when a refusal starts the
+  // round, the keep takes the exact signed bytes from CacheKeep's live
+  // target for the session, which already holds the last body actually
+  // sent. If that target is absent (CacheKeep off, not hybrid), there is
+  // nothing to warm.
+  const pendingSourceMeta = new Map<
     string,
-    {
-      bodyText: string
-      url: string
-      headers: Record<string, string>
-      oauthAccountId: string
-      accountIdentity?: string
-      sentAt: number
-      subagent: boolean
-    }
+    { accountIdentity?: string; sentAt: number }
   >()
   // Stop every source warm in a session for good and drop the CacheKeep
   // targets with it. The manager already forgot the kept prefixes (session
@@ -1899,8 +1893,8 @@ const anthropicAuthPlugin = async (
       if (parsed && parsed.sessionId === sessionId)
         cacheKeepManager.untrack(target.id)
     }
-    for (const key of [...pendingSourceSends.keys()]) {
-      if (key.startsWith(`${sessionId}\0`)) pendingSourceSends.delete(key)
+    for (const key of [...pendingSourceMeta.keys()]) {
+      if (key.startsWith(`${sessionId}\0`)) pendingSourceMeta.delete(key)
     }
   }
   const laneStartTracker = new LaneStartTracker()
@@ -7619,35 +7613,26 @@ const anthropicAuthPlugin = async (
                   reason: tracked.tracked ? undefined : tracked.reason,
                   bodyBytes: body.length,
                 })
-                // Remember the exact signed bytes sent to a recoverable
-                // source model. A later refusal keeps them as the round's
-                // source prefix; anything else (a 4.8 request, a probe that
-                // never refuses) overwrites them so only sent source bodies
-                // can become a warm.
+                // Remember a refusal-prone source send's account identity
+                // and time. The keep itself takes the exact signed bytes
+                // from CacheKeep's live target for the session, so only
+                // this small metadata is stored per round.
                 if (
                   relayAffinity &&
                   fableRequest &&
                   !fableRequest.plan.downgraded &&
                   tracked.tracked
                 ) {
-                  pendingSourceSends.set(fableRequest.plan.recoveryKey, {
-                    bodyText: body,
-                    url:
-                      rewritten.url?.toString() ?? rewritten.input.toString(),
-                    headers: Object.fromEntries(
-                      requestHeaders.entries(),
-                    ) as Record<string, string>,
-                    oauthAccountId,
+                  pendingSourceMeta.set(fableRequest.plan.recoveryKey, {
                     ...(nativeAuthorization.accountIdentity !== undefined && {
                       accountIdentity: nativeAuthorization.accountIdentity,
                     }),
                     sentAt: Date.now(),
-                    subagent: subagentRequest,
                   })
-                  while (pendingSourceSends.size > 128) {
-                    const oldest = pendingSourceSends.keys().next().value
+                  while (pendingSourceMeta.size > 128) {
+                    const oldest = pendingSourceMeta.keys().next().value
                     if (oldest === undefined) break
-                    pendingSourceSends.delete(oldest)
+                    pendingSourceMeta.delete(oldest)
                   }
                 }
               }
@@ -8989,24 +8974,49 @@ const anthropicAuthPlugin = async (
                             )
                             return false
                           }
-                          // Keep the exact signed bytes this refusal answered
-                          // (normally the refused request itself) as the
-                          // round's source prefix. Never build it from a 4.8
-                          // request: the fallback boundary markers would not
-                          // match the source cache.
-                          const pending = pendingSourceSends.get(
+                          // Keep the source prefix from CacheKeep's live
+                          // target for the session: the exact signed bytes
+                          // just sent (normally the refused request itself),
+                          // never rebuilt from a 4.8 request. The live target
+                          // is required to be this round's source-model send
+                          // for this session and account; anything else (a
+                          // 4.8 request, another round's probe) cannot become
+                          // a warm. Without a live target (CacheKeep off or
+                          // not hybrid) there is nothing to warm.
+                          const pending = pendingSourceMeta.get(
                             fablePlan.recoveryKey,
                           )
-                          pendingSourceSends.delete(fablePlan.recoveryKey)
-                          const remaining = fableFallbackManager.activate(
-                            fablePlan,
-                            fableRequest.oauthAccountId,
+                          pendingSourceMeta.delete(fablePlan.recoveryKey)
+                          const live = cacheKeepManager.trackedRequest(
+                            fablePlan.sessionId,
+                          )
+                          let liveModel: string | undefined
+                          if (live) {
+                            try {
+                              const parsed = JSON.parse(live.bodyText) as {
+                                model?: unknown
+                              }
+                              if (typeof parsed.model === 'string')
+                                liveModel = parsed.model
+                            } catch {}
+                          }
+                          const liveFamily = liveModel
+                            ? recoverableRefusalFamily(liveModel)
+                            : null
+                          const requestedFamily = recoverableRefusalFamily(
+                            fablePlan.requestedModel,
+                          )
+                          const liveAccountId = live?.oauthAccountId
+                          const keep =
                             pending &&
-                              pending.oauthAccountId ===
-                                fableRequest.oauthAccountId
+                            live &&
+                            liveAccountId !== undefined &&
+                            liveFamily !== null &&
+                            liveFamily === requestedFamily &&
+                            liveAccountId === fableRequest.oauthAccountId
                               ? {
-                                  bodyText: pending.bodyText,
-                                  oauthAccountId: pending.oauthAccountId,
+                                  bodyText: live.bodyText,
+                                  oauthAccountId: liveAccountId,
                                   ...(pending.accountIdentity !== undefined && {
                                     accountIdentity: pending.accountIdentity,
                                   }),
@@ -9014,13 +9024,19 @@ const anthropicAuthPlugin = async (
                                   model: fablePlan.requestedModel,
                                   firstAnchorFingerprint:
                                     hybridUserMessageCacheAnchorFingerprints(
-                                      pending.bodyText,
+                                      live.bodyText,
                                     )[0],
-                                  url: pending.url,
-                                  headers: pending.headers,
-                                  ...(pending.subagent && { subagent: true }),
+                                  url: live.url,
+                                  headers: live.headers,
+                                  ...(fableRequest.subagent && {
+                                    subagent: true,
+                                  }),
                                 }
-                              : undefined,
+                              : undefined
+                          const remaining = fableFallbackManager.activate(
+                            fablePlan,
+                            fableRequest.oauthAccountId,
+                            keep,
                           )
                           void syncSourceWarmTarget(fablePlan).catch(() => {
                             logger.warn(

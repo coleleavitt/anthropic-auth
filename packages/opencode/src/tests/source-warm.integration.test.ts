@@ -125,8 +125,11 @@ function hybridStorage(): AccountStorage {
   })
 }
 
-async function setupRound(mainExpiresInMs = 8 * 60 * 60_000) {
-  await useTempAccountFile(hybridStorage(), {
+async function setupRound(
+  mainExpiresInMs = 8 * 60 * 60_000,
+  storage: AccountStorage = hybridStorage(),
+) {
+  await useTempAccountFile(storage, {
     ...syntheticMainHostAuth(),
     expires: Date.now() + mainExpiresInMs,
   })
@@ -204,6 +207,7 @@ async function startRound(
   sessionId: string,
   round: Awaited<ReturnType<typeof setupRound>>,
   extraHeaders: Record<string, string> = {},
+  expectWarmTarget = true,
 ) {
   const request = {
     method: 'POST',
@@ -212,7 +216,7 @@ async function startRound(
   }
   const filtered = await round.result.fetch(MESSAGES_URL, request)
   await expect(filtered.text()).rejects.toThrow()
-  await waitForSourceWarmTarget(round.plugin, sessionId)
+  if (expectWarmTarget) await waitForSourceWarmTarget(round.plugin, sessionId)
   const firstOpus = await round.result.fetch(MESSAGES_URL, request)
   await firstOpus.text()
 }
@@ -513,6 +517,38 @@ describe('source-warm', () => {
       elapsed += 60 * 60_000
       await cacheKeep.tick()
       expect(sourceWarms(round)).toHaveLength(1 + 39)
+    } finally {
+      Date.now = realDateNow
+    }
+  })
+
+  test('without CacheKeep nothing is kept or warmed', async () => {
+    const realDateNow = Date.now
+    try {
+      const round = await setupRound(
+        8 * 60 * 60_000,
+        createFallbackStorage({
+          accounts: [],
+          quota: { enabled: false } as AccountStorage['quota'],
+          claudeCache: { enabled: true, mode: 'hybrid' },
+          cacheKeep: { enabled: false },
+        }),
+      )
+      const sessionId = 'ses_warm_disabled'
+      await startRound(sessionId, round, {}, false)
+      const manager = getPluginTestHandles(round.plugin).cacheKeepManager
+      expect(
+        manager.trackedSessions().some((s) => s.id === targetId(sessionId)),
+      ).toBe(false)
+      expect(
+        getPluginTestHandles(
+          round.plugin,
+        ).fableFallbackManager.hasSourceWarmForSession(sessionId),
+      ).toBe(false)
+      const baseNow = realDateNow()
+      Date.now = () => baseNow + 56 * 60_000
+      await manager.tick()
+      expect(round.warms).toHaveLength(0)
     } finally {
       Date.now = realDateNow
     }

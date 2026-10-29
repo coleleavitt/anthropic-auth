@@ -53,8 +53,10 @@ function sourceBody() {
 }
 
 describe('cachekeep source-warm prewarm body', () => {
-  test('drops the server-side fallback opt-in so a warm cannot be sticky-routed away', async () => {
-    const result = await buildCacheKeepPrewarmBody(sourceBody())
+  test('drops the server-side fallback opt-in for a source warm so it cannot be sticky-routed away', async () => {
+    const result = await buildCacheKeepPrewarmBody(sourceBody(), {
+      stripServerFallback: true,
+    })
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error(result.reason)
     const parsed = JSON.parse(result.bodyText)
@@ -62,6 +64,16 @@ describe('cachekeep source-warm prewarm body', () => {
     expect(parsed.max_tokens).toBe(0)
     expect(parsed.fallbacks).toBeUndefined()
     expect('fallbacks' in parsed).toBe(false)
+  })
+
+  test('an ordinary prewarm keeps the server-side fallback opt-in', async () => {
+    const result = await buildCacheKeepPrewarmBody(sourceBody())
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error(result.reason)
+    const parsed = JSON.parse(result.bodyText)
+    expect(parsed.model).toBe('claude-opus-5-5')
+    expect(parsed.max_tokens).toBe(0)
+    expect(parsed.fallbacks).toBe('default')
   })
 })
 
@@ -222,6 +234,20 @@ describe('CacheKeepManager source-warm targets', () => {
     expect(manager.trackedSessions().map((session) => session.id)).toEqual([
       'ses_round',
     ])
+    manager.stop()
+  })
+
+  test('trackedRequest returns the live send for a session', () => {
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+    })
+    expect(manager.trackedRequest('missing')).toBeUndefined()
+    expect(trackSourceWarm(manager)).toEqual({ tracked: true })
+    const live = manager.trackedRequest('source-warm:ses_round:fable-5')
+    expect(live?.bodyText).toBe(sourceBody())
+    expect(live?.url).toBe('https://api.anthropic.com/v1/messages?beta=true')
+    expect(live?.oauthAccountId).toBe('main')
+    expect(live?.isSubagent).toBe(false)
     manager.stop()
   })
 

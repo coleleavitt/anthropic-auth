@@ -301,6 +301,7 @@ function hasExplicitCacheControl(value: unknown): boolean {
 
 export async function buildCacheKeepPrewarmBody(
   bodyText: string,
+  options: { stripServerFallback?: boolean } = {},
 ): Promise<{ ok: true; bodyText: string } | { ok: false; reason: string }> {
   let body: Record<string, unknown>
   try {
@@ -317,11 +318,16 @@ export async function buildCacheKeepPrewarmBody(
   stripBillingLineageFromBody(warm)
   warm.max_tokens = 0
   delete warm.stream
-  // A prewarm carrying the server-side fallback opt-in can be sticky-routed
-  // to a fallback model instead of the model whose cache it should extend.
-  // The warm re-derives its betas from its own body, so dropping the opt-in
-  // here also drops the server-fallback beta from its headers.
-  delete warm.fallbacks
+  if (options.stripServerFallback === true) {
+    // A source warm carrying the server-side fallback opt-in can be
+    // sticky-routed to a fallback model instead of the source model whose
+    // cache it should extend. The warm re-derives its betas from its own
+    // body, so dropping the opt-in here also drops the server-fallback
+    // beta from its headers. Ordinary prewarms keep the opt-in: while the
+    // fallback model serves the live turns, the prewarm should warm that
+    // same cache.
+    delete warm.fallbacks
+  }
 
   const thinking = warm.thinking as Record<string, unknown> | undefined
   if (thinking?.type === 'enabled') delete warm.thinking
@@ -424,11 +430,12 @@ export function cacheWarmCacheablePrefixFingerprint(
 
 /**
  * How many warms one idle recovery round may send before stopping: each
- * warm pays the 1-hour cache write while a cache hit saves the difference
- * between that write and a read, so the round stops after
- * floor((write - read) / read) warms since the last user turn. Rates come
- * from the source model's own catalogue pricing; models without catalogue
- * facts (Opus 5) use the nearest sibling with 1-hour pricing.
+ * warm pays a cache read, and the idle warms stay worth it while the reads
+ * sent since the last user turn cost less than one 1-hour rewrite, so the
+ * round stops after floor((1-hour write rate - read rate) / read rate)
+ * warms. Rates come from the source model's own catalogue pricing; models
+ * without catalogue facts (Opus 5) use the nearest sibling with 1-hour
+ * pricing.
  */
 export function cacheKeepSourceWarmIdleCap(modelId: string): number {
   let pricing: { cacheRead: number; cacheWrite1h: number }
@@ -632,6 +639,39 @@ export class CacheKeepManager {
   ): { oauthAccountId?: string } | undefined {
     const target = this.targets.get(sessionId)
     return target ? { oauthAccountId: target.oauthAccountId } : undefined
+  }
+
+  /**
+   * The last request actually sent for a session, as tracked live: the
+   * exact signed bytes, destination, and account they went out on. A copy
+   * of the headers; the body string itself is shared, never re-serialized.
+   */
+  trackedRequest(id: string):
+    | {
+        bodyText: string
+        url: string
+        headers: Record<string, string>
+        oauthAccountId?: string
+        oauthAccountIdentity?: string
+        isSubagent: boolean
+        cacheExpiresAt: number
+      }
+    | undefined {
+    const target = this.targets.get(id)
+    if (!target) return undefined
+    return {
+      bodyText: target.bodyText,
+      url: target.url,
+      headers: { ...target.headers },
+      ...(target.oauthAccountId !== undefined && {
+        oauthAccountId: target.oauthAccountId,
+      }),
+      ...(target.oauthAccountIdentity !== undefined && {
+        oauthAccountIdentity: target.oauthAccountIdentity,
+      }),
+      isSubagent: target.isSubagent,
+      cacheExpiresAt: target.cacheExpiresAt,
+    }
   }
 
   /**
@@ -946,7 +986,9 @@ export class CacheKeepManager {
         }
       }
       const preparedTarget = { ...target, bodyText }
-      const prewarm = await buildCacheKeepPrewarmBody(bodyText)
+      const prewarm = await buildCacheKeepPrewarmBody(bodyText, {
+        stripServerFallback: target.sourceWarm === true,
+      })
       if (!prewarm.ok) return prewarm
 
       if (this.options.validatePrewarm) {
