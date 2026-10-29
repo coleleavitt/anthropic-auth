@@ -14,7 +14,11 @@ import {
   nativeAccountCanServe,
   refreshBackoffActive,
 } from '@cortexkit/anthropic-auth-core'
-import type { SidebarAccountState, SidebarState } from '../sidebar-state'
+import {
+  normalizeSidebarState,
+  type SidebarAccountState,
+  type SidebarState,
+} from '../sidebar-state'
 
 export interface NativeSidebarExtras {
   /** The account that served the requested session, if any. */
@@ -58,7 +62,9 @@ export function buildNativeSidebarState(
   const quotaRetryAt = main?.lastQuotaRefreshError?.nextRetryAt
   const refreshError = main?.lastRefreshError
   const window = getCacheKeepWindow(storage)
-  return {
+  // Native quotas and Prime statuses can carry undefined optional fields or
+  // non-finite numbers. Apply the file sidebar's normalization before RPC too.
+  return normalizeSidebarState({
     main: {
       quota: main?.quota ?? null,
       enabled: main?.enabled,
@@ -123,5 +129,5 @@ export function buildNativeSidebarState(
       ? { enabled: true, accounts: buildPrimeAccountStatuses(storage, { now }) }
       : undefined,
     lastUpdated: now,
-  }
+  } satisfies SidebarState)
 }

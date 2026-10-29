@@ -83,6 +83,51 @@ function nonJsonPaths(value: unknown, path = '$'): string[] {
 }
 
 describe('OpenCode 2 sidebar state', () => {
+  test('omits absent and non-finite fields before the RPC boundary, including Prime status', () => {
+    for (const prime of [false, true]) {
+      const state = buildNativeSidebarState(
+        snapshot(
+          [
+            account({
+              quota: quota(0, 80),
+              lastQuotaRefreshError: {
+                message: 'rate limited',
+                checkedAt: now,
+                nextRetryAt: Number.NaN,
+              },
+              lastRefreshError: {
+                message: 'unavailable',
+                checkedAt: now,
+                nextRetryAt: Number.POSITIVE_INFINITY,
+              },
+            }),
+            account({ id: 'work', quota: quota(25, 40) }),
+          ],
+          { prime: { enabled: prime } },
+        ),
+        { ...extras, trackedSessions: Number.NEGATIVE_INFINITY },
+      )
+      expect(nonJsonPaths(state)).toEqual([])
+      expect(Object.keys(state.main)).not.toContain('tierLabel')
+      expect(Object.keys(state.main)).not.toContain('stateLine')
+      expect(Object.keys(state.main)).not.toContain('quotaBackoffUntil')
+      expect(Object.keys(state.main)).not.toContain('refreshBackoffUntil')
+      expect(state.cacheKeep).not.toHaveProperty('trackedSessions')
+      expect(state.fallbacks[0]?.quota?.five_hour?.remainingPercent).toBe(75)
+      expect(state.main.quota?.five_hour?.remainingPercent).toBe(100)
+      expect(toWire(state)).toStrictEqual(state)
+    }
+
+    const withoutMain = buildNativeSidebarState(snapshot([]), {
+      ...extras,
+      now: Number.NaN,
+    })
+    expect(Object.keys(withoutMain.main)).not.toContain('enabled')
+    expect(Object.keys(withoutMain)).not.toContain('prime')
+    expect(withoutMain.lastUpdated).toBe(0)
+    expect(toWire(withoutMain)).toStrictEqual(withoutMain)
+  })
+
   test('lists main and enabled OAuth fallbacks with their quota, never API keys', () => {
     const state = buildNativeSidebarState(
       snapshot([

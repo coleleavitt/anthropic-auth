@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- OpenCode 2: an account whose quota window has no reset time (for example one with no usage yet in the current five-hour window) no longer blanks the Claude sidebar to 'Waiting for quota…'. Addresses #556.
 - During an Opus 4.8 recovery round on OpenCode 1, cache keep-warm also keeps the original model's prompt cache alive, so returning to it doesn't rebuild the whole prompt. A restart during a round drops this.
 - CacheKeep stops warming a session whose account is blocked by its own policy (such as a killswitch floor) and logs the reason once, instead of retrying it as a network failure for up to an hour. Addresses #553.
 

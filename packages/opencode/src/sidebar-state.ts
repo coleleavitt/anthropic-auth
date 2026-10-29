@@ -244,7 +244,7 @@ function normalizeQuotaWindow(value: unknown): QuotaWindow | undefined {
   return {
     usedPercent,
     remainingPercent,
-    resetsAt: typeof value.resetsAt === 'string' ? value.resetsAt : undefined,
+    ...(typeof value.resetsAt === 'string' && { resetsAt: value.resetsAt }),
     ...(isFiniteNumber(value.checkedAt) && { checkedAt: value.checkedAt }),
   }
 }
@@ -464,7 +464,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
       typeof raw.fastMode === 'boolean'
         ? raw.fastMode
         : DEFAULT_SIDEBAR_STATE.fastMode,
-    cacheKeep,
+    ...(cacheKeep && { cacheKeep }),
     ...(prime && { prime }),
     ...(fableRecoveries.length > 0 && { fableRecoveries }),
     lastUpdated: isFiniteNumber(raw.lastUpdated) ? raw.lastUpdated : 0,

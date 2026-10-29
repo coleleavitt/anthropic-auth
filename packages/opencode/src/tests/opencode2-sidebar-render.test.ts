@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
+import { normalizeSidebarState } from '../sidebar-state'
+import { NATIVE_MENU_RPC } from '../v2/rpc'
 import {
   expectOneLineQuotaRows,
   fiveAccountSidebarState,
@@ -267,6 +269,43 @@ test(
     expect(colorOf('active')).toBe(rgba('#00ff00'))
     expect(colorOf('main-first')).toBe(rgba('#3366ff'))
     expect(result.released).toBe(1)
+  },
+  SUBPROCESS_TIMEOUT_MS,
+)
+
+test(
+  'OpenCode 2 sidebar at 37 columns renders a no-reset window without reset text',
+  async () => {
+    const state = quotaState()
+    const normalized = normalizeSidebarState({
+      ...state,
+      main: {
+        quota: {
+          ...state.main.quota,
+          five_hour: { usedPercent: 0, remainingPercent: 100 },
+        },
+      },
+    })
+    const checked =
+      await NATIVE_MENU_RPC.methods.sidebar.output['~standard'].validate(
+        normalized,
+      )
+    if (checked.issues) throw new Error('Sidebar output did not validate')
+    const result = await renderOpenCode2Sidebar(
+      [checked.value],
+      [{ wanted: ['100% left', '80% left'] }],
+      { width: 37, height: 32 },
+    )
+    const frame = result.frames[0]!
+    const fiveHour = frame
+      .split('\n')
+      .find((line) => line.trim().startsWith('5h '))
+    const sevenDay = frame
+      .split('\n')
+      .find((line) => line.trim().startsWith('7d '))
+    expect(fiveHour?.trim()).toMatch(/^5h .*100% left( •)?$/)
+    expect(sevenDay).toMatch(/80% left( •)? +2h59m/)
+    expect(frame).not.toContain('Waiting for quota')
   },
   SUBPROCESS_TIMEOUT_MS,
 )

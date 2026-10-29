@@ -5,14 +5,11 @@ import type {
   CommandMenu,
   NativeCommandApplyResult,
 } from '@cortexkit/anthropic-auth-core'
+import { logger } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
-import {
-  DEFAULT_SIDEBAR_STATE,
-  normalizeSidebarState,
-  type SidebarState,
-} from '../sidebar-state'
+import { normalizeSidebarState, type SidebarState } from '../sidebar-state'
 import type { NativeMenuCapabilities } from './menu-contract'
 
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -86,22 +83,61 @@ const result = (value: unknown): value is NativeCommandApplyResult =>
   record(value.menu) &&
   Array.isArray(value.menu.sections)
 
-// Anything that is not a JSON value cannot cross the RPC boundary: the host
-// encodes every method output with its JSON codec, which refuses `undefined`
-// and non-finite numbers anywhere in the value. `normalizeSidebarState` drops
-// those on its own; checking the result afterwards is the backstop that turns
-// any later field into a dropped value instead of a failed call.
-const isJsonValue = (value: unknown): boolean => {
+type JsonValue =
+  | null
+  | string
+  | boolean
+  | number
+  | JsonValue[]
+  | { [key: string]: JsonValue }
+
+let warnedInvalidSidebarField = false
+
+// The host codec refuses undefined and non-finite numbers, even deep inside
+// an output. Keep valid siblings if a future normalized field is not JSON.
+// Invalid array entries become null so later entries keep their positions.
+const repairSidebarJson = (
+  value: unknown,
+  path: string,
+  ancestors = new Set<object>(),
+): JsonValue | undefined => {
   if (value === null || typeof value === 'string' || typeof value === 'boolean')
-    return true
-  if (typeof value === 'number') return Number.isFinite(value)
-  if (Array.isArray(value)) return value.every(isJsonValue)
-  if (record(value)) return Object.values(value).every(isJsonValue)
-  return false
+    return value
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'object' && value !== null && !ancestors.has(value)) {
+    ancestors.add(value)
+    if (Array.isArray(value)) {
+      const repaired = Array.from(
+        value,
+        (entry, index) =>
+          repairSidebarJson(entry, `${path}[${index}]`, ancestors) ?? null,
+      )
+      ancestors.delete(value)
+      return repaired
+    }
+    if (
+      Object.getPrototypeOf(value) === Object.prototype ||
+      Object.getPrototypeOf(value) === null
+    ) {
+      const repaired = Object.fromEntries(
+        Object.entries(value).flatMap(([key, entry]) => {
+          const child = repairSidebarJson(entry, `${path}.${key}`, ancestors)
+          return child === undefined ? [] : [[key, child]]
+        }),
+      )
+      ancestors.delete(value)
+      return repaired
+    }
+    ancestors.delete(value)
+  }
+  if (!warnedInvalidSidebarField) {
+    warnedInvalidSidebarField = true
+    // Never log the value: sidebar fields can originate in account storage.
+    logger.warn('sidebar', 'Dropped non-JSON sidebar field', { path })
+  }
+  return undefined
 }
 
-// Sidebar state is display data: anything that does not parse becomes the
-// empty state, the same fail-closed rule the OpenCode 1 sidebar file uses.
 const sidebarState: StandardSchemaV1<unknown, SidebarState> = {
   '~standard': {
     version: 1 as const,
@@ -109,7 +145,7 @@ const sidebarState: StandardSchemaV1<unknown, SidebarState> = {
     validate: (value: unknown) => {
       const state = normalizeSidebarState(value)
       return {
-        value: isJsonValue(state) ? state : { ...DEFAULT_SIDEBAR_STATE },
+        value: repairSidebarJson(state, 'sidebar') as unknown as SidebarState,
       }
     },
   },
