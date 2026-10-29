@@ -3,19 +3,28 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
+  __setLogTestSink,
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   CACHE_KEEP_PREWARM_LEAD_MS,
   CACHE_KEEP_TTL_MS,
   CacheKeepSessionRegistry,
+  createNativeAccountRuntime,
   createNativePoolStore,
+  formatLogLine,
+  getLogLevel,
+  logger,
   resolveNativePoolPaths,
   runNativeMigration,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
+import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
+import type { NativeSource } from '../v2/source'
 
 const cleanups: Array<() => void | Promise<void>> = []
 afterEach(async () => {
@@ -41,7 +50,12 @@ class Timers {
   }
 }
 
-async function fixture(child = false, brokenRegistry = false) {
+async function fixture(
+  child = false,
+  brokenRegistry = false,
+  savedLevel?: string,
+  vaultMode = false,
+) {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(
@@ -87,7 +101,27 @@ async function fixture(child = false, brokenRegistry = false) {
     routing: { mode: 'main-first' },
     claudeCache: { enabled: true, mode: 'hybrid' },
     cacheKeep: { enabled: true, always: true },
+    ...(savedLevel && { logging: { level: savedLevel } }),
   }))
+  if (vaultMode) {
+    await writeFile(
+      join(directory, 'enrollment.json'),
+      JSON.stringify({
+        token: '01'.repeat(32),
+        token_generation: 1,
+      }),
+      { mode: 0o600 },
+    )
+    const vaultStore = createNativePoolStore({
+      paths: nativeVaultPaths(paths),
+      quota: nativeQuotaCodec,
+    })
+    await vaultStore.initialize()
+    await vaultStore.updateSettings((settings) => ({
+      ...settings,
+      logging: { level: 'debug' },
+    }))
+  }
   let now = Date.now()
   const timers = new Timers()
   const registryDirectory = join(directory, 'registry')
@@ -108,7 +142,12 @@ async function fixture(child = false, brokenRegistry = false) {
         },
       },
       model: { transform: async () => registration },
-      integration: { transform: async () => registration },
+      integration: {
+        transform: async () => {
+          logger.debug('startup-test', 'registering integration')
+          return registration
+        },
+      },
       rpc: {
         register: async () => ({
           ...registration,
@@ -224,6 +263,89 @@ async function fixture(child = false, brokenRegistry = false) {
     },
   }
 }
+
+function captureStartupLogs() {
+  const previous = getLogLevel()
+  const env = process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
+  const lines: string[] = []
+  delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
+  setLogLevel('info')
+  __setLogTestSink(({ level, channel, message, payload }) => {
+    lines.push(formatLogLine(level, channel, message, payload))
+  })
+  cleanups.push(() => {
+    __setLogTestSink(null)
+    setLogLevel(previous)
+    if (env === undefined) delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
+    else process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL = env
+  })
+  return lines
+}
+
+test('OpenCode 2 saved debug level emits a debug line during plugin startup', async () => {
+  const lines = captureStartupLogs()
+  await fixture(false, false, 'debug')
+  expect(
+    lines.some(
+      (line) =>
+        line.includes('DEBUG') && line.includes('registering integration'),
+    ),
+  ).toBe(true)
+  expect(getLogLevel()).toBe('debug')
+})
+
+test('OpenCode 2 startup preserves the environment log-level override', async () => {
+  const lines = captureStartupLogs()
+  process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL = 'warn'
+  // The logger reads the environment on module load, before host startup.
+  setLogLevel('warn')
+  await fixture(false, false, 'debug')
+  expect(getLogLevel()).toBe('warn')
+  expect(lines.some((line) => line.includes('registering integration'))).toBe(
+    false,
+  )
+})
+
+test('OpenCode 2 startup reads saved logging from vault rather than local settings', async () => {
+  const lines = captureStartupLogs()
+  await fixture(false, false, 'warn', true)
+  expect(getLogLevel()).toBe('debug')
+  expect(
+    lines.some(
+      (line) =>
+        line.includes('DEBUG') && line.includes('registering integration'),
+    ),
+  ).toBe(true)
+})
+
+test('OpenCode 2 menu re-picking the saved log level repairs live drift', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture(false, false, 'debug')
+  const runtime = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+  })
+  cleanups.push(() => runtime.close())
+  const capabilities = createNativeMenuCapabilities({
+    runtime,
+    source: {} as NativeSource,
+    start: async () => {},
+  })
+  cleanups.push(() => capabilities.close())
+  setLogLevel('info')
+  await capabilities.dispatch(
+    { action: 'logging-level', values: { level: 'debug' } },
+    {},
+  )
+  logger.debug('menu-test', 'debug after re-pick')
+  expect(getLogLevel()).toBe('debug')
+  expect(
+    lines.some(
+      (line) => line.includes('DEBUG') && line.includes('debug after re-pick'),
+    ),
+  ).toBe(true)
+  expect((await runtime.read()).settings.logging).toEqual({ level: 'debug' })
+})
 test('OpenCode 2 hybrid requests publish a CacheKeep lease and dispose removes its timer', async () => {
   const f = await fixture()
   await f.live()

@@ -16,7 +16,7 @@ export const CACHE_KEEP_PREWARM_LEAD_MS = 5 * 60_000
 export const CACHE_KEEP_TICK_MS = 60_000
 export const CACHE_KEEP_EXTENDED_TTL_BETA = 'extended-cache-ttl-2025-04-11'
 export const CACHE_KEEP_MAX_TARGETS = 32
-export const CACHE_KEEP_MAX_BODY_BYTES = 16 * 1024 * 1024
+export const CACHE_KEEP_MAX_BODY_BYTES = 64 * 1024 * 1024
 export const CACHE_KEEP_PREWARM_TIMEOUT_MS = 30_000
 export const CACHE_KEEP_RETRY_BASE_MS = 60_000
 export const CACHE_KEEP_RETRY_MAX_MS = 15 * 60_000
@@ -333,6 +333,7 @@ export type CacheKeepTarget = {
   url: string
   headers: Record<string, string>
   bodyText: string
+  bodyBytes: number
   cacheExpiresAt: number
   nextPrewarmAt: number
   consecutiveFailures: number
@@ -545,28 +546,62 @@ export class CacheKeepManager {
 
   private totalBodyBytes() {
     return [...this.targets.values()].reduce(
-      (sum, target) => sum + target.bodyText.length,
+      (sum, target) => sum + target.bodyBytes,
       0,
     )
   }
 
-  private evictOldestTarget() {
-    const oldest = this.targets.keys().next().value
-    if (oldest !== undefined) this.targets.delete(oldest)
+  private removeTarget(
+    target: CacheKeepTarget,
+    reason: string,
+    now: number,
+    details: Record<string, unknown> = {},
+  ) {
+    if (this.targets.get(target.id) !== target) return
+    if (now < target.cacheExpiresAt)
+      logger.warn('cachekeep', 'stopped warming session', {
+        session: target.id,
+        reason,
+        bodyBytes: target.bodyBytes,
+        totalBodyBytes: this.totalBodyBytes(),
+        budgetBytes: CACHE_KEEP_MAX_BODY_BYTES,
+        targets: this.targets.size,
+        maxTargets: CACHE_KEEP_MAX_TARGETS,
+        cacheExpiresAt: target.cacheExpiresAt,
+        nextPrewarmAt: target.nextPrewarmAt,
+        ...details,
+      })
+    this.targets.delete(target.id)
+  }
+
+  private evictOldestTarget(now: number, reason: 'budget' | 'count') {
+    const oldest = this.targets.values().next().value
+    if (!oldest) return
+    // Map order follows user turns, not prewarms. Preserve sessions about to
+    // be warmed when a less urgent candidate (even the new session) can go.
+    const target =
+      [...this.targets.values()].find(
+        (candidate) => candidate.nextPrewarmAt > now + 60_000,
+      ) ?? oldest
+    this.removeTarget(target, reason, now, {
+      detail: 'evicted by cachekeep limits',
+      ...(target !== oldest && { selection: 'imminent-protected' }),
+    })
   }
 
   private pruneTargets(now: number, today?: string) {
     for (const [id, target] of this.targets) {
       if (today && target.dayKey !== today) {
-        this.targets.delete(id)
+        this.removeTarget(target, 'schedule-period-ended', now)
         continue
       }
       if (now >= target.cacheExpiresAt) this.targets.delete(id)
     }
-    while (this.targets.size > CACHE_KEEP_MAX_TARGETS) this.evictOldestTarget()
+    while (this.targets.size > CACHE_KEEP_MAX_TARGETS)
+      this.evictOldestTarget(now, 'count')
     while (this.totalBodyBytes() > CACHE_KEEP_MAX_BODY_BYTES) {
       const before = this.targets.size
-      this.evictOldestTarget()
+      this.evictOldestTarget(now, 'budget')
       if (this.targets.size === before) break
     }
   }
@@ -582,22 +617,38 @@ export class CacheKeepManager {
     oauthAccountIdentity?: string
     accountStoragePath?: string
     isSubagent?: boolean
-  }) {
-    if (!input.sessionId)
-      return { tracked: false, reason: 'missing session id' }
+  }): { tracked: true } | { tracked: false; reason: string } {
+    const bodyBytes = Buffer.byteLength(input.bodyText, 'utf8')
+    const now = this.options.now?.() ?? Date.now()
+    const refuse = (reason: string, reasonCode: string) => {
+      logger.warn('cachekeep', 'tracking skipped', {
+        session: input.sessionId ?? null,
+        reason: reasonCode,
+        detail: reason,
+        bodyBytes,
+        totalBodyBytes: this.totalBodyBytes(),
+        budgetBytes: CACHE_KEEP_MAX_BODY_BYTES,
+        targets: this.targets.size,
+        maxTargets: CACHE_KEEP_MAX_TARGETS,
+        cacheExpiresAt: input.sessionId
+          ? this.targets.get(input.sessionId)?.cacheExpiresAt
+          : undefined,
+      })
+      return { tracked: false as const, reason }
+    }
+    if (!input.sessionId) return refuse('missing session id', 'missing-session')
     if (!isCacheKeepPersistentlyEnabled(input.storage)) {
-      return { tracked: false, reason: 'cachekeep disabled' }
+      return refuse('cachekeep disabled', 'disabled')
     }
     if (input.cacheMode !== 'hybrid') {
-      return { tracked: false, reason: 'cache mode is not hybrid' }
+      return refuse('cache mode is not hybrid', 'not-hybrid')
     }
-    if (input.bodyText.length > CACHE_KEEP_MAX_BODY_BYTES) {
-      return { tracked: false, reason: 'body exceeds cachekeep memory budget' }
+    if (bodyBytes > CACHE_KEEP_MAX_BODY_BYTES) {
+      return refuse('body exceeds cachekeep memory budget', 'body-budget')
     }
-    const now = this.options.now?.() ?? Date.now()
     const window = getCacheKeepWindow(input.storage)
     if (!isCacheKeepActiveNow(input.storage, new Date(now))) {
-      return { tracked: false, reason: 'outside configured schedule' }
+      return refuse('outside configured schedule', 'outside-schedule')
     }
 
     const today = cacheKeepPeriodKey(input.storage, window, new Date(now))
@@ -614,6 +665,7 @@ export class CacheKeepManager {
       url: input.url,
       headers,
       bodyText: input.bodyText,
+      bodyBytes,
       cacheExpiresAt: now + CACHE_KEEP_TTL_MS,
       nextPrewarmAt: now + CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS,
       consecutiveFailures: 0,
@@ -625,6 +677,8 @@ export class CacheKeepManager {
     })
     this.pruneTargets(now, today)
     this.publishTrackedSessions()
+    if (!this.targets.has(input.sessionId))
+      return { tracked: false, reason: 'evicted by cachekeep limits' }
     this.start()
     return { tracked: true }
   }
@@ -648,6 +702,7 @@ export class CacheKeepManager {
       url: input.url,
       headers,
       bodyText: input.bodyText,
+      bodyBytes: Buffer.byteLength(input.bodyText, 'utf8'),
       cacheExpiresAt: this.options.now?.() ?? Date.now(),
       nextPrewarmAt: this.options.now?.() ?? Date.now(),
       consecutiveFailures: 0,
@@ -889,11 +944,14 @@ export class CacheKeepManager {
     const result = await this.sendPrewarm(target)
     if (!result.ok) {
       if (result.status == null && !result.transient) {
-        logger.debug('cachekeep', 'prewarm skipped', {
-          session: target.id,
-          reason: result.reason,
-        })
-        this.targets.delete(target.id)
+        this.removeTarget(
+          target,
+          result.reason === 'body is not valid JSON'
+            ? 'invalid-json'
+            : 'no-breakpoints',
+          now,
+          { detail: result.reason },
+        )
       } else {
         logger.warn('cachekeep', 'prewarm failed', {
           session: target.id,

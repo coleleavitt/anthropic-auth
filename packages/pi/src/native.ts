@@ -5,6 +5,7 @@ import {
   decidePiStateLayout,
   getAccountStatePath,
   getHostClaustrumEnrollmentPaths,
+  getPersistedLogLevel,
   isKillswitchEnabled,
   killswitchPassesPolicy,
   LEGACY_STATE_LAYOUT,
@@ -31,6 +32,7 @@ import {
   resolveClaustrumConnectionPath,
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import {
   getPiAccountStoragePath,
@@ -232,6 +234,13 @@ export class PiNativeRuntime {
           identity,
         },
       })
+      // Apply local or vault preferences before the watcher can log. Match
+      // OpenCode's startup precedence without blocking migration refusals.
+      try {
+        const initial = await runtime.read()
+        if (!env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL)
+          setLogLevel(getPersistedLogLevel(initial.policyStorage) ?? 'info')
+      } catch {}
       if (this.closed) runtime.close()
       // Refresh returns at once while this host uses local accounts, so the
       // poll costs one enrollment read per tick outside vault custody.

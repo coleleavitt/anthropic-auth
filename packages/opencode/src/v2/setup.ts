@@ -6,6 +6,7 @@ import {
   decideOpenCodeStateLayoutOnce,
   disconnectNativeVaultForHost,
   exchange,
+  getPersistedLogLevel,
   isDumpPersistentlyEnabled,
   logger,
   type NativeAccountRuntime,
@@ -18,6 +19,7 @@ import {
   registerNativePoolHolder,
   resolveNativePoolPaths,
   setDumpEnabled,
+  setLogLevel,
   stateLayoutIoFailure,
   unmovedRegistrationPolicy,
 } from '@cortexkit/anthropic-auth-core'
@@ -313,12 +315,12 @@ export async function setupAnthropicAuth(
   const enrollment = nativeEnrollmentCallbacks(
     options.vault?.env ?? process.env,
   )
-  // Mirror the persisted dump switch for the current custody mode into this
-  // process's Core dump flag, as OpenCode 1 does at startup. The adapter still
-  // reads the persisted switch per send; this covers background Core dumps
-  // before the first request.
+  // Read the current custody mode's settings before starting background work.
+  // As in OpenCode 1, an environment override wins over the saved log level.
   try {
     const initial = await runtime.read()
+    if (!process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL)
+      setLogLevel(getPersistedLogLevel(initial.policyStorage) ?? 'info')
     setDumpEnabled(isDumpPersistentlyEnabled(initial.policyStorage))
   } catch {}
   let active = true

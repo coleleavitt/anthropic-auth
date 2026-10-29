@@ -20,6 +20,7 @@ import {
   type NativeAccountSnapshot,
   type NativeMenuDispatch,
   nativeAccountCanServe,
+  parseLogLevel,
   resetClaustrumEnrollmentState,
   setDumpEnabled,
 } from '@cortexkit/anthropic-auth-core'
@@ -320,9 +321,12 @@ export function createNativeMenuCapabilities(options: {
         } catch {}
         return done()
       }
-      case 'logging-level':
-        await write('logging', { level: request.values.level })
+      case 'logging-level': {
+        const level = parseLogLevel(request.values.level)
+        if (!level) throw new Error('Invalid log level')
+        await runtime.setLoggingLevel(level)
         return done()
+      }
       case 'fast-on':
       case 'fast-off':
         await write('claudeFast', { enabled: request.action === 'fast-on' })

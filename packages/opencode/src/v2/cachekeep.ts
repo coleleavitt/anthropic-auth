@@ -1,4 +1,6 @@
 import {
+  CACHE_KEEP_MAX_BODY_BYTES,
+  CACHE_KEEP_MAX_TARGETS,
   CacheKeepManager,
   type CacheKeepPrewarmAttempt,
   CacheKeepSessionRegistry,
@@ -442,45 +444,54 @@ export function createNativeCacheKeep(
     async track(
       input: Parameters<NonNullable<NativeSource['onRequestPrepared']>>[0],
     ) {
-      if (
-        lease.stopped ||
-        input.route !== 'oauth' ||
-        input.agent === 'cachekeep' ||
-        input.agent === 'prime' ||
-        input.kind !== 'primary'
-      )
-        return
+      const skipped = (reason: string) => {
+        logger.warn('cachekeep', 'tracking skipped', {
+          session: input.sessionID,
+          reason,
+          bodyBytes: Buffer.byteLength(input.bodyText, 'utf8'),
+          budgetBytes: CACHE_KEEP_MAX_BODY_BYTES,
+          targets: manager.trackedCount(),
+          maxTargets: CACHE_KEEP_MAX_TARGETS,
+          cacheExpiresAt: manager
+            .trackedSessions()
+            .find((target) => target.id === input.sessionID)?.cacheExpiresAt,
+        })
+      }
+      if (lease.stopped) return skipped('lease-stopped')
+      if (input.route !== 'oauth') return skipped('not-oauth')
+      if (input.agent === 'cachekeep' || input.agent === 'prime')
+        return skipped('background-agent')
+      if (input.kind !== 'primary') return skipped('not-primary')
       const snapshot = await runtime.read()
-      if (lease.stopped || !isCacheKeepHybridActive(snapshot.policyStorage))
-        return
+      if (lease.stopped) return skipped('lease-stopped')
+      if (!isCacheKeepHybridActive(snapshot.policyStorage))
+        return skipped('hybrid-inactive')
       let isSubagent = false
       try {
         isSubagent = (await options.isSubagent?.(input.sessionID)) ?? false
       } catch {
         // A missing host session record cannot justify background spending.
-        return
+        return skipped('session-lookup-failed')
       }
-      if (
-        lease.stopped ||
-        (isSubagent && !isCacheKeepSubagentsEnabled(snapshot.policyStorage))
-      )
-        return
+      if (lease.stopped) return skipped('lease-stopped')
+      if (isSubagent && !isCacheKeepSubagentsEnabled(snapshot.policyStorage))
+        return skipped('subagents-disabled')
       const account = snapshot.accounts.find(
         (row) => row.id === input.accountId,
       )
-      if (!account?.accountIdentity) return
+      if (!account?.accountIdentity) return skipped('account-identity-missing')
       if (
         input.provenance.kind === 'local' &&
         JSON.stringify(account.binding) !==
           JSON.stringify(input.provenance.subject.binding)
       )
-        return
+        return skipped('local-binding-changed')
       if (
         input.provenance.kind === 'vault' &&
         account.credentialId !== input.provenance.credentialId
       )
-        return
-      manager.track({
+        return skipped('vault-credential-changed')
+      const result = manager.track({
         sessionId: input.sessionID,
         url: input.url,
         headers: new Headers(),
@@ -492,6 +503,8 @@ export function createNativeCacheKeep(
         isSubagent,
       })
       await registry.publish(manager.trackedSessions())
+      // Core records each refusal or eviction, including its reason and sizes.
+      return result
     },
     registry,
     dispose() {
