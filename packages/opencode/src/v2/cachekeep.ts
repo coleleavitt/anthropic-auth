@@ -1,6 +1,4 @@
 import {
-  CACHE_KEEP_MAX_BODY_BYTES,
-  CACHE_KEEP_MAX_TARGETS,
   CacheKeepManager,
   type CacheKeepPrewarmAttempt,
   CacheKeepSessionRegistry,
@@ -444,17 +442,13 @@ export function createNativeCacheKeep(
     async track(
       input: Parameters<NonNullable<NativeSource['onRequestPrepared']>>[0],
     ) {
+      // These skips are normal (API-key routes, prewarms, subagents, policy
+      // off) and keep any existing target, so they stay at debug and do no
+      // per-request work beyond the log call.
       const skipped = (reason: string) => {
         logger.debug('cachekeep', 'tracking skipped', {
           session: input.sessionID,
           reason,
-          bodyBytes: Buffer.byteLength(input.bodyText, 'utf8'),
-          budgetBytes: CACHE_KEEP_MAX_BODY_BYTES,
-          targets: manager.trackedCount(),
-          maxTargets: CACHE_KEEP_MAX_TARGETS,
-          cacheExpiresAt: manager
-            .trackedSessions()
-            .find((target) => target.id === input.sessionID)?.cacheExpiresAt,
         })
       }
       if (lease.stopped) return skipped('lease-stopped')

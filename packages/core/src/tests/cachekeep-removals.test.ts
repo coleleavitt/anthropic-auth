@@ -217,16 +217,28 @@ test.each([
   })
   expect(result).toEqual({ tracked: false, reason })
   expect(logs).toHaveLength(1)
-  expect(logs[0]).toMatchObject({
-    level: code === 'body-budget' ? 'warn' : 'debug',
-    payload: {
-      session: code === 'missing-session' ? null : 'refused',
-      reason: code,
-      detail: reason,
-      bodyBytes: Buffer.byteLength(text),
-      budgetBytes: 67_108_864,
-      targets: 0,
-    },
-  })
+  // Only the over-budget refusal is a warning, with the sizes that explain
+  // it; normal policy exclusions are a short debug line.
+  expect(logs[0]).toMatchObject(
+    code === 'body-budget'
+      ? {
+          level: 'warn',
+          payload: {
+            session: 'refused',
+            reason: code,
+            detail: reason,
+            bodyBytes: Buffer.byteLength(text),
+            budgetBytes: 67_108_864,
+            targets: 0,
+          },
+        }
+      : {
+          level: 'debug',
+          payload: {
+            session: code === 'missing-session' ? null : 'refused',
+            reason: code,
+          },
+        },
+  )
   expect(JSON.stringify(logs)).not.toContain('PRIVATE')
 })

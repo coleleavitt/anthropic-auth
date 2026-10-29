@@ -202,11 +202,6 @@ test.each([
           : path.startsWith('stopped-during-')
             ? 'lease-stopped'
             : path,
-        bodyBytes: 20,
-        budgetBytes: 67_108_864,
-        targets: 1,
-        maxTargets: 32,
-        cacheExpiresAt: tracked[0]!.cacheExpiresAt,
       },
     })
     expect(f.logs.filter((record) => record.level === 'warn')).toEqual([])

@@ -618,25 +618,32 @@ export class CacheKeepManager {
     accountStoragePath?: string
     isSubagent?: boolean
   }): { tracked: true } | { tracked: false; reason: string } {
-    const bodyBytes = Buffer.byteLength(input.bodyText, 'utf8')
     const now = this.options.now?.() ?? Date.now()
+    // Measured only once the policy checks pass: track() runs on every live
+    // request, and most requests are excluded before the body matters.
+    let bodyBytes: number | undefined
     const refuse = (reason: string, reasonCode: string) => {
       // Policy exclusions leave any existing target intact. Only a body that
       // cannot fit in the budget warrants a warning rather than debug detail.
-      const level = reasonCode === 'body-budget' ? 'warn' : 'debug'
-      logger[level]('cachekeep', 'tracking skipped', {
-        session: input.sessionId ?? null,
-        reason: reasonCode,
-        detail: reason,
-        bodyBytes,
-        totalBodyBytes: this.totalBodyBytes(),
-        budgetBytes: CACHE_KEEP_MAX_BODY_BYTES,
-        targets: this.targets.size,
-        maxTargets: CACHE_KEEP_MAX_TARGETS,
-        cacheExpiresAt: input.sessionId
-          ? this.targets.get(input.sessionId)?.cacheExpiresAt
-          : undefined,
-      })
+      if (reasonCode === 'body-budget')
+        logger.warn('cachekeep', 'tracking skipped', {
+          session: input.sessionId ?? null,
+          reason: reasonCode,
+          detail: reason,
+          bodyBytes,
+          totalBodyBytes: this.totalBodyBytes(),
+          budgetBytes: CACHE_KEEP_MAX_BODY_BYTES,
+          targets: this.targets.size,
+          maxTargets: CACHE_KEEP_MAX_TARGETS,
+          cacheExpiresAt: input.sessionId
+            ? this.targets.get(input.sessionId)?.cacheExpiresAt
+            : undefined,
+        })
+      else
+        logger.debug('cachekeep', 'tracking skipped', {
+          session: input.sessionId ?? null,
+          reason: reasonCode,
+        })
       return { tracked: false as const, reason }
     }
     if (!input.sessionId) return refuse('missing session id', 'missing-session')
@@ -646,6 +653,7 @@ export class CacheKeepManager {
     if (input.cacheMode !== 'hybrid') {
       return refuse('cache mode is not hybrid', 'not-hybrid')
     }
+    bodyBytes = Buffer.byteLength(input.bodyText, 'utf8')
     if (bodyBytes > CACHE_KEEP_MAX_BODY_BYTES) {
       return refuse('body exceeds cachekeep memory budget', 'body-budget')
     }
