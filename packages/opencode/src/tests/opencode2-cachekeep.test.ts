@@ -1,7 +1,15 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
@@ -29,6 +37,7 @@ import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
 } from '../v2/adapter'
+import { cacheKeepStoreDirectory } from '../v2/cachekeep-store'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
 import type { NativeSource } from '../v2/source'
@@ -62,6 +71,7 @@ async function fixture(
   brokenRegistry = false,
   savedLevel?: string,
   vaultMode = false,
+  unsafePersistence = false,
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -137,6 +147,10 @@ async function fixture(
     directory: registryDirectory,
     now: () => now,
   })
+  if (unsafePersistence)
+    await mkdir(cacheKeepStoreDirectory(paths.storageId, directory), {
+      mode: 0o755,
+    })
   const start = async () => {
     const hooks = new Map<string, Array<(draft: any) => unknown>>()
     const registration = { dispose: async () => {} }
@@ -197,15 +211,17 @@ async function fixture(
         setIntervalImpl: timers.setInterval,
         clearIntervalImpl: timers.clearInterval,
         registryDirectory,
+        persistence: { root: directory },
       },
     })
     cleanups.push(dispose)
     const live = async (
       url = 'https://api.anthropic.com/v1/messages',
       extra: Record<string, unknown> = {},
+      sessionID = 'ses_oc2_keep',
     ) => {
       const draft = {
-        sessionID: 'ses_oc2_keep' as SessionHooks['http.request']['sessionID'],
+        sessionID: sessionID as SessionHooks['http.request']['sessionID'],
         agent: 'build',
         model: { providerID: 'anthropic', id: 'claude-sonnet-4-6' },
         kind: 'primary',
@@ -261,6 +277,7 @@ async function fixture(
     paths,
     store,
     registry,
+    disk: cacheKeepStoreDirectory(paths.storageId, directory),
     timers,
     due: () => {
       now += CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS
@@ -762,6 +779,217 @@ test('an OpenCode 2 instance that boots after the last one was disposed keeps wa
   expect(next.sent[0]!.headers.get('authorization')).toBe(
     'Bearer sk-ant-oat01-first',
   )
+})
+
+test('OpenCode 2 restores a gzipped session after a server restart with the same cacheable prefix', async () => {
+  const f = await fixture()
+  const live = (await (
+    await f.live(undefined, {
+      tools: [
+        { name: 'read', description: 'Read', input_schema: { type: 'object' } },
+      ],
+    })
+  ).json()) as Record<string, any>
+  await f.dispose()
+  const [name] = await readdir(f.disk)
+  expect(name).toMatch(/^[a-f0-9]{64}\.json\.gz$/)
+  const bytes = await readFile(join(f.disk, name!))
+  expect([...bytes.subarray(0, 2)]).toEqual([0x1f, 0x8b])
+  const saved = gunzipSync(bytes).toString()
+  expect(saved).not.toMatch(
+    /authorization|x-api-key|sk-ant-oat01|refresh-first|placeholder/,
+  )
+  // A fresh server has no process-wide registry, even though its files survive.
+  for (const version of ['v1', 'v2']) {
+    const key = Symbol.for(
+      `cortexkit.anthropic-auth.opencode2.cachekeep.${version}`,
+    )
+    ;(globalThis as any)[key]?.delete(f.paths.storageId)
+  }
+  const next = await f.start()
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  const warm = (await next.sent[0]!.json()) as Record<string, any>
+  expect(warm.tools).toEqual(live.tools)
+  expect(warm.system.slice(1)).toEqual(live.system.slice(1))
+  expect(warm.messages).toEqual(live.messages)
+  expect(warm.max_tokens).toBe(0)
+  expect(next.sent[0]!.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-first',
+  )
+})
+
+function forgetCacheKeepProcess(storageId: string) {
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  ;(globalThis as any)[key]?.delete(storageId)
+}
+
+test.each([
+  'expired',
+  'foreign-identity',
+  'schema-version',
+  'plugin-version',
+  'unreadable',
+])(
+  'OpenCode 2 deletes a %s restart record without sending it',
+  async (change) => {
+    const f = await fixture()
+    await f.live()
+    await f.dispose()
+    const [name] = await readdir(f.disk)
+    const path = join(f.disk, name!)
+    const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+    if (change === 'expired') saved.cacheExpiresAt = 0
+    if (change === 'foreign-identity')
+      saved.oauthAccountIdentity = 'someone-else'
+    if (change === 'schema-version') saved.v = 99
+    if (change === 'plugin-version') saved.pluginVersion = '0.0.0'
+    await writeFile(
+      path,
+      change === 'unreadable' ? 'not gzip' : gzipSync(JSON.stringify(saved)),
+    )
+    forgetCacheKeepProcess(f.paths.storageId)
+    const next = await f.start()
+    f.due()
+    await f.timers.fire()
+    expect(next.sent).toHaveLength(0)
+    expect(await readdir(f.disk)).toEqual([])
+  },
+)
+
+test.each(['removed', 'disabled'])(
+  'OpenCode 2 drops a restored session whose account was %s',
+  async (change) => {
+    const f = await fixture()
+    await f.live()
+    await f.dispose()
+    if (change === 'removed') await f.store.remove('first')
+    else await f.store.disable('first', 'user')
+    forgetCacheKeepProcess(f.paths.storageId)
+    const next = await f.start()
+    f.due()
+    await f.timers.fire()
+    expect(next.sent).toHaveLength(0)
+    expect(await readdir(f.disk)).toEqual([])
+  },
+)
+
+test.each(['cachekeep', 'hybrid'])(
+  'turning OpenCode 2 %s off deletes persisted targets, including pending writes',
+  async (setting) => {
+    const f = await fixture()
+    await f.live()
+    await f.dispose()
+    expect(await readdir(f.disk)).toHaveLength(1)
+    const next = await f.start()
+    await next.live()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      ...(setting === 'cachekeep'
+        ? { cacheKeep: { enabled: false } }
+        : { claudeCache: { enabled: true, mode: 'explicit' as const } }),
+    }))
+    f.due()
+    await f.timers.fire()
+    await next.dispose()
+    expect(next.sent).toHaveLength(0)
+    expect(await readdir(f.disk)).toEqual([])
+  },
+)
+
+test.skipIf(process.platform === 'win32')(
+  'an unsafe OpenCode 2 restart folder warns once and keeps prewarming in memory',
+  async () => {
+    const logs = captureStartupLogs()
+    const f = await fixture(false, false, undefined, false, true)
+    await f.live()
+    f.due()
+    await f.timers.fire()
+    expect(f.sent).toHaveLength(1)
+    await f.dispose()
+    expect(await readdir(f.disk)).toEqual([])
+    expect(logs.filter((line) => line.includes(' WARN '))).toHaveLength(1)
+    expect(logs.join('\n')).toContain('retaining sessions in memory only')
+  },
+)
+
+test('restored OpenCode 2 sessions honour subagent policy', async () => {
+  const f = await fixture(true)
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, always: true, subagents: true },
+  }))
+  await f.live()
+  await f.dispose()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, always: true, subagents: false },
+  }))
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(0)
+  expect(await readdir(f.disk)).toEqual([])
+})
+
+test('OpenCode 2 does not restore sessions outside the configured schedule', async () => {
+  const f = await fixture()
+  await f.live()
+  await f.dispose()
+  const startHour = (new Date().getHours() + 2) % 24
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, startHour, endHour: (startHour + 1) % 24 },
+  }))
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(0)
+  expect(await readdir(f.disk)).toEqual([])
+})
+
+test('OpenCode 2 staggers overdue restored prewarms instead of sending a burst', async () => {
+  const f = await fixture()
+  await f.live(undefined, {}, 'ses_one')
+  await f.live(undefined, {}, 'ses_two')
+  await f.dispose()
+  forgetCacheKeepProcess(f.paths.storageId)
+  f.due()
+  const next = await f.start()
+  const times: number[] = []
+  next.setSend(async () => {
+    times.push(Date.now())
+    return Response.json({ usage: { cache_read_input_tokens: 1 } })
+  })
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  f.advance(3000)
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(2)
+  expect(times[1]! - times[0]!).toBeGreaterThanOrEqual(2900)
+})
+
+test('a policy-refused OpenCode 2 target is also removed from restart storage', async () => {
+  const f = await fixture()
+  await f.live()
+  await f.dispose()
+  const next = await f.start()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    killswitch: {
+      enabled: true,
+      main: { five_hour: 0, seven_day: 0 },
+      accounts: { first: { five_hour: 10 } },
+    },
+  }))
+  f.due()
+  await f.timers.fire()
+  await next.dispose()
+  expect(next.sent).toHaveLength(0)
+  expect(await readdir(f.disk)).toEqual([])
 })
 
 test('nothing is sent while no OpenCode 2 instance exists, and the next one sends with the current token', async () => {

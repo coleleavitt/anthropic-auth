@@ -129,7 +129,6 @@ test.each([
   'cachekeep-agent',
   'prime-agent',
   'not-primary',
-  'hybrid-inactive',
   'session-lookup-failed',
   'subagents-disabled',
   'account-identity-missing',
@@ -160,9 +159,6 @@ test.each([
         break
       case 'not-primary':
         f.input.kind = 'auxiliary' as Prepared['kind']
-        break
-      case 'hybrid-inactive':
-        f.policy.cacheKeep.enabled = false
         break
       case 'session-lookup-failed':
         f.lookupFails()

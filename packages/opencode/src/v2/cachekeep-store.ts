@@ -1,0 +1,334 @@
+import { createHash, randomUUID } from 'node:crypto'
+import { constants } from 'node:fs'
+import { lstat, mkdir, open, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
+import { gunzip, gzip } from 'node:zlib'
+import {
+  CACHE_KEEP_MAX_BODY_BYTES,
+  type CacheKeepTarget,
+  createWindowsOwnerOnly,
+  ensureWindowsOwnerOnlyDirectory,
+  isOwnerOnly,
+  logger,
+  type OwnerOnlyOptions,
+  readWindowsOwnerOnly,
+  renameWithWindowsSharingRetry,
+} from '@cortexkit/anthropic-auth-core'
+import { version as pluginVersion } from '../../package.json'
+
+const compress = promisify(gzip)
+const decompress = promisify(gunzip)
+const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+const FILE = /^[a-f0-9]{64}\.json\.gz$/
+const TEMP = /^[a-f0-9]{64}\.json\.gz\.[a-f0-9-]+\.tmp$/
+const MAX_RECORD_BYTES = 2 * CACHE_KEEP_MAX_BODY_BYTES + 64 * 1024
+
+export function cacheKeepStoreDirectory(storageId: string, root = tmpdir()) {
+  return join(
+    root,
+    `cortexkit-anthropic-auth-cachekeep-${hash(storageId).slice(0, 16)}`,
+  )
+}
+
+export type SavedCacheKeepTarget = Pick<
+  CacheKeepTarget,
+  | 'id'
+  | 'bodyText'
+  | 'url'
+  | 'cacheExpiresAt'
+  | 'nextPrewarmAt'
+  | 'oauthAccountIdentity'
+  | 'isSubagent'
+> & { v: 1; pluginVersion: string }
+
+function record(target: Readonly<CacheKeepTarget>): SavedCacheKeepTarget {
+  // Deliberately whitelist fields: transport headers and account credentials
+  // must never become part of the restart record, even if tracking gains them.
+  return {
+    v: 1,
+    pluginVersion,
+    id: target.id,
+    bodyText: target.bodyText,
+    url: target.url,
+    cacheExpiresAt: target.cacheExpiresAt,
+    nextPrewarmAt: target.nextPrewarmAt,
+    oauthAccountIdentity: target.oauthAccountIdentity,
+    isSubagent: target.isSubagent,
+  }
+}
+
+function sanitizedBody(text: string): string {
+  const body = JSON.parse(text) as Record<string, unknown>
+  if (!body || typeof body !== 'object' || Array.isArray(body))
+    throw new Error('Invalid restart body')
+  let stripped = false
+  // Only transport-like fields at the request root are credentials. A tool's
+  // JSON schema or conversation content can legitimately name these fields;
+  // changing those would change the cached prefix.
+  for (const key of Object.keys(body)) {
+    if (
+      /^(authorization|x-api-key|cookie|set-cookie|headers|credentials|token|access[_-]?token|refresh[_-]?token)$/i.test(
+        key,
+      )
+    ) {
+      delete body[key]
+      stripped = true
+    }
+  }
+  return stripped ? JSON.stringify(body) : text
+}
+
+function valid(
+  value: SavedCacheKeepTarget,
+  name: string,
+  now: number,
+): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  if (
+    value.v !== 1 ||
+    value.pluginVersion !== pluginVersion ||
+    typeof value.id !== 'string' ||
+    !value.id ||
+    `${hash(value.id)}.json.gz` !== name ||
+    typeof value.bodyText !== 'string' ||
+    Buffer.byteLength(value.bodyText) > CACHE_KEEP_MAX_BODY_BYTES ||
+    typeof value.url !== 'string' ||
+    typeof value.oauthAccountIdentity !== 'string' ||
+    !value.oauthAccountIdentity ||
+    typeof value.isSubagent !== 'boolean' ||
+    !Number.isFinite(value.cacheExpiresAt) ||
+    value.cacheExpiresAt <= now ||
+    !Number.isFinite(value.nextPrewarmAt)
+  )
+    return false
+  // Malformed bodies and credential-bearing records are not replayable.
+  return sanitizedBody(value.bodyText) === value.bodyText
+}
+
+/** Best-effort restart storage. No caller of changed() waits for disk or zlib. */
+export class CacheKeepStore {
+  readonly directory: string
+  private disabled = false
+  private chain: Promise<void> = Promise.resolve()
+  private readonly pending = new Map<string, SavedCacheKeepTarget>()
+  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly lastWrite = new Map<string, number>()
+  private readonly latest = new Map<string, SavedCacheKeepTarget>()
+  private readonly writtenTurn = new Map<string, string>()
+  private readonly pendingTurn = new Map<string, string>()
+
+  constructor(
+    private readonly options: {
+      storageId: string
+      /** Test seam; production always uses os.tmpdir(), never OpenCode's config. */
+      root?: string
+      ownerOnly?: OwnerOnlyOptions
+    },
+  ) {
+    this.directory = cacheKeepStoreDirectory(options.storageId, options.root)
+  }
+
+  private refuse() {
+    if (this.disabled) return
+    this.disabled = true
+    for (const timer of this.timers.values()) clearTimeout(timer)
+    this.timers.clear()
+    this.pending.clear()
+    this.latest.clear()
+    this.pendingTurn.clear()
+    this.writtenTurn.clear()
+    this.lastWrite.clear()
+    logger.warn(
+      'cachekeep',
+      'restart storage unavailable; retaining sessions in memory only',
+    )
+  }
+
+  private async directoryReady() {
+    if (this.disabled) return false
+    try {
+      if (
+        !(await ensureWindowsOwnerOnlyDirectory(
+          this.directory,
+          this.options.ownerOnly,
+        ))
+      ) {
+        try {
+          await mkdir(this.directory, { mode: 0o700 })
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        }
+      }
+      const stat = await lstat(this.directory)
+      if (
+        !stat.isDirectory() ||
+        stat.isSymbolicLink() ||
+        !(await isOwnerOnly(
+          this.directory,
+          () =>
+            stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o700,
+          this.options.ownerOnly,
+        ))
+      )
+        throw new Error('Unsafe restart directory')
+      return true
+    } catch {
+      this.refuse()
+      return false
+    }
+  }
+
+  private enqueue(action: () => Promise<void>) {
+    this.chain = this.chain
+      .then(async () => {
+        if (await this.directoryReady()) await action()
+      })
+      .catch(() => this.refuse())
+  }
+
+  async load(now: number, accept: (entry: SavedCacheKeepTarget) => boolean) {
+    if (!(await this.directoryReady())) return
+    try {
+      for (const name of (await readdir(this.directory)).sort()) {
+        if (!FILE.test(name) && !TEMP.test(name)) continue
+        const path = join(this.directory, name)
+        try {
+          if (TEMP.test(name)) throw new Error('Unfinished write')
+          const stat = await lstat(path)
+          if (
+            !stat.isFile() ||
+            stat.isSymbolicLink() ||
+            stat.size > MAX_RECORD_BYTES ||
+            !(await isOwnerOnly(
+              path,
+              () =>
+                stat.uid === process.getuid?.() &&
+                (stat.mode & 0o777) === 0o600,
+              this.options.ownerOnly,
+            ))
+          )
+            throw new Error('Unsafe restart file')
+          let bytes = await readWindowsOwnerOnly(path, this.options.ownerOnly)
+          if (!bytes) {
+            const file = await open(
+              path,
+              constants.O_RDONLY | constants.O_NOFOLLOW,
+            )
+            try {
+              bytes = await file.readFile()
+            } finally {
+              await file.close()
+            }
+          }
+          const raw = await decompress(bytes, {
+            maxOutputLength: MAX_RECORD_BYTES,
+          })
+          const entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
+          if (!valid(entry, name, now) || !accept(entry))
+            throw new Error('Stale restart file')
+        } catch {
+          await rm(path, { force: true })
+        }
+      }
+    } catch {
+      this.refuse()
+    }
+  }
+
+  changed(target: Readonly<CacheKeepTarget>, turnId?: string) {
+    if (this.disabled) return
+    if (turnId && this.writtenTurn.get(target.id) === turnId) return
+    const entry = record(target)
+    const previous = this.latest.get(entry.id)
+    if (
+      previous &&
+      previous.bodyText === entry.bodyText &&
+      previous.url === entry.url &&
+      previous.oauthAccountIdentity === entry.oauthAccountIdentity &&
+      previous.cacheExpiresAt === entry.cacheExpiresAt &&
+      previous.nextPrewarmAt === entry.nextPrewarmAt &&
+      previous.isSubagent === entry.isSubagent
+    )
+      return
+    this.latest.set(entry.id, entry)
+    this.pending.set(entry.id, entry)
+    if (turnId) this.pendingTurn.set(entry.id, turnId)
+    if (this.timers.has(entry.id)) return
+    // Coalesce preparation before the first write of a user turn. Later tool
+    // steps in that same turn stay in memory; the next turn can save again.
+    // Each session is also capped at one write per five seconds.
+    const delay = Math.max(
+      250,
+      (this.lastWrite.get(entry.id) ?? 0) + 5000 - Date.now(),
+    )
+    const timer = setTimeout(() => this.flush(entry.id), delay)
+    timer.unref?.()
+    this.timers.set(entry.id, timer)
+  }
+
+  private flush(id: string) {
+    const timer = this.timers.get(id)
+    if (timer) clearTimeout(timer)
+    this.timers.delete(id)
+    const entry = this.pending.get(id)
+    this.pending.delete(id)
+    if (!entry) return
+    const turn = this.pendingTurn.get(id)
+    this.pendingTurn.delete(id)
+    if (turn) this.writtenTurn.set(id, turn)
+    this.lastWrite.set(id, Date.now())
+    this.enqueue(async () => {
+      const path = join(this.directory, `${hash(id)}.json.gz`)
+      const temp = `${path}.${randomUUID()}.tmp`
+      try {
+        const safe = { ...entry, bodyText: sanitizedBody(entry.bodyText) }
+        const bytes = await compress(JSON.stringify(safe))
+        if (
+          !(await createWindowsOwnerOnly(temp, bytes, this.options.ownerOnly))
+        )
+          await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
+        await renameWithWindowsSharingRetry(temp, path, {
+          platform: this.options.ownerOnly?.platform,
+        })
+      } finally {
+        await rm(temp, { force: true })
+      }
+    })
+  }
+
+  removed(id: string) {
+    const timer = this.timers.get(id)
+    if (timer) clearTimeout(timer)
+    this.timers.delete(id)
+    this.pending.delete(id)
+    this.latest.delete(id)
+    this.lastWrite.delete(id)
+    this.writtenTurn.delete(id)
+    this.pendingTurn.delete(id)
+    this.enqueue(() =>
+      rm(join(this.directory, `${hash(id)}.json.gz`), { force: true }),
+    )
+  }
+
+  clear() {
+    for (const timer of this.timers.values()) clearTimeout(timer)
+    this.timers.clear()
+    this.pending.clear()
+    this.latest.clear()
+    this.lastWrite.clear()
+    this.writtenTurn.clear()
+    this.pendingTurn.clear()
+    this.enqueue(async () => {
+      for (const name of await readdir(this.directory))
+        if (FILE.test(name) || TEMP.test(name))
+          await rm(join(this.directory, name), { force: true })
+    })
+  }
+
+  async drain() {
+    for (const id of this.pending.keys()) this.flush(id)
+    await this.chain
+  }
+}

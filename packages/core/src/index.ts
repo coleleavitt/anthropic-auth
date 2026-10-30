@@ -289,6 +289,7 @@ export {
   ensureWindowsOwnerOnlyDirectory,
   isOwnerOnly,
   type OwnerOnlyOptions,
+  readWindowsOwnerOnly,
 } from './owner-only.ts'
 export * from './pkce.ts'
 export type {
@@ -319,6 +320,7 @@ export {
   createProviderErrorResponseScope,
   summarizePrewarmProviderError,
 } from './provider-error.ts'
+export { renameWithWindowsSharingRetry } from './publication-rename.ts'
 export * from './quota-header-feed.ts'
 export * from './quota-headers.ts'
 export * from './quota-manager.ts'

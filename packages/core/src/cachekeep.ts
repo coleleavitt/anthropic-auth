@@ -556,6 +556,9 @@ export class CacheKeepManager {
       onTrackedSessionsChanged?: (
         sessions: readonly CacheKeepTrackedSession[],
       ) => Promise<void> | void
+      /** Hosts may mirror targets without delaying a live request on storage I/O. */
+      onTargetChanged?: (target: Readonly<CacheKeepTarget>) => void
+      onTargetRemoved?: (id: string) => void
       prepareBody?: (
         bodyText: string,
         target: CacheKeepTarget,
@@ -682,6 +685,7 @@ export class CacheKeepManager {
   untrack(id: string): boolean {
     if (!this.targets.has(id)) return false
     this.targets.delete(id)
+    this.options.onTargetRemoved?.(id)
     this.publishTrackedSessions()
     return true
   }
@@ -749,6 +753,7 @@ export class CacheKeepManager {
         ...details,
       })
     this.targets.delete(target.id)
+    this.options.onTargetRemoved?.(target.id)
   }
 
   private evictOldestTarget(now: number, reason: 'budget' | 'count') {
@@ -772,7 +777,10 @@ export class CacheKeepManager {
         this.removeTarget(target, 'schedule-period-ended', now)
         continue
       }
-      if (now >= target.cacheExpiresAt) this.targets.delete(id)
+      if (now >= target.cacheExpiresAt) {
+        this.targets.delete(id)
+        this.options.onTargetRemoved?.(id)
+      }
     }
     while (this.targets.size > CACHE_KEEP_MAX_TARGETS)
       this.evictOldestTarget(now, 'count')
@@ -795,8 +803,12 @@ export class CacheKeepManager {
     accountStoragePath?: string
     isSubagent?: boolean
     sourceWarm?: boolean
+    /** Restore only the remaining lifetime, never grant a restarted cache a new hour. */
+    retained?: Pick<CacheKeepTarget, 'cacheExpiresAt' | 'nextPrewarmAt'>
   }): { tracked: true } | { tracked: false; reason: string } {
     const now = this.options.now?.() ?? Date.now()
+    if (input.retained && input.retained.cacheExpiresAt <= now)
+      return { tracked: false, reason: 'cache expired' }
     // Measured only once the policy checks pass: track() runs on every live
     // request, and most requests are excluded before the body matters.
     let bodyBytes: number | undefined
@@ -855,8 +867,10 @@ export class CacheKeepManager {
       headers,
       bodyText: input.bodyText,
       bodyBytes,
-      cacheExpiresAt: now + CACHE_KEEP_TTL_MS,
-      nextPrewarmAt: now + CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS,
+      cacheExpiresAt: input.retained?.cacheExpiresAt ?? now + CACHE_KEEP_TTL_MS,
+      nextPrewarmAt:
+        input.retained?.nextPrewarmAt ??
+        now + CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS,
       consecutiveFailures: 0,
       dayKey: today,
       oauthAccountId: input.oauthAccountId,
@@ -867,8 +881,10 @@ export class CacheKeepManager {
     })
     this.pruneTargets(now, today)
     this.publishTrackedSessions()
-    if (!this.targets.has(input.sessionId))
+    const target = this.targets.get(input.sessionId)
+    if (!target)
       return { tracked: false, reason: 'evicted by cachekeep limits' }
+    this.options.onTargetChanged?.(target)
     this.start()
     return { tracked: true }
   }
@@ -960,6 +976,9 @@ export class CacheKeepManager {
         target.consecutiveFailures += 1
         target.nextPrewarmAt =
           now + cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
+      } finally {
+        if (this.targets.get(target.id) === target)
+          this.options.onTargetChanged?.(target)
       }
     }
     this.publishTrackedSessions()

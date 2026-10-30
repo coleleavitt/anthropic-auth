@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import {
   CacheKeepManager,
   type CacheKeepPrewarmAttempt,
@@ -12,13 +13,16 @@ import {
   type NativeAccountRefusalReason,
   type NativeAccountRuntime,
   type NativeAccountView,
+  nativeAccountCanServe,
   nativeAccountRefusal,
+  type OwnerOnlyOptions,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
 import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
 } from './adapter'
+import { CacheKeepStore } from './cachekeep-store'
 import type { NativeSource, NativeSourceProvenance } from './source'
 
 export interface NativeCacheKeepOptions {
@@ -26,6 +30,8 @@ export interface NativeCacheKeepOptions {
   readonly setIntervalImpl?: typeof globalThis.setInterval
   readonly clearIntervalImpl?: typeof globalThis.clearInterval
   readonly registryDirectory?: string
+  /** Filesystem seam for tests; this is not a user setting. */
+  readonly persistence?: { root?: string; ownerOnly?: OwnerOnlyOptions }
 }
 
 // Token refreshes preserve this identity; replacing a local row or a vault
@@ -61,6 +67,7 @@ interface CacheKeepLease {
   ) => Promise<Response>
   /** Sends this lease started; its disposal waits for them to settle. */
   readonly inflight: Set<Promise<unknown>>
+  readonly read: NativeAccountRuntime['read']
 }
 
 /**
@@ -72,6 +79,9 @@ interface CacheKeepLease {
 interface SharedCacheKeep {
   readonly manager: CacheKeepManager
   readonly registry: CacheKeepSessionRegistry
+  readonly persistence: CacheKeepStore
+  loading?: Promise<void>
+  trackingTurn?: string
   readonly prepared: Map<
     number,
     {
@@ -88,14 +98,14 @@ interface SharedCacheKeep {
   /** Called after the last lease is released. */
   readonly retain: () => void
   /** Called when a lease is taken; resumes warming any retained sessions. */
-  readonly adopt: () => void
+  readonly adopt: () => Promise<void>
 }
 
 // Kept on globalThis rather than in a module variable, so a plugin reload that
 // imports this module again still finds the sessions the previous copy
 // tracked. The version suffix keeps a future, differently shaped entry apart.
 const SHARED_CACHE_KEEPS = Symbol.for(
-  'cortexkit.anthropic-auth.opencode2.cachekeep.v1',
+  'cortexkit.anthropic-auth.opencode2.cachekeep.v2',
 )
 
 function sharedCacheKeeps(): Map<string, SharedCacheKeep> {
@@ -112,6 +122,9 @@ function createSharedCacheKeep(
 ): SharedCacheKeep {
   const prepared: SharedCacheKeep['prepared'] = new Map()
   const leases: SharedCacheKeep['leases'] = new Map()
+  const persistence = new CacheKeepStore({ storageId, ...options.persistence })
+  const restored = new Set<string>()
+  let lastRestoredSend = 0
   const registry = new CacheKeepSessionRegistry({
     directory:
       options.registryDirectory ||
@@ -128,7 +141,13 @@ function createSharedCacheKeep(
   const manager: CacheKeepManager = new CacheKeepManager({
     loadStorage: async () => {
       const lease = newestLease()
-      return lease ? lease.loadStorage() : null
+      const storage = lease ? await lease.loadStorage() : null
+      if (lease && !isCacheKeepHybridActive(storage)) {
+        for (const session of manager.trackedSessions())
+          manager.untrack(session.id)
+        persistence.clear()
+      }
+      return storage
     },
     now: options.now,
     // Return the tick's promise from the timer callback, so an injected timer
@@ -142,6 +161,12 @@ function createSharedCacheKeep(
         return shared.ticking
       }, ms)) as typeof globalThis.setInterval,
     clearIntervalImpl: options.clearIntervalImpl,
+    onTargetChanged: (target) =>
+      persistence.changed(target, shared.trackingTurn),
+    onTargetRemoved: (id) => {
+      restored.delete(id)
+      persistence.removed(id)
+    },
     // While no instance is live the sessions are only retained, not warmed,
     // so the shared session list for the status menu shows none of them.
     onTrackedSessionsChanged: (sessions) =>
@@ -161,6 +186,18 @@ function createSharedCacheKeep(
       prepared.delete(id)
       if (!entry || entry.lease.stopped)
         throw new Error('CacheKeep attempt is unavailable')
+      // Even if a busy scheduler first runs after several targets became due,
+      // restored sessions must not all hit the provider together.
+      if (restored.delete(entry.target.id)) {
+        await delay(
+          Math.max(0, lastRestoredSend + 3000 - Date.now()),
+          undefined,
+          {
+            signal: entry.attempt.signal,
+          },
+        )
+        lastRestoredSend = Date.now()
+      }
       const sending = entry.lease.send(
         entry.target,
         request as Request,
@@ -181,8 +218,8 @@ function createSharedCacheKeep(
   // OpenCode 2 disposes an evicted directory's instance before anything boots
   // that directory again, so the last release must not drop the sessions: a
   // new instance for this storage may adopt them while their cache is alive.
-  // Only the request bodies stay, in memory; there is no timer sending
-  // prewarms, no runtime and no credential until an instance adopts them.
+  // The bodies also survive a server restart in private temporary storage.
+  // There is no timer sending prewarms, runtime or credential until adoption.
   // A single timer deletes each body when its cache expires.
   let expiry: ReturnType<typeof setTimeout> | undefined
   const stopExpiry = () => {
@@ -205,6 +242,7 @@ function createSharedCacheKeep(
   const shared: SharedCacheKeep = {
     manager,
     registry,
+    persistence,
     prepared,
     leases,
     nextGeneration: 0,
@@ -213,8 +251,55 @@ function createSharedCacheKeep(
       prepared.clear()
       dropExpired()
     },
-    adopt() {
+    async adopt() {
       stopExpiry()
+      shared.loading ??= (async () => {
+        const lease = newestLease()
+        if (!lease) return
+        const snapshot = await lease.read()
+        if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
+          persistence.clear()
+          return
+        }
+        const now = options.now?.() ?? Date.now()
+        let overdue = 0
+        await persistence.load(now, (entry) => {
+          // Disposal may race startup. Leave the file for the next live lease.
+          if (!leases.size || manager.trackedRequest(entry.id)) return true
+          const account = snapshot.accounts.find(
+            (row) => accountKey(row) === entry.oauthAccountIdentity,
+          )
+          if (
+            account?.type !== 'oauth' ||
+            !nativeAccountCanServe(account) ||
+            (entry.isSubagent &&
+              !isCacheKeepSubagentsEnabled(snapshot.policyStorage))
+          )
+            return false
+          const nextPrewarmAt =
+            entry.nextPrewarmAt <= now
+              ? now + overdue++ * 3000
+              : entry.nextPrewarmAt
+          const result = manager.track({
+            sessionId: entry.id,
+            url: entry.url,
+            headers: new Headers(),
+            bodyText: entry.bodyText,
+            storage: snapshot.policyStorage,
+            cacheMode: 'hybrid',
+            oauthAccountId: account.id,
+            oauthAccountIdentity: entry.oauthAccountIdentity,
+            isSubagent: entry.isSubagent,
+            retained: { cacheExpiresAt: entry.cacheExpiresAt, nextPrewarmAt },
+          })
+          if (result.tracked) restored.add(entry.id)
+          return result.tracked
+        })
+      })().catch(() => {
+        logger.warn('cachekeep', 'failed to restore tracked sessions')
+      })
+      await shared.loading
+      if (!leases.size) return
       // A session whose cache expired while no instance was live has nothing
       // left to keep warm; drop it rather than prewarm it.
       if (manager.dropExpiredTargets() === undefined) return
@@ -293,7 +378,7 @@ export function createNativeCacheKeep(
           const snapshot = await runtime.read()
           signal.throwIfAborted()
           const account = snapshot.accounts.find((row) => row.id === accountId)
-          if (account?.type !== 'oauth')
+          if (account?.type !== 'oauth' || !nativeAccountCanServe(account))
             throw new NativeAccountRefusal('account-unavailable')
           if (accountKey(account) !== target.oauthAccountIdentity)
             throw new NativeAccountRefusal('credential-changed')
@@ -456,14 +541,17 @@ export function createNativeCacheKeep(
     loadStorage: async () => (await runtime.read()).policyStorage,
     send,
     inflight: new Set(),
+    read: () => runtime.read(),
   }
   const adopting = owner.leases.size === 0
   owner.leases.set(lease.generation, lease)
-  if (adopting) owner.adopt()
+  const ready = adopting ? owner.adopt() : (owner.loading ?? Promise.resolve())
   let cleanup: Promise<void> | undefined
   return {
+    ready,
     async track(
       input: Parameters<NonNullable<NativeSource['onRequestPrepared']>>[0],
+      turnId?: string,
     ) {
       // These skips are normal (API-key routes, prewarms, subagents, policy
       // off) and keep any existing target, so they stay at debug and do no
@@ -481,8 +569,12 @@ export function createNativeCacheKeep(
       if (input.kind !== 'primary') return skipped('not-primary')
       const snapshot = await runtime.read()
       if (lease.stopped) return skipped('lease-stopped')
-      if (!isCacheKeepHybridActive(snapshot.policyStorage))
+      if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
+        for (const session of manager.trackedSessions())
+          manager.untrack(session.id)
+        owner.persistence.clear()
         return skipped('hybrid-inactive')
+      }
       let isSubagent = false
       try {
         isSubagent = (await options.isSubagent?.(input.sessionID)) ?? false
@@ -508,6 +600,7 @@ export function createNativeCacheKeep(
         account.credentialId !== input.provenance.credentialId
       )
         return skipped('vault-credential-changed')
+      owner.trackingTurn = turnId ?? input.attemptId
       const result = manager.track({
         sessionId: input.sessionID,
         url: input.url,
@@ -519,6 +612,7 @@ export function createNativeCacheKeep(
         oauthAccountIdentity: accountKey(account),
         isSubagent,
       })
+      owner.trackingTurn = undefined
       await registry.publish(manager.trackedSessions())
       // Core records each refusal or eviction, including its reason and sizes.
       return result
@@ -541,9 +635,11 @@ export function createNativeCacheKeep(
           // Join a scheduler pass already in progress. With no lease left it
           // cannot authorize or send anything more.
           if (last) await owner.ticking
+          await ready
           // Sends this instance started use its runtime, which the caller
           // closes after disposal; wait for them to observe the abort.
           await Promise.all(lease.inflight)
+          await owner.persistence.drain()
         } finally {
           // Retained sessions are not being warmed, so withdraw them from the
           // shared session list unless another instance adopted them already.

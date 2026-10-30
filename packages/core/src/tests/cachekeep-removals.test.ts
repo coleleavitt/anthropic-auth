@@ -193,6 +193,54 @@ test('count eviction warns once with expiry and capacity numbers', () => {
   expect(manager.trackedCount()).toBe(32)
 })
 
+test('target mirrors observe eviction, explicit removal and expiry', () => {
+  const removed: string[] = []
+  const changed: string[] = []
+  const { manager, track } = fixture({
+    onTargetChanged: (target) => {
+      changed.push(target.id)
+    },
+    onTargetRemoved: (id) => {
+      removed.push(id)
+    },
+  })
+  for (let i = 0; i <= CACHE_KEEP_MAX_TARGETS; i++) track(`s${i}`)
+  expect(removed).toEqual(['s0'])
+  expect(changed).toHaveLength(33)
+  manager.untrack('s1')
+  expect(removed).toEqual(['s0', 's1'])
+  now += CACHE_KEEP_TTL_MS
+  expect(manager.dropExpiredTargets()).toBeUndefined()
+  expect(removed).toHaveLength(33)
+})
+
+test('restoring a target preserves its remaining lifetime and uses the usual memory budget', () => {
+  const removed: string[] = []
+  const { manager, track } = fixture({
+    onTargetRemoved: (id) => {
+      removed.push(id)
+    },
+  })
+  track('old', 'x'.repeat(CACHE_KEEP_MAX_BODY_BYTES))
+  const cacheExpiresAt = now + 60_000
+  const nextPrewarmAt = now - 60_000
+  expect(
+    manager.track({
+      sessionId: 'restored',
+      bodyText: body,
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      storage,
+      cacheMode: 'hybrid',
+      retained: { cacheExpiresAt, nextPrewarmAt },
+    }).tracked,
+  ).toBe(true)
+  expect(removed).toEqual(['old'])
+  expect(manager.trackedSessions()).toEqual([
+    { id: 'restored', cacheExpiresAt, nextPrewarmAt },
+  ])
+})
+
 test('imminent prewarm protection can evict the new session instead of the oldest', () => {
   const { manager, track } = fixture()
   track('due', 'x'.repeat(32 * 1024 * 1024))

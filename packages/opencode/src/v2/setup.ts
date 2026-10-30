@@ -339,7 +339,7 @@ export async function setupAnthropicAuth(
     onForgetSession: wire.forgetSession,
     onRequestPrepared: async (input) => {
       try {
-        await cacheKeep?.track(input)
+        await cacheKeep?.track(input, wire.turnId(input.sessionID))
       } catch {
         logger.warn('cachekeep', 'live request tracking failed')
       }
@@ -372,6 +372,7 @@ export async function setupAnthropicAuth(
         ).parentID,
       ),
   })
+  await cacheKeep.ready
   const capabilities = createNativeMenuCapabilities({
     runtime,
     source,
