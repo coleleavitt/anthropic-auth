@@ -131,13 +131,22 @@ export function createNativePrime(options: {
             index < 2
           ) {
             discard(response)
-            const input = {
+            // Same-account recoveries (a newer vault or local credential, or
+            // relay to direct) go through the source's dedicated recovery
+            // hook, as the OpenCode 2 installer calls it for model requests;
+            // the source's account choice no longer handles them.
+            const next = await source.retrySameAccount?.({
               ...scope,
-              phase: 'retry' as const,
-              rerouteFrom: { accountId, limit },
-            }
-            const next = await source.chooseAccount(input)
-            if (next !== accountId)
+              accountId,
+              attempt: index + 1,
+              limit,
+              error: {
+                type: 'api_error',
+                message: 'Native Prime credential retry',
+                status: response.status,
+              },
+            })
+            if (next?.accountId !== accountId)
               throw new Error('Native Prime retry changed account')
             continue
           }
