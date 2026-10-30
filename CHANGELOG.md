@@ -2,6 +2,8 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
 ## 2.4.6
 
 - After a 429 whose rate-limit headers already show the limit used up, the plugin no longer asks Anthropic's usage endpoint for that account again, which had extended the endpoint's own rate limit for capped accounts.
