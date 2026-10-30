@@ -140,6 +140,7 @@ import {
   type NativeUiOptions,
   NativeVaultNoAccountError,
   nativeAccountCanServe,
+  nativeAccountPolicy,
   nativeAccountRefusal,
   nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
@@ -277,6 +278,11 @@ import {
   formatKillswitchBlockMessage,
   resolveScopedDrivenBlock,
 } from './request-policy.ts'
+import {
+  createRoutingRelay,
+  routingChoiceMatches,
+  routingReserveAllows,
+} from './routing-relay.ts'
 import {
   drainNotifications,
   isTuiConnected,
@@ -1915,6 +1921,8 @@ const anthropicAuthPlugin = async (
   // routing never opens or rewrites the local file. The runtime's mode is read
   // per use because enrollment can change while the plugin runs.
   const stickySessionRouters = new Map<string, StickySessionRouter>()
+  const routingRelay = createRoutingRelay()
+  const routingServedTurns = new WeakSet<PerfTrace>()
   async function currentStickyRouting(): Promise<{
     router: StickySessionRouter
     accountIdentities?: ReadonlyMap<string, string>
@@ -7918,6 +7926,7 @@ const anthropicAuthPlugin = async (
             // that, a relayed upstream 401 is only recorded: the dispatch may
             // still replay on a newer version, which makes this one obsolete.
             let relayReturned = false
+            let routingHeaders: Headers | undefined
             const reportScoped401 = reportVault401
             // The relay scrubs each physical relay attempt's responses and
             // errors with that attempt's own credentials and the relay token;
@@ -7968,6 +7977,7 @@ const anthropicAuthPlugin = async (
                   }
                 },
                 onResponseHeaders: (headers) => {
+                  routingHeaders = headers
                   harvestQuotaHeaders(headers, served)
                   billingLineageTracker.commit(
                     activeBillingLineage,
@@ -8087,6 +8097,38 @@ const anthropicAuthPlugin = async (
               billingLineageTracker.commit(
                 activeBillingLineage,
                 extractAnthropicRequestId(response.headers),
+              )
+            }
+            if (relayAffinity && !laneStartRequest) {
+              const headers = usedDirectFetch
+                ? response.headers
+                : (routingHeaders ?? response.headers)
+              // All retries for one client request reuse its trace, so report served only once.
+              const servedTurn =
+                response.status < 400 &&
+                (!trace || !routingServedTurns.has(trace))
+              if (servedTurn && trace) routingServedTurns.add(trace)
+              routingRelay.report(
+                relayAffinity,
+                {
+                  accountIdentity: nativeAuthorization.accountIdentity,
+                  credentialId: nativeAuthorization.scopedAttempt?.credentialId,
+                },
+                headers,
+                response.status,
+                response.status === 429
+                  ? mergeHeaderQuotaForPersistence(
+                      oauthAccountId === 'main'
+                        ? quotaManager.getMain(mainQuotaIdentity?.quotaKey)
+                            ?.quota
+                        : quotaManager.getAllFallbacks().get(oauthAccountId)
+                            ?.quota,
+                      normalizeQuotaHeaders(headers),
+                    )
+                  : isQuotaBearingHeaderFrame(headers)
+                    ? normalizeQuotaHeaders(headers)
+                    : undefined,
+                servedTurn,
               )
             }
             attachCacheDiagnosticsResponse(response, {
@@ -9486,17 +9528,59 @@ const anthropicAuthPlugin = async (
                     requestedModelId: routingModelId,
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
+                  const advice = await routingRelay.accountFor(
+                    sessionId,
+                    routingModelId ?? '',
+                  )
+                  let advisedAccountId: string | undefined
+                  if (advice) {
+                    const snapshot = await nativeAccounts.read()
+                    const account = snapshot.accounts.find((row) =>
+                      routingChoiceMatches(advice, row),
+                    )
+                    if (
+                      account &&
+                      nativeAccountCanServe(account) &&
+                      nativeAccountPolicy(account, snapshot, routingModelId)
+                        .status === 'allowed' &&
+                      stickyRoutes.candidates.some(
+                        (row) => row.accountId === account.id,
+                      ) &&
+                      routingReserveAllows(
+                        account.id,
+                        stickyRoutes.candidates,
+                        stickyRoutes.storage,
+                        routingModelId ?? '',
+                      )
+                    ) {
+                      advisedAccountId = account.id
+                    } else {
+                      routingRelay.override(
+                        sessionId,
+                        'unknown account, credential, account policy or Fable reserve',
+                      )
+                    }
+                  }
                   const resolveRoute = async (
                     excludeAccountIds?: Set<string>,
                   ) => {
                     const routing = await currentStickyRouting()
+                    // Use shared routing advice only for the first choice;
+                    // retries after quota exhaustion make their own account choice.
+                    const advised = !excludeAccountIds && advisedAccountId
                     return routing.router.resolve({
                       sessionId,
                       family,
                       modelId: routingModelId,
                       affinityModelId: requestModel,
-                      candidates: stickyRoutes.candidates,
-                      retainAccountIds: stickyRoutes.retainAccountIds,
+                      candidates: advised
+                        ? stickyRoutes.candidates.filter(
+                            (row) => row.accountId === advised,
+                          )
+                        : stickyRoutes.candidates,
+                      retainAccountIds: advised
+                        ? new Set([advised])
+                        : stickyRoutes.retainAccountIds,
                       storage: stickyRoutes.storage,
                       inputBytes:
                         typeof init?.body === 'string'
@@ -9504,6 +9588,7 @@ const anthropicAuthPlugin = async (
                           : 1,
                       preferredAccountId,
                       excludeAccountIds,
+                      ...(advised && { preserveOnNoCandidate: true }),
                       ...(routing.accountIdentities && {
                         accountIdentities: routing.accountIdentities,
                       }),
@@ -9526,6 +9611,39 @@ const anthropicAuthPlugin = async (
                         ),
                     )
                   let resolution = await resolveRoute()
+                  if (advisedAccountId && !resolution) {
+                    routingRelay.override(
+                      sessionId,
+                      'advised account is not selectable',
+                    )
+                    advisedAccountId = undefined
+                    resolution = await resolveRoute()
+                  }
+                  if (
+                    advisedAccountId &&
+                    resolution?.accountId === advisedAccountId &&
+                    advice?.hold
+                  ) {
+                    return new Response(
+                      JSON.stringify({
+                        type: 'error',
+                        error: {
+                          type: 'rate_limit_error',
+                          message:
+                            'Shared routing requested a wait; retaining session affinity.',
+                        },
+                      }),
+                      {
+                        status: 429,
+                        headers: {
+                          'content-type': 'application/json',
+                          'retry-after': String(
+                            Math.ceil(advice.hold.retry_after_ms / 1000),
+                          ),
+                        },
+                      },
+                    )
+                  }
                   if (!resolution && incompleteQuotaPool) {
                     if (auth.modelDenied) return modelDeniedResponse()
                     throw new Error(

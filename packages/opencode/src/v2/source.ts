@@ -47,6 +47,11 @@ import type {
 } from '@cortexkit/common-auth/opencode2'
 import { extractAnthropicRequestId } from '../billing-lineage'
 import {
+  createRoutingRelay,
+  routingChoiceMatches,
+  routingReserveAllows,
+} from '../routing-relay'
+import {
   type NativeAnthropicAttemptContext,
   type NativeAnthropicAuthorization,
   type NativeAnthropicBodyOptions,
@@ -208,6 +213,8 @@ export function createNativeAnthropicSource(
 ): NativeSource {
   const { runtime } = options
   const usagePublications = createNativeUsagePublisher('native-auth')
+  const routingRelay = createRoutingRelay()
+  const servedTurns = new Set<string>()
   // Vault mode keeps session affinity in its own file, named by the snapshot,
   // so vault sessions never read or write the local account's routing state.
   // Local mode uses the destination from the runtime's existing authority read.
@@ -490,6 +497,14 @@ export function createNativeAnthropicSource(
         )
       )
         return undefined
+      if (input.phase === 'request') servedTurns.delete(input.sessionID)
+      const advice = await routingRelay.accountFor(input.sessionID, modelID)
+      active.signal.throwIfAborted()
+      if (advice) {
+        snapshot = await runtime.read()
+        active.signal.throwIfAborted()
+        assertTransport(snapshot)
+      }
       const oauth: NativeAccountView[] = []
       for (const account of snapshot.accounts) {
         if (account.type !== 'oauth' || !eligible(account, snapshot, modelID))
@@ -506,6 +521,60 @@ export function createNativeAnthropicSource(
           if (admission.status !== 'usable') continue
         }
         oauth.push(account)
+      }
+      if (advice) {
+        const account = oauth.find((row) => routingChoiceMatches(advice, row))
+        const candidates = oauth.map((row, order) => ({
+          accountId: row.id,
+          order,
+          quota: row.quota ?? { kind: 'unknown' as const },
+        }))
+        const supportedHold =
+          !advice.hold ||
+          (input.phase === 'retry' &&
+            input.rerouteFrom?.accountId === account?.id)
+        if (
+          account &&
+          supportedHold &&
+          (advice.hold || account.id !== input.rerouteFrom?.accountId) &&
+          routingReserveAllows(
+            account.id,
+            candidates,
+            snapshot.policyStorage,
+            modelID,
+          )
+        ) {
+          const selected = await routerFor(snapshot).resolve({
+            sessionId: input.sessionID,
+            family: stickyRouteFamilyForModel(modelID),
+            modelId: modelID,
+            affinityModelId: input.modelID,
+            candidates: candidates.filter(
+              (row) => row.accountId === account.id,
+            ),
+            retainAccountIds: new Set([account.id]),
+            ...(snapshot.mode === 'claustrum'
+              ? {
+                  accountIdentities: new Map([[account.id, advice.account_id]]),
+                }
+              : {}),
+            storage: snapshot.policyStorage,
+            inputBytes: 1,
+            preserveOnNoCandidate: true,
+          })
+          active.signal.throwIfAborted()
+          if (selected)
+            return advice.hold
+              ? { hold: { delayMs: advice.hold.retry_after_ms } }
+              : selected.accountId
+        }
+        // Unlike OpenCode 1's 429, the host hold can only retain a refused retry account.
+        routingRelay.override(
+          input.sessionID,
+          !supportedHold
+            ? 'hold requires the same refused retry account'
+            : 'unknown account, credential, account policy or Fable reserve',
+        )
       }
       const hold = stickyHold(input, snapshot, oauth, modelID)
       if (hold) return hold
@@ -861,6 +930,29 @@ export function createNativeAnthropicSource(
     },
     quotaFromHeaders(headers, input) {
       const state = states.get(input.provenance)
+      if (state) {
+        const served = input.status < 400 && !servedTurns.has(input.sessionID)
+        if (served) servedTurns.add(input.sessionID)
+        routingRelay.report(
+          input.sessionID,
+          {
+            accountIdentity: state.account.accountIdentity,
+            credentialId:
+              input.provenance.kind === 'vault'
+                ? input.provenance.credentialId
+                : state.account.credentialId,
+          },
+          headers,
+          input.status,
+          input.status === 429
+            ? mergeHeaderQuotaForPersistence(
+                state.quota,
+                normalizeQuotaHeaders(headers),
+              )
+            : normalizeQuotaHeaders(headers),
+          served,
+        )
+      }
       const requestId = extractAnthropicRequestId(headers)
       if (requestId) options.onRequestId?.(input, requestId)
       if (
@@ -1071,6 +1163,7 @@ export function createNativeAnthropicSource(
       }
     },
     forgetSession(sessionID) {
+      servedTurns.delete(sessionID)
       sessions.get(sessionID)?.abort()
       sessions.delete(sessionID)
       servedBy.delete(sessionID)

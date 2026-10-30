@@ -6,6 +6,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - OpenCode 2: cache keep-warm saves its sessions, gzipped, to an owner-only folder in the system temp directory, so a server restart no longer drops them and the next turn reads the existing prompt cache. Addresses #545.
 - Sticky-balanced routing no longer parks a session for days when its account hits a weekly limit: a 429 whose own rate-limit headers show the limit used up moves the session to an account with room, and a 429 that can't be confirmed is retried after a short wait instead of Anthropic's long `retry-after`.
+- When OpenCode runs under CortexKit's agent runner, the plugin asks the shared routing service which Claude account to use and reports quota back. The answer is advisory: the plugin's own account rules still apply, and without the runner nothing changes.
 - `@cortexkit/common-auth` moves to 0.31.0. On OpenCode 2, a session that also uses OpenCode's own Anthropic login or an API key now still retries a rejected vault or local login, and a failed relay, on the same account.
 
 ## 2.4.4

@@ -62,6 +62,7 @@ import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-f
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
+import { ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
 import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,
@@ -110,6 +111,272 @@ const exists = (path: string) =>
 const cleanups: Array<() => Promise<void> | void> = []
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+})
+
+describe('OC2 shared routing relay', () => {
+  function bridge(
+    accountFor: () => unknown,
+    report: (value: unknown) => unknown = () => {},
+  ) {
+    const globals = globalThis as Record<symbol, unknown>
+    const key = Symbol.for('cortexkit.routing')
+    globals[key] = () => ({ accountFor, report })
+    cleanups.push(() => {
+      delete globals[key]
+    })
+  }
+
+  test('accepts a late-installed answer, moves an existing pin and stays pinned without advice', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    expect(await native.chooseAccount(scope)).toBe('main')
+    const snapshot = await f.runtime.read()
+    const fallback = snapshot.accounts.find(
+      (row) => row.accountIdentity === fallbackIdentity,
+    )!
+    let answer: unknown = {
+      account_id: fallbackIdentity,
+      credential_id: fallback.credentialId,
+    }
+    bridge(() => answer)
+    expect(await native.chooseAccount(scope)).toBe(fallback.id)
+    await native.drainRoutingPublications()
+    expect(
+      rawPin(await readFile(snapshot.routingPath!, 'utf8'), scope.sessionID),
+    ).toContain(fallbackIdentity)
+    answer = null
+    expect(await native.chooseAccount(scope)).toBe(fallback.id)
+  })
+
+  test.each(['null', 'unknown', 'wrong credential'])(
+    '%s answer preserves the local choice',
+    async (mode) => {
+      const f = await vaultWithFallback()
+      const native = source(f.runtime, f.paths)
+      bridge(() =>
+        mode === 'null'
+          ? null
+          : {
+              account_id: mode === 'unknown' ? 'unknown' : fallbackIdentity,
+              credential_id: 'wrong',
+            },
+      )
+      expect(await native.chooseAccount(scope)).toBe('main')
+    },
+  )
+
+  test('a retry asks routing again and a capped same-account hold keeps the pin', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    let calls = 0
+    bridge(() => {
+      calls++
+      return {
+        account_id: identity,
+        credential_id: 'oauth:anthropic',
+        hold: { retry_after_ms: 9_000_000 },
+      }
+    })
+    // The host can wait only when retrying a refused account, not before an initial send.
+    expect(await native.chooseAccount(scope)).toBe('main')
+    const before = await f.runtime.read()
+    await native.drainRoutingPublications()
+    const pin = rawPin(
+      await readFile(before.routingPath!, 'utf8'),
+      scope.sessionID,
+    )
+    expect(
+      await native.chooseAccount({
+        ...scope,
+        phase: 'retry',
+        rerouteFrom: {
+          accountId: 'main',
+          limit: { reason: 'provider-429', status: 429 },
+        },
+      }),
+    ).toEqual({ hold: { delayMs: ROUTING_HOLD_LIMIT_MS } })
+    await native.drainRoutingPublications()
+    expect(
+      rawPin(await readFile(before.routingPath!, 'utf8'), scope.sessionID),
+    ).toBe(pin)
+    expect(calls).toBe(2)
+  })
+
+  test('a hold naming another account cannot hold or move the refused account', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    await native.chooseAccount(scope)
+    bridge(() => ({
+      account_id: identity,
+      credential_id: 'oauth:anthropic',
+      hold: { retry_after_ms: 100 },
+    }))
+    const choice = await native.chooseAccount({
+      ...scope,
+      phase: 'retry',
+      rerouteFrom: {
+        accountId: 'main',
+        limit: { reason: 'provider-403', status: 403 },
+      },
+    })
+    expect(choice).toEqual({ hold: { delayMs: 100 } })
+    bridge(() => ({
+      account_id: fallbackIdentity,
+      credential_id: 'oauth:anthropic:work',
+      hold: { retry_after_ms: 100 },
+    }))
+    expect(
+      typeof (await native.chooseAccount({
+        ...scope,
+        phase: 'retry',
+        rerouteFrom: {
+          accountId: 'main',
+          limit: { reason: 'provider-403', status: 403 },
+        },
+      })),
+    ).toBe('string')
+  })
+
+  test('reports the actual serving account once with safe headers even if report throws', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const reports: any[] = []
+    bridge(
+      () => null,
+      (report) => {
+        reports.push(report)
+        throw new Error('bridge unavailable')
+      },
+    )
+    await native.chooseAccount(scope)
+    const auth = await native.authorizeAccount(scope, 'main')
+    if (!auth) throw new Error('No authorization')
+    const headers = new Headers({
+      'Anthropic-RateLimit-New-Header': 'kept',
+      'request-id': 'discarded',
+    })
+    native.quotaFromHeaders?.(headers, {
+      ...context(auth.provenance),
+      status: 200,
+    })
+    native.quotaFromHeaders?.(headers, {
+      ...context(auth.provenance),
+      status: 200,
+    })
+    await Promise.resolve()
+    expect(reports).toEqual([
+      {
+        account_id: identity,
+        credential_id: 'oauth:anthropic',
+        outcome: 'served',
+        headers: { 'anthropic-ratelimit-new-header': 'kept' },
+      },
+    ])
+  })
+
+  test.each(['floor', 'reserve', 'disabled', 'model scope'])(
+    'overrides advice refused by %s',
+    async (mode) => {
+      const f = await vaultWithFallback()
+      const originalRead = f.runtime.read
+      const now = Date.now()
+      const quota = (remaining: number, fable: number) => ({
+        checkedAt: now,
+        five_hour: {
+          usedPercent: 100 - remaining,
+          remainingPercent: remaining,
+          checkedAt: now,
+        },
+        seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+        scoped: [
+          {
+            id: 'fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 100 - fable,
+            remainingPercent: fable,
+            checkedAt: now,
+          },
+        ],
+      })
+      const runtime: NativeAccountRuntime = {
+        ...f.runtime,
+        read: async () => {
+          const snapshot = await originalRead()
+          return {
+            ...snapshot,
+            policyStorage: {
+              ...snapshot.policyStorage,
+              ...(mode === 'floor'
+                ? { killswitch: { enabled: true, main: { five_hour: 20 } } }
+                : {}),
+            },
+            accounts: snapshot.accounts.map((row) => ({
+              ...row,
+              ...(mode === 'disabled' && row.id !== 'main'
+                ? { enabled: false }
+                : {}),
+              quota:
+                row.id === 'main'
+                  ? quota(100, mode === 'reserve' ? 0 : 100)
+                  : quota(
+                      mode === 'floor' ? 10 : 100,
+                      mode === 'model scope' ? 0 : 100,
+                    ),
+            })),
+          }
+        },
+      }
+      const native = source(runtime, f.paths)
+      bridge(() => ({
+        account_id: fallbackIdentity,
+        credential_id: 'oauth:anthropic:work',
+        ...(mode === 'floor' ? { hold: { retry_after_ms: 100 } } : {}),
+      }))
+      expect(
+        await native.chooseAccount({
+          ...scope,
+          modelID:
+            mode === 'reserve'
+              ? 'claude-opus-4-8'
+              : mode === 'model scope'
+                ? 'claude-fable-5'
+                : scope.modelID,
+        }),
+      ).toBe('main')
+    },
+  )
+
+  test('a slow relay falls back to our account choice', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    bridge(() => new Promise(() => {}))
+    expect(await native.chooseAccount(scope)).toBe('main')
+  })
+
+  test('same-account credential recovery never asks routing', async () => {
+    const f = await vault()
+    const native = source(f.runtime, f.paths)
+    let calls = 0
+    bridge(() => {
+      calls++
+      return null
+    })
+    expect(await native.chooseAccount(scope)).toBe('main')
+    const auth = await native.authorizeAccount(scope, 'main')
+    if (!auth) throw new Error('No authorization')
+    const limit = await native.limitFromResponse?.({
+      ...context(auth.provenance),
+      status: 401,
+      headers: new Headers(),
+      body: async () => '',
+    })
+    if (!limit) throw new Error('No newer credential recovery')
+    expect(await native.retrySameAccount?.(sameAccountInput(limit))).toEqual({
+      accountId: 'main',
+    })
+    expect(calls).toBe(1)
+  })
 })
 const usageTests = createTestLifetimeSuite()
 
