@@ -487,6 +487,10 @@ describe('source-warm', () => {
         fallbackManager.sourceWarmFor(recoveryKey(sessionId)),
       ).toMatchObject({ warmsSinceUserTurn: 0 })
 
+      // Only the kept source prefix has an idle cap. Stop warming the live
+      // Opus 4.8 prefix so the long idle stretch sends no unrelated prewarms.
+      expect(cacheKeep.untrack(sessionId)).toBe(true)
+
       // Opus 5.5 pricing derives a cap of 39 warms per idle stretch. Step
       // just under a lifetime so every tick finds a due (not expired) warm.
       for (let index = 0; index < 39; index++) {

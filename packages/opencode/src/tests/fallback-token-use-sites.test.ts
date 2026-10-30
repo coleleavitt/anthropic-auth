@@ -740,6 +740,9 @@ async function createFixture(
   const clearInterval = mock(
     () => {},
   ) as unknown as typeof globalThis.clearInterval
+  // Recovery advances a frozen clock past quota expiry. Keep the quota GETs,
+  // but do not spend real time spacing calls to the in-memory usage endpoint.
+  const quotaCallPause = mock((_ms: number) => Promise.resolve())
   scope.assertOpen()
   if (options.fallbackMode)
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
@@ -760,6 +763,7 @@ async function createFixture(
       claustrumScopedConnect: async () => scopedClient,
       setInterval,
       clearInterval,
+      ...(options.recovery ? { quotaCallPause } : {}),
     },
   )) as any
   scope.own(plugin)
@@ -781,6 +785,7 @@ async function createFixture(
     plugin,
     records,
     result,
+    quotaCallPause,
     storage,
     discoverNextFallback() {
       includeNextInRoster = true
@@ -1113,6 +1118,7 @@ describe('vault-served fallback outbound token census', () => {
             })
             await send('claude-opus-5-5')
           }
+          expect(fixture.quotaCallPause).toHaveBeenCalledWith(1_000)
         },
       )
 
