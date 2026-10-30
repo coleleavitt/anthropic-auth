@@ -2,10 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.4.6
 
 - After a 429 whose rate-limit headers already show the limit used up, the plugin no longer asks Anthropic's usage endpoint for that account again, which had extended the endpoint's own rate limit for capped accounts.
 - When OpenCode runs under CortexKit's agent runner, the plugin asks the shared routing service which Claude account to use and reports quota back. The answer is advisory: the plugin's own account rules still apply, and without the runner nothing changes.
+
 ## 2.4.5
 
 - OpenCode 2: cache keep-warm saves its sessions, gzipped, to an owner-only folder in the system temp directory, so a server restart no longer drops them and the next turn reads the existing prompt cache. Addresses #545.
