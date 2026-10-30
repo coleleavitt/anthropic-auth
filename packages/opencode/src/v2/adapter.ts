@@ -323,7 +323,10 @@ export interface NativeAnthropicSource<Q, P> {
     | Promise<SameAccountRetryResult | undefined>
     | SameAccountRetryResult
     | undefined
-  /** Releases a same-account recovery the host will not send. */
+  /**
+   * Discards the retry `retrySameAccount` prepared (the newer credential or
+   * the switch from relay to direct) when the host decides not to send it.
+   */
   readonly dropSameAccountRetry?: (
     input: SameAccountRetryInput & SameAccountRetryResult,
   ) => Promise<void> | void

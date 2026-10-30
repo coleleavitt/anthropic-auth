@@ -607,7 +607,8 @@ export function createNativeAnthropicSource(
         key(retry.scope, retry.accountId) !== key(input, input.accountId)
       )
         return undefined
-      // A declined or throwing recovery must release its uncommitted state.
+      // Remove the prepared retry now, so a retry this call declines or fails
+      // on can never be handed to a later request.
       retries.delete(retry.reason)
       const active = controller(input)
       const snapshot = await runtime.read()

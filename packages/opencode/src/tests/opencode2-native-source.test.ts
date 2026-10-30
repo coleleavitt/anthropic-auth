@@ -1320,7 +1320,8 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
     ).toEqual(['request'])
     await native.drainRoutingPublications()
     expect(await readFile(routingPath, 'utf8')).toBe(pin)
-    // A used recovery must leave the queue so a later authorization cannot consume it.
+    // The retry above used its prepared credential; a later authorization
+    // must get a fresh one, not that credential again.
     expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
       accessToken: 'sk-ant-oat01-vault-9',
     })
@@ -1412,8 +1413,9 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
       const events: string[] = []
       choose.mockImplementation((input) => {
         events.push(`choose:${input.sessionID}`)
-        // Returning the refused account keeps the host's decision, unlike an
-        // same-account recovery, which requests an immediate retry.
+        // Naming the refused account again leaves the retry decision to the
+        // host. Retrying on the same account with a newer credential goes
+        // through retrySameAccount instead, which asks for an immediate retry.
         if (input.phase === 'retry') return input.rerouteFrom?.accountId
         return originalChoose(input)
       })

@@ -131,10 +131,10 @@ export function createNativePrime(options: {
             index < 2
           ) {
             discard(response)
-            // Same-account recoveries (a newer vault or local credential, or
-            // relay to direct) go through the source's dedicated recovery
-            // hook, as the OpenCode 2 installer calls it for model requests;
-            // the source's account choice no longer handles them.
+            // A retry on the same account (with a newer vault or local
+            // credential, or direct instead of through the relay) goes through
+            // retrySameAccount, the same hook OpenCode 2 uses for model
+            // requests; chooseAccount only picks a different account.
             const next = await source.retrySameAccount?.({
               ...scope,
               accountId,
