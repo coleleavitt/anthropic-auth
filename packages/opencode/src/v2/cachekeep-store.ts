@@ -107,6 +107,16 @@ function valid(
   return sanitizedBody(value.bodyText) === value.bodyText
 }
 
+export interface CacheKeepStoreOptions {
+  storageId: string
+  /** Test seam; production always uses os.tmpdir(), never OpenCode's config. */
+  root?: string
+  ownerOnly?: OwnerOnlyOptions
+  now?: () => number
+  setTimeoutImpl?: typeof globalThis.setTimeout
+  clearTimeoutImpl?: typeof globalThis.clearTimeout
+}
+
 /** Best-effort restart storage. No caller of changed() waits for disk or zlib. */
 export class CacheKeepStore {
   readonly directory: string
@@ -116,29 +126,19 @@ export class CacheKeepStore {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly lastWrite = new Map<string, number>()
   private readonly latest = new Map<string, SavedCacheKeepTarget>()
-  private readonly writtenTurn = new Map<string, string>()
-  private readonly pendingTurn = new Map<string, string>()
 
-  constructor(
-    private readonly options: {
-      storageId: string
-      /** Test seam; production always uses os.tmpdir(), never OpenCode's config. */
-      root?: string
-      ownerOnly?: OwnerOnlyOptions
-    },
-  ) {
+  constructor(private readonly options: CacheKeepStoreOptions) {
     this.directory = cacheKeepStoreDirectory(options.storageId, options.root)
   }
 
   private refuse() {
     if (this.disabled) return
     this.disabled = true
-    for (const timer of this.timers.values()) clearTimeout(timer)
+    for (const timer of this.timers.values())
+      (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
     this.timers.clear()
     this.pending.clear()
     this.latest.clear()
-    this.pendingTurn.clear()
-    this.writtenTurn.clear()
     this.lastWrite.clear()
     logger.warn(
       'cachekeep',
@@ -237,9 +237,8 @@ export class CacheKeepStore {
     }
   }
 
-  changed(target: Readonly<CacheKeepTarget>, turnId?: string) {
+  changed(target: Readonly<CacheKeepTarget>) {
     if (this.disabled) return
-    if (turnId && this.writtenTurn.get(target.id) === turnId) return
     const entry = record(target)
     const previous = this.latest.get(entry.id)
     if (
@@ -254,31 +253,32 @@ export class CacheKeepStore {
       return
     this.latest.set(entry.id, entry)
     this.pending.set(entry.id, entry)
-    if (turnId) this.pendingTurn.set(entry.id, turnId)
     if (this.timers.has(entry.id)) return
-    // Coalesce preparation before the first write of a user turn. Later tool
-    // steps in that same turn stay in memory; the next turn can save again.
-    // Each session is also capped at one write per five seconds.
+    // Coalesce nearby preparations into the latest body, including tool steps
+    // in a long user turn. Each session is capped at one write per five seconds;
+    // disposal drains the latest pending body without waiting for that window.
     const delay = Math.max(
       250,
-      (this.lastWrite.get(entry.id) ?? 0) + 5000 - Date.now(),
+      (this.lastWrite.get(entry.id) ?? 0) +
+        5000 -
+        (this.options.now?.() ?? Date.now()),
     )
-    const timer = setTimeout(() => this.flush(entry.id), delay)
+    const timer = (this.options.setTimeoutImpl ?? setTimeout)(
+      () => this.flush(entry.id),
+      delay,
+    )
     timer.unref?.()
     this.timers.set(entry.id, timer)
   }
 
   private flush(id: string) {
     const timer = this.timers.get(id)
-    if (timer) clearTimeout(timer)
+    if (timer) (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
     this.timers.delete(id)
     const entry = this.pending.get(id)
     this.pending.delete(id)
-    if (!entry) return
-    const turn = this.pendingTurn.get(id)
-    this.pendingTurn.delete(id)
-    if (turn) this.writtenTurn.set(id, turn)
-    this.lastWrite.set(id, Date.now())
+    if (!entry) return this.chain
+    this.lastWrite.set(id, this.options.now?.() ?? Date.now())
     this.enqueue(async () => {
       const path = join(this.directory, `${hash(id)}.json.gz`)
       const temp = `${path}.${randomUUID()}.tmp`
@@ -296,30 +296,28 @@ export class CacheKeepStore {
         await rm(temp, { force: true })
       }
     })
+    return this.chain
   }
 
   removed(id: string) {
     const timer = this.timers.get(id)
-    if (timer) clearTimeout(timer)
+    if (timer) (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
     this.timers.delete(id)
     this.pending.delete(id)
     this.latest.delete(id)
     this.lastWrite.delete(id)
-    this.writtenTurn.delete(id)
-    this.pendingTurn.delete(id)
     this.enqueue(() =>
       rm(join(this.directory, `${hash(id)}.json.gz`), { force: true }),
     )
   }
 
   clear() {
-    for (const timer of this.timers.values()) clearTimeout(timer)
+    for (const timer of this.timers.values())
+      (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
     this.timers.clear()
     this.pending.clear()
     this.latest.clear()
     this.lastWrite.clear()
-    this.writtenTurn.clear()
-    this.pendingTurn.clear()
     this.enqueue(async () => {
       for (const name of await readdir(this.directory))
         if (FILE.test(name) || TEMP.test(name))

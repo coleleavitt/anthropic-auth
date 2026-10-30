@@ -39,7 +39,6 @@ export function createNativeWirePolicy() {
   }
 
   return {
-    turnId: (sessionID: string) => latest.get(sessionID),
     async install(ctx: Pick<Plugin.Context, 'session'>): Promise<Registration> {
       const registrations: Registration[] = []
       try {

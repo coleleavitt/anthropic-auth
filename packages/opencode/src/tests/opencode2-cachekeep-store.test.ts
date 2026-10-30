@@ -107,18 +107,15 @@ test('restart storage does not redact tool schemas or change ordinary cached bod
   expect((await f.saved()).bodyText).toBe(f.target.bodyText)
 })
 
-test('restart writes coalesce and persist at most one snapshot per user turn', async () => {
+test('restart writes coalesce the latest body and drain includes later tool steps', async () => {
   const f = await fixture()
-  f.store.changed(f.target, 'turn-1')
+  f.store.changed(f.target)
   f.target.bodyText = '{"system":"latest before flush"}'
-  f.store.changed(f.target, 'turn-1')
+  f.store.changed(f.target)
   await f.store.drain()
   expect((await f.saved()).bodyText).toContain('latest before flush')
   f.target.bodyText = '{"system":"later tool step"}'
-  f.store.changed(f.target, 'turn-1')
-  await f.store.drain()
-  expect((await f.saved()).bodyText).toContain('latest before flush')
-  f.store.changed(f.target, 'turn-2')
+  f.store.changed(f.target)
   await f.store.drain()
   expect((await f.saved()).bodyText).toContain('later tool step')
 })

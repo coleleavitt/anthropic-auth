@@ -339,7 +339,7 @@ export async function setupAnthropicAuth(
     onForgetSession: wire.forgetSession,
     onRequestPrepared: async (input) => {
       try {
-        await cacheKeep?.track(input, wire.turnId(input.sessionID))
+        await cacheKeep?.track(input)
       } catch {
         logger.warn('cachekeep', 'live request tracking failed')
       }

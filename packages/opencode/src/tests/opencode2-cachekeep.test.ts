@@ -48,7 +48,30 @@ afterEach(async () => {
 })
 
 class Timers {
+  constructor(
+    private readonly now: () => number,
+    private readonly afterTick: () => Promise<unknown>,
+  ) {}
   readonly callbacks = new Map<object, () => unknown>()
+  readonly timeouts = new Map<object, { callback: () => unknown; at: number }>()
+  readonly setTimeout: typeof globalThis.setTimeout = ((
+    callback: () => unknown,
+    ms: number,
+  ) => {
+    const id = { unref() {} }
+    this.timeouts.set(id, { callback, at: this.now() + ms })
+    return id
+  }) as unknown as typeof globalThis.setTimeout
+  readonly clearTimeout: typeof globalThis.clearTimeout = ((id: object) => {
+    this.timeouts.delete(id)
+  }) as unknown as typeof globalThis.clearTimeout
+  async fireTimeouts() {
+    for (const [id, timeout] of this.timeouts) {
+      if (timeout.at > this.now()) continue
+      this.timeouts.delete(id)
+      await timeout.callback()
+    }
+  }
   readonly setInterval: typeof globalThis.setInterval = ((
     callback: () => unknown,
   ) => {
@@ -63,6 +86,7 @@ class Timers {
     await Promise.all(
       [...this.callbacks.values()].map((callback) => callback()),
     )
+    await this.afterTick()
   }
 }
 
@@ -140,7 +164,15 @@ async function fixture(
     }))
   }
   let now = Date.now()
-  const timers = new Timers()
+  const timers = new Timers(
+    () => now,
+    async () => {
+      // Registry publication is queued after a scheduler pass. Join the writer
+      // before the fixture's separate registry reader inspects the lease file.
+      const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+      await (globalThis as any)[key]?.get(paths.storageId)?.registry.list()
+    },
+  )
   const registryDirectory = join(directory, 'registry')
   if (brokenRegistry) await writeFile(registryDirectory, 'not a directory')
   const registry = new CacheKeepSessionRegistry({
@@ -211,7 +243,12 @@ async function fixture(
         setIntervalImpl: timers.setInterval,
         clearIntervalImpl: timers.clearInterval,
         registryDirectory,
-        persistence: { root: directory },
+        persistence: {
+          root: directory,
+          now: () => now,
+          setTimeoutImpl: timers.setTimeout,
+          clearTimeoutImpl: timers.clearTimeout,
+        },
       },
     })
     cleanups.push(dispose)
@@ -824,6 +861,73 @@ function forgetCacheKeepProcess(storageId: string) {
   const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
   ;(globalThis as any)[key]?.delete(storageId)
 }
+
+test('OpenCode 2 restores the latest body from two steps in the same turn more than five seconds apart', async () => {
+  const f = await fixture()
+  const first = (await (await f.live()).json()) as Record<string, any>
+  f.advance(250)
+  await f.timers.fireTimeouts()
+  f.advance(6000)
+  // live() reuses the same user-message ID, so these tool-loop steps belong
+  // to one user turn rather than starting a new turn for the second body.
+  const second = (await (
+    await f.live(undefined, {
+      messages: [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Long tool-loop output' },
+        { role: 'user', content: 'Continue from the latest tool step' },
+      ],
+    })
+  ).json()) as Record<string, any>
+  expect(second.messages).not.toEqual(first.messages)
+  f.advance(250)
+  await f.timers.fireTimeouts()
+  const [name] = await readdir(f.disk)
+  const saved = JSON.parse(
+    gunzipSync(await readFile(join(f.disk, name!))).toString(),
+  )
+  expect(JSON.parse(saved.bodyText).messages).toEqual(second.messages)
+  await f.dispose()
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  const warm = (await next.sent[0]!.json()) as Record<string, any>
+  expect(warm.messages).toEqual(second.messages)
+  expect(warm.system.slice(1)).toEqual(second.system.slice(1))
+})
+
+test('OpenCode 2 throttles later tool steps for five seconds but disposal drains the latest body', async () => {
+  const f = await fixture()
+  const first = (await (await f.live()).json()) as Record<string, any>
+  f.advance(250)
+  await f.timers.fireTimeouts()
+  const second = (await (
+    await f.live(undefined, {
+      messages: [
+        { role: 'user', content: 'Latest tool step before a clean restart' },
+      ],
+    })
+  ).json()) as Record<string, any>
+  f.advance(4999)
+  await f.timers.fireTimeouts()
+  const [name] = await readdir(f.disk)
+  const saved = JSON.parse(
+    gunzipSync(await readFile(join(f.disk, name!))).toString(),
+  )
+  expect(JSON.parse(saved.bodyText).messages).toEqual(first.messages)
+  expect(f.timers.timeouts.size).toBe(1)
+  await f.dispose()
+  expect(f.timers.timeouts.size).toBe(0)
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  const warm = (await next.sent[0]!.json()) as Record<string, any>
+  expect(warm.messages).toEqual(second.messages)
+})
 
 test.each([
   'expired',

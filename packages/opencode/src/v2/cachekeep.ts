@@ -15,14 +15,13 @@ import {
   type NativeAccountView,
   nativeAccountCanServe,
   nativeAccountRefusal,
-  type OwnerOnlyOptions,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
 import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
 } from './adapter'
-import { CacheKeepStore } from './cachekeep-store'
+import { CacheKeepStore, type CacheKeepStoreOptions } from './cachekeep-store'
 import type { NativeSource, NativeSourceProvenance } from './source'
 
 export interface NativeCacheKeepOptions {
@@ -31,7 +30,7 @@ export interface NativeCacheKeepOptions {
   readonly clearIntervalImpl?: typeof globalThis.clearInterval
   readonly registryDirectory?: string
   /** Filesystem seam for tests; this is not a user setting. */
-  readonly persistence?: { root?: string; ownerOnly?: OwnerOnlyOptions }
+  readonly persistence?: Omit<CacheKeepStoreOptions, 'storageId'>
 }
 
 // Token refreshes preserve this identity; replacing a local row or a vault
@@ -81,7 +80,6 @@ interface SharedCacheKeep {
   readonly registry: CacheKeepSessionRegistry
   readonly persistence: CacheKeepStore
   loading?: Promise<void>
-  trackingTurn?: string
   readonly prepared: Map<
     number,
     {
@@ -161,8 +159,7 @@ function createSharedCacheKeep(
         return shared.ticking
       }, ms)) as typeof globalThis.setInterval,
     clearIntervalImpl: options.clearIntervalImpl,
-    onTargetChanged: (target) =>
-      persistence.changed(target, shared.trackingTurn),
+    onTargetChanged: (target) => persistence.changed(target),
     onTargetRemoved: (id) => {
       restored.delete(id)
       persistence.removed(id)
@@ -551,7 +548,6 @@ export function createNativeCacheKeep(
     ready,
     async track(
       input: Parameters<NonNullable<NativeSource['onRequestPrepared']>>[0],
-      turnId?: string,
     ) {
       // These skips are normal (API-key routes, prewarms, subagents, policy
       // off) and keep any existing target, so they stay at debug and do no
@@ -600,7 +596,6 @@ export function createNativeCacheKeep(
         account.credentialId !== input.provenance.credentialId
       )
         return skipped('vault-credential-changed')
-      owner.trackingTurn = turnId ?? input.attemptId
       const result = manager.track({
         sessionId: input.sessionID,
         url: input.url,
@@ -612,7 +607,6 @@ export function createNativeCacheKeep(
         oauthAccountIdentity: accountKey(account),
         isSubagent,
       })
-      owner.trackingTurn = undefined
       await registry.publish(manager.trackedSessions())
       // Core records each refusal or eviction, including its reason and sizes.
       return result
