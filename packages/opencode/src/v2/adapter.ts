@@ -50,6 +50,8 @@ import type {
   LimitSignal,
   OpenCode2AuthAdapter,
   RequestScope,
+  SameAccountRetryInput,
+  SameAccountRetryResult,
   Transport,
 } from '@cortexkit/common-auth/opencode2'
 import { BILLING_LINEAGE_REQUEST_HEADER } from '../billing-lineage'
@@ -142,6 +144,15 @@ const ANTHROPIC_ERROR_TYPES: ReadonlySet<string> = new Set([
   'api_error',
   'overloaded_error',
 ])
+
+const safeHostError = (
+  error: HostError,
+  message = 'provider request failed',
+): HostError => ({
+  type: ANTHROPIC_ERROR_TYPES.has(error.type) ? error.type : 'provider_error',
+  message,
+  ...(error.status !== undefined ? { status: error.status } : {}),
+})
 
 /** Which kind of credential one send goes out with. */
 export type NativeAnthropicRoute = 'oauth' | 'api'
@@ -305,6 +316,17 @@ export interface NativeAnthropicSource<Q, P> {
   ) => Promise<ChooseAccountResult> | ChooseAccountResult
   /** Discards one queued choice that the installer will not authorize. */
   readonly dropChoice?: (input: AccountRequest) => Promise<void> | void
+  /** Retries a prepared credential or switches relay to direct on the same account. */
+  readonly retrySameAccount?: (
+    input: SameAccountRetryInput,
+  ) =>
+    | Promise<SameAccountRetryResult | undefined>
+    | SameAccountRetryResult
+    | undefined
+  /** Releases a same-account recovery the host will not send. */
+  readonly dropSameAccountRetry?: (
+    input: SameAccountRetryInput & SameAccountRetryResult,
+  ) => Promise<void> | void
   /**
    * The credential for one send with the chosen account; `undefined` refuses
    * the request before anything is sent.
@@ -721,6 +743,19 @@ export function createNativeAnthropicAdapter<Q, P>(
   // A relay's own failure is not a provider credential failure. Only a
   // provider request-id proves that its response came from Anthropic.
   const relayUpstream = new WeakMap<Data, boolean>()
+  // The same-account hook has scope but no attempt handle. Retain only the
+  // latest send's correlation data to classify a relay network error when no
+  // response supplied a limit. Credentials remain in the per-send stores.
+  const retryKey = (scope: AccountRequest) =>
+    JSON.stringify([
+      scope.providerID,
+      scope.sessionID,
+      scope.kind,
+      scope.modelID,
+      scope.agent,
+      scope.accountId,
+    ])
+  const retryAttempts = new Map<string, Attempt<Data>>()
   const responseToolNameMaps = new WeakMap<
     Data,
     NonNullable<StrippedStreamOptions['toolNameMap']>
@@ -1067,6 +1102,11 @@ export function createNativeAnthropicAdapter<Q, P>(
   ): Promise<Request> => {
     const { request, attempt } = input
     const data = attempt.data
+    retryAttempts.set(retryKey(input), attempt)
+    while (retryAttempts.size > maxPending) {
+      const first = retryAttempts.keys().next()
+      if (!first.done) retryAttempts.delete(first.value)
+    }
     const send = data ? pending.get(data) : undefined
     // One authorization serves one send: the entry is gone after this call,
     // so a credential never outlives the request it was issued for.
@@ -1315,6 +1355,25 @@ export function createNativeAnthropicAdapter<Q, P>(
         return choice
       }),
     dropChoice: (input) => source.dropChoice?.(input),
+    async retrySameAccount(input) {
+      if (!source.retrySameAccount) return undefined
+      const key = retryKey(input)
+      const attempt = retryAttempts.get(key)
+      retryAttempts.delete(key)
+      const limit =
+        input.limit ??
+        (attempt ? adapter.limitFromError?.(input.error, attempt) : undefined)
+      return source.retrySameAccount({
+        ...input,
+        error: safeHostError(input.error),
+        ...(limit ? { limit } : {}),
+      })
+    },
+    dropSameAccountRetry: (input) =>
+      source.dropSameAccountRetry?.({
+        ...input,
+        error: safeHostError(input.error),
+      }),
     accountHeaders,
     rewriteRequest,
     rewriteHandshakeURL() {
@@ -1653,13 +1712,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       // The host's error text is never re-scrubbed here: the send's
       // credentials may already be retired. The source gets the status, a
       // documented error type, and safe text recorded while the send was live.
-      const safe: HostError = {
-        type: ANTHROPIC_ERROR_TYPES.has(error.type)
-          ? error.type
-          : 'provider_error',
-        message: safeSummaries.get(data) ?? 'provider request failed',
-        ...(error.status !== undefined ? { status: error.status } : {}),
-      }
+      const safe = safeHostError(error, safeSummaries.get(data))
       // This hook has copied the failed send's classification into safe data.
       // It no longer needs the redactor's credentials to classify the error.
       release(data)
@@ -1762,6 +1815,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       inProgress.clear()
       pending.clear()
+      retryAttempts.clear()
       dumpContexts.clear()
       for (const data of [...owned.keys()]) release(data)
     },
@@ -1770,6 +1824,9 @@ export function createNativeAnthropicAdapter<Q, P>(
         operation.revoked = true
       }
       inProgress.delete(sessionID)
+      for (const [key, attempt] of retryAttempts) {
+        if (attempt.sessionID === sessionID) retryAttempts.delete(key)
+      }
       for (const [data, send] of pending) {
         if (send.sessionID === sessionID) pending.delete(data)
       }

@@ -37,6 +37,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
+  type LimitSignal,
   type OpenCode2HookContext,
   placeholderSecret,
   registerOpenCode2AuthMethods,
@@ -94,6 +95,13 @@ const scope = {
   agent: 'build',
   kind: 'primary' as const,
 }
+const sameAccountInput = (limit: LimitSignal, input = scope) => ({
+  ...input,
+  accountId: 'main',
+  limit,
+  attempt: 1,
+  error: { type: 'provider_error', message: 'provider refused the attempt' },
+})
 const exists = (path: string) =>
   access(path).then(
     () => true,
@@ -352,10 +360,7 @@ usageTests.test(
     })
     expect(limit).toMatchObject({ status: 401 })
     if (!limit) throw new Error('Missing retry limit')
-    await native.chooseAccount({
-      ...scope,
-      rerouteFrom: { accountId: 'main', limit },
-    })
+    await native.retrySameAccount?.(sameAccountInput(limit))
     expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
       accessToken: quotaRefreshAccess,
     })
@@ -444,10 +449,7 @@ for (const scenario of ['proactive', '401', 'deadline'] as const) {
             !('reason' in limit)
           )
             throw new Error('Missing 401 retry')
-          await native.chooseAccount({
-            ...scope,
-            rerouteFrom: { accountId: 'main', limit },
-          })
+          await native.retrySameAccount?.(sameAccountInput(limit))
           expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
             accessToken: refreshedJoinAccess,
           })
@@ -985,6 +987,41 @@ function rawPin(text: string, sessionID: string) {
 /** Drives installNativeAnthropic's hooks with the real adapter and account runtime. */
 async function retryHost(native: ReturnType<typeof source>) {
   const callbacks = new Map<string, (input: unknown) => unknown>()
+  type HostEvent =
+    ReturnType<
+      NonNullable<OpenCode2HookContext['event']>['subscribe']
+    > extends AsyncIterable<infer E>
+      ? E
+      : never
+  const listeners = new Set<{
+    events: HostEvent[]
+    changed: ReturnType<typeof Promise.withResolvers<void>>
+  }>()
+  const event: NonNullable<OpenCode2HookContext['event']> = {
+    subscribe: async function* (options?: { signal?: AbortSignal }) {
+      const signal = options?.signal
+      const listener = {
+        events: [] as HostEvent[],
+        changed: Promise.withResolvers<void>(),
+      }
+      listeners.add(listener)
+      signal?.addEventListener('abort', () => listener.changed.resolve(), {
+        once: true,
+      })
+      try {
+        while (!signal?.aborted) {
+          const next = listener.events.shift()
+          if (next) yield next
+          else {
+            await listener.changed.promise
+            listener.changed = Promise.withResolvers<void>()
+          }
+        }
+      } finally {
+        listeners.delete(listener)
+      }
+    } as NonNullable<OpenCode2HookContext['event']>['subscribe'],
+  }
   const hook: OpenCode2HookContext['session']['hook'] = async (name, run) => {
     callbacks.set(name, (input) => run(input as SessionHooks[typeof name]))
     return {
@@ -994,7 +1031,7 @@ async function retryHost(native: ReturnType<typeof source>) {
     }
   }
   const installation = await installNativeAnthropic(
-    { session: { hook } },
+    { session: { hook }, event },
     { source: native },
     { credential: preparedAnthropicCredential },
   )
@@ -1019,13 +1056,33 @@ async function retryHost(native: ReturnType<typeof source>) {
   })
   return {
     installation,
-    async send(input = scope) {
+    idle() {
+      const idle: HostEvent = {
+        id: 'evt_native_idle' as HostEvent['id'],
+        created: Date.now(),
+        type: 'session.status',
+        data: {
+          sessionID: scope.sessionID as SessionHooks['retry']['sessionID'],
+          status: { type: 'idle' },
+        },
+      }
+      for (const listener of listeners) {
+        listener.events.push(idle)
+        listener.changed.resolve()
+      }
+    },
+    async send(
+      input = scope,
+      credential: string | { apiKey: string } = placeholderSecret('anthropic'),
+    ) {
       const draft = {
         ...hostScope(input),
         request: new Request('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: {
-            authorization: `Bearer ${placeholderSecret('anthropic')}`,
+            ...(typeof credential === 'string'
+              ? { authorization: `Bearer ${credential}` }
+              : { 'x-api-key': credential.apiKey }),
             'content-type': 'application/json',
           },
           body: JSON.stringify({
@@ -1074,8 +1131,166 @@ async function retryHost(native: ReturnType<typeof source>) {
   }
 }
 
-describe('OC2 installed retry contract (requires common-auth 0.25.0)', () => {
-  test('installed vault-newer retry consumes one committed choice in either phase', async () => {
+describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
+  test('mixed session retries vault-newer on the same account without choosing again', async () => {
+    const fixture = await vault([7, 8, 9])
+    const native = source(fixture.runtime, fixture.paths)
+    const choose = spyOn(native, 'chooseAccount')
+    const host = await retryHost(native)
+    const foreign = await host.send(scope, 'foreign-anthropic-login')
+    expect(foreign.headers.get('authorization')).toBe(
+      'Bearer foreign-anthropic-login',
+    )
+    expect(choose).toHaveBeenCalledTimes(0)
+    const first = await host.send()
+    await host.response(first, 401)
+    expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+    const next = await host.send()
+    expect(next.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-vault-8',
+    )
+    expect(
+      host.installation.installation.accountFor(scope.sessionID, scope.kind),
+    ).toBe('main')
+    expect(choose).toHaveBeenCalledTimes(1)
+    expect(fixture.gets).toHaveLength(2)
+    await host.response(next, 401)
+    expect(await host.retry(false)).toEqual({ retry: false })
+    expect(fixture.gets).toHaveLength(2)
+    expect(fixture.reports.map((report) => report.recordVersion)).toEqual([
+      7, 8,
+    ])
+  })
+
+  test('mixed session retries local-newer on the same account with only one refresh', async () => {
+    let refreshes = 0
+    const fixture = await local({
+      refreshToken: async () => {
+        refreshes++
+        return {
+          access: 'sk-ant-oat01-refreshed',
+          refresh: 'rotated-refresh',
+          expires: Date.now() + 3600_000,
+          expiresIn: 3600,
+        }
+      },
+      resolveIdentity: async () => ({
+        accountUuid: identity as ProviderAccountUuid,
+        deviceId: 'fixture',
+        sessionId: 'fixture',
+      }),
+    })
+    const native = source(fixture.runtime, fixture.paths)
+    const choose = spyOn(native, 'chooseAccount')
+    const host = await retryHost(native)
+    const foreign = await host.send(scope, { apiKey: 'foreign-api-key' })
+    expect(foreign.headers.get('x-api-key')).toBe('foreign-api-key')
+    expect(choose).toHaveBeenCalledTimes(0)
+    const first = await host.send()
+    expect(first.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-native-only',
+    )
+    await host.response(first, 401)
+    expect(refreshes).toBe(1)
+    expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+    const next = await host.send()
+    expect(next.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-refreshed',
+    )
+    expect(
+      host.installation.installation.accountFor(scope.sessionID, scope.kind),
+    ).toBe('main')
+    expect(choose).toHaveBeenCalledTimes(1)
+    await host.response(next, 401)
+    expect(await host.retry(false)).toEqual({ retry: false })
+    expect(refreshes).toBe(1)
+  })
+
+  for (const failure of ['relay-response', 'network-error'] as const) {
+    test(`mixed session retries relay-to-direct on the same account after ${failure}`, async () => {
+      const fixture = await vault([7, 8, 9])
+      await fixture.runtime.updateRelay({
+        enabled: true,
+        transport: 'http',
+        url: 'https://relay.invalid',
+        fallbackToDirect: true,
+        token: 'synthetic-relay-token',
+      })
+      const native = source(fixture.runtime, fixture.paths)
+      const choose = spyOn(native, 'chooseAccount')
+      const host = await retryHost(native)
+      await host.send(scope, 'foreign-anthropic-login')
+      const first = await host.send()
+      expect(first.url).toBe('https://relay.invalid/')
+      if (failure === 'relay-response') await host.response(first, 502)
+      expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+      const next = await host.send()
+      expect(next.url).toBe('https://api.anthropic.com/v1/messages?beta=true')
+      expect(next.headers.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-vault-8',
+      )
+      expect(next.headers.has('x-relay-token')).toBe(false)
+      expect(
+        host.installation.installation.accountFor(scope.sessionID, scope.kind),
+      ).toBe('main')
+      expect(choose).toHaveBeenCalledTimes(1)
+      expect(await host.retry(false)).toEqual({ retry: false })
+      expect(fixture.gets).toHaveLength(2)
+      expect(fixture.reports).toHaveLength(0)
+    })
+  }
+
+  for (const unused of [
+    'host-declines',
+    'model-change',
+    'agent-change',
+    'forgotten',
+    'shutdown',
+  ] as const) {
+    test(`installed ${unused} releases only its pending same-account recovery`, async () => {
+      const fixture = await vault([7, 8, 9, 10, 11])
+      const native = source(fixture.runtime, fixture.paths)
+      const retry = spyOn(native, 'retrySameAccount')
+      const originalDrop = native.dropSameAccountRetry?.bind(native)
+      const drop = spyOn(native, 'dropSameAccountRetry')
+      const dropChoice = spyOn(native, 'dropChoice')
+      const host = await retryHost(native)
+      await host.send(scope, 'foreign-anthropic-login')
+      const first = await host.send()
+      await host.response(first, 401)
+      expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+      const released = Promise.withResolvers<void>()
+      drop.mockImplementation(async (input) => {
+        await originalDrop?.(input)
+        released.resolve()
+      })
+      if (unused === 'host-declines') host.idle()
+      else if (unused === 'forgotten')
+        host.installation.forgetSession(scope.sessionID)
+      else if (unused === 'shutdown') await host.installation.dispose()
+      else
+        await host.send({
+          ...scope,
+          ...(unused === 'model-change'
+            ? { modelID: 'claude-opus-4-6' }
+            : { agent: 'plan' }),
+        })
+      await released.promise
+      expect(drop).toHaveBeenCalledTimes(1)
+      expect(drop.mock.calls[0]?.[0]).toEqual(retry.mock.calls[0]?.[0])
+      expect(dropChoice).toHaveBeenCalledTimes(0)
+      if (unused !== 'shutdown') {
+        const next = await host.send()
+        expect(next.headers.get('authorization')).toBe(
+          `Bearer sk-ant-oat01-vault-${unused === 'model-change' || unused === 'agent-change' ? 10 : 9}`,
+        )
+      }
+      await host.installation.dispose()
+      expect(drop).toHaveBeenCalledTimes(1)
+    })
+  }
+
+  test('installed vault-newer retry consumes one recovery without committing another choice', async () => {
     const fixture = await vault([7, 8, 9], () => identity, {
       mode: 'sticky-balanced',
     })
@@ -1092,20 +1307,20 @@ describe('OC2 installed retry contract (requires common-auth 0.25.0)', () => {
     if (!routingPath) throw new Error('Missing routing path')
     const pin = await readFile(routingPath, 'utf8')
     await host.response(first, 401)
-    expect(await host.retry()).toEqual({ retry: true, delay: 1234 })
+    expect(await host.retry()).toEqual({ retry: true, delay: 0 })
     const second = await host.send()
     expect(second.headers.get('authorization')).toBe(
       'Bearer sk-ant-oat01-vault-8',
     )
-    expect(choose).toHaveBeenCalledTimes(2)
+    expect(choose).toHaveBeenCalledTimes(1)
     expect(
       choose.mock.calls.map(([input]) =>
         'phase' in input ? input.phase : undefined,
       ),
-    ).toEqual(['request', 'retry'])
+    ).toEqual(['request'])
     await native.drainRoutingPublications()
     expect(await readFile(routingPath, 'utf8')).toBe(pin)
-    // A used retry choice must leave the queue so a later authorization cannot consume it.
+    // A used recovery must leave the queue so a later authorization cannot consume it.
     expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
       accessToken: 'sk-ant-oat01-vault-9',
     })
@@ -1197,6 +1412,9 @@ describe('OC2 installed retry contract (requires common-auth 0.25.0)', () => {
       const events: string[] = []
       choose.mockImplementation((input) => {
         events.push(`choose:${input.sessionID}`)
+        // Returning the refused account keeps the host's decision, unlike an
+        // same-account recovery, which requests an immediate retry.
+        if (input.phase === 'retry') return input.rerouteFrom?.accountId
         return originalChoose(input)
       })
       const originalDrop = native.dropChoice?.bind(native)
@@ -1212,9 +1430,9 @@ describe('OC2 installed retry contract (requires common-auth 0.25.0)', () => {
       const host = await retryHost(native)
       const other = { ...scope, sessionID: 'ses_other_pending' }
       const first = await host.send()
-      await host.response(first, 401)
+      await host.response(first, 429)
       const otherFirst = await host.send(other)
-      await host.response(otherFirst, 401, other)
+      await host.response(otherFirst, 429, other)
       await host.retry(true, other)
       await native.drainRoutingPublications()
       const { routingPath } = await fixture.runtime.read()
@@ -1251,7 +1469,7 @@ describe('OC2 installed retry contract (requires common-auth 0.25.0)', () => {
       release.resolve()
       await retry
       expect((await next).headers.get('authorization')).toBe(
-        'Bearer sk-ant-oat01-vault-11',
+        'Bearer sk-ant-oat01-vault-9',
       )
       expect(events.slice(-3)).toEqual([
         'drop:start',
@@ -1264,7 +1482,7 @@ describe('OC2 installed retry contract (requires common-auth 0.25.0)', () => {
       expect(choose).toHaveBeenCalledTimes(5)
       // Reading the old scope would consume a leaked choice, even after a model change.
       expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
-        accessToken: 'sk-ant-oat01-vault-12',
+        accessToken: 'sk-ant-oat01-vault-11',
       })
       await host.installation.dispose()
       expect(drop).toHaveBeenCalledTimes(1)
@@ -1748,11 +1966,8 @@ describe('OC2 source over actual native services', () => {
     }
     await fixture.runtime.vault.publish(receipt, { quota: quota(100) })
     expect(
-      await native.chooseAccount({
-        ...fable,
-        rerouteFrom: { accountId: 'main', limit },
-      }),
-    ).toBe('main')
+      await native.retrySameAccount?.(sameAccountInput(limit, fable)),
+    ).toEqual({ accountId: 'main' })
     await fixture.runtime.updateRelay({
       enabled: true,
       transport: 'http',
@@ -2157,12 +2372,9 @@ describe('OC2 source over actual native services', () => {
     })
     expect(limit?.status).toBe(401)
     if (!limit) throw new Error('Strict-newer retry was not offered')
-    expect(
-      await native.chooseAccount({
-        ...scope,
-        rerouteFrom: { accountId: 'main', limit },
-      }),
-    ).toBe('main')
+    expect(await native.retrySameAccount?.(sameAccountInput(limit))).toEqual({
+      accountId: 'main',
+    })
     const second = await native.authorizeAccount(scope, 'main')
     if (second?.route !== 'oauth')
       throw new Error('Retry authorization refused')
@@ -2268,10 +2480,7 @@ describe('OC2 source over actual native services', () => {
       { ...context(first.provenance), dispatch: 'http-relay' },
       { outputStarted: false },
     )
-    await native.chooseAccount({
-      ...scope,
-      rerouteFrom: { accountId: 'main', limit },
-    })
+    await native.retrySameAccount?.(sameAccountInput(limit))
     const direct = await native.authorizeAccount(scope, 'main')
     expect(direct?.dispatch?.kind).toBe('direct')
     if (direct?.route !== 'oauth')
@@ -2280,7 +2489,50 @@ describe('OC2 source over actual native services', () => {
     expect(fixture.gets).toHaveLength(2)
     expect(fixture.reports).toHaveLength(0)
   })
-  test('an undefined retry choice preserves the pending retry until its account is eligible', async () => {
+  test('same-account recovery rejects a different scope or a replaced account', async () => {
+    const fixture = await vault([7, 8])
+    const native = source(fixture.runtime, fixture.paths)
+    const first = await native.authorizeAccount(scope, 'main')
+    if (!first) throw new Error('Vault authorization refused')
+    const limit = await native.limitFromResponse?.({
+      ...context(first.provenance),
+      status: 401,
+      headers: new Headers(),
+      body: async () => '{}',
+    })
+    if (!limit) throw new Error('Strict-newer retry was not offered')
+    const input = sameAccountInput(limit)
+    for (const wrong of [
+      { accountId: 'other' },
+      { sessionID: 'other' },
+      { agent: 'plan' },
+      { modelID: 'other' },
+      { kind: 'compaction' as const },
+      { providerID: 'other' },
+    ]) {
+      expect(
+        await native.retrySameAccount?.({ ...input, ...wrong }),
+      ).toBeUndefined()
+    }
+    expect(await native.retrySameAccount?.(input)).toEqual({
+      accountId: 'main',
+    })
+    const snapshot = await fixture.runtime.read()
+    const read = spyOn(fixture.runtime, 'read').mockResolvedValue({
+      ...snapshot,
+      accounts: snapshot.accounts.map((account) => ({
+        ...account,
+        accountIdentity: changedIdentity,
+      })),
+    })
+    try {
+      expect(await native.authorizeAccount(scope, 'main')).toBeUndefined()
+    } finally {
+      read.mockRestore()
+    }
+    expect(fixture.gets).toHaveLength(2)
+  })
+  test('a declined same-account recovery releases its prepared state', async () => {
     const fixture = await local()
     await fixture.runtime.updateRelay({
       enabled: true,
@@ -2298,14 +2550,14 @@ describe('OC2 source over actual native services', () => {
       status: 502,
     })
     if (!limit) throw new Error('Direct fallback was not offered')
-    const input = { ...scope, rerouteFrom: { accountId: 'main', limit } }
+    const input = sameAccountInput(limit)
     const snapshot = await fixture.runtime.read()
     const read = spyOn(fixture.runtime, 'read').mockResolvedValue({
       ...snapshot,
       accounts: [],
     })
     try {
-      expect(await native.chooseAccount(input)).toBeUndefined()
+      expect(await native.retrySameAccount?.(input)).toBeUndefined()
       read.mockResolvedValue({
         ...snapshot,
         accounts: snapshot.accounts.map((account) => ({
@@ -2313,17 +2565,19 @@ describe('OC2 source over actual native services', () => {
           enabled: false,
         })),
       })
-      expect(await native.chooseAccount(input)).toBeUndefined()
+      expect(await native.retrySameAccount?.(input)).toBeUndefined()
     } finally {
       read.mockRestore()
     }
-    expect(await native.chooseAccount(input)).toBe('main')
+    expect(await native.retrySameAccount?.(input)).toBeUndefined()
     expect((await native.authorizeAccount(scope, 'main'))?.dispatch).toEqual({
-      kind: 'direct',
+      kind: 'http-relay',
+      url: 'https://relay.invalid',
+      token: 'synthetic-relay-token',
     })
-    expect(await native.chooseAccount(input)).toBeUndefined()
+    expect(await native.retrySameAccount?.(input)).toBeUndefined()
   })
-  test('dropping an unused choice removes only one matching queued retry', async () => {
+  test('dropping a same-account recovery removes only its matching scoped retry', async () => {
     const fixture = await vault([7, 8, 9])
     await fixture.runtime.updateRelay({
       enabled: true,
@@ -2349,21 +2603,21 @@ describe('OC2 source over actual native services', () => {
     })
     for (const limit of [unused, kept]) {
       if (!limit) throw new Error('Direct fallback was not offered')
-      expect(
-        await native.chooseAccount({
-          ...scope,
-          rerouteFrom: { accountId: 'main', limit },
-        }),
-      ).toBe('main')
+      expect(await native.retrySameAccount?.(sameAccountInput(limit))).toEqual({
+        accountId: 'main',
+      })
     }
-    const drop = native.dropChoice
+    const drop = native.dropSameAccountRetry
     expect(typeof drop).toBe('function')
-    if (!drop) throw new Error('Missing dropChoice')
-    drop({ ...scope, accountId: 'another-account' })
-    drop({ ...scope, sessionID: 'another-session', accountId: 'main' })
-    drop({ ...scope, modelID: 'another-model', accountId: 'main' })
-    drop({ ...scope, kind: 'compaction', accountId: 'main' })
-    drop({ ...scope, accountId: 'main' })
+    if (!drop || !unused) throw new Error('Missing same-account recovery')
+    const input = sameAccountInput(unused)
+    drop({ ...input, accountId: 'another-account' })
+    drop({ ...input, sessionID: 'another-session' })
+    drop({ ...input, modelID: 'another-model' })
+    drop({ ...input, agent: 'another-agent' })
+    drop({ ...input, providerID: 'another-provider' })
+    drop({ ...input, kind: 'compaction' })
+    drop(input)
     expect(await native.authorizeAccount(scope, 'main')).toMatchObject({
       accessToken: 'sk-ant-oat01-vault-9',
       dispatch: { kind: 'direct' },
@@ -2371,7 +2625,7 @@ describe('OC2 source over actual native services', () => {
     expect((await native.authorizeAccount(scope, 'main'))?.dispatch?.kind).toBe(
       'http-relay',
     )
-    drop({ ...scope, accountId: 'main' })
+    drop(input)
   })
   test('an undefined sticky retry choice leaves the existing session pin unchanged', async () => {
     const fixture = await local()

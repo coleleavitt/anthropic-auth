@@ -5,6 +5,7 @@ import type {
   HostError,
   OpenCode2AuthAdapter,
   RequestScope,
+  SameAccountRetryInput,
 } from '@cortexkit/common-auth/opencode2'
 import type { TestGate } from '../../../core/src/tests/test-lifetime.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
@@ -1270,4 +1271,52 @@ test('OC2 relay-local 401 cancels the physical body and retires its credentials 
   const lateText = await visibleText(late)
   expectScrubbed(lateText, [ACCESS_A])
   expect(lateText).not.toContain('late exact=')
+})
+
+test('OC2 same-account recovery and release keep scope and limit without forwarding raw host errors', async () => {
+  const retried: SameAccountRetryInput[] = []
+  const dropped: SameAccountRetryInput[] = []
+  const { source } = makeSource(oauthFor(ACCESS_A))
+  const native = own(
+    createNativeAnthropicAdapter({
+      source: {
+        ...source,
+        retrySameAccount(input) {
+          retried.push(input)
+          return { accountId: input.accountId }
+        },
+        dropSameAccountRetry(input) {
+          dropped.push(input)
+        },
+      },
+    }),
+  )
+  await send(native.adapter, 'same-account-error')
+  const input: SameAccountRetryInput = {
+    ...scopeOf('same-account-error'),
+    accountId: 'acct',
+    attempt: 1,
+    error: { type: ACCESS_A, message: echoOf(ACCESS_A), status: 401 },
+    limit: { reason: 'local-newer:prepared', status: 401 },
+  }
+  const result = required(
+    await required(native.adapter.retrySameAccount, 'retrySameAccount')(input),
+    'same-account recovery',
+  )
+  await required(
+    native.adapter.dropSameAccountRetry,
+    'dropSameAccountRetry',
+  )({ ...input, ...result })
+  expect(retried).toEqual([
+    {
+      ...input,
+      error: {
+        type: 'provider_error',
+        message: 'provider request failed',
+        status: 401,
+      },
+    },
+  ])
+  expect(dropped).toEqual(retried)
+  expectScrubbed(JSON.stringify({ retried, dropped }), [ACCESS_A])
 })

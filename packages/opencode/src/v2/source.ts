@@ -84,8 +84,10 @@ type State = {
   quota?: OAuthQuotaSnapshot
 }
 type Retry = {
-  readonly sessionID: string
+  readonly scope: RequestScope
+  readonly reason: string
   readonly accountId: string
+  readonly account: NativeAccountView
   readonly direct?: boolean
   readonly auth?: Authorization
   readonly retry: boolean
@@ -230,7 +232,7 @@ export function createNativeAnthropicSource(
   }
   const states = new WeakMap<NativeSourceProvenance, State>()
   const retries = new Map<string, Retry>()
-  const choices = new Map<string, Retry[]>()
+  const recoveries = new Map<string, Retry[]>()
   const sessions = new Map<string, AbortController>()
   // The account behind each session's latest authorization, for the sidebar.
   // Entries leave with forgetSession, which also bounds `sessions`.
@@ -264,8 +266,22 @@ export function createNativeAnthropicSource(
     }
   }
 
+  const retryScope = (scope: RequestScope): RequestScope => ({
+    providerID: scope.providerID,
+    sessionID: scope.sessionID,
+    kind: scope.kind,
+    modelID: scope.modelID,
+    agent: scope.agent,
+  })
   const key = (scope: RequestScope, accountId: string) =>
-    JSON.stringify([scope.sessionID, scope.kind, scope.modelID, accountId])
+    JSON.stringify([
+      scope.providerID,
+      scope.sessionID,
+      scope.kind,
+      scope.modelID,
+      scope.agent,
+      accountId,
+    ])
   const controller = (scope: RequestScope) => {
     if (closed) throw new Error('Native Anthropic source is closed')
     let current = sessions.get(scope.sessionID)
@@ -288,6 +304,13 @@ export function createNativeAnthropicSource(
     (account.type === 'api' ||
       nativeAccountPolicy(account, snapshot, remapModelId(modelID)).status ===
         'allowed')
+  const sameAccount = (
+    account: NativeAccountView,
+    expected: NativeAccountView,
+  ) =>
+    account.source === expected.source &&
+    account.accountIdentity === expected.accountIdentity &&
+    account.credentialId === expected.credentialId
   const admitted = async (
     accountId: string,
     modelID: string,
@@ -460,29 +483,13 @@ export function createNativeAnthropicSource(
         if (refreshed) snapshot = await runtime.read()
         active.signal.throwIfAborted()
       }
-      const retry = input.rerouteFrom
-        ? retries.get(input.rerouteFrom.limit.reason)
-        : undefined
       if (
         input.rerouteFrom &&
         /^(vault-newer|local-newer|relay-direct):/.test(
           input.rerouteFrom.limit.reason,
-        ) &&
-        !retry
+        )
       )
         return undefined
-      if (retry && input.rerouteFrom) {
-        const account = snapshot.accounts.find(
-          (row) => row.id === retry.accountId,
-        )
-        if (!account || !eligible(account, snapshot, modelID)) return undefined
-        retries.delete(input.rerouteFrom.limit.reason)
-        const queueKey = key(input, retry.accountId)
-        const queue = choices.get(queueKey) ?? []
-        queue.push(retry)
-        choices.set(queueKey, queue)
-        return retry.accountId
-      }
       const oauth: NativeAccountView[] = []
       for (const account of snapshot.accounts) {
         if (account.type !== 'oauth' || !eligible(account, snapshot, modelID))
@@ -588,11 +595,52 @@ export function createNativeAnthropicSource(
           account.id !== input.rerouteFrom?.accountId,
       )?.id
     },
-    dropChoice(input) {
+    dropChoice() {
+      // Account choices retain no authorization. Session routing pins outlive
+      // an unused choice; same-account recoveries have their own release hook.
+    },
+    async retrySameAccount(input) {
+      const reason = input.limit?.reason
+      const retry = reason ? retries.get(reason) : undefined
+      if (
+        !retry ||
+        key(retry.scope, retry.accountId) !== key(input, input.accountId)
+      )
+        return undefined
+      // A declined or throwing recovery must release its uncommitted state.
+      retries.delete(retry.reason)
+      const active = controller(input)
+      const snapshot = await runtime.read()
+      active.signal.throwIfAborted()
+      assertTransport(snapshot)
+      const modelID = remapModelId(
+        (await options.resolveModelId?.(input)) ?? input.modelID,
+      )
+      active.signal.throwIfAborted()
+      const account = snapshot.accounts.find(
+        (row) => row.id === input.accountId,
+      )
+      if (
+        !account ||
+        !sameAccount(account, retry.account) ||
+        !eligible(account, snapshot, modelID)
+      )
+        return undefined
       const queueKey = key(input, input.accountId)
-      const queue = choices.get(queueKey)
-      queue?.shift()
-      if (queue?.length === 0) choices.delete(queueKey)
+      const queue = recoveries.get(queueKey) ?? []
+      queue.push(retry)
+      recoveries.set(queueKey, queue)
+      return { accountId: input.accountId }
+    },
+    dropSameAccountRetry(input) {
+      const queueKey = key(input, input.accountId)
+      const queue = recoveries.get(queueKey)
+      const index =
+        queue?.findIndex(
+          (retry) => !input.limit || retry.reason === input.limit.reason,
+        ) ?? -1
+      if (index !== -1) queue?.splice(index, 1)
+      if (queue?.length === 0) recoveries.delete(queueKey)
     },
     async authorizeAccount(scope, accountId, onRefusal) {
       const active = controller(scope)
@@ -614,9 +662,10 @@ export function createNativeAnthropicSource(
         return undefined
       }
       const queueKey = key(scope, accountId)
-      const queue = choices.get(queueKey)
+      const queue = recoveries.get(queueKey)
       const choice = queue?.shift()
-      if (queue?.length === 0) choices.delete(queueKey)
+      if (queue?.length === 0) recoveries.delete(queueKey)
+      if (choice && !sameAccount(account, choice.account)) return undefined
       const { dispatch, relayFallback } = await dispatchFor(
         snapshot,
         choice?.direct === true,
@@ -694,6 +743,12 @@ export function createNativeAnthropicSource(
       if (account.source === 'vault') {
         const receipt = await runtime.authorizeVault(accountId, active.signal)
         active.signal.throwIfAborted()
+        if (
+          choice &&
+          (receipt.credentialId !== choice.account.credentialId ||
+            receipt.assertedAccountIdentity !== choice.account.accountIdentity)
+        )
+          return undefined
         if (!(await admitted(accountId, modelID, 'oauth', active, onRefusal)))
           return undefined
         const provenance: NativeSourceProvenance = {
@@ -877,8 +932,10 @@ export function createNativeAnthropicSource(
         states.set(provenance, { ...state, receipt, retry: true })
         const reason = `vault-newer:${input.attemptId}`
         retries.set(reason, {
-          sessionID: input.sessionID,
+          scope: retryScope(input),
+          reason,
           accountId: input.accountId,
+          account: state.account,
           retry: true,
           auth: {
             route: 'oauth',
@@ -918,8 +975,10 @@ export function createNativeAnthropicSource(
         const identity = result.subject.binding.identity
         const reason = `local-newer:${input.attemptId}`
         retries.set(reason, {
-          sessionID: input.sessionID,
+          scope: retryScope(input),
+          reason,
           accountId: input.accountId,
+          account: state.account,
           retry: true,
           auth: {
             route: 'oauth',
@@ -949,8 +1008,10 @@ export function createNativeAnthropicSource(
         return undefined
       const reason = `relay-direct:${input.attemptId}`
       retries.set(reason, {
-        sessionID: input.sessionID,
+        scope: retryScope(input),
+        reason,
         accountId: input.accountId,
+        account: state.account,
         direct: true,
         retry: false,
       })
@@ -972,8 +1033,10 @@ export function createNativeAnthropicSource(
       ) {
         const reason = `relay-direct:${input.attemptId}`
         retries.set(reason, {
-          sessionID: input.sessionID,
+          scope: retryScope(input),
+          reason,
           accountId: input.accountId,
+          account: state.account,
           direct: true,
           retry: false,
         })
@@ -1011,9 +1074,9 @@ export function createNativeAnthropicSource(
       sessions.delete(sessionID)
       servedBy.delete(sessionID)
       for (const [reason, retry] of retries)
-        if (retry.sessionID === sessionID) retries.delete(reason)
-      for (const [queueKey, queue] of choices)
-        if (queue[0]?.sessionID === sessionID) choices.delete(queueKey)
+        if (retry.scope.sessionID === sessionID) retries.delete(reason)
+      for (const [queueKey, queue] of recoveries)
+        if (queue[0]?.scope.sessionID === sessionID) recoveries.delete(queueKey)
       options.onForgetSession?.(sessionID)
     },
     servedAccount: (sessionID) => servedBy.get(sessionID),
@@ -1045,7 +1108,7 @@ export function createNativeAnthropicSource(
       closed = true
       for (const active of sessions.values()) active.abort()
       sessions.clear()
-      choices.clear()
+      recoveries.clear()
       retries.clear()
       return Promise.all([
         usagePublications.drain(),
