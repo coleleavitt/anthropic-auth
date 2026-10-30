@@ -3385,31 +3385,40 @@ async function weeklyStickyRefusal(
   } = {},
 ) {
   const resetSeconds = options.resetSeconds ?? 5 * 24 * 60 * 60
-  const setup = await stickyVaultRejectedFirstSend(false, undefined, {
-    fallback: options.fallback,
-    firstRefusal: (headers) =>
-      Response.json(
-        {
-          type: 'error',
-          error: {
-            type: 'rate_limit_error',
-            message: 'Synthetic weekly limit',
+  let upstreamRateLimits: Array<[string, string]> = []
+  const setup = await stickyVaultRejectedFirstSend(
+    false,
+    (response) => {
+      upstreamRateLimits = [...response.headers].filter(([name]) =>
+        name.startsWith('anthropic-ratelimit-'),
+      )
+    },
+    {
+      fallback: options.fallback,
+      firstRefusal: (headers) =>
+        Response.json(
+          {
+            type: 'error',
+            error: {
+              type: 'rate_limit_error',
+              message: 'Synthetic weekly limit',
+            },
           },
-        },
-        {
-          status: 429,
-          headers: {
-            ...headers,
-            'retry-after': String(resetSeconds),
-            'anthropic-ratelimit-unified-7d-utilization': '1.0',
-            'anthropic-ratelimit-unified-7d-reset': String(
-              Math.floor(Date.now() / 1000) + resetSeconds,
-            ),
-            ...options.headers,
+          {
+            status: 429,
+            headers: {
+              ...headers,
+              'retry-after': String(resetSeconds),
+              'anthropic-ratelimit-unified-7d-utilization': '1.0',
+              'anthropic-ratelimit-unified-7d-reset': String(
+                Math.floor(Date.now() / 1000) + resetSeconds,
+              ),
+              ...options.headers,
+            },
           },
-        },
-      ),
-  })
+        ),
+    },
+  )
   const runtime = createNativeAccountRuntime({
     paths: setup.fixture.paths,
     host: 'opencode',
@@ -3433,7 +3442,12 @@ async function weeklyStickyRefusal(
     inputBytes: 1,
   })
   await router.drain()
-  return { ...setup, sessionId, routingPath }
+  return {
+    ...setup,
+    sessionId,
+    routingPath,
+    upstreamRateLimits: () => upstreamRateLimits,
+  }
 }
 
 test('vault sticky weekly 429 headers migrate main to an account with room in the same request', async () => {
@@ -3474,7 +3488,7 @@ test('vault sticky weekly 429 rejected status migrates even when the quota refre
 for (const shortWait of [false, true]) {
   test(`vault sticky weekly 429 retains on probe failure with a bounded retry (short upstream=${shortWait})`, async () => {
     const reset = Date.now() + 5 * 24 * 60 * 60_000
-    const { plugin, served, sessionId, routingPath } =
+    const { plugin, served, sessionId, routingPath, upstreamRateLimits } =
       await weeklyStickyRefusal({
         headers: {
           'anthropic-ratelimit-unified-7d-utilization': '0.999',
@@ -3498,12 +3512,10 @@ for (const shortWait of [false, true]) {
         shortWait ? 1500 : 60_000,
       )
       expect(
-        Number(response.headers.get('anthropic-ratelimit-unified-7d-reset')) *
-          1000,
-      ).toBeLessThanOrEqual(Date.now() + 60_000)
-      expect(
-        Date.parse(response.headers.get('anthropic-ratelimit-requests-reset')!),
-      ).toBeLessThanOrEqual(Date.now() + 60_000)
+        [...response.headers].filter(([name]) =>
+          name.startsWith('anthropic-ratelimit-'),
+        ),
+      ).toEqual(upstreamRateLimits())
       expect(served).toEqual(['oauth:anthropic'])
       await plugin.dispose?.()
       expect((await stickyPin(routingPath, sessionId))?.accountId).toBe('main')

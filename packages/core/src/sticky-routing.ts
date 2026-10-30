@@ -577,23 +577,8 @@ export function stickyRetainRetryHeaders(upstream: Headers, now = Date.now()) {
   }
   headers.set('retry-after', String(seconds))
   headers.set('retry-after-ms', String(seconds * 1000))
-  for (const name of resets) {
-    const value = headers.get(name)!
-    const reset = now + seconds * 1000
-    if (
-      !value.trim() ||
-      (!Number.isFinite(Number(value)) && !Number.isFinite(Date.parse(value)))
-    ) {
-      headers.delete(name)
-    } else {
-      headers.set(
-        name,
-        Number.isFinite(Number(value))
-          ? String(reset / 1000)
-          : new Date(reset).toISOString(),
-      )
-    }
-  }
+  // Reset headers are quota evidence, not retry controls. Preserve them even
+  // when the host should retry sooner than the account's next quota reset.
   return headers
 }
 

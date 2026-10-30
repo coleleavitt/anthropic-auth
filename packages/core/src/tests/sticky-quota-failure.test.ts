@@ -111,7 +111,7 @@ describe('sticky quota hold', () => {
     })
   })
 
-  test('retained retry caps all hints without lengthening a shorter HTTP-date or millisecond wait', () => {
+  test('retained retry caps retry hints without changing rate-limit evidence', () => {
     for (const seconds of [2, 60, 5 * 24 * 60 * 60]) {
       const headers = stickyRetainRetryHeaders(
         new Headers({
@@ -130,12 +130,32 @@ describe('sticky quota hold', () => {
       expect(headers.get('retry-after')).toBe(String(expected))
       expect(headers.get('retry-after-ms')).toBe(String(expected * 1000))
       expect(headers.get('anthropic-ratelimit-unified-7d-reset')).toBe(
-        String(NOW / 1000 + expected),
+        String(NOW / 1000 + seconds),
       )
       expect(headers.get('anthropic-ratelimit-tokens-reset')).toBe(
-        new Date(NOW + expected * 1000).toISOString(),
+        new Date(NOW + seconds * 1000).toISOString(),
       )
     }
+  })
+
+  test('retained retry can shorten its wait from reset evidence without changing any rate-limit header', () => {
+    const upstream = new Headers({
+      'retry-after': '432000',
+      'retry-after-ms': '432000000',
+      'anthropic-ratelimit-unified-7d-reset': String(NOW / 1000 + 432000),
+      'anthropic-ratelimit-requests-reset': new Date(NOW + 2000).toISOString(),
+      'anthropic-ratelimit-tokens-reset': 'invalid-reset',
+      'anthropic-ratelimit-unified-7d-utilization': '0.999',
+      'anthropic-ratelimit-unified-status': 'allowed_warning',
+    })
+    const headers = stickyRetainRetryHeaders(upstream, NOW)
+    expect(headers.get('retry-after')).toBe('2')
+    expect(headers.get('retry-after-ms')).toBe('2000')
+    expect(
+      [...headers].filter(([name]) => name.startsWith('anthropic-ratelimit-')),
+    ).toEqual(
+      [...upstream].filter(([name]) => name.startsWith('anthropic-ratelimit-')),
+    )
   })
 
   for (const kind of kinds) {
