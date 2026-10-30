@@ -21,13 +21,16 @@ import {
   captureNativeLocalPoolBinding,
   createNativeAccountRuntime,
   createNativePoolStore,
+  fetchOAuthQuotaSnapshot,
   getLogLevel,
   getStickyRoutingStatePath,
   type LogTestRecord,
   type NativeAccountRuntime,
   type NativeCustodyClient,
   type NativePoolPaths,
+  nativeAccountPolicy,
   type ProviderAccountUuid,
+  quotaSnapshotPassesPolicy,
   readNativeAccountsForRequest,
   readNativeEnrollmentMode,
   resolveNativePoolPaths,
@@ -109,6 +112,107 @@ const exists = (path: string) =>
     () => false,
   )
 const cleanups: Array<() => Promise<void> | void> = []
+
+test('Ultra fresh weekly-only poll passes policy and selects the local OpenCode 2 account', async () => {
+  const fixture = await local()
+  const credential = await fixture.runtime.authorizeLocal('main')
+  if (credential.status !== 'usable')
+    throw new Error('Missing local credential')
+  const quota = await fetchOAuthQuotaSnapshot({
+    accessToken: 'synthetic-ultra-access',
+    fetchImpl: Object.assign(
+      async () =>
+        Response.json({ five_hour: null, seven_day: { utilization: 0 } }),
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  await fixture.runtime.publishLocal(credential.subject, {
+    quota: { ...quota, accountIdentity: identity },
+  })
+  await fixture.store.updateSettings((settings) => ({
+    ...settings,
+    quota: {
+      enabled: true,
+      // A zero floor permits 0%; use a positive weekly floor to prove quota refusal.
+      minimumRemaining: { seven_day: 1 },
+      failClosedOnUnknownQuota: true,
+    },
+  }))
+  const snapshot = await fixture.runtime.read()
+  const selected = await Promise.resolve(
+    source(fixture.runtime, fixture.paths).chooseAccount(scope),
+  ).catch((error: Error) => error.message)
+  expect({
+    passes: quotaSnapshotPassesPolicy(quota, snapshot.policyStorage),
+    selected,
+  }).toEqual({ passes: true, selected: 'main' })
+  await fixture.runtime.publishLocal(credential.subject, {
+    quota: {
+      ...quota,
+      accountIdentity: identity,
+      seven_day: { ...quota.seven_day!, usedPercent: 100, remainingPercent: 0 },
+    },
+  })
+  const exhausted = await fixture.runtime.read()
+  expect(nativeAccountPolicy(exhausted.accounts[0]!, exhausted)).toMatchObject({
+    status: 'blocked',
+    reason: 'quota-ineligible',
+    quotaPolicyLimits: ['quota-floor'],
+  })
+  expect(
+    await source(fixture.runtime, fixture.paths).chooseAccount(scope),
+  ).toBeUndefined()
+  await fixture.runtime.addApi({
+    routeId: 'paid-ultra',
+    apiKey: 'synthetic-ultra-api-key',
+    baseURL: 'https://api-route.invalid',
+    authHeader: 'x-api-key',
+  })
+  expect(
+    await source(fixture.runtime, fixture.paths).chooseAccount(scope),
+  ).toBe('paid-ultra')
+  await fixture.runtime.publishLocal(credential.subject, {
+    quota: {
+      ...quota,
+      accountIdentity: identity,
+      scoped: [
+        {
+          id: 'fable',
+          title: 'Fable only',
+          modelId: 'claude-fable-5-1',
+          modelName: 'Fable',
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: quota.checkedAt!,
+        },
+      ],
+    },
+  })
+  expect(
+    await source(fixture.runtime, fixture.paths).chooseAccount({
+      ...scope,
+      modelID: 'claude-fable-5-1',
+    }),
+  ).toBeUndefined()
+})
+
+test('Ultra unknown local quota still refuses OpenCode 2 under fail-closed', async () => {
+  const fixture = await local()
+  await fixture.store.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: true, failClosedOnUnknownQuota: true },
+  }))
+  const poll = spyOn(fixture.runtime, 'fetchQuota').mockRejectedValue(
+    new Error('No reading'),
+  )
+  try {
+    expect(
+      await source(fixture.runtime, fixture.paths).chooseAccount(scope),
+    ).toBeUndefined()
+  } finally {
+    poll.mockRestore()
+  }
+})
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })

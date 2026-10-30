@@ -20,6 +20,44 @@ import {
 const lifetimes = createTestLifetimeSuite()
 const test = lifetimes.test
 
+for (const collapsed of [false, true]) {
+  test(`Ultra OpenCode 2 sidebar omits the five-hour row ${collapsed ? 'collapsed' : 'expanded'}`, async () => {
+    const now = Date.now()
+    const result = await renderOpenCode2Sidebar(
+      [
+        {
+          main: {
+            quota: {
+              seven_day: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: now,
+              },
+              scoped: [
+                {
+                  id: 'fable',
+                  title: 'Fable only',
+                  modelName: 'Fable',
+                  usedPercent: 20,
+                  remainingPercent: 80,
+                  checkedAt: now,
+                },
+              ],
+            },
+          },
+          fallbacks: [],
+          activeId: 'main',
+          route: 'main-first',
+          lastUpdated: now,
+        },
+      ],
+      [{ wanted: ['7d', '100%', '80%'] }],
+      { width: 42, height: 32, collapsed },
+    )
+    expect(result.frames[0]).not.toContain('5h')
+  }, 20_000)
+}
+
 interface Step {
   /** Text the frame must contain before the step completes. */
   wanted: string[]

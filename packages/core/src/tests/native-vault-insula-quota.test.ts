@@ -15,6 +15,7 @@ import {
   type ProviderAccountUuid,
   QUOTA_URL,
   quotaSnapshotModelScopeIsExhausted,
+  quotaSnapshotPassesPolicy,
 } from '../accounts.ts'
 import {
   mergeInsulaQuota,
@@ -310,6 +311,48 @@ test('the primary account is looked up in insula by its roster row account id, n
   expect(f.counts.usage).toEqual([])
   expect(quota.accountIdentity).toBe(uuid)
   expect(quota.five_hour?.checkedAt).toBe(fetchedAt)
+})
+
+test('Ultra secondary-only insula reading is published by the vault runtime without a usage GET', async () => {
+  const ultra = entry(uuid2)
+  delete ultra.usage!.primary
+  ultra.usage!.secondary!.usedPercent = 0
+  const f = await fixture(() => [ultra])
+  const quota = await f.runtime.fetchQuota(
+    f.routeOf(uuid2),
+    f.usage,
+    undefined,
+    undefined,
+    'background',
+  )
+  expect(f.counts.usage).toEqual([])
+  expect(quota.five_hour).toBeUndefined()
+  expect(quota.seven_day).toMatchObject({
+    remainingPercent: 100,
+    checkedAt: fetchedAt,
+  })
+  expect(quota.source).toBe('poll')
+  expect(quota.checkedAt).toBe(fetchedAt)
+  // Use the fixture's reading clock when evaluating the live policy.
+  const clock = spyOn(Date, 'now').mockReturnValue(now)
+  try {
+    expect(quotaSnapshotPassesPolicy(quota, { version: 1, accounts: [] })).toBe(
+      true,
+    )
+  } finally {
+    clock.mockRestore()
+  }
+  await f.runtime.drainQuotaPublications()
+  const state = await readNativeRuntime(
+    f.vaultPaths.runtime,
+    f.vaultPaths.storageId,
+  )
+  const stored =
+    state.status === 'ready'
+      ? state.state.accounts[f.routeOf(uuid2)]?.quota
+      : undefined
+  expect(stored?.limits.map((limit) => limit.label)).not.toContain('five_hour')
+  expect(stored?.limits.some((limit) => limit.label === 'seven_day')).toBe(true)
 })
 
 for (const [miss, entries] of [

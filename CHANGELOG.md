@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Verified Ultra accounts, which no longer have a five-hour limit, are no longer refused as having unknown quota. Their weekly and Fable limits still apply. Addresses #572.
 - In vault mode, a request refused because your own quota floors or killswitch limits exclude every account now says which limit blocked it and where to change it, instead of asking you to sign in again. Addresses #567.
 ## 2.4.6
 

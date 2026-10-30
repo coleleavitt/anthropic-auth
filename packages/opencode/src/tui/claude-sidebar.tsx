@@ -541,30 +541,34 @@ export function AccountBlock(props: {
         when={props.quota}
         fallback={<text fg={props.theme.textMuted}>{'checking\u2026'}</text>}
       >
-        <QuotaRow
-          theme={props.theme}
-          appearance={props.appearance}
-          label='5h'
-          labelWidth={labelWidth()}
-          width={width()}
-          part={partFor('5h')}
-          usedPercent={props.quota?.five_hour?.usedPercent}
-          pacing={pacingFor(props.quota?.five_hour, FIVE_HOUR_MS)}
-          binding={props.quota?.bindingWindow === 'five_hour'}
-          now={props.now}
-        />
-        <QuotaRow
-          theme={props.theme}
-          appearance={props.appearance}
-          label='7d'
-          labelWidth={labelWidth()}
-          width={width()}
-          part={partFor('7d')}
-          usedPercent={props.quota?.seven_day?.usedPercent}
-          pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
-          binding={props.quota?.bindingWindow === 'seven_day'}
-          now={props.now}
-        />
+        <Show when={props.quota?.five_hour}>
+          <QuotaRow
+            theme={props.theme}
+            appearance={props.appearance}
+            label='5h'
+            labelWidth={labelWidth()}
+            width={width()}
+            part={partFor('5h')}
+            usedPercent={props.quota?.five_hour?.usedPercent}
+            pacing={pacingFor(props.quota?.five_hour, FIVE_HOUR_MS)}
+            binding={props.quota?.bindingWindow === 'five_hour'}
+            now={props.now}
+          />
+        </Show>
+        <Show when={props.quota?.seven_day}>
+          <QuotaRow
+            theme={props.theme}
+            appearance={props.appearance}
+            label='7d'
+            labelWidth={labelWidth()}
+            width={width()}
+            part={partFor('7d')}
+            usedPercent={props.quota?.seven_day?.usedPercent}
+            pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
+            binding={props.quota?.bindingWindow === 'seven_day'}
+            now={props.now}
+          />
+        </Show>
         <For each={props.quota?.scoped ?? []}>
           {(window, index) => (
             <QuotaRow

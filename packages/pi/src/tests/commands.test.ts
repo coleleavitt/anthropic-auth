@@ -275,6 +275,38 @@ describe('native diagnostics persistence', () => {
     expect(text).toContain('checked 2d ago')
   })
 
+  test('Ultra quota status shows only weekly and Fable limits through Core', async () => {
+    const checkedAt = Date.now()
+    await saveNativePiFixture(
+      {
+        version: 1,
+        accounts: [],
+        quota: {
+          mainQuota: {
+            source: 'poll',
+            checkedAt,
+            seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt },
+            scoped: [
+              {
+                id: 'fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 20,
+                remainingPercent: 80,
+                checkedAt,
+              },
+            ],
+          },
+        },
+      },
+      storagePath,
+    )
+    const text = await controller().backend.readStatus('quota', {})
+    expect(text).toContain('7d 100% left')
+    expect(text).toContain('Fable only 80% left')
+    expect(text).not.toContain('5h')
+  })
+
   test('logging status shows current level without mutating', async () => {
     await controller().execute({
       action: 'logging-level',

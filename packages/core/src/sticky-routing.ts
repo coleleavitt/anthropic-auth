@@ -15,6 +15,8 @@ import {
   killswitchRetryAfterSeconds,
   type OAuthQuotaSnapshot,
   quotaFieldSource,
+  quotaSnapshotFiveHourIsNotApplicable,
+  quotaSnapshotOmitsFiveHour,
   quotaSnapshotPassesModelScope,
 } from './accounts.ts'
 import { logger } from './logger.ts'
@@ -370,6 +372,11 @@ export function stickyQuotaSnapshotIsFresh(
 ) {
   const maxAge = getQuotaCheckIntervalMs(storage)
   const standardFresh = (['five_hour', 'seven_day'] as const).every((key) => {
+    if (
+      key === 'five_hour' &&
+      quotaSnapshotFiveHourIsNotApplicable(quota, storage, now)
+    )
+      return true
     const window = quota?.[key]
     return Boolean(window && now - window.checkedAt < maxAge)
   })
@@ -454,6 +461,11 @@ export function stickyRouteCandidateWeight(input: {
   }
   const weights: number[] = []
   for (const key of ['five_hour', 'seven_day'] as const) {
+    if (
+      key === 'five_hour' &&
+      quotaSnapshotFiveHourIsNotApplicable(quota, storage, now)
+    )
+      continue
     const window = quota[key]
     if (!window || !Number.isFinite(window.remainingPercent)) return 0
     const threshold = remainingThreshold(storage, candidate.accountId, key)
@@ -518,6 +530,11 @@ export function decideStickyQuotaFailure(input: {
 }): StickyQuotaFailureDecision {
   const now = input.now ?? Date.now()
   let reading = knownQuota(input.quota)
+  if (
+    quotaSnapshotOmitsFiveHour(reading) &&
+    !quotaSnapshotFiveHourIsNotApplicable(reading, null, now)
+  )
+    reading = undefined
   // The refused request can confirm exhaustion even when a quota probe fails
   // or serves an older cached reading. Never use rounded header percentages here.
   const confirmed = input.responseHeaders

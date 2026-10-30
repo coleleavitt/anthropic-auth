@@ -17,6 +17,42 @@ import {
 const lifetimes = createTestLifetimeSuite()
 const test = lifetimes.test
 
+for (const collapsed of [false, true]) {
+  test(`Ultra OpenCode 1 sidebar omits the five-hour row ${collapsed ? 'collapsed' : 'expanded'}`, async () => {
+    const now = Date.now()
+    const frame = await renderSidebar(
+      {
+        main: {
+          quota: {
+            seven_day: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              checkedAt: now,
+            },
+            scoped: [
+              {
+                id: 'fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                usedPercent: 20,
+                remainingPercent: 80,
+                checkedAt: now,
+              },
+            ],
+          },
+        },
+        fallbacks: [],
+        activeId: 'main',
+        route: 'main-first',
+        lastUpdated: now,
+      },
+      ['7d', '100%', '80%'],
+      collapsed,
+    )
+    expect(frame.split('STYLES:')[0]).not.toContain('5h')
+  }, 20_000)
+}
+
 /**
  * After the first frame, the probe writes `state` to the sidebar state file,
  * waits until the sidebar's file poll draws every `wanted` part, and reports

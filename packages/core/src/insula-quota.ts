@@ -10,11 +10,11 @@ import {
   type OAuthQuotaSnapshot,
   type QuotaFieldSources,
   quotaSnapshotCheckedAt,
+  quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
 
 /** An insula reading in the shape our usage poll produces, before the account identity is attached. */
 export type InsulaClaudeQuota = OAuthQuotaSnapshot & {
-  five_hour: AccountQuotaWindow
   seven_day: AccountQuotaWindow
   scoped: AccountScopedQuotaWindow[]
   checkedAt: number
@@ -171,8 +171,8 @@ function extraUsageReading(
 /**
  * Convert insula's Claude entry into our usage-poll snapshot. Every window's
  * checkedAt is when insula fetched the reading, never when we read its cache,
- * so a newer header or poll reading still wins. Both standard windows must be
- * present; otherwise this returns undefined and our own poll stays in charge.
+ * so a newer header or poll reading still wins. The weekly window is required;
+ * an absent primary slot means the five-hour limit does not apply.
  * The tertiary slot (legacy seven_day_opus/sonnet) is not a window we model.
  */
 export function normalizeInsulaClaudeQuota(
@@ -191,18 +191,18 @@ export function normalizeInsulaClaudeQuota(
     kind: 'weekly',
     minutes: 10_080,
   })
-  if (!five_hour || !seven_day) return undefined
+  if (!seven_day || (usage?.primary != null && !five_hour)) return undefined
   const scoped = scopedReadings(usage?.extraRateWindows, checkedAt)
   const extraUsage = extraUsageReading(entry.pools ?? usage?.pools)
   return {
-    five_hour,
+    ...(five_hour && { five_hour }),
     seven_day,
     scoped,
     ...(extraUsage && { extraUsage }),
     source: 'poll',
     checkedAt,
     fieldSources: {
-      five_hour: 'poll',
+      ...(five_hour && { five_hour: 'poll' as const }),
       seven_day: 'poll',
       scoped: 'poll',
       ...(extraUsage && { extraUsage: 'poll' as const }),
@@ -232,7 +232,12 @@ export function mergeInsulaQuota(
 ): OAuthQuotaSnapshot {
   if (!stored || quotaSnapshotCheckedAt(stored) <= reading.checkedAt)
     return reading
-  const five_hour = newer(reading.five_hour, stored.five_hour)
+  const five_hour = quotaSnapshotOmitsFiveHour(stored)
+    ? undefined
+    : !reading.five_hour &&
+        (stored.five_hour?.checkedAt ?? 0) <= reading.checkedAt
+      ? undefined
+      : newer(reading.five_hour, stored.five_hour)
   const seven_day = newer(reading.seven_day, stored.seven_day)
   const scoped = new Map(reading.scoped.map((window) => [window.id, window]))
   for (const window of stored.scoped ?? []) {
@@ -246,10 +251,14 @@ export function mergeInsulaQuota(
     fieldSources.seven_day = stored.fieldSources.seven_day
   return {
     ...reading,
-    ...(five_hour && { five_hour }),
+    five_hour,
     ...(seven_day && { seven_day }),
     scoped: [...scoped.values()],
-    checkedAt: Math.max(reading.checkedAt, quotaSnapshotCheckedAt(stored)),
+    checkedAt: quotaSnapshotOmitsFiveHour(stored)
+      ? stored.checkedAt
+      : quotaSnapshotOmitsFiveHour(reading)
+        ? reading.checkedAt
+        : Math.max(reading.checkedAt, quotaSnapshotCheckedAt(stored)),
     fieldSources,
   }
 }

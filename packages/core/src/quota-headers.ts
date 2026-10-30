@@ -4,7 +4,11 @@ import type {
   QuotaFieldSources,
   QuotaWindowName,
 } from './accounts.ts'
-import { QUOTA_FIELD_NAMES, quotaFieldSource } from './accounts.ts'
+import {
+  QUOTA_FIELD_NAMES,
+  quotaFieldSource,
+  quotaSnapshotOmitsFiveHour,
+} from './accounts.ts'
 
 const PREFIX = 'anthropic-ratelimit-unified-'
 const WINDOW_KEYS: Record<string, QuotaWindowName> = {
@@ -139,6 +143,17 @@ export function mergeHeaderQuotaSnapshot(
   existing: OAuthQuotaSnapshot | undefined,
   incoming: OAuthQuotaSnapshot,
 ): OAuthQuotaSnapshot {
+  if (
+    quotaSnapshotOmitsFiveHour(existing) &&
+    incoming.five_hour &&
+    incoming.five_hour.checkedAt <= existing.checkedAt
+  ) {
+    // A late header frame cannot restore a session limit removed by a poll.
+    return mergeHeaderQuotaSnapshot(existing, {
+      ...incoming,
+      five_hour: undefined,
+    })
+  }
   const {
     scoped: existingScoped,
     extraUsage: existingExtraUsage,
@@ -190,6 +205,8 @@ export function mergeHeaderQuotaSnapshot(
                 quotaFieldSource(existing, field))
     if (source) fieldSources[field] = source
   }
+  if (quotaSnapshotOmitsFiveHour(existing) && !incoming.five_hour)
+    fieldSources.five_hour = 'poll'
 
   return {
     ...existingWithoutPollOwnedFields,
@@ -209,7 +226,11 @@ export function mergeHeaderQuotaSnapshot(
         ? 'poll'
         : (incoming.bindingWindowSource ?? existing?.bindingWindowSource),
     ...(Object.keys(fieldSources).length > 0 && { fieldSources }),
-    // Top-level source remains headers for compatibility; fieldSources records ownership after partial harvests.
+    // Keep the poll's absence evidence on its original clock; headers must
+    // neither resurrect an older session limit nor renew the exemption.
     source: 'headers',
+    ...(quotaSnapshotOmitsFiveHour(existing) && {
+      checkedAt: existing.checkedAt,
+    }),
   }
 }

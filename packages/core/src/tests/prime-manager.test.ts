@@ -12,6 +12,12 @@ import { join, resolve } from 'node:path'
 
 import type { AccountStorage, OAuthQuotaSnapshot } from '../accounts.ts'
 import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
+import {
   buildPrimeRequestBody,
   PRIME_DUE_OFFSET_MS,
   PRIME_MARKER_MAX_AGE_MS,
@@ -100,6 +106,49 @@ function manager(input: {
 }
 
 describe('PrimeManager storage namespaces', () => {
+  test('Ultra skips priming a stored or newly polled account with no five-hour limit', async () => {
+    const now = Date.now()
+    const quota: OAuthQuotaSnapshot = {
+      source: 'poll',
+      checkedAt: now,
+      seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+    }
+    const markerDir = await tempMarkerRoot()
+    const records: LogTestRecord[] = []
+    const previous = getLogLevel()
+    setLogLevel('debug')
+    __setLogTestSink((record) => records.push(record))
+    let fires = 0
+    let refreshes = 0
+    try {
+      for (const stored of [false, true]) {
+        const config = storage()
+        if (stored) config.quota!.mainQuota = quota
+        await manager({
+          storagePath: `/config/ultra-${stored}/accounts.json`,
+          markerDir,
+          now: () => now,
+          loadStorage: async () => config,
+          refreshQuota: async () => {
+            refreshes++
+            return quota
+          },
+          sendPrime: async () => {
+            fires++
+          },
+        }).tick()
+      }
+      expect(fires).toBe(0)
+      expect(refreshes).toBe(1)
+      expect(
+        records.filter((record) => record.message === 'no five-hour limit'),
+      ).toHaveLength(2)
+      expect(await readdir(markerDir)).toEqual([])
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(previous)
+    }
+  })
   test('fingerprints resolved paths without exposing the path', () => {
     const relative = join('.', 'config', 'accounts.json')
     const fingerprint = primeStorageFingerprint(relative)

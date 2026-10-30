@@ -151,6 +151,37 @@ describe('killswitch fetch gate', () => {
       expires: Date.now() + 100000,
     })
 
+  test('Ultra fresh weekly-only poll selects the local OpenCode 1 account', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: true, failClosedOnUnknownQuota: true },
+        killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+      }),
+    )
+    let messages = 0
+    globalThis.fetch = mock(
+      withNativeAdmission((input: any) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            Response.json({
+              five_hour: null,
+              seven_day: { utilization: 0 },
+            }),
+          )
+        }
+        messages++
+        return Promise.resolve(new Response('ultra-ok'))
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('ultra-ok')
+    expect(messages).toBe(1)
+  })
+
   // Main below the soft routing threshold but ABOVE the killswitch threshold,
   // with no fallbacks: the killswitch must not hard-block — the request falls
   // through to main as it would with the killswitch disabled.

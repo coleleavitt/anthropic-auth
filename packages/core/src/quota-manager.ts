@@ -25,6 +25,7 @@ import {
   mergeMainQuotaErrorClearedAt,
   quotaBackoffActive,
   quotaSnapshotCheckedAt,
+  quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
 import { logger } from './logger.ts'
 import { nativeAccountCanServe } from './native-account-view.ts'
@@ -138,10 +139,17 @@ function mergePollCompletionWithNewerHeaders(
   current: OAuthQuotaSnapshot | undefined,
   polled: OAuthQuotaSnapshot,
 ): OAuthQuotaSnapshot {
+  // A late poll must not undo a newer successful read that removed the limit.
+  if (
+    quotaSnapshotOmitsFiveHour(current) &&
+    (polled.checkedAt ?? quotaSnapshotCheckedAt(polled)) < current.checkedAt
+  )
+    return current
   if (current?.source !== 'headers') return polled
   const fiveHourIsNewer = Boolean(
     current.five_hour &&
-      current.five_hour.checkedAt > (polled.five_hour?.checkedAt ?? 0),
+      current.five_hour.checkedAt >
+        (polled.five_hour?.checkedAt ?? polled.checkedAt ?? 0),
   )
   const sevenDayIsNewer = Boolean(
     current.seven_day &&
