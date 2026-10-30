@@ -213,6 +213,43 @@ test('Ultra unknown local quota still refuses OpenCode 2 under fail-closed', asy
     poll.mockRestore()
   }
 })
+
+test('Ultra paid API authorization still requires a fresh weekly reading', async () => {
+  const fixture = await local()
+  await fixture.runtime.addApi({
+    routeId: 'paid-ultra',
+    apiKey: 'synthetic-ultra-api-key',
+    baseURL: 'https://api-route.invalid',
+    authHeader: 'x-api-key',
+  })
+  const credential = await fixture.runtime.authorizeLocal('main')
+  if (credential.status !== 'usable')
+    throw new Error('Missing local credential')
+  const now = Date.now()
+  const quota = {
+    source: 'poll' as const,
+    accountIdentity: identity,
+    checkedAt: now - 301_000,
+    seven_day: {
+      usedPercent: 100,
+      remainingPercent: 0,
+      checkedAt: now - 301_000,
+    },
+  }
+  await fixture.runtime.publishLocal(credential.subject, { quota })
+  const native = source(fixture.runtime, fixture.paths)
+  expect(await native.authorizeAccount(scope, 'paid-ultra')).toBeUndefined()
+  await fixture.runtime.publishLocal(credential.subject, {
+    quota: {
+      ...quota,
+      checkedAt: now,
+      seven_day: { ...quota.seven_day, checkedAt: now },
+    },
+  })
+  expect((await native.authorizeAccount(scope, 'paid-ultra'))?.route).toBe(
+    'api',
+  )
+})
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })

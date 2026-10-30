@@ -14,7 +14,7 @@ import {
   killswitchPassesPolicy,
   type OAuthQuotaSnapshot,
   type PrimeUsageCounters,
-  quotaSnapshotFiveHourIsNotApplicable,
+  quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
 import { logger } from './logger.ts'
 import {
@@ -726,13 +726,7 @@ export class PrimeManager {
         return
       }
 
-      if (
-        quotaSnapshotFiveHourIsNotApplicable(
-          evaluation.storedQuota,
-          storage,
-          now,
-        )
-      ) {
+      if (quotaSnapshotOmitsFiveHour(evaluation.storedQuota)) {
         logger.debug('prime', 'no five-hour limit', {
           account: evaluation.label,
         })
@@ -839,7 +833,7 @@ export class PrimeManager {
         return
       }
 
-      if (quotaSnapshotFiveHourIsNotApplicable(fresh, reloaded, now)) {
+      if (quotaSnapshotOmitsFiveHour(fresh)) {
         logger.debug('prime', 'no five-hour limit', {
           account: evaluation.label,
         })

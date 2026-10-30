@@ -686,8 +686,8 @@ export function mergeHeaderQuotaForPersistence(
     bindingWindowSource: preservePollBinding
       ? 'poll'
       : (incoming.bindingWindowSource ?? existing.bindingWindowSource),
-    // Retain the successful poll's absence evidence and its original clock.
-    // Header harvests cannot extend how long an omitted limit is trusted.
+    // Keep the successful poll's absence evidence and original clock so later
+    // merges can distinguish older polls from newer observations.
     ...(quotaSnapshotOmitsFiveHour(existing) && {
       checkedAt: existing.checkedAt,
     }),
@@ -1341,11 +1341,7 @@ export function quotaSnapshotPassesPolicy(
   const thresholds = getQuotaMinimumRemainingThresholds(storage)
   let sawUnknownWindow = false
   for (const key of ['five_hour', 'seven_day'] as const) {
-    if (
-      key === 'five_hour' &&
-      quotaSnapshotFiveHourIsNotApplicable(quota, storage)
-    )
-      continue
+    if (key === 'five_hour' && quotaSnapshotOmitsFiveHour(quota)) continue
     const window = quota?.[key]
     if (!window || !Number.isFinite(window.remainingPercent)) {
       sawUnknownWindow = true
@@ -1371,39 +1367,6 @@ export function quotaSnapshotOmitsFiveHour(
       quota.seven_day &&
       Number.isFinite(quota.checkedAt) &&
       (quota.checkedAt ?? 0) > 0,
-  )
-}
-
-/** Only a current successful reading proves the five-hour limit does not apply. */
-export function quotaSnapshotFiveHourIsNotApplicable(
-  quota: OAuthQuotaSnapshot | undefined,
-  storage: AccountStorage | null = null,
-  now = Date.now(),
-) {
-  if (!quotaSnapshotOmitsFiveHour(quota)) return false
-  const maxAge = getQuotaCheckIntervalMs(storage)
-  const errors = [
-    storage?.quota?.mainLastQuotaApiError,
-    ...(storage?.accounts ?? [])
-      .filter(isOAuthAccount)
-      .map((account) => account.lastQuotaRefreshError),
-  ]
-  if (
-    errors.some(
-      (error) =>
-        error &&
-        error.accountIdentity === quota.accountIdentity &&
-        error.checkedAt >= quota.checkedAt,
-    )
-  )
-    return false
-  return (
-    quota.checkedAt <= now &&
-    now - quota.checkedAt < maxAge &&
-    Number.isFinite(quota.seven_day?.remainingPercent) &&
-    (quota.seven_day?.checkedAt ?? 0) > 0 &&
-    (quota.seven_day?.checkedAt ?? 0) <= now &&
-    now - (quota.seven_day?.checkedAt ?? 0) < maxAge
   )
 }
 
@@ -1484,11 +1447,7 @@ export function killswitchPassesPolicy(
   const thresholds = getKillswitchThresholdsForAccount(storage, accountId)
   let sawUnknownWindow = false
   for (const key of ['five_hour', 'seven_day'] as const) {
-    if (
-      key === 'five_hour' &&
-      quotaSnapshotFiveHourIsNotApplicable(quota, storage)
-    )
-      continue
+    if (key === 'five_hour' && quotaSnapshotOmitsFiveHour(quota)) continue
     const window = quota?.[key]
     // Each configured floor needs its own reading. A present window below
     // its floor blocks even when the other window has no enabled floor.
@@ -1601,11 +1560,7 @@ export function getQuotaNextRefreshAt(
   const thresholds = getQuotaMinimumRemainingThresholds(storage)
   const blockedResetTimes: number[] = []
   for (const key of ['five_hour', 'seven_day'] as const) {
-    if (
-      key === 'five_hour' &&
-      quotaSnapshotFiveHourIsNotApplicable(quota, storage, now)
-    )
-      continue
+    if (key === 'five_hour' && quotaSnapshotOmitsFiveHour(quota)) continue
     const window = quota?.[key]
     if (!window) return capAtOldestWindow(now + intervalMs)
     if (window.remainingPercent >= thresholds[key]) continue

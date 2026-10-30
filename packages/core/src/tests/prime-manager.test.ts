@@ -121,11 +121,16 @@ describe('PrimeManager storage namespaces', () => {
     let fires = 0
     let refreshes = 0
     try {
-      for (const stored of [false, true]) {
+      for (const age of [undefined, 0, 301_000]) {
         const config = storage()
-        if (stored) config.quota!.mainQuota = quota
+        if (age !== undefined)
+          config.quota!.mainQuota = {
+            ...quota,
+            checkedAt: now - age,
+            seven_day: { ...quota.seven_day!, checkedAt: now - age },
+          }
         await manager({
-          storagePath: `/config/ultra-${stored}/accounts.json`,
+          storagePath: `/config/ultra-${age}/accounts.json`,
           markerDir,
           now: () => now,
           loadStorage: async () => config,
@@ -142,7 +147,7 @@ describe('PrimeManager storage namespaces', () => {
       expect(refreshes).toBe(1)
       expect(
         records.filter((record) => record.message === 'no five-hour limit'),
-      ).toHaveLength(2)
+      ).toHaveLength(3)
       expect(await readdir(markerDir)).toEqual([])
     } finally {
       __setLogTestSink(null)

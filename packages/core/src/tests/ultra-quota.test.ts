@@ -2,12 +2,14 @@ import { expect, test } from 'bun:test'
 import {
   type AccountStorage,
   fetchOAuthQuotaSnapshot,
+  getQuotaNextRefreshAt,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
   mergeHeaderQuotaForPersistence,
   type OAuthQuotaSnapshot,
-  quotaSnapshotFiveHourIsNotApplicable,
+  quotaBackoffActive,
   quotaSnapshotHasStandardWindows,
+  quotaSnapshotOmitsFiveHour,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
 } from '../accounts.ts'
@@ -75,6 +77,87 @@ const window = (checkedAt: number, remainingPercent = 100) => ({
   checkedAt,
 })
 
+test('Ultra stored weekly-only quota remains eligible after the poll interval', async () => {
+  const now = Date.now()
+  const quota = await poll(0, now - 301_000)
+  const policy = storage()
+  policy.killswitch = { enabled: true, main: { five_hour: 5, seven_day: 20 } }
+  const twoWindow = { ...quota, five_hour: window(quota.checkedAt!) }
+  expect(quotaSnapshotPassesPolicy(twoWindow, policy)).toBe(true)
+  expect(quotaSnapshotPassesPolicy(quota, policy)).toBe(true)
+  expect(killswitchPassesPolicy(quota, policy)).toBe(true)
+  expect(getQuotaNextRefreshAt(quota, policy, now)).toBe(
+    getQuotaNextRefreshAt(twoWindow, policy, now),
+  )
+  expect(stickyQuotaSnapshotIsFresh(quota, policy, now)).toBe(false)
+  expect(decideStickyQuotaFailure({ quota, now })).toEqual({
+    action: 'retain',
+    reason: 'not-exhausted',
+  })
+  expect(
+    decideStickyQuotaFailure({ quota: await poll(100, now - 301_000), now }),
+  ).toEqual({ action: 'migrate', reason: 'seven-day' })
+})
+
+test('Ultra stored weekly-only quota remains eligible during quota API backoff', async () => {
+  const now = Date.now()
+  const quota = await poll(0, now - 1000)
+  const policy = storage()
+  policy.killswitch = { enabled: true, main: { five_hour: 5, seven_day: 20 } }
+  policy.quota!.mainLastQuotaApiError = {
+    checkedAt: now,
+    nextRetryAt: now + 900_000,
+    accountIdentity: quota.accountIdentity,
+    message: 'Quota API rate-limited',
+    status: 429,
+  }
+  expect(quotaBackoffActive(policy.quota!.mainLastQuotaApiError, now)).toBe(
+    true,
+  )
+  expect(quotaSnapshotPassesPolicy(quota, policy)).toBe(true)
+  expect(killswitchPassesPolicy(quota, policy)).toBe(true)
+})
+
+test('Ultra newer reading with an exhausted five-hour window ends the exemption', async () => {
+  const now = Date.now()
+  const quota = await poll(0, now - 1000)
+  const incoming = {
+    ...quota,
+    checkedAt: now,
+    five_hour: window(now, 0),
+    seven_day: window(now),
+  }
+  const merged = fromNativeQuotaMap(
+    nativeQuotaCodec.merge(toNativeQuotaMap(quota), toNativeQuotaMap(incoming)),
+  )
+  const policy = storage()
+  policy.quota!.minimumRemaining = { five_hour: 5, seven_day: 1 }
+  policy.killswitch = { enabled: true, main: { five_hour: 5, seven_day: 20 } }
+  expect(merged.five_hour?.remainingPercent).toBe(0)
+  expect(quotaSnapshotOmitsFiveHour(merged)).toBe(false)
+  expect(quotaSnapshotPassesPolicy(merged, policy)).toBe(false)
+  expect(killswitchPassesPolicy(merged, policy)).toBe(false)
+})
+
+test('Ultra omitted five-hour freshness follows the weekly window clock', async () => {
+  const now = Date.now()
+  const quota = await poll(0, now - 301_000)
+  const harvested = mergeHeaderQuotaForPersistence(quota, {
+    source: 'headers',
+    checkedAt: now,
+    seven_day: window(now),
+  })
+  expect(stickyQuotaSnapshotIsFresh(harvested, storage(), now)).toBe(true)
+  expect(
+    stickyRouteCandidateWeight({
+      candidate: { accountId: 'main', order: 0, quota: harvested },
+      family: 'general',
+      storage: storage(),
+      now,
+    }),
+  ).toBeGreaterThan(0)
+})
+
 test('Ultra successful weekly-only poll is eligible; weekly and Fable quota still block', async () => {
   const quota = await poll()
   const policy = storage()
@@ -100,23 +183,10 @@ test('Ultra successful weekly-only poll is eligible; weekly and Fable quota stil
   expect(quotaSnapshotPassesModelScope(scoped, model)).toBe(false)
 })
 
-test('absent, failed, stale, header-only and missing-weekly readings remain unknown', async () => {
+test('absent, header-only and missing-weekly readings remain unknown', async () => {
   const policy = storage()
   const quota = await poll()
-  const stale = await poll(0, Date.now() - 301_000)
-  const failedPolicy = storage()
-  failedPolicy.quota!.mainLastQuotaApiError = {
-    checkedAt: quota.checkedAt! + 1,
-    accountIdentity: quota.accountIdentity,
-    message: 'Quota fetch failed',
-  }
   expect(quotaSnapshotPassesPolicy(undefined, policy)).toBe(false)
-  expect(quotaSnapshotPassesPolicy(stale, policy)).toBe(false)
-  expect(decideStickyQuotaFailure({ quota: stale })).toEqual({
-    action: 'retain',
-    reason: 'unknown',
-  })
-  expect(quotaSnapshotPassesPolicy(quota, failedPolicy)).toBe(false)
   expect(
     quotaSnapshotPassesPolicy({ ...quota, source: 'headers' }, policy),
   ).toBe(false)
@@ -219,7 +289,7 @@ test('newer Ultra poll clears a stored five-hour window and older observations c
     ),
   ]) {
     expect(reading.five_hour).toBeUndefined()
-    expect(quotaSnapshotFiveHourIsNotApplicable(reading)).toBe(true)
+    expect(quotaSnapshotOmitsFiveHour(reading)).toBe(true)
   }
   const map = toNativeQuotaMap(merged)
   expect(map.limits.map((limit) => limit.label)).not.toContain('five_hour')
@@ -250,15 +320,15 @@ test('a newer weekly header cannot keep an older session window after an Ultra p
   expect(merged.five_hour).toBeUndefined()
   expect(merged.seven_day?.remainingPercent).toBe(80)
   expect(merged.checkedAt).toBe(quota.checkedAt)
-  expect(quotaSnapshotFiveHourIsNotApplicable(merged)).toBe(true)
+  expect(quotaSnapshotOmitsFiveHour(merged)).toBe(true)
   const harvested = mergeHeaderQuotaSnapshot(quota, {
     ...headers,
     five_hour: undefined,
   })
   expect(harvested.checkedAt).toBe(quota.checkedAt)
-  expect(
-    quotaSnapshotFiveHourIsNotApplicable(harvested, storage(), now + 301_000),
-  ).toBe(false)
+  expect(stickyQuotaSnapshotIsFresh(harvested, storage(), now + 301_000)).toBe(
+    false,
+  )
 })
 
 test('quota manager poll completion does not restore a pre-poll harvested session window', async () => {

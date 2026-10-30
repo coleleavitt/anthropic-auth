@@ -226,8 +226,8 @@ export function mergeHeaderQuotaSnapshot(
         ? 'poll'
         : (incoming.bindingWindowSource ?? existing?.bindingWindowSource),
     ...(Object.keys(fieldSources).length > 0 && { fieldSources }),
-    // Keep the poll's absence evidence on its original clock; headers must
-    // neither resurrect an older session limit nor renew the exemption.
+    // Keep the poll's absence evidence on its original clock so late header
+    // or poll readings cannot resurrect the removed session limit.
     source: 'headers',
     ...(quotaSnapshotOmitsFiveHour(existing) && {
       checkedAt: existing.checkedAt,
