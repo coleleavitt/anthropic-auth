@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - In vault mode, a request refused because your own quota floors or killswitch limits exclude every account now says which limit blocked it and where to change it, instead of asking you to sign in again. Addresses #567.
-
 ## 2.4.6
 
 - After a 429 whose rate-limit headers already show the limit used up, the plugin no longer asks Anthropic's usage endpoint for that account again, which had extended the endpoint's own rate limit for capped accounts.
