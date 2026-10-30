@@ -5,10 +5,14 @@ import { join } from 'node:path'
 import {
   __setLogTestSink,
   createNativeAccountRuntime,
+  getLogLevel,
+  isDumpEnabled,
   type LogTestRecord,
   type NativePoolPaths,
   type ProviderAccountUuid,
   resetClaudeCodeIdentityCachesForTest,
+  setDumpEnabled,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import type { CommandApplyResult } from '@cortexkit/common-auth/commands'
 import { createOpencodeClient } from '@opencode-ai/sdk'
@@ -64,6 +68,11 @@ const nativeLocal = {
 async function start(settings: Record<string, unknown>) {
   const savedFetch = globalThis.fetch
   const savedEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
+  // Starting the plugin applies the stored dump and log settings to
+  // process-wide state. Restore both, or a later file in the same Bun process
+  // inherits dumps switched on and a changed log level.
+  const savedDumpEnabled = isDumpEnabled()
+  const savedLogLevel = getLogLevel()
   const logs: LogTestRecord[] = []
   const plugins: PluginHooks[] = []
   deferCleanup(async () => {
@@ -71,6 +80,8 @@ async function start(settings: Record<string, unknown>) {
       for (const plugin of plugins.splice(0)) await plugin.dispose?.()
     } finally {
       __setLogTestSink(null)
+      setDumpEnabled(savedDumpEnabled)
+      setLogLevel(savedLogLevel)
       globalThis.fetch = savedFetch
       for (const key of envKeys) {
         const value = savedEnv.get(key)
