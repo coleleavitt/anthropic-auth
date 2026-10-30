@@ -1,7 +1,7 @@
 import {
   type AccountStorage,
   logger,
-  type OAuthQuotaSnapshot,
+  quotaExhaustionFromHeaders,
   type StickyRouteCandidate,
   stickyRouteFamilyForModel,
   stickyRouteKnownFableExhausted,
@@ -137,7 +137,7 @@ export function createRoutingRelay() {
       subject: RoutingSubject,
       headers: Headers,
       status: number,
-      quota?: OAuthQuotaSnapshot,
+      modelId?: string,
       served = status < 400,
     ) {
       if (!subject.accountIdentity) return
@@ -148,7 +148,7 @@ export function createRoutingRelay() {
           : {}),
       }
       const reports: RoutingReport[] = []
-      if (served) {
+      if (served && status < 400) {
         const rateHeaders: Record<string, string> = {}
         headers.forEach((value, name) => {
           if (name.toLowerCase().startsWith('anthropic-ratelimit-'))
@@ -156,38 +156,27 @@ export function createRoutingRelay() {
         })
         reports.push({ ...identity, outcome: 'served', headers: rateHeaders })
       }
-      for (const [window, reading] of [
-        ['5h', quota?.five_hour],
-        ['7d', quota?.seven_day],
-        ...(quota?.scoped?.map((row) => [row.id.toLowerCase(), row] as const) ??
-          []),
-      ] as const) {
-        if (
-          reading &&
-          (reading.remainingPercent <= 0 || reading.usedPercent >= 100)
-        )
-          reports.push({
-            ...identity,
-            outcome: 'exhausted',
-            window,
-            ...(reading.resetsAt ? { resets_at: reading.resetsAt } : {}),
-          })
-      }
-      if (
-        status === 429 &&
-        !reports.some((row) => row.outcome === 'exhausted')
-      ) {
-        const binding = quota?.bindingWindow?.toLowerCase()
-        reports.push({
-          ...identity,
-          outcome: 'exhausted',
-          window:
-            binding === 'five_hour'
-              ? '5h'
-              : binding === 'seven_day'
-                ? '7d'
-                : (binding ?? '7d'),
-        })
+      if (status === 429) {
+        // Display percentages round near-full windows to 100. Only the refused
+        // response's raw headers can confirm exhaustion, never saved quota.
+        const quota = quotaExhaustionFromHeaders(headers, modelId)
+        for (const [window, reading] of [
+          ['5h', quota.five_hour],
+          ['7d', quota.seven_day],
+          ...(quota.scoped?.map(
+            (row) => [row.id.toLowerCase(), row] as const,
+          ) ?? []),
+        ] as const) {
+          if (reading)
+            reports.push({
+              ...identity,
+              outcome: 'exhausted',
+              window,
+              ...(reading.resetsAt ? { resets_at: reading.resetsAt } : {}),
+            })
+        }
+        if (!reports.length)
+          reports.push({ ...identity, outcome: 'exhausted', window: '7d' })
       }
       // Neither synchronous bridge errors nor rejected report promises can fail a send.
       void Promise.resolve()

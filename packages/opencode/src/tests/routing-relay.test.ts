@@ -70,7 +70,7 @@ describe('shared routing relay', () => {
     ).toBe(ROUTING_HOLD_LIMIT_MS)
   })
 
-  test('reports only all lowercased rate-limit headers and attributed exhausted windows', async () => {
+  test('a served response reports only all lowercased rate-limit headers, even at full utilization', async () => {
     const reports: unknown[] = []
     globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
     const relay = createRoutingRelay()
@@ -85,24 +85,6 @@ describe('shared routing relay', () => {
         'request-id': 'never sent',
       }),
       200,
-      {
-        five_hour: {
-          usedPercent: 100,
-          remainingPercent: 0,
-          checkedAt: 1,
-          resetsAt: 'known',
-        },
-        scoped: [
-          {
-            id: 'FaBlE',
-            title: 'Fable',
-            modelName: 'Fable',
-            usedPercent: 100,
-            remainingPercent: 0,
-            checkedAt: 1,
-          },
-        ],
-      },
     )
     await Promise.resolve()
     expect(reports).toEqual([
@@ -115,24 +97,11 @@ describe('shared routing relay', () => {
           'anthropic-ratelimit-future-field': 'unfiltered',
         },
       },
-      {
-        account_id: 'account',
-        credential_id: 'credential',
-        outcome: 'exhausted',
-        window: '5h',
-        resets_at: 'known',
-      },
-      {
-        account_id: 'account',
-        credential_id: 'credential',
-        outcome: 'exhausted',
-        window: 'fable',
-      },
     ])
     relay.report('session', subject, new Headers(), 429)
     relay.report('session', subject, new Headers(), 401)
     await Promise.resolve()
-    expect(reports.slice(3)).toEqual([
+    expect(reports.slice(1)).toEqual([
       {
         account_id: 'account',
         credential_id: 'credential',
@@ -167,12 +136,12 @@ describe('shared routing relay', () => {
   )
 
   test.each([
-    ['five_hour', '5h'],
-    ['seven_day', '7d'],
-    ['FaBlE', 'fable'],
+    ['5h', '5h'],
+    ['7d', '7d'],
+    ['7d_fable', '7d_fable'],
   ])(
-    'attributes a 429 binding window %s as %s',
-    async (bindingWindow, window) => {
+    'attributes a raw rejected 429 window %s as %s',
+    async (suffix, window) => {
       const reports: unknown[] = []
       globals[key] = () => ({
         report: (report: unknown) => reports.push(report),
@@ -180,14 +149,66 @@ describe('shared routing relay', () => {
       createRoutingRelay().report(
         'session',
         { accountIdentity: 'account' },
-        new Headers(),
+        new Headers({
+          [`anthropic-ratelimit-unified-${suffix}-status`]: 'rejected',
+          [`anthropic-ratelimit-unified-${suffix}-utilization`]: '0.996',
+          [`anthropic-ratelimit-unified-${suffix}-reset`]: '2000000000',
+        }),
         429,
-        { bindingWindow },
+        'claude-fable-5',
       )
       await Promise.resolve()
       expect(reports).toEqual([
-        { account_id: 'account', outcome: 'exhausted', window },
+        {
+          account_id: 'account',
+          outcome: 'exhausted',
+          window,
+          resets_at: '2033-05-18T03:33:20.000Z',
+        },
       ])
     },
   )
+
+  test('an unconfirmed 429 ignores rounded utilization and binding claims and falls back to 7d', async () => {
+    const reports: unknown[] = []
+    globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
+    createRoutingRelay().report(
+      'session',
+      { accountIdentity: 'account' },
+      new Headers({
+        'anthropic-ratelimit-unified-5h-utilization': '0.996',
+        'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+      }),
+      429,
+    )
+    await Promise.resolve()
+    expect(reports).toEqual([
+      { account_id: 'account', outcome: 'exhausted', window: '7d' },
+    ])
+  })
+
+  test('reports each exhausted window from the same 429 once', async () => {
+    const reports: unknown[] = []
+    globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
+    createRoutingRelay().report(
+      'session',
+      { accountIdentity: 'account' },
+      new Headers({
+        'anthropic-ratelimit-unified-5h-utilization': '1',
+        'anthropic-ratelimit-unified-7d-status': 'rejected',
+        'anthropic-ratelimit-unified-7d_fable-utilization': '1.01',
+        'anthropic-ratelimit-unified-7d_fable-status': 'rejected',
+      }),
+      429,
+      'claude-fable-5',
+    )
+    await Promise.resolve()
+    expect(reports).toEqual(
+      ['5h', '7d', '7d_fable'].map((window) => ({
+        account_id: 'account',
+        outcome: 'exhausted',
+        window,
+      })),
+    )
+  })
 })

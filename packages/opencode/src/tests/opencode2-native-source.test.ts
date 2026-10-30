@@ -274,6 +274,124 @@ describe('OC2 shared routing relay', () => {
     ])
   })
 
+  test('served raw utilization 0.996 reports served without exhausted', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const reports: unknown[] = []
+    bridge(
+      () => null,
+      (report) => reports.push(report),
+    )
+    const auth = await native.authorizeAccount(scope, 'main')
+    if (!auth) throw new Error('No authorization')
+    native.quotaFromHeaders?.(
+      new Headers({
+        'anthropic-ratelimit-unified-5h-utilization': '0.996',
+      }),
+      { ...context(auth.provenance), status: 200 },
+    )
+    await Promise.resolve()
+    expect(reports).toEqual([
+      {
+        account_id: identity,
+        credential_id: 'oauth:anthropic',
+        outcome: 'served',
+        headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.996' },
+      },
+    ])
+  })
+
+  test('429 reports only its own exhausted 7d window, never a stored 5h reading', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const reports: unknown[] = []
+    bridge(
+      () => null,
+      (report) => reports.push(report),
+    )
+    const auth = await native.authorizeAccount(scope, 'main')
+    if (!auth) throw new Error('No authorization')
+    native.quotaFromHeaders?.(
+      new Headers({
+        'anthropic-ratelimit-unified-5h-utilization': '1',
+      }),
+      { ...context(auth.provenance), status: 200 },
+    )
+    await Promise.resolve()
+    reports.length = 0
+    native.quotaFromHeaders?.(
+      new Headers({
+        'anthropic-ratelimit-unified-7d-utilization': '1.0',
+        'anthropic-ratelimit-unified-7d-reset': '2000000000',
+      }),
+      { ...context(auth.provenance), status: 429 },
+    )
+    await Promise.resolve()
+    expect(reports).toEqual([
+      {
+        account_id: identity,
+        credential_id: 'oauth:anthropic',
+        outcome: 'exhausted',
+        window: '7d',
+        resets_at: '2033-05-18T03:33:20.000Z',
+      },
+    ])
+  })
+
+  test.each([true, false])(
+    'stream rate limit uses its response headers once (confirmed=%s)',
+    async (confirmed) => {
+      const f = await vaultWithFallback()
+      const native = source(f.runtime, f.paths)
+      const reports: unknown[] = []
+      bridge(
+        () => null,
+        (report) => reports.push(report),
+      )
+      const auth = await native.authorizeAccount(scope, 'main')
+      if (!auth) throw new Error('No authorization')
+      const input = context(auth.provenance)
+      native.quotaFromHeaders?.(
+        new Headers(
+          confirmed
+            ? {
+                'anthropic-ratelimit-unified-5h-status': 'rejected',
+                'anthropic-ratelimit-unified-5h-utilization': '0.996',
+                'anthropic-ratelimit-unified-5h-reset': '2000000000',
+              }
+            : {},
+        ),
+        { ...input, status: 200 },
+      )
+      await Promise.resolve()
+      reports.length = 0
+      native.limitFromStreamError?.({
+        ...input,
+        errorType: 'rate_limit_error',
+        message: 'limited',
+      })
+      native.limitFromStreamError?.({
+        ...input,
+        errorType: 'rate_limit_error',
+        message: 'limited',
+      })
+      native.limitFromHostError?.(
+        { type: 'rate_limit_error', message: 'limited', status: 429 },
+        input,
+      )
+      await Promise.resolve()
+      expect(reports).toEqual([
+        {
+          account_id: identity,
+          credential_id: 'oauth:anthropic',
+          outcome: 'exhausted',
+          window: confirmed ? '5h' : '7d',
+          ...(confirmed ? { resets_at: '2033-05-18T03:33:20.000Z' } : {}),
+        },
+      ])
+    },
+  )
+
   test.each(['floor', 'reserve', 'disabled', 'model scope'])(
     'overrides advice refused by %s',
     async (mode) => {

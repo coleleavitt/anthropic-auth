@@ -7,6 +7,7 @@ import {
   createFallbackStorage,
   getPlugin,
   syntheticFallbackAccountUuid,
+  syntheticMainAccountUuid,
   useTempAccountFile,
   withNativeAdmission,
 } from './support/opencode1-pool-fixture'
@@ -28,7 +29,7 @@ afterEach(() => {
 
 describe('OC1 shared routing relay', () => {
   installLoaderSetup(ctx)
-  async function fixture(mode = 'normal') {
+  async function fixture(mode = 'normal', responseFor?: () => Response) {
     const now = Date.now()
     const quota = (remaining: number, fable = 100) => ({
       checkedAt: now,
@@ -94,8 +95,10 @@ describe('OC1 shared routing relay', () => {
               }),
             ),
           )
-        if (extractUrl(input).includes('/v1/messages'))
+        if (extractUrl(input).includes('/v1/messages')) {
           sends.push(new Headers(init?.headers).get('authorization') ?? '')
+          if (responseFor) return Promise.resolve(responseFor())
+        }
         return Promise.resolve(
           new Response('ok', {
             headers: {
@@ -221,4 +224,78 @@ describe('OC1 shared routing relay', () => {
     expect(await response.text()).toBe(baselineBody)
     expect(f.sends).toEqual([])
   })
+
+  test('a served 200 at 0.996 sends only served with the raw utilization', async () => {
+    const f = await fixture(
+      'normal',
+      () =>
+        new Response('ok', {
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.996',
+          },
+        }),
+    )
+    const reports: unknown[] = []
+    globals[key] = () => ({
+      accountFor: async () => null,
+      report: (report: unknown) => reports.push(report),
+    })
+    await (await f.send()).text()
+    expect(reports).toEqual([
+      {
+        account_id: syntheticMainAccountUuid,
+        outcome: 'served',
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.996',
+        },
+      },
+    ])
+  })
+
+  for (const streaming of [false, true]) {
+    test(`${streaming ? 'stream rate limit' : '429'} reports upstream 7d exhaustion before a sticky hold rewrites Retry-After`, async () => {
+      const reset = Math.floor(Date.now() / 1000) + 120
+      const f = await fixture(
+        'normal',
+        () =>
+          new Response(
+            streaming
+              ? 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"limited"}}\n\n'
+              : 'limited',
+            {
+              status: streaming ? 200 : 429,
+              headers: {
+                'content-type': streaming ? 'text/event-stream' : 'text/plain',
+                'retry-after': '999999',
+                'anthropic-ratelimit-unified-7d-utilization': '1.0',
+                'anthropic-ratelimit-unified-7d-reset': String(reset),
+              },
+            },
+          ),
+      )
+      const reports: Array<{ outcome: string; [key: string]: unknown }> = []
+      globals[key] = () => ({
+        accountFor: async () => null,
+        report: (report: { outcome: string; [key: string]: unknown }) =>
+          reports.push(report),
+      })
+      const response = await f.send()
+      expect(response.status).toBe(429)
+      expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(
+        140,
+      )
+      expect(f.sends).toHaveLength(1)
+      expect(
+        reports.filter((report) => report.outcome === 'exhausted'),
+      ).toEqual([
+        {
+          account_id: syntheticMainAccountUuid,
+          outcome: 'exhausted',
+          window: '7d',
+          resets_at: new Date(reset * 1000).toISOString(),
+        },
+      ])
+      await response.body?.cancel()
+    })
+  }
 })

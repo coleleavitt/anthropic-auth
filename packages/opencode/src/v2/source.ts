@@ -87,6 +87,8 @@ type State = {
   readonly retry: boolean
   readonly relayFallback: boolean
   quota?: OAuthQuotaSnapshot
+  responseHeaders?: Headers
+  exhaustionReported?: boolean
 }
 type Retry = {
   readonly scope: RequestScope
@@ -431,6 +433,28 @@ export function createNativeAnthropicSource(
     return runtime.quotaObservations.hold(state.account.id, observation)
       ? observation
       : undefined
+  }
+
+  function reportRateLimit(
+    input: NativeAnthropicAttemptContext<NativeSourceProvenance>,
+    state: State,
+  ) {
+    if (state.exhaustionReported) return
+    state.exhaustionReported = true
+    routingRelay.report(
+      input.sessionID,
+      {
+        accountIdentity: state.account.accountIdentity,
+        credentialId:
+          input.provenance.kind === 'vault'
+            ? input.provenance.credentialId
+            : state.account.credentialId,
+      },
+      state.responseHeaders ?? new Headers(),
+      429,
+      state.scope.modelID,
+      false,
+    )
   }
 
   const source: NativeSource = {
@@ -931,27 +955,25 @@ export function createNativeAnthropicSource(
     quotaFromHeaders(headers, input) {
       const state = states.get(input.provenance)
       if (state) {
+        state.responseHeaders = headers
         const served = input.status < 400 && !servedTurns.has(input.sessionID)
         if (served) servedTurns.add(input.sessionID)
-        routingRelay.report(
-          input.sessionID,
-          {
-            accountIdentity: state.account.accountIdentity,
-            credentialId:
-              input.provenance.kind === 'vault'
-                ? input.provenance.credentialId
-                : state.account.credentialId,
-          },
-          headers,
-          input.status,
-          input.status === 429
-            ? mergeHeaderQuotaForPersistence(
-                state.quota,
-                normalizeQuotaHeaders(headers),
-              )
-            : normalizeQuotaHeaders(headers),
-          served,
-        )
+        if (input.status === 429) reportRateLimit(input, state)
+        else
+          routingRelay.report(
+            input.sessionID,
+            {
+              accountIdentity: state.account.accountIdentity,
+              credentialId:
+                input.provenance.kind === 'vault'
+                  ? input.provenance.credentialId
+                  : state.account.credentialId,
+            },
+            headers,
+            input.status,
+            state.scope.modelID,
+            served,
+          )
       }
       const requestId = extractAnthropicRequestId(headers)
       if (requestId) options.onRequestId?.(input, requestId)
@@ -1112,6 +1134,9 @@ export function createNativeAnthropicSource(
       return { reason }
     },
     limitFromStreamError(input) {
+      const state = states.get(input.provenance)
+      if (state && input.errorType === 'rate_limit_error')
+        reportRateLimit(input, state)
       return input.errorType === 'rate_limit_error'
         ? { reason: 'provider-rate-limit', status: 429 }
         : undefined

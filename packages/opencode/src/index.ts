@@ -1923,6 +1923,7 @@ const anthropicAuthPlugin = async (
   const stickySessionRouters = new Map<string, StickySessionRouter>()
   const routingRelay = createRoutingRelay()
   const routingServedTurns = new WeakSet<PerfTrace>()
+  const routingStreamLimits = new WeakMap<Response, () => void>()
   async function currentStickyRouting(): Promise<{
     router: StickySessionRouter
     accountIdentities?: ReadonlyMap<string, string>
@@ -6972,6 +6973,8 @@ const anthropicAuthPlugin = async (
             }
 
             if (rateLimited) {
+              routingStreamLimits.get(response)?.()
+              routingStreamLimits.delete(response)
               await reader.cancel().catch(() => {})
               try {
                 reader.releaseLock()
@@ -8108,28 +8111,32 @@ const anthropicAuthPlugin = async (
                 response.status < 400 &&
                 (!trace || !routingServedTurns.has(trace))
               if (servedTurn && trace) routingServedTurns.add(trace)
+              const subject = {
+                accountIdentity: nativeAuthorization.accountIdentity,
+                credentialId: nativeAuthorization.scopedAttempt?.credentialId,
+              }
               routingRelay.report(
                 relayAffinity,
-                {
-                  accountIdentity: nativeAuthorization.accountIdentity,
-                  credentialId: nativeAuthorization.scopedAttempt?.credentialId,
-                },
+                subject,
                 headers,
                 response.status,
-                response.status === 429
-                  ? mergeHeaderQuotaForPersistence(
-                      oauthAccountId === 'main'
-                        ? quotaManager.getMain(mainQuotaIdentity?.quotaKey)
-                            ?.quota
-                        : quotaManager.getAllFallbacks().get(oauthAccountId)
-                            ?.quota,
-                      normalizeQuotaHeaders(headers),
-                    )
-                  : isQuotaBearingHeaderFrame(headers)
-                    ? normalizeQuotaHeaders(headers)
-                    : undefined,
+                modelForIdentity,
                 servedTurn,
               )
+              if (response.status === 200) {
+                // Keep the upstream headers before sticky retries replace the
+                // response's status or Retry-After for the host.
+                routingStreamLimits.set(response, () =>
+                  routingRelay.report(
+                    relayAffinity,
+                    subject,
+                    headers,
+                    429,
+                    modelForIdentity,
+                    false,
+                  ),
+                )
+              }
             }
             attachCacheDiagnosticsResponse(response, {
               source: laneStartRequest ? 'start' : 'turn',
