@@ -1,4 +1,4 @@
-import { afterEach, expect, mock } from 'bun:test'
+import { afterEach, expect, mock, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
 import {
   chmod,
@@ -3252,17 +3252,24 @@ test('OpenCode routes normally during roster deferral without publishing an empt
 })
 
 /**
- * An enrolled host serving two vault accounts with sticky-balanced routing,
+ * An enrolled host serving vault accounts with sticky-balanced routing,
  * directly or through an HTTP relay. Model sends reach an owned loopback
- * server that rejects the test's first send with 401 and accepts every later
- * one. `served` lists the vault credential each model send used, in order.
+ * server that rejects the first send (401 unless configured otherwise) and
+ * accepts every later one. `served` lists the credential used by each send.
  * `afterSend` sees each model response before the plugin does.
  */
 async function stickyVaultRejectedFirstSend(
   relay: boolean,
   afterSend?: (response: Response) => void,
+  options: {
+    firstRefusal?: (headers: Record<string, string>) => Response
+    fallback?: boolean
+  } = {},
 ) {
-  const fixture = await migrateServingFixture('claustrum', true)
+  const fixture = await migrateServingFixture(
+    'claustrum',
+    options.fallback ?? true,
+  )
   const relayServer = relay ? new MockRelayServer() : undefined
   if (relayServer) relays.add(relayServer)
   const relayAddress = await relayServer?.start({
@@ -3322,6 +3329,8 @@ async function stickyVaultRejectedFirstSend(
       )
       // An Anthropic request id is what lets a relayed status count as upstream.
       const headers = { 'request-id': `req_synthetic_sticky_${served.length}` }
+      if (served.length === 1 && options.firstRefusal)
+        return options.firstRefusal(headers)
       if (served.length === 1)
         return Response.json(
           {
@@ -3367,6 +3376,169 @@ async function stickyVaultRejectedFirstSend(
   })
   return { fixture, served, plugin }
 }
+
+async function weeklyStickyRefusal(
+  options: {
+    resetSeconds?: number
+    headers?: Record<string, string>
+    fallback?: boolean
+  } = {},
+) {
+  const resetSeconds = options.resetSeconds ?? 5 * 24 * 60 * 60
+  const setup = await stickyVaultRejectedFirstSend(false, undefined, {
+    fallback: options.fallback,
+    firstRefusal: (headers) =>
+      Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: 'Synthetic weekly limit',
+          },
+        },
+        {
+          status: 429,
+          headers: {
+            ...headers,
+            'retry-after': String(resetSeconds),
+            'anthropic-ratelimit-unified-7d-utilization': '1.0',
+            'anthropic-ratelimit-unified-7d-reset': String(
+              Math.floor(Date.now() / 1000) + resetSeconds,
+            ),
+            ...options.headers,
+          },
+        },
+      ),
+  })
+  const runtime = createNativeAccountRuntime({
+    paths: setup.fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => setup.fixture.scopedClient },
+  })
+  const snapshot = await runtime.read()
+  runtime.close()
+  const routingPath = snapshot.routingPath
+  if (!routingPath) throw new Error('Vault fixture has no routing path')
+  const main = snapshot.accounts.find((account) => account.id === 'main')!
+  const router = new StickySessionRouter({ path: routingPath })
+  const sessionId = 'synthetic-weekly-sticky'
+  await router.resolve({
+    sessionId,
+    modelId: 'claude-opus-5-5',
+    family: stickyRouteFamilyForModel('claude-opus-5-5'),
+    candidates: [{ accountId: 'main', quota: main.quota!, order: 0 }],
+    retainAccountIds: new Set(['main']),
+    accountIdentities: new Map([['main', mainIdentity]]),
+    storage: snapshot.policyStorage,
+    inputBytes: 1,
+  })
+  await router.drain()
+  return { ...setup, sessionId, routingPath }
+}
+
+test('vault sticky weekly 429 headers migrate main to an account with room in the same request', async () => {
+  const { fixture, plugin, served, sessionId, routingPath } =
+    await weeklyStickyRefusal()
+  const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+  expect(response.status).toBe(200)
+  expect(served).toEqual(['oauth:anthropic', 'oauth:secondary'])
+  expect(await response.text()).toContain('native-serving-ok')
+  await plugin.dispose?.()
+  expect((await stickyPin(routingPath, sessionId))?.accountIdentity).toBe(
+    fallbackIdentity,
+  )
+  expect(fixture.scopedReports).toEqual([])
+})
+
+test('vault sticky weekly 429 rejected status migrates even when the quota refresh throws', async () => {
+  const { plugin, served, sessionId } = await weeklyStickyRefusal({
+    headers: {
+      'anthropic-ratelimit-unified-7d-utilization': '',
+      'anthropic-ratelimit-unified-7d-status': 'rejected',
+    },
+  })
+  const probe = spyOn(
+    getPluginTestHandles(plugin).quotaManager,
+    'refreshMain',
+  ).mockRejectedValue(new Error('Synthetic quota probe unavailable'))
+  try {
+    const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+    expect(response.status).toBe(200)
+    expect(served).toEqual(['oauth:anthropic', 'oauth:secondary'])
+    expect(probe).toHaveBeenCalled()
+  } finally {
+    probe.mockRestore()
+  }
+})
+
+for (const shortWait of [false, true]) {
+  test(`vault sticky weekly 429 retains on probe failure with a bounded retry (short upstream=${shortWait})`, async () => {
+    const reset = Date.now() + 5 * 24 * 60 * 60_000
+    const { plugin, served, sessionId, routingPath } =
+      await weeklyStickyRefusal({
+        headers: {
+          'anthropic-ratelimit-unified-7d-utilization': '0.999',
+          'retry-after': new Date(reset).toUTCString(),
+          'retry-after-ms': shortWait ? '1500' : String(5 * 24 * 60 * 60_000),
+          'anthropic-ratelimit-requests-reset': new Date(reset).toISOString(),
+        },
+      })
+    const probe = spyOn(
+      getPluginTestHandles(plugin).quotaManager,
+      'refreshMain',
+    ).mockRejectedValue(new Error('Synthetic quota probe unavailable'))
+    try {
+      const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+      expect(response.status).toBe(429)
+      expect(probe).toHaveBeenCalled()
+      expect(Number(response.headers.get('retry-after'))).toBe(
+        shortWait ? 1.5 : 60,
+      )
+      expect(Number(response.headers.get('retry-after-ms'))).toBe(
+        shortWait ? 1500 : 60_000,
+      )
+      expect(
+        Number(response.headers.get('anthropic-ratelimit-unified-7d-reset')) *
+          1000,
+      ).toBeLessThanOrEqual(Date.now() + 60_000)
+      expect(
+        Date.parse(response.headers.get('anthropic-ratelimit-requests-reset')!),
+      ).toBeLessThanOrEqual(Date.now() + 60_000)
+      expect(served).toEqual(['oauth:anthropic'])
+      await plugin.dispose?.()
+      expect((await stickyPin(routingPath, sessionId))?.accountId).toBe('main')
+    } finally {
+      probe.mockRestore()
+    }
+  })
+}
+
+test('vault sticky weekly 429 holds main for a ten minute reset', async () => {
+  const { plugin, served, sessionId, routingPath } = await weeklyStickyRefusal({
+    resetSeconds: 600,
+  })
+  const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+  expect(response.status).toBe(429)
+  expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(
+    599,
+  )
+  expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(630)
+  expect(served).toEqual(['oauth:anthropic'])
+  await plugin.dispose?.()
+  expect((await stickyPin(routingPath, sessionId))?.accountId).toBe('main')
+})
+
+test('vault sticky weekly 429 on the last eligible account still returns a quota refusal', async () => {
+  const { plugin, served, sessionId } = await weeklyStickyRefusal({
+    fallback: false,
+  })
+  const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+  expect(response.status).toBe(429)
+  expect(await response.json()).toMatchObject({
+    error: { type: 'rate_limit_error' },
+  })
+  expect(served).toEqual(['oauth:anthropic'])
+})
 
 const reportedRecords = (fixture: ServingFixture) =>
   fixture.scopedReports.map((report) => [

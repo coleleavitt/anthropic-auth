@@ -1,5 +1,6 @@
 import {
   setBounded,
+  stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -103,12 +104,16 @@ export async function withStickyRetryAfter(
   retryAfterSeconds: number,
   streamingRateLimit: boolean,
   contexts: WeakMap<Response, unknown>,
+  retain = false,
 ) {
-  const headers = new Headers(response.headers)
-  headers.set(
-    'retry-after',
-    String(stickyRetryAfterWithJitter(sessionId, retryAfterSeconds)),
-  )
+  const headers = retain
+    ? stickyRetainRetryHeaders(response.headers)
+    : new Headers(response.headers)
+  if (!retain)
+    headers.set(
+      'retry-after',
+      String(stickyRetryAfterWithJitter(sessionId, retryAfterSeconds)),
+    )
   if (streamingRateLimit) {
     await response.body?.cancel().catch(() => {})
     headers.set('content-type', 'application/json')
@@ -117,8 +122,9 @@ export async function withStickyRetryAfter(
         type: 'error',
         error: {
           type: 'rate_limit_error',
-          message:
-            'Sticky OAuth account quota resets shortly; retaining session affinity.',
+          message: retain
+            ? 'Sticky OAuth account quota is unconfirmed; retrying shortly while retaining session affinity.'
+            : 'Sticky OAuth account quota resets shortly; retaining session affinity.',
         },
       }),
       { status: 429, headers },

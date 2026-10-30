@@ -9757,13 +9757,14 @@ const anthropicAuthPlugin = async (
                                 route.account,
                               )
                       } catch {
-                        // A model 429 plus a failed quota probe is not enough to
-                        // break session affinity. Migrate only from fresh quota.
+                        // A failed probe retains affinity unless the response's
+                        // own quota headers confirm an exhausted window.
                         quota = undefined
                       }
                       const decision = decideStickyQuotaFailure({
                         quota,
                         modelId: routingModelId,
+                        responseHeaders: inspected.response.headers,
                       })
                       trace.mark('sticky_quota_failure', {
                         accountId: route.id,
@@ -9779,6 +9780,19 @@ const anthropicAuthPlugin = async (
                             decision.retryAfterSeconds,
                             inspected.streamingRateLimit,
                             cacheDiagnosticsResponses,
+                          ),
+                        )
+                      }
+                      if (decision.action === 'retain') {
+                        return completeRoute(
+                          route,
+                          await withStickyRetryAfter(
+                            inspected.response,
+                            sessionId,
+                            60,
+                            inspected.streamingRateLimit,
+                            cacheDiagnosticsResponses,
+                            true,
                           ),
                         )
                       }

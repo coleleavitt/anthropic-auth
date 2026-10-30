@@ -887,6 +887,110 @@ describe('Pi API fallback routing helpers', () => {
     }
   })
 
+  test('sticky-balanced Pi moves on weekly 429 headers even when the quota probe still reports room', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-weekly-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = join(
+      tempDir,
+      'sticky-routes.json',
+    )
+    const checkedAt = Date.now()
+    const quota = (remaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 100 - remaining,
+        remainingPercent: remaining,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 100 - remaining,
+        remainingPercent: remaining,
+        checkedAt,
+      },
+    })
+    await saveNativePiFixture(
+      {
+        version: 1,
+        mainAccountId: 'main-account',
+        main: { type: 'opencode', provider: 'anthropic' },
+        quota: {
+          enabled: true,
+          mainQuota: { ...quota(0), accountIdentity: 'main-account' },
+          mainQuotaCheckedAt: checkedAt,
+        },
+        routing: { mode: 'sticky-balanced' },
+        accounts: [
+          {
+            id: 'full',
+            type: 'oauth',
+            access: 'sk-ant-oat01-full-access',
+            refresh: 'full-refresh',
+            expires: checkedAt + 8 * 60 * 60_000,
+            quota: quota(100),
+          },
+          {
+            id: 'room',
+            type: 'oauth',
+            access: 'sk-ant-oat01-room-access',
+            refresh: 'room-refresh',
+            expires: checkedAt + 8 * 60 * 60_000,
+            quota: quota(10),
+          },
+        ],
+      },
+      storagePath,
+    )
+    const authorizations: string[] = []
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : input.toString()
+        if (url.includes('/api/oauth/usage'))
+          return Response.json({
+            five_hour: { utilization: 0 },
+            seven_day: { utilization: 10 },
+          })
+        if (!url.includes('/v1/messages')) return Response.json({})
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        authorizations.push(authorization)
+        if (authorization.includes('full-access'))
+          return Response.json(
+            { error: { type: 'rate_limit_error' } },
+            {
+              status: 429,
+              headers: {
+                'retry-after': '432000',
+                'anthropic-ratelimit-unified-7d-utilization': '1.0',
+                'anthropic-ratelimit-unified-7d-reset': String(
+                  Math.floor(Date.now() / 1000) + 432000,
+                ),
+              },
+            },
+          )
+        return new Response(
+          [
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join(''),
+        )
+      },
+    ) as unknown as typeof fetch
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'sk-ant-oat01-main-access',
+      sessionId: 'pi-weekly-headers',
+    })
+    for await (const _event of stream) {
+      /* Drain the migrated response. */
+    }
+    expect((await stream.result()).errorMessage).toBeUndefined()
+    expect(authorizations).toEqual([
+      'Bearer sk-ant-oat01-full-access',
+      'Bearer sk-ant-oat01-room-access',
+    ])
+  })
+
   for (const window of ['5h', '7d', 'model-scoped'] as const) {
     test(`sticky-balanced holds the assigned Pi account for a 10-minute ${window} reset and moves for a far reset`, async () => {
       tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-hold-'))

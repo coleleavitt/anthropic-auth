@@ -1484,6 +1484,10 @@ async function executeWithFallback(options: {
         const decision = decideStickyQuotaFailure({
           quota,
           modelId: options.model.id,
+          responseHeaders:
+            preflight instanceof Response
+              ? preflight.headers
+              : response.headers,
         })
         if (decision.action === 'hold') {
           const headers = new Headers(

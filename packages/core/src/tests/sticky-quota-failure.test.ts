@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { OAuthQuotaSnapshot } from '../accounts.ts'
 import {
   decideStickyQuotaFailure,
+  stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
 } from '../sticky-routing.ts'
 
@@ -38,6 +39,105 @@ function decide(quota: OAuthQuotaSnapshot, modelId = MODEL) {
 const resetIn = (ms: number) => new Date(NOW + ms).toISOString()
 
 describe('sticky quota hold', () => {
+  test('429 headers confirm raw exhaustion, including rejected windows without utilization', () => {
+    for (const suffix of ['5h', '7d', '7d_opus', '7d-opus']) {
+      for (const evidence of [{ utilization: '1.0' }, { status: 'rejected' }]) {
+        const headers = new Headers({
+          [`anthropic-ratelimit-unified-${suffix}-reset`]: String(
+            (NOW + 5 * 24 * 60 * 60_000) / 1000,
+          ),
+        })
+        for (const [name, value] of Object.entries(evidence))
+          headers.set(`anthropic-ratelimit-unified-${suffix}-${name}`, value)
+        expect(
+          decideStickyQuotaFailure({
+            quota: undefined,
+            responseHeaders: headers,
+            modelId: 'claude-opus-5-5',
+            now: NOW,
+          }).action,
+        ).toBe('migrate')
+      }
+    }
+  })
+
+  test('429 header confirmation ignores rounded near-exhaustion and other models', () => {
+    for (const suffix of ['5h', '7d']) {
+      const headers = new Headers({
+        [`anthropic-ratelimit-unified-${suffix}-utilization`]: '0.999',
+      })
+      expect(
+        decideStickyQuotaFailure({
+          quota: {
+            source: 'headers',
+            ...exhausted(
+              suffix === '5h' ? 'five-hour' : 'seven-day',
+              undefined,
+            ),
+          },
+          responseHeaders: headers,
+          now: NOW,
+        }).action,
+      ).toBe('retain')
+    }
+    expect(
+      decideStickyQuotaFailure({
+        quota: undefined,
+        responseHeaders: new Headers({
+          'anthropic-ratelimit-unified-7d_opus-status': 'rejected',
+        }),
+        modelId: 'claude-sonnet-4-6',
+        now: NOW,
+      }).action,
+    ).toBe('retain')
+  })
+
+  test('429 headers override a non-exhausted probe and preserve the latest blocking reset', () => {
+    expect(
+      decideStickyQuotaFailure({
+        quota: exhausted('five-hour', resetIn(12 * 60_000)),
+        responseHeaders: new Headers({
+          'anthropic-ratelimit-unified-7d-status': 'rejected',
+          'anthropic-ratelimit-unified-7d-reset': String(
+            (NOW + 10 * 60_000) / 1000,
+          ),
+        }),
+        now: NOW,
+      }),
+    ).toEqual({
+      action: 'hold',
+      reason: 'five-hour-short-reset',
+      retryAfterSeconds: 720,
+    })
+  })
+
+  test('retained retry caps all hints without lengthening a shorter HTTP-date or millisecond wait', () => {
+    for (const seconds of [2, 60, 5 * 24 * 60 * 60]) {
+      const headers = stickyRetainRetryHeaders(
+        new Headers({
+          'retry-after': new Date(NOW + seconds * 1000).toUTCString(),
+          'retry-after-ms': String(seconds * 1000),
+          'anthropic-ratelimit-unified-7d-reset': String(
+            (NOW + seconds * 1000) / 1000,
+          ),
+          'anthropic-ratelimit-tokens-reset': new Date(
+            NOW + seconds * 1000,
+          ).toISOString(),
+        }),
+        NOW,
+      )
+      const expected = Math.min(60, seconds)
+      expect(headers.get('retry-after')).toBe(String(expected))
+      expect(headers.get('retry-after-ms')).toBe(String(expected * 1000))
+      expect(headers.get('anthropic-ratelimit-unified-7d-reset')).toBe(
+        String(NOW / 1000 + expected),
+      )
+      expect(headers.get('anthropic-ratelimit-tokens-reset')).toBe(
+        new Date(NOW + expected * 1000).toISOString(),
+      )
+    }
+  })
+
   for (const kind of kinds) {
     test(`${kind} holds within fifteen minutes including the boundary`, () => {
       for (const ms of [1, 10 * 60_000, 15 * 60_000]) {

@@ -14,6 +14,7 @@ import {
   isPermanentRefreshError,
   killswitchRetryAfterSeconds,
   type OAuthQuotaSnapshot,
+  quotaFieldSource,
   quotaSnapshotPassesModelScope,
 } from './accounts.ts'
 import { logger } from './logger.ts'
@@ -28,6 +29,7 @@ import {
   nativeVaultLegacyRoutes,
   readNativeVaultLegacyJson,
 } from './native-vault-seed.ts'
+import { quotaExhaustionFromHeaders } from './quota-headers.ts'
 
 export const STICKY_ROUTING_MAIN_ACCOUNT_ID = 'main'
 export const STICKY_ROUTING_SHORT_RESET_GRACE_MS = 15 * 60_000
@@ -485,11 +487,28 @@ export function stickyRouteKnownFableExhausted(
 
 export function decideStickyQuotaFailure(input: {
   quota: OAuthQuotaSnapshot | QuotaState | undefined
+  responseHeaders?: Headers
   modelId?: string
   now?: number
 }): StickyQuotaFailureDecision {
   const now = input.now ?? Date.now()
-  const quota = knownQuota(input.quota)
+  let reading = knownQuota(input.quota)
+  // The refused request can confirm exhaustion even when a quota probe fails
+  // or serves an older cached reading. Never use rounded header percentages here.
+  const confirmed = input.responseHeaders
+    ? quotaExhaustionFromHeaders(input.responseHeaders, input.modelId, now)
+    : undefined
+  if (reading && input.responseHeaders) {
+    reading = { ...reading }
+    for (const key of ['five_hour', 'seven_day', 'scoped'] as const) {
+      // Stored header readings contain display-rounded percentages, not raw evidence.
+      if (quotaFieldSource(reading, key) === 'headers') delete reading[key]
+    }
+  }
+  const quota =
+    reading || (confirmed && Object.keys(confirmed).length)
+      ? { ...reading, ...confirmed }
+      : undefined
   if (!quota) return { action: 'retain', reason: 'unknown' }
   let blocking:
     | { resetAt: number; reason: 'five-hour' | 'seven-day' | 'model-scoped' }
@@ -523,6 +542,59 @@ export function decideStickyQuotaFailure(input: {
     }
   }
   return { action: 'migrate', reason: blocking.reason }
+}
+
+/** Bound an unconfirmed 429's host retry while preserving any shorter upstream wait. */
+export function stickyRetainRetryHeaders(upstream: Headers, now = Date.now()) {
+  const headers = new Headers(upstream)
+  let seconds = 60
+  const shorten = (value: number) => {
+    if (Number.isFinite(value)) seconds = Math.min(seconds, Math.max(0, value))
+  }
+  const after = headers.get('retry-after')
+  if (after?.trim()) {
+    shorten(
+      Number.isFinite(Number(after))
+        ? Number(after)
+        : (Date.parse(after) - now) / 1000,
+    )
+  }
+  const ms = headers.get('retry-after-ms')
+  if (ms?.trim()) shorten(Number(ms) / 1000)
+  const resets = [...headers.keys()].filter((name) =>
+    /^anthropic-ratelimit-.*-reset$/.test(name),
+  )
+  for (const name of resets) {
+    const value = headers.get(name)!
+    if (!value.trim()) continue
+    shorten(
+      (Number.isFinite(Number(value))
+        ? Number(value) * 1000
+        : Date.parse(value)) /
+        1000 -
+        now / 1000,
+    )
+  }
+  headers.set('retry-after', String(seconds))
+  headers.set('retry-after-ms', String(seconds * 1000))
+  for (const name of resets) {
+    const value = headers.get(name)!
+    const reset = now + seconds * 1000
+    if (
+      !value.trim() ||
+      (!Number.isFinite(Number(value)) && !Number.isFinite(Date.parse(value)))
+    ) {
+      headers.delete(name)
+    } else {
+      headers.set(
+        name,
+        Number.isFinite(Number(value))
+          ? String(reset / 1000)
+          : new Date(reset).toISOString(),
+      )
+    }
+  }
+  return headers
 }
 
 export function getStickyRoutingStatePath(accountStoragePath: string) {
