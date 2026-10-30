@@ -3450,7 +3450,7 @@ async function weeklyStickyRefusal(
   }
 }
 
-test('vault sticky weekly 429 headers migrate main to an account with room in the same request', async () => {
+test('vault sticky weekly 429 headers skip the usage endpoint and migrate main in the same request', async () => {
   const { fixture, plugin, served, sessionId, routingPath } =
     await weeklyStickyRefusal()
   const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
@@ -3462,9 +3462,28 @@ test('vault sticky weekly 429 headers migrate main to an account with room in th
     fallbackIdentity,
   )
   expect(fixture.scopedReports).toEqual([])
+  expect(
+    fixture.records.filter((record) => record.url.includes('/api/oauth/usage')),
+  ).toHaveLength(0)
 })
 
-test('vault sticky weekly 429 rejected status migrates even when the quota refresh throws', async () => {
+test('vault sticky 429 without confirming headers re-reads the usage endpoint exactly once', async () => {
+  const { fixture, plugin, served, sessionId, routingPath } =
+    await weeklyStickyRefusal({
+      headers: { 'anthropic-ratelimit-unified-7d-utilization': '' },
+    })
+  const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+  expect(response.status).toBe(429)
+  expect(Number(response.headers.get('retry-after'))).toBe(60)
+  expect(served).toEqual(['oauth:anthropic'])
+  await plugin.dispose?.()
+  expect((await stickyPin(routingPath, sessionId))?.accountId).toBe('main')
+  expect(
+    fixture.records.filter((record) => record.url.includes('/api/oauth/usage')),
+  ).toHaveLength(1)
+})
+
+test('vault sticky weekly 429 rejected status migrates without a quota refresh', async () => {
   const { plugin, served, sessionId } = await weeklyStickyRefusal({
     headers: {
       'anthropic-ratelimit-unified-7d-utilization': '',
@@ -3479,7 +3498,7 @@ test('vault sticky weekly 429 rejected status migrates even when the quota refre
     const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
     expect(response.status).toBe(200)
     expect(served).toEqual(['oauth:anthropic', 'oauth:secondary'])
-    expect(probe).toHaveBeenCalled()
+    expect(probe).not.toHaveBeenCalled()
   } finally {
     probe.mockRestore()
   }

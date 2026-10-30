@@ -52,6 +52,7 @@ import {
   type QuotaManagerOptions,
   type QuotaState,
   quotaBackoffActive,
+  quotaExhaustionFromHeaders,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -1471,23 +1472,33 @@ async function executeWithFallback(options: {
         (preflight instanceof Response && preflight.status === 403) ||
         permanentAuthFailure
       if (primaryResponseAllowsApiFallback(preflight)) {
-        let quota: OAuthQuotaSnapshot | undefined
-        try {
-          quota =
-            route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
-              ? await quotaManager.refreshMain(mainAccountId, '')
-              : await quotaManager.refreshFallback(route.id, '', route.account)
-        } catch {
-          // Retain affinity when the quota probe itself is unavailable.
-          quota = undefined
+        const responseHeaders =
+          preflight instanceof Response ? preflight.headers : response.headers
+        let quota: OAuthQuotaSnapshot | undefined = quotaExhaustionFromHeaders(
+          responseHeaders,
+          options.model.id,
+        )
+        // Do not extend the usage endpoint's own rate limit when the refusal
+        // already confirms exhaustion.
+        if (Object.keys(quota).length === 0) {
+          try {
+            quota =
+              route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                ? await quotaManager.refreshMain(mainAccountId, '')
+                : await quotaManager.refreshFallback(
+                    route.id,
+                    '',
+                    route.account,
+                  )
+          } catch {
+            // Retain affinity when the quota probe itself is unavailable.
+            quota = undefined
+          }
         }
         const decision = decideStickyQuotaFailure({
           quota,
           modelId: options.model.id,
-          responseHeaders:
-            preflight instanceof Response
-              ? preflight.headers
-              : response.headers,
+          responseHeaders,
         })
         if (decision.action === 'hold') {
           const headers = new Headers(

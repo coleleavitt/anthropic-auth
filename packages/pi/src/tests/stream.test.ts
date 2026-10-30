@@ -887,7 +887,7 @@ describe('Pi API fallback routing helpers', () => {
     }
   })
 
-  test('sticky-balanced Pi moves on weekly 429 headers even when the quota probe still reports room', async () => {
+  const checkStickyQuotaReread = async (confirmed: boolean) => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-weekly-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
@@ -942,14 +942,17 @@ describe('Pi API fallback routing helpers', () => {
       storagePath,
     )
     const authorizations: string[] = []
+    const usageRequests: string[] = []
     globalThis.fetch = mock(
       async (input: string | URL | Request, init?: RequestInit) => {
         const url = input instanceof Request ? input.url : input.toString()
-        if (url.includes('/api/oauth/usage'))
+        if (url.includes('/api/oauth/usage')) {
+          usageRequests.push(url)
           return Response.json({
             five_hour: { utilization: 0 },
             seven_day: { utilization: 10 },
           })
+        }
         if (!url.includes('/v1/messages')) return Response.json({})
         const authorization =
           new Headers(init?.headers).get('authorization') ?? ''
@@ -961,7 +964,9 @@ describe('Pi API fallback routing helpers', () => {
               status: 429,
               headers: {
                 'retry-after': '432000',
-                'anthropic-ratelimit-unified-7d-utilization': '1.0',
+                'anthropic-ratelimit-unified-7d-utilization': confirmed
+                  ? '1.0'
+                  : '',
                 'anthropic-ratelimit-unified-7d-reset': String(
                   Math.floor(Date.now() / 1000) + 432000,
                 ),
@@ -982,13 +987,27 @@ describe('Pi API fallback routing helpers', () => {
       sessionId: 'pi-weekly-headers',
     })
     for await (const _event of stream) {
-      /* Drain the migrated response. */
+      /* Drain the provider stream. */
     }
-    expect((await stream.result()).errorMessage).toBeUndefined()
-    expect(authorizations).toEqual([
-      'Bearer sk-ant-oat01-full-access',
-      'Bearer sk-ant-oat01-room-access',
-    ])
+    if (confirmed) {
+      expect((await stream.result()).errorMessage).toBeUndefined()
+      expect(authorizations).toEqual([
+        'Bearer sk-ant-oat01-full-access',
+        'Bearer sk-ant-oat01-room-access',
+      ])
+    } else {
+      expect((await stream.result()).stopReason).toBe('error')
+      expect(authorizations).toEqual(['Bearer sk-ant-oat01-full-access'])
+    }
+    expect(usageRequests).toHaveLength(confirmed ? 0 : 1)
+  }
+
+  test('sticky-balanced Pi weekly 429 headers skip the usage endpoint and still migrate', async () => {
+    await checkStickyQuotaReread(true)
+  })
+
+  test('sticky-balanced Pi 429 without confirming headers re-reads the usage endpoint exactly once', async () => {
+    await checkStickyQuotaReread(false)
   })
 
   for (const window of ['5h', '7d', 'model-scoped'] as const) {

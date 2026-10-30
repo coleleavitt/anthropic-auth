@@ -177,6 +177,7 @@ import {
   type QuotaManagerOptions,
   type QuotaReadingPurpose,
   type QuotaState,
+  quotaExhaustionFromHeaders,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
@@ -9867,24 +9868,31 @@ const anthropicAuthPlugin = async (
                       inspected.response.status === 429 ||
                       inspected.streamingRateLimit
                     ) {
-                      let quota: OAuthQuotaSnapshot | undefined
-                      try {
-                        quota =
-                          route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
-                            ? await quotaManager.refreshMain(
-                                requestMainQuotaIdentity?.quotaKey,
-                                route.access ?? '',
-                                requestMainQuotaIdentity?.generation,
-                              )
-                            : await quotaManager.refreshFallback(
-                                route.id,
-                                route.access ?? '',
-                                route.account,
-                              )
-                      } catch {
-                        // A failed probe retains affinity unless the response's
-                        // own quota headers confirm an exhausted window.
-                        quota = undefined
+                      let quota: OAuthQuotaSnapshot | undefined =
+                        quotaExhaustionFromHeaders(
+                          inspected.response.headers,
+                          routingModelId,
+                        )
+                      // Do not extend the usage endpoint's own rate limit when
+                      // the refusal already confirms exhaustion.
+                      if (Object.keys(quota).length === 0) {
+                        try {
+                          quota =
+                            route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                              ? await quotaManager.refreshMain(
+                                  requestMainQuotaIdentity?.quotaKey,
+                                  route.access ?? '',
+                                  requestMainQuotaIdentity?.generation,
+                                )
+                              : await quotaManager.refreshFallback(
+                                  route.id,
+                                  route.access ?? '',
+                                  route.account,
+                                )
+                        } catch {
+                          // An unavailable probe leaves exhaustion unconfirmed.
+                          quota = undefined
+                        }
                       }
                       const decision = decideStickyQuotaFailure({
                         quota,
