@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.4.4
 
 - OpenCode 2: an account whose quota window has no reset time (for example one with no usage yet in the current five-hour window) no longer blanks the Claude sidebar to 'Waiting for quota…'. Addresses #556.
 - During an Opus 4.8 recovery round on OpenCode 1, cache keep-warm also keeps the original model's prompt cache alive, so returning to it doesn't rebuild the whole prompt. A restart during a round drops this.
