@@ -658,6 +658,61 @@ async function stickyRejectedFirstSend(
   return { f, served }
 }
 
+for (const limit of ['quota floor', 'killswitch'] as const) {
+  test(`Pi vault quota policy identifies ${limit} without sending a request`, async () => {
+    const f = await fixture('sticky-balanced')
+    const service = await f.native.service()
+    await service.updateSettings((settings) => ({
+      ...settings,
+      quota: {
+        enabled: true,
+        minimumRemaining: {
+          five_hour: 0,
+          seven_day: limit === 'quota floor' ? 20 : 0,
+        },
+      },
+      killswitch: {
+        enabled: limit === 'killswitch',
+        main: { five_hour: 0, seven_day: 20 },
+      },
+    }))
+    const receipt = await service.authorizeVault('main')
+    const checkedAt = Date.now()
+    expect(
+      await service.vault.publish(receipt, {
+        quota: {
+          accountIdentity: fixtureAccountIdentity('main'),
+          checkedAt,
+          five_hour: { remainingPercent: 100, usedPercent: 0, checkedAt },
+          seven_day: {
+            remainingPercent: limit === 'quota floor' ? 20 : 19,
+            usedPercent: limit === 'quota floor' ? 80 : 81,
+            checkedAt,
+          },
+        },
+      }),
+    ).toBe(true)
+    let networkCalls = 0
+    globalThis.fetch = Object.assign(
+      async () => {
+        networkCalls++
+        throw new Error('NETWORK FORBIDDEN')
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const result = await streamCortexKitAnthropic(model, context, {
+      sessionId: 'pi-vault-quota-policy',
+    }).result()
+    expect(result.stopReason).toBe('error')
+    expect(result.errorMessage).toContain('429')
+    expect(result.errorMessage).toContain(limit)
+    expect(result.errorMessage).toContain('Retry in ')
+    expect(result.errorMessage).toContain('/claude → Killswitch / Quota')
+    expect(result.errorMessage).not.toContain('signing in')
+    expect(networkCalls).toBe(0)
+  })
+}
+
 test('Pi cancel during vault re-authorization after a 401 ends aborted and keeps the sticky account', async () => {
   const { f, served } = await stickyRejectedFirstSend()
   const entered = lifetimes.gate()

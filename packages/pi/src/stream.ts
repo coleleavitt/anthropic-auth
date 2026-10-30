@@ -7,6 +7,7 @@ import {
   CacheKeepManager,
   CacheKeepSessionRegistry,
   type ClaudeCodeIdentity,
+  createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
   createSseFramer,
   createStickyNoRouteResponse,
@@ -41,7 +42,6 @@ import {
   type NativeAccountSnapshot,
   type NativeAccountView,
   type NativeApiSubject,
-  NativeVaultNoAccountError,
   nativeAccountCanServe,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
@@ -1393,7 +1393,12 @@ async function executeWithFallback(options: {
       throw error
     }
     if (!resolution) {
-      if (snapshot.mode === 'claustrum') throw new NativeVaultNoAccountError()
+      if (snapshot.mode === 'claustrum')
+        return createNativeVaultNoRouteResponse({
+          snapshot: await native.view(),
+          modelId: options.model.id,
+          sticky: true,
+        })
       return createStickyNoRouteResponse({
         mainRefreshError: storage?.refresh?.mainLastRefreshError,
         fallbackReauthLabels: getFallbackReauthLabels(storage),
@@ -1620,7 +1625,11 @@ async function executeWithFallback(options: {
       const fallback = await tryFallbackAccounts()
       if (fallback) return fallback
     }
-    if (snapshot.mode === 'claustrum') throw new NativeVaultNoAccountError()
+    if (snapshot.mode === 'claustrum')
+      return createNativeVaultNoRouteResponse({
+        snapshot: await native.view(),
+        modelId: options.model.id,
+      })
     return createStickyNoRouteResponse({
       routeQuotas: (storage?.accounts ?? [])
         .filter(isOAuthAccount)

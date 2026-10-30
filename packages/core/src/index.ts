@@ -66,11 +66,13 @@ export * from './model-remap.ts'
 export * from './models.ts'
 export * from './native-account-refusal.ts'
 export type {
+  NativeAccountPolicy,
   NativeAccountRuntime,
   NativeAccountRuntimeOptions,
   NativeAccountWriteInput,
   NativeApiSubject,
   NativeLocalAuthorizeOptions,
+  NativeQuotaPolicyLimit,
   NativeRelayUpdate,
 } from './native-account-runtime.ts'
 export {
@@ -268,6 +270,10 @@ export {
   nativePiAuthSlotPaths,
   openNativePiAuthSlot,
 } from './native-vault-connection.ts'
+export {
+  createNativeVaultNoRouteResponse,
+  NativeVaultQuotaPolicyError,
+} from './native-vault-refusal.ts'
 export type {
   NativeVaultQuotaPurpose,
   NativeVaultRuntime,

@@ -19,6 +19,7 @@ import {
 } from './accounts.ts'
 import { logger } from './logger.ts'
 import { isClaudeFableOrMythos5Model } from './models.ts'
+import type { NativeQuotaPolicyLimit } from './native-account-runtime.ts'
 import {
   type NativeLockEvent,
   nativeLockObserver,
@@ -108,6 +109,7 @@ export function createStickyNoRouteResponse(input: {
   mainRefreshError?: AccountOperationError
   fallbackReauthLabels?: readonly string[]
   routeQuotas: readonly OAuthQuotaSnapshot[]
+  vaultPolicyLimits?: readonly NativeQuotaPolicyLimit[]
   modelId?: string
   now?: number
 }): Response {
@@ -159,8 +161,16 @@ export function createStickyNoRouteResponse(input: {
   )
   const minutes = Math.floor(retryAfter / 60)
   const seconds = retryAfter % 60
-  const reason =
-    scopedBlocked && modelName
+  const limitNames = input.vaultPolicyLimits?.map((limit) =>
+    limit === 'model-scoped'
+      ? `${modelName ?? 'Model'} scoped limit`
+      : limit === 'killswitch'
+        ? 'killswitch limit'
+        : 'quota floor',
+  )
+  const reason = limitNames
+    ? `No vault account currently satisfies quota policy: ${limitNames.join(', ')}. Open /claude → Killswitch / Quota to change these limits.`
+    : scopedBlocked && modelName
       ? `${modelName} weekly limit reached, no routable OAuth accounts.`
       : 'No OAuth account currently satisfies sticky-balanced quota policy.'
   const message = `${reason} Retry in ${minutes}m ${seconds}s.`
@@ -433,6 +443,7 @@ export function stickyRouteCandidateWeight(input: {
   modelId?: string
   storage: AccountStorage | null
   now?: number
+  onPolicyBlock?: (limit: NativeQuotaPolicyLimit) => void
 }) {
   const now = input.now ?? Date.now()
   const { candidate, storage } = input
@@ -445,10 +456,19 @@ export function stickyRouteCandidateWeight(input: {
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota[key]
     if (!window || !Number.isFinite(window.remainingPercent)) return 0
+    const threshold = remainingThreshold(storage, candidate.accountId, key)
+    if (window.remainingPercent <= threshold) {
+      const quotaThreshold = getQuotaMinimumRemainingThresholds(storage)[key]
+      input.onPolicyBlock?.(
+        isKillswitchEnabled(storage) && threshold > quotaThreshold
+          ? 'killswitch'
+          : 'quota-floor',
+      )
+    }
     weights.push(
       sustainableWindowWeight(
         window.remainingPercent,
-        remainingThreshold(storage, candidate.accountId, key),
+        threshold,
         window.resetsAt,
         now,
       ),
@@ -457,6 +477,11 @@ export function stickyRouteCandidateWeight(input: {
   if (input.family === 'fable') {
     const window = getScopedQuotaWindowForModel(quota, input.modelId)
     if (window && Number.isFinite(window.remainingPercent)) {
+      if (
+        window.remainingPercent <=
+        remainingThreshold(storage, candidate.accountId, 'scoped')
+      )
+        input.onPolicyBlock?.('model-scoped')
       weights.push(
         sustainableWindowWeight(
           window.remainingPercent,

@@ -367,17 +367,29 @@ export function acquireNativeAccountRuntime(
   }
 }
 
+export type NativeQuotaPolicyLimit =
+  | 'quota-floor'
+  | 'killswitch'
+  | 'model-scoped'
+
+export type NativeAccountPolicy = NativeLocalExternalPolicy & {
+  quotaPolicyLimits?: readonly NativeQuotaPolicyLimit[]
+}
+
 /** Evaluate quota and killswitch policy for this caller's model, outside shared credential refresh work. */
 export function nativeAccountPolicy(
   account: NativeAccountView,
   snapshot: NativeAccountSnapshot,
   modelId?: string,
-): NativeLocalExternalPolicy {
+): NativeAccountPolicy {
   if (!nativeAccountCanServe(account))
     return { status: 'blocked', reason: 'account-disabled' }
+  const quotaPolicyLimits: NativeQuotaPolicyLimit[] = []
+  if (!quotaSnapshotPassesPolicy(account.quota, snapshot.policyStorage))
+    quotaPolicyLimits.push('quota-floor')
+  if (!quotaSnapshotPassesModelScope(account.quota, modelId))
+    quotaPolicyLimits.push('model-scoped')
   if (
-    !quotaSnapshotPassesPolicy(account.quota, snapshot.policyStorage) ||
-    !quotaSnapshotPassesModelScope(account.quota, modelId) ||
     !killswitchPassesPolicy(
       account.quota,
       snapshot.policyStorage,
@@ -385,7 +397,9 @@ export function nativeAccountPolicy(
       modelId,
     )
   )
-    return { status: 'blocked', reason: 'quota-ineligible' }
+    quotaPolicyLimits.push('killswitch')
+  if (quotaPolicyLimits.length)
+    return { status: 'blocked', reason: 'quota-ineligible', quotaPolicyLimits }
   return { status: 'allowed' }
 }
 

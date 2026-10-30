@@ -3251,6 +3251,70 @@ test('OpenCode routes normally during roster deferral without publishing an empt
   expect(await readFile(configPath, 'utf8')).toBe(legacy)
 })
 
+for (const limit of ['quota floor', 'killswitch'] as const) {
+  test(`OC1 vault quota policy identifies ${limit} without sending a request`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+      vault: { connect: async () => fixture.scopedClient },
+    })
+    try {
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        quota: {
+          enabled: true,
+          minimumRemaining: {
+            five_hour: 0,
+            seven_day: limit === 'quota floor' ? 20 : 0,
+          },
+        },
+        killswitch: {
+          enabled: limit === 'killswitch',
+          main: { five_hour: 0, seven_day: 20 },
+        },
+        routing: { mode: 'sticky-balanced' },
+      }))
+      const receipt = await runtime.authorizeVault('main')
+      const checkedAt = Date.now()
+      expect(
+        await runtime.vault.publish(receipt, {
+          quota: {
+            accountIdentity: mainIdentity,
+            checkedAt,
+            five_hour: { remainingPercent: 100, usedPercent: 0, checkedAt },
+            seven_day: {
+              remainingPercent: limit === 'quota floor' ? 20 : 19,
+              usedPercent: limit === 'quota floor' ? 80 : 81,
+              checkedAt,
+            },
+          },
+        }),
+      ).toBe(true)
+      const plugin = await createPlugin({
+        claustrumScopedConnect: async () => fixture.scopedClient,
+      })
+      fixture.records.length = 0
+      const response = await sendNative(plugin)
+      expect(response.status).toBe(429)
+      expect(Number(response.headers.get('retry-after'))).toBeGreaterThan(0)
+      const body = (await response.json()) as {
+        type: string
+        error: { type: string; message: string }
+      }
+      expect(body.type).toBe('error')
+      expect(body.error.type).toBe('rate_limit_error')
+      expect(body.error.message).toContain(limit)
+      expect(body.error.message).toContain('Retry in ')
+      expect(body.error.message).toContain('/claude → Killswitch / Quota')
+      expect(body.error.message).not.toContain('signing in')
+      expect(fixture.records).toEqual([])
+    } finally {
+      runtime.close()
+    }
+  })
+}
+
 /**
  * An enrolled host serving vault accounts with sticky-balanced routing,
  * directly or through an HTTP relay. Model sends reach an owned loopback

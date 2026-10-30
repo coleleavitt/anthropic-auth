@@ -1,5 +1,6 @@
 import {
   createNativeUsagePublisher,
+  createNativeVaultNoRouteResponse,
   decideStickyQuotaFailure,
   effectiveRelayTransport,
   getClaudeCodeIdentityForVerifiedAccount,
@@ -9,6 +10,7 @@ import {
   isQuotaBearingHeaderFrame,
   logger,
   mergeHeaderQuotaForPersistence,
+  type NativeAccountPolicy,
   type NativeAccountRefusalReason,
   type NativeAccountRuntime,
   type NativeAccountSnapshot,
@@ -18,7 +20,7 @@ import {
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativePoolPaths,
   type NativeQuotaObservation,
-  NativeVaultNoAccountError,
+  NativeVaultQuotaPolicyError,
   nativeAccountCanServe,
   nativeAccountPolicy,
   nativeLocalAccountRefusal,
@@ -530,9 +532,12 @@ export function createNativeAnthropicSource(
         assertTransport(snapshot)
       }
       const oauth: NativeAccountView[] = []
+      const policies = new Map<string, NativeAccountPolicy>()
       for (const account of snapshot.accounts) {
-        if (account.type !== 'oauth' || !eligible(account, snapshot, modelID))
-          continue
+        if (account.type !== 'oauth') continue
+        const policy = nativeAccountPolicy(account, snapshot, modelID)
+        policies.set(account.id, policy)
+        if (policy.status !== 'allowed') continue
         if (account.source === 'local') {
           // Skip a local account whose token refresh failed, so it is not
           // selected. Check usability without keeping its token; the send
@@ -658,7 +663,16 @@ export function createNativeAnthropicSource(
               ]
         if (ordered[0]) return ordered[0].id
       }
-      if (snapshot.mode === 'claustrum') throw new NativeVaultNoAccountError()
+      if (snapshot.mode === 'claustrum')
+        throw await NativeVaultQuotaPolicyError.fromResponse(
+          createNativeVaultNoRouteResponse({
+            snapshot,
+            modelId: modelID,
+            policies,
+            sticky:
+              getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
+          }),
+        )
       // Fall back to a pay-per-token API key account only when the primary
       // Claude subscription account ('main') has run out: a recent usage
       // reading for main's current account and credential version must show

@@ -46,6 +46,7 @@ import {
   configuredAnthropicOAuthAccountCount,
   createEmptyStorage,
   createNativeUsagePublisher,
+  createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
   createSseFramer,
   createStickyNoRouteResponse,
@@ -9433,7 +9434,13 @@ const anthropicAuthPlugin = async (
                   },
                 )
               }
-              const modelDeniedResponse = () => {
+              const modelDeniedResponse = async () => {
+                if (isScopedCustodyActive(storage))
+                  return createNativeVaultNoRouteResponse({
+                    snapshot: await nativeAccounts.read(),
+                    modelId: credentialModelId,
+                    sticky: getRoutingMode(storage) === 'sticky-balanced',
+                  })
                 const retryAfter = killswitchRetryAfterSeconds(
                   quotaManager.getMain(requestMainQuotaIdentity?.quotaKey)
                     ?.quota,
@@ -9661,7 +9668,11 @@ const anthropicAuthPlugin = async (
                   if (!resolution) {
                     if (auth.modelDenied) return modelDeniedResponse()
                     if (isScopedCustodyActive(storage))
-                      throw new NativeVaultNoAccountError()
+                      return createNativeVaultNoRouteResponse({
+                        snapshot: await nativeAccounts.read(),
+                        modelId: routingModelId,
+                        sticky: true,
+                      })
                     const response = createStickyNoRouteResponse({
                       mainRefreshError:
                         stickyRoutes.storage?.refresh?.mainLastRefreshError,
@@ -10618,7 +10629,6 @@ const anthropicAuthPlugin = async (
               }
 
               if (auth.modelDenied) {
-                const deniedResponse = modelDeniedResponse()
                 const fallbackAccounts = replayableRequest
                   ? await getRoutableFallbackAccounts(storage, {
                       modelId: credentialModelId,
@@ -10654,7 +10664,8 @@ const anthropicAuthPlugin = async (
                     undefined,
                     credentialModelId,
                   )
-                if (!lastMainAttempt) return wrapResponse(deniedResponse)
+                if (!lastMainAttempt)
+                  return wrapResponse(await modelDeniedResponse())
                 return wrapResponse(
                   await sendWithAccessToken(
                     input,
