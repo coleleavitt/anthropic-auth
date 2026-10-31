@@ -6,7 +6,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - `@cortexkit/common-auth` 0.33.0.
 - Under the CortexKit agent runner, a used-up limit is now reported to shared routing as the five-hour or weekly window, with the model's own limit named as a pool (for example Fable), matching the other auth plugins.
-
 ## 2.4.8
 
 - The Claude sidebar now uses the same layout as the other CortexKit auth plugins. A usage window with no reading yet is no longer shown as `7d —`, and the credit line now sits below the "checked … ago" line.
