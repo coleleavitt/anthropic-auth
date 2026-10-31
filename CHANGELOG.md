@@ -2,6 +2,10 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- `@cortexkit/common-auth` 0.33.0.
+
 ## 2.4.8
 
 - The Claude sidebar now uses the same layout as the other CortexKit auth plugins. A usage window with no reading yet is no longer shown as `7d —`, and the credit line now sits below the "checked … ago" line.
