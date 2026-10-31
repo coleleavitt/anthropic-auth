@@ -2,10 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.4.7
 
 - Verified Ultra accounts, which no longer have a five-hour limit, are no longer refused as having unknown quota. Their weekly and Fable limits still apply. Addresses #572.
 - In vault mode, a request refused because your own quota floors or killswitch limits exclude every account now says which limit blocked it and where to change it, instead of asking you to sign in again. Addresses #567.
+
 ## 2.4.6
 
 - After a 429 whose rate-limit headers already show the limit used up, the plugin no longer asks Anthropic's usage endpoint for that account again, which had extended the endpoint's own rate limit for capped accounts.
