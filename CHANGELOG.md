@@ -5,7 +5,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - The Claude sidebar now uses the same layout as the other CortexKit auth plugins. A usage window with no reading yet is no longer shown as `7d —`, and the credit line now sits below the "checked … ago" line.
-- `@cortexkit/common-auth` 0.32.0. A vault account whose quota reading insula could not refresh because Anthropic refused it is no longer polled again by the plugin, which only extended the refusal.
+- `@cortexkit/common-auth` 0.32.1. A vault account whose quota reading insula could not refresh because Anthropic refused it is no longer polled again by the plugin, which only extended the refusal.
 
 ## 2.4.7
 

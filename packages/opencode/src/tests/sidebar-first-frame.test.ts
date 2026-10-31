@@ -4,8 +4,8 @@ import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.t
 
 const lifetimes = createTestLifetimeSuite()
 
-test.todo(
-  'common-auth 0.32.0 first-render bars are missing: enable with the 0.32.1 fix',
+test(
+  'common-auth 0.32.1 draws bars on the first expanded render without settling',
   lifetimes.wrapBody(async () => {
     const probe = `
 import { createTestRenderer } from '@opentui/core/testing';
