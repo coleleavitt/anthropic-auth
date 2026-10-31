@@ -66,6 +66,7 @@ import type { PluginRuntimeOverrides } from './support/opencode1-test-context.ts
 import {
   createOpencode1Test,
   createOpencode1TestContext,
+  drainBeforeReset,
   EMPTY_POST,
   getBodyLifetime,
   installOpencode1TestHooks,
@@ -201,6 +202,40 @@ function expectUnknownQuotaAdmissionBlocked(storage: AccountStorage) {
   return expectUnknownQuotaAdmissionBlockedWithCtx(testContext, storage)
 }
 
+async function deferModelRequestUntilTeardown() {
+  await useTempAccountFile(
+    createFallbackStorage({ quota: { enabled: false }, accounts: [] }),
+  )
+  let modelRequests = 0
+  globalThis.fetch = mock(
+    withNativeAdmission((input: Parameters<typeof fetch>[0]) => {
+      expect(extractUrl(input)).toContain('/v1/messages')
+      modelRequests++
+      return new Response('{}', { status: 200 })
+    }),
+  ) as unknown as typeof fetch
+  const plugin = await getPlugin()
+  const result = await plugin.auth.loader(
+    () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+    { models: {} },
+  )
+  const warmup = await result.fetch(MESSAGES_URL, EMPTY_POST)
+  expect(warmup.status).toBe(200)
+  await warmup.text()
+  const send = bodyLifetime().gate()
+  // Teardown releases the registered send, just as it releases an interrupted
+  // body's gates. Its fetch stub must remain installed until the send settles.
+  bodyLifetime().trackDetached(
+    send.wait.then(async () => {
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(response.status).toBe(200)
+      await response.text()
+      expect(modelRequests).toBe(2)
+    }),
+  )
+  expect(modelRequests).toBe(1)
+}
+
 describe('fallback quota persistence ordering', () => {
   test('does not restore a late quota error older than the persisted success', async () => {
     const successAt = Date.now()
@@ -319,9 +354,16 @@ describe('fallback quota persistence ordering', () => {
 describe('quota header feed integration', () => {
   const originalFetch = globalThis.fetch
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch
+  afterEach(async () => {
+    await drainBeforeReset(testContext.testLifetime, () => {
+      globalThis.fetch = originalFetch
+    })
   })
+
+  test(
+    'drains a deferred model request before restoring its fetch stub',
+    deferModelRequestUntilTeardown,
+  )
 
   test.serial(
     'non-OAT compatibility identity stays a local quota key without a provider uuid',
@@ -1656,9 +1698,16 @@ describe('main identity boot order', () => {
 describe('quota header feed extended integration', () => {
   const originalFetch = globalThis.fetch
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch
+  afterEach(async () => {
+    await drainBeforeReset(testContext.testLifetime, () => {
+      globalThis.fetch = originalFetch
+    })
   })
+
+  test(
+    'drains a deferred model request before restoring its fetch stub',
+    deferModelRequestUntilTeardown,
+  )
 
   test('disabled quota header feed publishes nothing by default or when explicitly false', async () => {
     for (const enabled of [undefined, false]) {
