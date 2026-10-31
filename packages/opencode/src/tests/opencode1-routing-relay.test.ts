@@ -29,7 +29,11 @@ afterEach(() => {
 
 describe('OC1 shared routing relay', () => {
   installLoaderSetup(ctx)
-  async function fixture(mode = 'normal', responseFor?: () => Response) {
+  async function fixture(
+    mode = 'normal',
+    responseFor?: () => Response,
+    modelId?: string,
+  ) {
     const now = Date.now()
     const quota = (remaining: number, fable = 100) => ({
       checkedAt: now,
@@ -39,16 +43,20 @@ describe('OC1 shared routing relay', () => {
         checkedAt: now,
       },
       seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
-      scoped: [
-        {
-          id: 'fable',
-          title: 'Fable only',
-          modelName: 'Fable',
-          usedPercent: 100 - fable,
-          remainingPercent: fable,
-          checkedAt: now,
-        },
-      ],
+      scoped:
+        mode === 'fable-without-poll'
+          ? []
+          : [
+              {
+                id: `claude-weekly-scoped-${modelId ?? 'fable'}`,
+                title: 'Fable only',
+                modelName: 'Fable',
+                ...(modelId ? { modelId } : {}),
+                usedPercent: 100 - fable,
+                remainingPercent: fable,
+                checkedAt: now,
+              },
+            ],
     })
     await useTempAccountFile(
       ctx,
@@ -124,7 +132,11 @@ describe('OC1 shared routing relay', () => {
         method: 'POST',
         headers: { 'x-session-affinity': 'ses_relay_oc1' },
         body: JSON.stringify({
-          model: mode === 'reserve' ? 'claude-opus-4-8' : 'claude-sonnet-5',
+          model: mode.startsWith('fable')
+            ? 'claude-fable-5'
+            : mode === 'reserve'
+              ? 'claude-opus-4-8'
+              : 'claude-sonnet-5',
           messages: [{ role: 'user', content: 'hello' }],
           max_tokens: 10,
         }),
@@ -292,10 +304,54 @@ describe('OC1 shared routing relay', () => {
           account_id: syntheticMainAccountUuid,
           outcome: 'exhausted',
           window: '7d',
-          resets_at: new Date(reset * 1000).toISOString(),
+          resets_at: reset * 1000,
         },
       ])
       await response.body?.cancel()
+    })
+  }
+
+  for (const { mode, modelId, pool } of [
+    { mode: 'fable', modelId: undefined, pool: 'Fable' },
+    { mode: 'fable', modelId: 'Claude-Fable-Pool', pool: 'Claude-Fable-Pool' },
+    { mode: 'fable-without-poll', modelId: undefined, pool: undefined },
+  ]) {
+    test(`Fable 429 uses only the stored poll pool ${pool} on OpenCode 1`, async () => {
+      let calls = 0
+      const f = await fixture(
+        mode,
+        () =>
+          ++calls === 1
+            ? new Response('limited', {
+                status: 429,
+                headers: {
+                  'anthropic-ratelimit-unified-7d_fable-status': 'rejected',
+                },
+              })
+            : new Response('ok'),
+        modelId,
+      )
+      const reports: Array<{ outcome: string; [key: string]: unknown }> = []
+      globals[key] = () => ({
+        accountFor: async () => null,
+        report: (report: (typeof reports)[number]) => reports.push(report),
+      })
+      const response = await f.send()
+      await response.body?.cancel()
+      expect(
+        reports.filter((report) => report.outcome === 'exhausted'),
+      ).toEqual(
+        pool
+          ? [
+              {
+                account_id: syntheticMainAccountUuid,
+                outcome: 'exhausted',
+                window: '7d',
+                pool,
+              },
+            ]
+          : [],
+      )
     })
   }
 })

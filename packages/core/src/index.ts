@@ -1,3 +1,8 @@
+export {
+  askRouting,
+  type ReportRoutingInput,
+  reportRouting,
+} from '@cortexkit/common-auth/routing-accessor'
 export type {
   CommandResult,
   CommandRunner,

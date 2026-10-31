@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { fetchOAuthQuotaSnapshot } from '@cortexkit/anthropic-auth-core'
 import { createRoutingRelay, ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
 
 const key = Symbol.for('cortexkit.routing')
 const globals = globalThis as Record<symbol, unknown>
+const candidates = [{ accountIdentity: 'account', credentialId: 'credential' }]
 afterEach(() => {
   delete globals[key]
 })
@@ -10,15 +12,16 @@ afterEach(() => {
 describe('shared routing relay', () => {
   test('discovers a bridge installed after module and client load', async () => {
     const relay = createRoutingRelay()
-    expect(await relay.accountFor('session', 'model')).toBeNull()
+    expect(await relay.accountFor('session', 'model', candidates)).toBeNull()
     globals[key] = (session: string) => ({
-      accountFor: async (input: unknown) => {
+      accountFor: async (input: unknown, options: unknown) => {
         expect(session).toBe('session')
         expect(input).toEqual({ provider: 'anthropic', modelId: 'model' })
+        expect(options).toEqual({ deadlineMs: 2000 })
         return { account_id: 'account', credential_id: 'credential' }
       },
     })
-    expect(await relay.accountFor('session', 'model')).toEqual({
+    expect(await relay.accountFor('session', 'model', candidates)).toEqual({
       account_id: 'account',
       credential_id: 'credential',
     })
@@ -36,7 +39,7 @@ describe('shared routing relay', () => {
         },
       })
       expect(
-        await createRoutingRelay().accountFor('session', 'model'),
+        await createRoutingRelay().accountFor('session', 'model', candidates),
       ).toBeNull()
     },
   )
@@ -50,7 +53,11 @@ describe('shared routing relay', () => {
         }),
     })
     const start = performance.now()
-    const result = await createRoutingRelay().accountFor('session', 'model')
+    const result = await createRoutingRelay().accountFor(
+      'session',
+      'model',
+      candidates,
+    )
     expect(result).toBeNull()
     expect(performance.now() - start).toBeGreaterThanOrEqual(1900)
     resolve({ account_id: 'late', credential_id: 'late' })
@@ -65,8 +72,8 @@ describe('shared routing relay', () => {
       }),
     })
     expect(
-      (await createRoutingRelay().accountFor('session', 'model'))?.hold
-        ?.retry_after_ms,
+      (await createRoutingRelay().accountFor('session', 'model', candidates))
+        ?.hold?.retry_after_ms,
     ).toBe(ROUTING_HOLD_LIMIT_MS)
   })
 
@@ -138,7 +145,6 @@ describe('shared routing relay', () => {
   test.each([
     ['5h', '5h'],
     ['7d', '7d'],
-    ['7d_fable', '7d_fable'],
   ])(
     'attributes a raw rejected 429 window %s as %s',
     async (suffix, window) => {
@@ -163,9 +169,105 @@ describe('shared routing relay', () => {
           account_id: 'account',
           outcome: 'exhausted',
           window,
-          resets_at: '2033-05-18T03:33:20.000Z',
+          resets_at: 2_000_000_000_000,
         },
       ])
+    },
+  )
+
+  test.each([undefined, 'Claude-Fable-5-Pool'])(
+    'scoped exhaustion uses the stored poll pool identity %s',
+    async (modelId) => {
+      const stored = await fetchOAuthQuotaSnapshot({
+        accessToken: 'token',
+        fetchImpl: Object.assign(
+          async () =>
+            new Response(
+              JSON.stringify({
+                limits: [
+                  {
+                    kind: 'weekly_scoped',
+                    group: 'weekly',
+                    percent: 20,
+                    scope: {
+                      model: {
+                        display_name: ' Fable ',
+                        ...(modelId ? { id: modelId } : {}),
+                      },
+                    },
+                  },
+                ],
+              }),
+            ),
+          { preconnect: fetch.preconnect },
+        ),
+      })
+      const reports: unknown[] = []
+      globals[key] = () => ({
+        report: (report: unknown) => reports.push(report),
+      })
+      createRoutingRelay(async (subject) => {
+        expect(subject.accountIdentity).toBe('account')
+        return stored
+      }).report(
+        'session',
+        { accountIdentity: 'account' },
+        new Headers({
+          'anthropic-ratelimit-unified-7d_fable-status': 'rejected',
+          'anthropic-ratelimit-unified-7d_fable-reset': '2000000000',
+        }),
+        429,
+        'claude-fable-5',
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(reports).toEqual([
+        {
+          account_id: 'account',
+          outcome: 'exhausted',
+          window: '7d',
+          pool: modelId ?? 'Fable',
+          resets_at: 2_000_000_000_000,
+        },
+      ])
+    },
+  )
+
+  test.each(['missing', 'headers', 'other-model', 'read-failed'])(
+    'scoped exhaustion with %s poll reading never blocks the whole account',
+    async (mode) => {
+      const reports: unknown[] = []
+      globals[key] = () => ({
+        report: (report: unknown) => reports.push(report),
+      })
+      createRoutingRelay(async () => {
+        if (mode === 'read-failed') throw new Error('storage unavailable')
+        if (mode === 'missing') return undefined
+        return {
+          scoped: [
+            {
+              id:
+                mode === 'headers' ? '7d_fable' : 'claude-weekly-scoped-mythos',
+              title: mode === 'headers' ? 'fable' : 'Mythos only',
+              modelName: mode === 'headers' ? 'fable' : 'Mythos',
+              usedPercent: 20,
+              remainingPercent: 80,
+              checkedAt: Date.now(),
+            },
+          ],
+        }
+      }).report(
+        'session',
+        { accountIdentity: 'account' },
+        new Headers({
+          'anthropic-ratelimit-unified-7d_fable-status': 'rejected',
+        }),
+        429,
+        'claude-fable-5',
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(reports).toEqual([])
     },
   )
 
@@ -190,7 +292,18 @@ describe('shared routing relay', () => {
   test('reports each exhausted window from the same 429 once', async () => {
     const reports: unknown[] = []
     globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
-    createRoutingRelay().report(
+    createRoutingRelay(async () => ({
+      scoped: [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: Date.now(),
+        },
+      ],
+    })).report(
       'session',
       { accountIdentity: 'account' },
       new Headers({
@@ -203,12 +316,19 @@ describe('shared routing relay', () => {
       'claude-fable-5',
     )
     await Promise.resolve()
-    expect(reports).toEqual(
-      ['5h', '7d', '7d_fable'].map((window) => ({
+    await Promise.resolve()
+    expect(reports).toEqual([
+      ...['5h', '7d'].map((window) => ({
         account_id: 'account',
         outcome: 'exhausted',
         window,
       })),
-    )
+      {
+        account_id: 'account',
+        outcome: 'exhausted',
+        window: '7d',
+        pool: 'Fable',
+      },
+    ])
   })
 })

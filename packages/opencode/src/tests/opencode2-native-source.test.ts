@@ -261,7 +261,7 @@ describe('OC2 shared routing relay', () => {
   ) {
     const globals = globalThis as Record<symbol, unknown>
     const key = Symbol.for('cortexkit.routing')
-    globals[key] = () => ({ accountFor, report })
+    globals[key] = () => ({ accountFor: async () => accountFor(), report })
     cleanups.push(() => {
       delete globals[key]
     })
@@ -442,6 +442,68 @@ describe('OC2 shared routing relay', () => {
     ])
   })
 
+  test.each([undefined, 'Claude-Fable-Pool'])(
+    'Fable 429 reports the persisted usage-poll pool %s on OpenCode 2',
+    async (modelId) => {
+      const f = await vaultWithFallback()
+      const quota = await fetchOAuthQuotaSnapshot({
+        accessToken: 'synthetic-access',
+        fetchImpl: Object.assign(
+          async () =>
+            Response.json({
+              limits: [
+                {
+                  kind: 'weekly_scoped',
+                  group: 'weekly',
+                  percent: 20,
+                  scope: {
+                    model: {
+                      display_name: ' Fable ',
+                      ...(modelId ? { id: modelId } : {}),
+                    },
+                  },
+                },
+              ],
+            }),
+          { preconnect: fetch.preconnect },
+        ),
+      })
+      const receipt = await f.runtime.authorizeVault('main')
+      await f.runtime.vault.publish(receipt, {
+        quota: { ...quota, accountIdentity: identity },
+      })
+      const native = source(f.runtime, f.paths)
+      const reports: unknown[] = []
+      const reported = Promise.withResolvers<void>()
+      bridge(
+        () => null,
+        (report) => {
+          reports.push(report)
+          reported.resolve()
+        },
+      )
+      const fable = { ...scope, modelID: 'claude-fable-5' }
+      const auth = await native.authorizeAccount(fable, 'main')
+      if (!auth) throw new Error('No authorization')
+      native.quotaFromHeaders?.(
+        new Headers({
+          'anthropic-ratelimit-unified-7d_fable-status': 'rejected',
+        }),
+        { ...context(auth.provenance), modelID: fable.modelID, status: 429 },
+      )
+      await reported.promise
+      expect(reports).toEqual([
+        {
+          account_id: identity,
+          credential_id: 'oauth:anthropic',
+          outcome: 'exhausted',
+          window: '7d',
+          pool: modelId ?? 'Fable',
+        },
+      ])
+    },
+  )
+
   test('429 reports only its own exhausted 7d window, never a stored 5h reading', async () => {
     const f = await vaultWithFallback()
     const native = source(f.runtime, f.paths)
@@ -474,7 +536,7 @@ describe('OC2 shared routing relay', () => {
         credential_id: 'oauth:anthropic',
         outcome: 'exhausted',
         window: '7d',
-        resets_at: '2033-05-18T03:33:20.000Z',
+        resets_at: 2_000_000_000_000,
       },
     ])
   })
@@ -527,7 +589,7 @@ describe('OC2 shared routing relay', () => {
           credential_id: 'oauth:anthropic',
           outcome: 'exhausted',
           window: confirmed ? '5h' : '7d',
-          ...(confirmed ? { resets_at: '2033-05-18T03:33:20.000Z' } : {}),
+          ...(confirmed ? { resets_at: 2_000_000_000_000 } : {}),
         },
       ])
     },

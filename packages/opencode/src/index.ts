@@ -1923,7 +1923,14 @@ const anthropicAuthPlugin = async (
   // routing never opens or rewrites the local file. The runtime's mode is read
   // per use because enrollment can change while the plugin runs.
   const stickySessionRouters = new Map<string, StickySessionRouter>()
-  const routingRelay = createRoutingRelay()
+  const routingRelay = createRoutingRelay(async (subject) => {
+    const snapshot = await nativeAccounts.read()
+    return snapshot.accounts.find(
+      (row) =>
+        row.accountIdentity === subject.accountIdentity &&
+        (!subject.credentialId || row.credentialId === subject.credentialId),
+    )?.quota
+  })
   const routingServedTurns = new WeakSet<PerfTrace>()
   const routingStreamLimits = new WeakMap<Response, () => void>()
   async function currentStickyRouting(): Promise<{
@@ -9543,9 +9550,19 @@ const anthropicAuthPlugin = async (
                     requestedModelId: routingModelId,
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
+                  const snapshot = await nativeAccounts.read()
                   const advice = await routingRelay.accountFor(
                     sessionId,
                     routingModelId ?? '',
+                    snapshot.accounts.filter(
+                      (row) =>
+                        nativeAccountCanServe(row) &&
+                        nativeAccountPolicy(row, snapshot, routingModelId)
+                          .status === 'allowed' &&
+                        stickyRoutes.candidates.some(
+                          (candidate) => candidate.accountId === row.id,
+                        ),
+                    ),
                   )
                   let advisedAccountId: string | undefined
                   if (advice) {

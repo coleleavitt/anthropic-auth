@@ -1,7 +1,12 @@
 import {
   type AccountStorage,
+  askRouting,
+  getScopedQuotaWindowForModel,
   logger,
+  type OAuthQuotaSnapshot,
   quotaExhaustionFromHeaders,
+  type ReportRoutingInput,
+  reportRouting,
   type StickyRouteCandidate,
   stickyRouteFamilyForModel,
   stickyRouteKnownFableExhausted,
@@ -14,29 +19,6 @@ export type RoutingChoice = {
   hold?: { retry_after_ms: number }
 }
 type RoutingSubject = { accountIdentity?: string; credentialId?: string }
-type RoutingReport = {
-  account_id: string
-  credential_id?: string
-} & (
-  | { outcome: 'served'; headers: Record<string, string> }
-  | { outcome: 'exhausted'; window: string; resets_at?: string }
-)
-type Handle = {
-  accountFor(input: {
-    provider: 'anthropic'
-    modelId: string
-  }): Promise<unknown>
-  report(input: RoutingReport): unknown
-}
-
-// The runner's bridge loads after the auth plugin, so never cache the global.
-function handleFor(sessionId: string): Handle | undefined {
-  const routing = (globalThis as Record<symbol, unknown>)[
-    Symbol.for('cortexkit.routing')
-  ]
-  if (typeof routing !== 'function') return undefined
-  return routing(sessionId) ?? undefined
-}
 
 export function routingChoiceMatches(
   choice: RoutingChoice,
@@ -62,7 +44,11 @@ export function routingReserveAllows(
   return !depleted.length || depleted.some((row) => row.accountId === accountId)
 }
 
-export function createRoutingRelay() {
+export function createRoutingRelay(
+  quotaFor?: (
+    subject: RoutingSubject,
+  ) => Promise<OAuthQuotaSnapshot | undefined>,
+) {
   const overridden = new Set<string>()
   const override = (sessionId: string, reason: string) => {
     if (overridden.has(sessionId)) return
@@ -81,55 +67,41 @@ export function createRoutingRelay() {
     async accountFor(
       sessionId: string,
       modelId: string,
+      candidates: readonly RoutingSubject[],
     ): Promise<RoutingChoice | null> {
-      let timer: ReturnType<typeof setTimeout> | undefined
-      try {
-        const handle = handleFor(sessionId)
-        if (!handle) return null
-        const result = await Promise.race([
-          Promise.resolve().then(() =>
-            handle.accountFor({ provider: 'anthropic', modelId }),
-          ),
-          new Promise<null>((resolve) => {
-            timer = setTimeout(() => resolve(null), 2000)
-          }),
-        ])
-        if (
-          !result ||
-          typeof result !== 'object' ||
-          !('account_id' in result) ||
-          typeof result.account_id !== 'string' ||
-          !('credential_id' in result) ||
-          typeof result.credential_id !== 'string'
-        ) {
-          override(sessionId, 'no valid answer within routing deadline')
-          return null
-        }
-        const hold = 'hold' in result ? result.hold : undefined
-        return {
-          account_id: result.account_id,
-          credential_id: result.credential_id,
-          ...(hold &&
-          typeof hold === 'object' &&
-          'retry_after_ms' in hold &&
-          typeof hold.retry_after_ms === 'number' &&
-          Number.isFinite(hold.retry_after_ms) &&
-          hold.retry_after_ms > 0
-            ? {
-                hold: {
-                  retry_after_ms: Math.min(
-                    hold.retry_after_ms,
-                    ROUTING_HOLD_LIMIT_MS,
-                  ),
+      const result = await askRouting({
+        sessionId,
+        provider: 'anthropic',
+        modelId,
+        deadlineMs: 2000,
+        candidates: candidates.flatMap((row) =>
+          row.accountIdentity
+            ? [
+                {
+                  accountId: row.accountIdentity,
+                  credentialId: row.credentialId ?? 'local',
                 },
-              }
-            : {}),
-        }
-      } catch {
-        override(sessionId, 'routing unavailable')
+              ]
+            : [],
+        ),
+      })
+      if (!result) {
+        override(sessionId, 'no valid answer within routing deadline')
         return null
-      } finally {
-        clearTimeout(timer)
+      }
+      return {
+        account_id: result.candidate.accountId,
+        credential_id: result.candidate.credentialId,
+        ...(result.hold && result.hold.retry_after_ms > 0
+          ? {
+              hold: {
+                retry_after_ms: Math.min(
+                  result.hold.retry_after_ms,
+                  ROUTING_HOLD_LIMIT_MS,
+                ),
+              },
+            }
+          : {}),
       }
     },
     report(
@@ -142,12 +114,11 @@ export function createRoutingRelay() {
     ) {
       if (!subject.accountIdentity) return
       const identity = {
-        account_id: subject.accountIdentity,
-        ...(subject.credentialId
-          ? { credential_id: subject.credentialId }
-          : {}),
+        sessionId,
+        accountId: subject.accountIdentity,
+        ...(subject.credentialId ? { credentialId: subject.credentialId } : {}),
       }
-      const reports: RoutingReport[] = []
+      const reports: ReportRoutingInput[] = []
       if (served && status < 400) {
         const rateHeaders: Record<string, string> = {}
         headers.forEach((value, name) => {
@@ -156,36 +127,59 @@ export function createRoutingRelay() {
         })
         reports.push({ ...identity, outcome: 'served', headers: rateHeaders })
       }
-      if (status === 429) {
+      const quota =
+        status === 429
+          ? quotaExhaustionFromHeaders(headers, modelId)
+          : undefined
+      if (quota) {
         // Display percentages round near-full windows to 100. Only the refused
         // response's raw headers can confirm exhaustion, never saved quota.
-        const quota = quotaExhaustionFromHeaders(headers, modelId)
         for (const [window, reading] of [
           ['5h', quota.five_hour],
           ['7d', quota.seven_day],
-          ...(quota.scoped?.map(
-            (row) => [row.id.toLowerCase(), row] as const,
-          ) ?? []),
         ] as const) {
           if (reading)
             reports.push({
               ...identity,
               outcome: 'exhausted',
               window,
-              ...(reading.resetsAt ? { resets_at: reading.resetsAt } : {}),
+              ...(reading.resetsAt
+                ? { resetsAt: Date.parse(reading.resetsAt) }
+                : {}),
             })
         }
-        if (!reports.length)
+        if (!reports.length && !quota.scoped?.length)
           reports.push({ ...identity, outcome: 'exhausted', window: '7d' })
       }
       // Neither synchronous bridge errors nor rejected report promises can fail a send.
       void Promise.resolve()
-        .then(() => {
-          const handle = handleFor(sessionId)
-          for (const report of reports) {
-            try {
-              void Promise.resolve(handle?.report(report)).catch(() => {})
-            } catch {}
+        .then(async () => {
+          for (const report of reports) reportRouting(report)
+          if (quota?.scoped?.length) {
+            const stored = await quotaFor?.(subject)
+            // Stored usage-poll rows use this id prefix and retain the provider's
+            // case-sensitive model identity. Header-only rows cannot name a pool.
+            const scoped = getScopedQuotaWindowForModel(
+              {
+                scoped: stored?.scoped?.filter((row) =>
+                  row.id.startsWith('claude-weekly-scoped-'),
+                ),
+              },
+              modelId,
+            )
+            const pool = scoped?.modelId ?? scoped?.modelName.trim()
+            if (!pool) return
+            for (const reading of quota.scoped) {
+              reportRouting({
+                ...identity,
+                outcome: 'exhausted',
+                window: '7d',
+                pool,
+                ...(reading.resetsAt
+                  ? { resetsAt: Date.parse(reading.resetsAt) }
+                  : {}),
+              })
+            }
           }
         })
         .catch(() => {})

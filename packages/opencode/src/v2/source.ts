@@ -217,7 +217,14 @@ export function createNativeAnthropicSource(
 ): NativeSource {
   const { runtime } = options
   const usagePublications = createNativeUsagePublisher('native-auth')
-  const routingRelay = createRoutingRelay()
+  const routingRelay = createRoutingRelay(async (subject) => {
+    const snapshot = await runtime.read()
+    return snapshot.accounts.find(
+      (row) =>
+        row.accountIdentity === subject.accountIdentity &&
+        (!subject.credentialId || row.credentialId === subject.credentialId),
+    )?.quota
+  })
   const servedTurns = new Set<string>()
   // Vault mode keeps session affinity in its own file, named by the snapshot,
   // so vault sessions never read or write the local account's routing state.
@@ -524,7 +531,16 @@ export function createNativeAnthropicSource(
       )
         return undefined
       if (input.phase === 'request') servedTurns.delete(input.sessionID)
-      const advice = await routingRelay.accountFor(input.sessionID, modelID)
+      const advice = await routingRelay.accountFor(
+        input.sessionID,
+        modelID,
+        snapshot.accounts.filter(
+          (row) =>
+            row.type === 'oauth' &&
+            nativeAccountCanServe(row) &&
+            nativeAccountPolicy(row, snapshot, modelID).status === 'allowed',
+        ),
+      )
       active.signal.throwIfAborted()
       if (advice) {
         snapshot = await runtime.read()
